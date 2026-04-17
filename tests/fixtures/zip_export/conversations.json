@@ -1,0 +1,26 @@
+[
+  {
+    "uuid": "conv-verif-1",
+    "name": "Panel zip fixture conversation",
+    "chat_messages": [
+      {
+        "uuid": "m1",
+        "text": "draft reply mentioning trapezoidal_integrator as the key identifier",
+        "sender": "human",
+        "created_at": "2024-07-01T00:00:00Z"
+      },
+      {
+        "uuid": "m2",
+        "text": "Confirmed — the trapezoidal_integrator in the zip export is the unique phrase the recall panel pins.",
+        "sender": "assistant",
+        "created_at": "2024-07-01T00:00:01Z"
+      },
+      {
+        "uuid": "m3",
+        "text": "thanks, filing that under zipexport_panel_marker",
+        "sender": "human",
+        "created_at": "2024-07-01T00:00:02Z"
+      }
+    ]
+  }
+]

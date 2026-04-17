@@ -1,0 +1,27 @@
+[package]
+name = "ostk-recall-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ostk-recall-core = { workspace = true }
+ostk-recall-store = { workspace = true }
+walkdir = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+globset = { workspace = true }
+shellexpand = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+zip = { workspace = true }

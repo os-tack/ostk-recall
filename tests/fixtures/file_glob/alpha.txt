@@ -1,0 +1,9 @@
+Alpha file glob fixture.
+
+The unique phrase in this fixture is `fleet_heartbeat_skew`. The recall
+panel searches for it to prove the file_glob scanner ingests plain-text
+files.
+
+A second paragraph to force a paragraph split, adding some common
+vocabulary like orchestrator, heartbeat, and timer so BM25 has tokens to
+chew on.

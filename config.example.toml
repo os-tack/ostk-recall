@@ -1,0 +1,50 @@
+# ostk-recall configuration.
+# Location: ${XDG_CONFIG_HOME:-~/.config}/ostk-recall/config.toml
+#
+# Every field below is validated at load time (unknown keys error).
+# See `ostk-recall --help` for CLI.
+
+[corpus]
+# Where the LanceDB table and DuckDB files live.
+root = "~/.local/share/ostk-recall"
+
+[embedder]
+# model2vec-rs model name. potion-retrieval-32M (default, 512-dim) has better
+# recall than potion-base-8M (256-dim) but takes a fixed extra few ms per batch.
+# Switching models requires `ostk-recall init --force` + full re-scan.
+model = "potion-retrieval-32M"
+
+# One [[sources]] table per logical corpus slice.
+# `project` is a free-text tag — namespace your corpora however you like.
+
+[[sources]]
+kind = "markdown"
+project = "notes"
+paths = ["~/notes", "~/Documents/research"]
+
+[[sources]]
+kind = "claude_code"
+project = "claude-code-history"
+paths = ["~/.claude/projects"]      # scanner walks every <slug>/*.jsonl
+
+[[sources]]
+kind = "ostk_project"
+project = "haystack"
+paths = ["~/projects/haystack"]     # expands to decisions, needles, audit,
+                                     # conversations, specs, code under .ostk/
+
+[[sources]]
+kind = "code"
+project = "experiments"
+paths = ["~/experiments"]
+extensions = ["rs", "py", "ts"]
+
+[[sources]]
+kind = "file_glob"
+project = "research-pdfs"
+paths = ["~/Documents/papers/**/*.txt"]
+
+[[sources]]
+kind = "zip_export"
+project = "claude-ai-exports"
+paths = ["~/Downloads/claude-data-export-*.zip"]

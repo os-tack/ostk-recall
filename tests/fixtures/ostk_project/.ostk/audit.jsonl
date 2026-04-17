@@ -1,0 +1,4 @@
+{"ts":"2026-04-17T10:00:00Z","event":"tool.call","tool":"bash","agent":"alpha","success":true,"duration_ms":5}
+{"ts":"2026-04-17T10:00:01Z","event":"tool.call","tool":"bash","agent":"alpha","success":false,"exit_code":1,"duration_ms":100}
+{"ts":"2026-04-17T10:00:02Z","event":"tool.call","tool":"bash","agent":"beta","success":false,"exit_code":2,"duration_ms":200}
+{"ts":"2026-04-17T10:00:03Z","event":"decision","tool":"none","agent":"alpha","success":true,"duration_ms":1}

@@ -1,0 +1,5 @@
+Beta file under a nested folder.
+
+Distinctive keywords: arboreal_scheduler, canopy_checkpoint. These exist
+nowhere else in the corpus so the recall panel can use them to
+demonstrate that glob recursion works.

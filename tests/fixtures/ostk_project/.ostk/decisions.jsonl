@@ -1,0 +1,2 @@
+{"key":"adopt_big_little","value":"use big.LITTLE scheduler for fleet","reason":"proven in TEA migration","timestamp":"2026-04-15T10:00:00Z"}
+{"key":"defer_fcp_overlay","value":"postpone FCP overlay to next tick","reason":"needs more spec work","timestamp":"2026-04-16T09:30:00Z"}

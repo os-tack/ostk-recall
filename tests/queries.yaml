@@ -1,0 +1,158 @@
+# Recall verification panel.
+#
+# Each entry is a query + expected-hit assertion. The panel test
+# (crates/cli/tests/verification_panel.rs) parses this file with a
+# minimal YAML-subset parser (no external crate), runs QueryEngine::recall
+# against a single shared temp corpus scanned from tests/fixtures/**, and
+# asserts the named hit is present.
+#
+# Fields (all strings unless marked):
+#   name           — human-readable label used in the pass/fail table.
+#   query          — the recall query string.
+#   project        — optional project filter forwarded to RecallParams.
+#   source         — optional source filter forwarded to RecallParams.
+#   limit          — optional integer; default 10.
+#   kind           — "recall" (default) | "recall_link" | "recall_audit" | "negative".
+#   chunk_id       — for recall_link.
+#   parents_len    — integer, expected parent count for recall_link.
+#   sql            — for recall_audit.
+#   expected_count — integer expected first-column value for recall_audit.
+#   in_top_k       — integer; hit must be within top-K recall results.
+#   must_contain   — list of substrings; AT LEAST ONE must match the matching hit's snippet.
+#   notes          — free-form.
+
+- name: "markdown cross-heading retrieval"
+  query: "tier2_line_rebase"
+  kind: "recall"
+  in_top_k: 5
+  must_contain:
+    - "tier2_line_rebase"
+  notes: "BM25 smoke test: markdown scanner must surface the rebase.md chunk"
+
+- name: "code identifier retrieval"
+  query: "compute_lagrangian_delta"
+  kind: "recall"
+  in_top_k: 5
+  must_contain:
+    - "compute_lagrangian_delta"
+  notes: "code scanner must find the function identifier"
+
+- name: "claude_code conversation recall"
+  query: "hoberman shared memory"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "hoberman shared memory"
+  notes: "claude_code session must be retrievable by a unique phrase in the body"
+
+- name: "file_glob alpha keyword"
+  query: "fleet_heartbeat_skew"
+  kind: "recall"
+  in_top_k: 5
+  must_contain:
+    - "fleet_heartbeat_skew"
+  notes: "plain-text file ingested via file_glob"
+
+- name: "file_glob nested folder recursion"
+  query: "arboreal_scheduler canopy_checkpoint"
+  kind: "recall"
+  in_top_k: 5
+  must_contain:
+    - "arboreal_scheduler"
+  notes: "proves file_glob walks into subdirectories"
+
+- name: "zip_export message recall"
+  query: "trapezoidal_integrator"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "trapezoidal_integrator"
+  notes: "zip_export scanner finds a chunk by unique identifier in message text"
+
+- name: "ostk_project decision"
+  query: "big.LITTLE scheduler fleet"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "big.LITTLE"
+  notes: "ostk_decision chunk"
+
+- name: "ostk_project needle marker"
+  query: "needlepanelmarkerzeta"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "needlepanelmarkerzeta"
+  notes: "ostk_needle chunk with single-token distinctive phrase"
+
+- name: "ostk_project spec anchor"
+  query: "specanchoromega"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "specanchoromega"
+  notes: "docs/spec/*.md ingested by ostk_project as ostk_spec source"
+
+- name: "ostk_project session marker"
+  query: "sessionmarkerdelta"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "sessionmarkerdelta"
+  notes: "ostk_session chunk via Anthropic-style JSONL"
+
+- name: "ostk_project conversation handoff"
+  query: "convohandoffgamma"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "convohandoffgamma"
+  notes: "ostk_conversation chunk"
+
+- name: "project filter excludes other projects"
+  query: "tier2_line_rebase"
+  project: "notes"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "tier2_line_rebase"
+  notes: "same query as cross-heading retrieval, but pinned to project=notes"
+
+- name: "source filter restricts to markdown"
+  query: "tier2_line_rebase"
+  source: "markdown"
+  kind: "recall"
+  in_top_k: 10
+  must_contain:
+    - "tier2_line_rebase"
+  notes: "source filter narrows to the markdown scanner output"
+
+- name: "negative: nonsense token not present in any snippet"
+  query: "zzqnonexistenttokenxyz987"
+  kind: "negative"
+  must_contain:
+    - "zzqnonexistenttokenxyz987"
+  notes: |
+    Query for a token that is not present anywhere in the corpus.
+    With the FakeEmbedder, hybrid recall still returns chunks via the
+    dense leg (all vectors collapse onto FAKE_DIM buckets), but none of
+    those chunks' snippets contain the query token. The assertion is
+    therefore: no returned snippet contains the probe token.
+
+- name: "recall_audit counts failures"
+  kind: "recall_audit"
+  sql: "SELECT COUNT(*) FROM audit_events WHERE success = FALSE"
+  expected_count: 2
+  notes: "two failing rows in the ostk_project fixture audit.jsonl"
+
+- name: "recall_link finds parent chain"
+  kind: "recall_link"
+  # The 2nd zip_export message (m2) mentions "Confirmed — the
+  # trapezoidal_integrator in the zip export". The harness picks the
+  # first recall hit whose snippet contains the must_contain phrase,
+  # then calls recall_link(chunk_id).
+  query: "Confirmed trapezoidal_integrator zip export"
+  must_contain:
+    - "Confirmed"
+  parents_len: 1
+  notes: "child zip_export message must have exactly one parent in its chain"

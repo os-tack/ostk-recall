@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/embed",
+    "crates/store",
+    "crates/scan",
+    "crates/pipeline",
+    "crates/query",
+    "crates/mcp",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/os-tack/ostk-recall"
+authors = ["Scott Meyer"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[workspace.dependencies]
+# workspace-internal
+ostk-recall-core = { path = "crates/core" }
+ostk-recall-embed = { path = "crates/embed" }
+ostk-recall-store = { path = "crates/store" }
+ostk-recall-scan = { path = "crates/scan" }
+ostk-recall-pipeline = { path = "crates/pipeline" }
+ostk-recall-query = { path = "crates/query" }
+ostk-recall-mcp = { path = "crates/mcp" }
+ostk-recall-cli = { path = "crates/cli" }
+
+# external
+model2vec-rs = "0.1.4"
+lancedb = "0.27.2"
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
+duckdb = { version = "1.10502.0", features = ["bundled", "json"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+walkdir = "2.5"
+globset = "0.4"
+pulldown-cmark = "0.12"
+regex = "1.11"
+dirs = "6"
+shellexpand = "3"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# dev
+tempfile = "3.14"
+insta = "1.41"

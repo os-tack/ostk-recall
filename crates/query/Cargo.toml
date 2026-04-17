@@ -1,0 +1,32 @@
+[package]
+name = "ostk-recall-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ostk-recall-core = { workspace = true }
+ostk-recall-store = { workspace = true }
+ostk-recall-embed = { workspace = true }
+ostk-recall-pipeline = { workspace = true }
+lancedb = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

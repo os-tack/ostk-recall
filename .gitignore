@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.user
+
+# artifacts
+/tests/fixtures/tmp/
+*.lance/
+*.duckdb
+*.duckdb.wal
+
+# editor
+.idea/
+.vscode/
+*.swp

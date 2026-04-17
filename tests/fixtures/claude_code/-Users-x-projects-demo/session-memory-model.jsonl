@@ -1,0 +1,5 @@
+{"type":"file-history-snapshot","messageId":"init"}
+{"type":"user","message":{"role":"user","content":"Can you outline the distributed OS memory model we discussed yesterday?"},"timestamp":"2026-04-16T09:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Sure — the distributed OS memory model treats every node's RAM as a tier-1 page cache. The canonical phrase we use in the spec is 'hoberman shared memory'. It composes under TEA migration."}]},"timestamp":"2026-04-16T09:00:01Z"}
+{"type":"user","message":{"role":"user","content":"What about ordering guarantees under churn?"},"timestamp":"2026-04-16T09:00:10Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Under churn we fall back to a causal ordering envelope, not total order. This is the delineation point between the memory model and the fleet scheduler."}]},"timestamp":"2026-04-16T09:00:11Z"}

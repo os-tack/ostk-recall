@@ -1,0 +1,4 @@
+{"role":"user","content":"Remind me what sessionmarkerdelta refers to.","timestamp":"2026-04-17T08:00:00Z"}
+{"role":"assistant","content":"sessionmarkerdelta is the keyword used to probe ostk_session chunks in retrieval tests.","timestamp":"2026-04-17T08:00:01Z"}
+{"role":"user","content":"Good. The follow-up mnemonic is eelectricoctopus as a second probe.","timestamp":"2026-04-17T08:00:02Z"}
+{"role":"assistant","content":"Noted. Links back to the rebase spec.","timestamp":"2026-04-17T08:00:03Z"}

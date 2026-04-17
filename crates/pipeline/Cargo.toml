@@ -1,0 +1,25 @@
+[package]
+name = "ostk-recall-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ostk-recall-core = { workspace = true }
+ostk-recall-store = { workspace = true }
+ostk-recall-embed = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+ostk-recall-scan = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

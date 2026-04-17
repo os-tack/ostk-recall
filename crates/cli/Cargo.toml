@@ -1,0 +1,41 @@
+[package]
+name = "ostk-recall"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "ostk_recall_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ostk-recall"
+path = "src/main.rs"
+
+[dependencies]
+ostk-recall-core = { workspace = true }
+ostk-recall-embed = { workspace = true }
+ostk-recall-store = { workspace = true }
+ostk-recall-pipeline = { workspace = true }
+ostk-recall-scan = { workspace = true }
+ostk-recall-query = { workspace = true }
+ostk-recall-mcp = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+ostk-recall-store = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+zip = { workspace = true }

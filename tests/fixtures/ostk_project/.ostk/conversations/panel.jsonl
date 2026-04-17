@@ -1,0 +1,2 @@
+{"turn":1,"from":"alpha","to":"beta","ts":"2026-04-17T09:00:00Z","msg":"handoff the convohandoffgamma marker to you"}
+{"turn":2,"from":"beta","to":"alpha","ts":"2026-04-17T09:00:05Z","msg":"ack — convohandoffgamma received"}
