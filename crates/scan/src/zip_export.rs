@@ -71,6 +71,7 @@ impl Scanner for ZipExportScanner {
                         path: Some(path),
                         project: project.clone(),
                         bytes: None,
+                        ignore: Vec::new(),
                     })
                 })
         });
@@ -282,6 +283,7 @@ mod tests {
             kind: SourceKind::ZipExport,
             project: Some("export".into()),
             paths: vec![pat.into()],
+            ignore: vec![],
             extensions: vec![],
         }
     }

@@ -70,6 +70,7 @@ impl Scanner for ClaudeCodeScanner {
                         path: Some(path),
                         project,
                         bytes: None,
+                        ignore: Vec::new(),
                     })
                 })
         });
@@ -124,6 +125,7 @@ mod tests {
             kind: SourceKind::ClaudeCode,
             project: project.map(str::to_string),
             paths: vec![root.to_string_lossy().into_owned()],
+            ignore: vec![],
             extensions: vec![],
         }
     }

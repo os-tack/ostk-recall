@@ -300,6 +300,7 @@ mod tests {
             kind: SourceKind::Markdown,
             project: Some("test".into()),
             paths: vec![root.to_string_lossy().into_owned()],
+            ignore: vec![],
             extensions: vec![],
         }
     }

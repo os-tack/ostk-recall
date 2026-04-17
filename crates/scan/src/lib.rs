@@ -19,4 +19,5 @@ pub mod code;
 pub mod file_glob;
 pub mod markdown;
 pub mod ostk_project;
+pub mod walk;
 pub mod zip_export;

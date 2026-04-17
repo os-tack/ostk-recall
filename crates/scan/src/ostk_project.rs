@@ -33,11 +33,11 @@ use ostk_recall_core::{
 };
 use ostk_recall_store::{AuditEventRow, EventsDb};
 use serde::Deserialize;
-use walkdir::WalkDir;
 
 use crate::anthropic_session::parse_session_file;
 use crate::code::walk_and_window;
 use crate::markdown::split_markdown;
+use crate::walk::walk_filtered;
 
 /// Code extensions the composite scanner sweeps from each project's `src/`.
 const CODE_EXTENSIONS: &[&str] = &["rs", "py", "ts", "tsx", "js", "go", "md"];
@@ -91,6 +91,7 @@ impl Scanner for OstkProjectScanner {
             Err(e) => return Box::new(std::iter::once(Err(e))),
         };
         let project = cfg.project.clone();
+        let ignore_patterns = cfg.ignore.clone();
         let iter = roots.into_iter().map(move |root| {
             let source_id = root.to_string_lossy().into_owned();
             Ok(SourceItem {
@@ -98,12 +99,14 @@ impl Scanner for OstkProjectScanner {
                 path: Some(root),
                 project: project.clone(),
                 bytes: None,
+                ignore: ignore_patterns.clone(),
             })
         });
         Box::new(iter)
     }
 
     fn parse(&self, item: SourceItem) -> Result<Vec<Chunk>> {
+        let ignore_patterns = item.ignore.clone();
         let root = item
             .path
             .ok_or_else(|| Error::Parse("ostk_project: SourceItem.path missing".into()))?;
@@ -129,10 +132,10 @@ impl Scanner for OstkProjectScanner {
         out.extend(scan_sessions(&root, project.as_deref())?);
         // 6. memory pages
         out.extend(scan_memory(&root, project.as_deref())?);
-        // 7. spec + draft markdown
-        out.extend(scan_specs(&root, project.as_deref()));
-        // 8. source code
-        out.extend(scan_code(&root, project.as_deref()));
+        // 7. spec + draft markdown — honors per-source ignore patterns
+        out.extend(scan_specs(&root, project.as_deref(), &ignore_patterns));
+        // 8. source code — honors per-source ignore patterns
+        out.extend(scan_code(&root, project.as_deref(), &ignore_patterns));
 
         Ok(out)
     }
@@ -506,18 +509,12 @@ fn scan_conversations(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> 
     }
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_index: u32 = 0;
-    for entry in WalkDir::new(&dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x.eq_ignore_ascii_case("jsonl"))
-        })
-    {
+    for entry in walk_filtered(&dir, &[]).filter(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("jsonl"))
+    }) {
         let path = entry.path();
         let stem = path
             .file_stem()
@@ -580,18 +577,12 @@ fn scan_sessions(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
         return Ok(Vec::new());
     }
     let mut chunks: Vec<Chunk> = Vec::new();
-    for entry in WalkDir::new(&dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x.eq_ignore_ascii_case("jsonl"))
-        })
-    {
+    for entry in walk_filtered(&dir, &[]).filter(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("jsonl"))
+    }) {
         let path = entry.path();
         let source_id = path
             .file_name()
@@ -687,7 +678,7 @@ fn scan_memory(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
 
 // ─────────────────────────────── specs ──────────────────────────────────
 
-fn scan_specs(root: &Path, project: Option<&str>) -> Vec<Chunk> {
+fn scan_specs(root: &Path, project: Option<&str>, ignore_patterns: &[String]) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_index: u32 = 0;
     for subdir in ["docs/spec", "docs/draft"] {
@@ -695,18 +686,12 @@ fn scan_specs(root: &Path, project: Option<&str>) -> Vec<Chunk> {
         if !dir.exists() {
             continue;
         }
-        for entry in WalkDir::new(&dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .is_some_and(|x| x.eq_ignore_ascii_case("md"))
-            })
-        {
+        for entry in walk_filtered(&dir, ignore_patterns).filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+        }) {
             let path = entry.path();
             let source_id = path.strip_prefix(root).map_or_else(
                 |_| path.to_string_lossy().into_owned(),
@@ -750,7 +735,7 @@ fn scan_specs(root: &Path, project: Option<&str>) -> Vec<Chunk> {
 
 // ──────────────────────────────── code ──────────────────────────────────
 
-fn scan_code(root: &Path, project: Option<&str>) -> Vec<Chunk> {
+fn scan_code(root: &Path, project: Option<&str>, ignore_patterns: &[String]) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_index: u32 = 0;
     for subdir in ["src", "crates", "lib"] {
@@ -758,22 +743,16 @@ fn scan_code(root: &Path, project: Option<&str>) -> Vec<Chunk> {
         if !dir.exists() {
             continue;
         }
-        for entry in WalkDir::new(&dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .is_some_and(|x| {
-                        CODE_EXTENSIONS
-                            .iter()
-                            .any(|allowed| allowed.eq_ignore_ascii_case(x))
-                    })
-            })
-        {
+        for entry in walk_filtered(&dir, ignore_patterns).filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| {
+                    CODE_EXTENSIONS
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(x))
+                })
+        }) {
             let path = entry.path();
             let source_id = path.strip_prefix(root).map_or_else(
                 |_| path.to_string_lossy().into_owned(),
@@ -916,6 +895,7 @@ mod tests {
             kind: SourceKind::OstkProject,
             project: project.map(str::to_string),
             paths: vec![root.to_string_lossy().into_owned()],
+            ignore: vec![],
             extensions: vec![],
         }
     }

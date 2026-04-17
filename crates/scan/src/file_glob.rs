@@ -14,7 +14,8 @@ use globset::{Glob, GlobSetBuilder};
 use ostk_recall_core::{
     Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
 };
-use walkdir::WalkDir;
+
+use crate::walk::walk_filtered;
 
 /// Token budget per chunk (same proxy as markdown: bytes/4).
 const MAX_CHUNK_TOKENS: usize = 2000;
@@ -37,6 +38,7 @@ impl Scanner for FileGlobScanner {
     ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
         let raw_paths = cfg.paths.clone();
         let project = cfg.project.clone();
+        let ignore_patterns = cfg.ignore.clone();
 
         // Resolve each glob to (walk_root, glob_pattern).
         let planned: Vec<GlobPlan> = match plan_globs(&raw_paths) {
@@ -48,11 +50,8 @@ impl Scanner for FileGlobScanner {
             let project = project.clone();
             let walk_root = plan.root.clone();
             let matcher = plan.matcher.clone();
-            WalkDir::new(&plan.root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(std::result::Result::ok)
-                .filter(|e| e.file_type().is_file())
+            let ignore_patterns = ignore_patterns.clone();
+            walk_filtered(&plan.root, &ignore_patterns)
                 .filter(move |e| matcher.is_match(e.path()))
                 .map(move |entry| {
                     let path = entry.path().to_path_buf();
@@ -62,6 +61,7 @@ impl Scanner for FileGlobScanner {
                         path: Some(path),
                         project: project.clone(),
                         bytes: None,
+                        ignore: Vec::new(),
                     })
                 })
         });
@@ -270,6 +270,7 @@ mod tests {
             kind: SourceKind::FileGlob,
             project: Some(project.into()),
             paths: vec![pat.into()],
+            ignore: vec![],
             extensions: vec![],
         }
     }

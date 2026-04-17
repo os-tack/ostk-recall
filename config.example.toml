@@ -38,6 +38,14 @@ kind = "code"
 project = "experiments"
 paths = ["~/experiments"]
 extensions = ["rs", "py", "ts"]
+# Patterns merged on top of standard .gitignore behavior. Globs are
+# anchored at each path root. Underlying engine is the `ignore` crate
+# (same as ripgrep), so anything you'd write in a .gitignore works here.
+ignore = [
+    ".venv/**",        # cover venvs not always in .gitignore
+    "vendor/**",
+    "**/__pycache__/**",
+]
 
 [[sources]]
 kind = "file_glob"

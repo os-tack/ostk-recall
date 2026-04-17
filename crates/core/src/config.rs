@@ -37,6 +37,13 @@ pub struct SourceConfig {
     pub project: Option<String>,
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Per-source ignore patterns layered on top of standard `.gitignore`,
+    /// `.ignore`, and `.ostk-recall-ignore` handling. Globs follow the same
+    /// syntax as `.gitignore` (`vendor/**`, `**/__pycache__/**`, etc.) and
+    /// are anchored at each path root. Underlying engine is the `ignore`
+    /// crate (the same one ripgrep uses).
+    #[serde(default)]
+    pub ignore: Vec<String>,
     #[serde(default)]
     pub extensions: Vec<String>,
 }
@@ -144,5 +151,45 @@ paths = []
     fn expands_tilde() {
         let p = expand_path("~/foo").unwrap();
         assert!(!p.to_string_lossy().starts_with('~'));
+    }
+
+    #[test]
+    fn parses_ignore_patterns() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[[sources]]
+kind = "code"
+project = "p"
+paths = ["~/projects/foo"]
+ignore = ["vendor/**", "fixtures/"]
+extensions = ["rs"]
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert_eq!(cfg.sources.len(), 1);
+        assert_eq!(cfg.sources[0].ignore, vec!["vendor/**", "fixtures/"]);
+    }
+
+    #[test]
+    fn ignore_defaults_to_empty() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[[sources]]
+kind = "code"
+project = "p"
+paths = ["~/projects/foo"]
+extensions = ["rs"]
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert!(cfg.sources[0].ignore.is_empty());
     }
 }

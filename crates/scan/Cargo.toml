@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 ostk-recall-core = { workspace = true }
 ostk-recall-store = { workspace = true }
+ignore = { workspace = true }
 walkdir = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

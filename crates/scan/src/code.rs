@@ -13,7 +13,8 @@ use chrono::{DateTime, Utc};
 use ostk_recall_core::{
     Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
 };
-use walkdir::WalkDir;
+
+use crate::walk::walk_filtered;
 
 /// Lines per window.
 pub const WINDOW_LINES: usize = 200;
@@ -43,16 +44,13 @@ impl Scanner for CodeScanner {
             .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
             .collect();
         let project = cfg.project.clone();
+        let ignore_patterns = cfg.ignore.clone();
 
         let iter = roots.into_iter().flat_map(move |root| {
             let project = project.clone();
             let root_for_rel = root.clone();
             let extensions = extensions.clone();
-            WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(std::result::Result::ok)
-                .filter(|e| e.file_type().is_file())
+            walk_filtered(&root, &ignore_patterns)
                 .filter(move |e| extension_matches(e.path(), &extensions))
                 .map(move |entry| {
                     let path = entry.path().to_path_buf();
@@ -62,6 +60,7 @@ impl Scanner for CodeScanner {
                         path: Some(path),
                         project: project.clone(),
                         bytes: None,
+                        ignore: Vec::new(),
                     })
                 })
         });
@@ -192,6 +191,7 @@ mod tests {
             kind: SourceKind::Code,
             project: Some("code".into()),
             paths: vec![root.to_string_lossy().into_owned()],
+            ignore: vec![],
             extensions: exts.iter().map(|s| (*s).to_string()).collect(),
         }
     }
