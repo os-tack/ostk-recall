@@ -290,10 +290,20 @@ fn scan_audit(root: &Path, project: Option<&str>, events: Option<&EventsDb>) -> 
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let file = root.join(".ostk/audit.jsonl");
-    if !file.exists() {
+    // haystack renamed `audit.jsonl` → `journal.jsonl` in commit 9df538c
+    // (ontology audit.jsonl → journal.jsonl rename, →1458). We try the
+    // canonical name first, fall back to the legacy name so older ostk
+    // projects (osteak, ostk-site, ostk.ai.discord) keep working without
+    // requiring a migration on their side.
+    let canonical = root.join(".ostk/journal.jsonl");
+    let legacy = root.join(".ostk/audit.jsonl");
+    let file = if canonical.exists() {
+        canonical
+    } else if legacy.exists() {
+        legacy
+    } else {
         return Ok(Vec::new());
-    }
+    };
     let abs = absolute(&file);
 
     let f = File::open(&file)?;
