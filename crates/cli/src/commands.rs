@@ -322,6 +322,65 @@ pub async fn scan(
     })
 }
 
+/// Wipe every corpus row whose `project = reingest_project` and the
+/// matching `ingest_chunks` entries, then rescan that source.
+///
+/// LanceDB holds the `project` column, so we ask it for the doomed
+/// chunk ids first, delete from LanceDB, then delete those ids from
+/// `ingest.duckdb::ingest_chunks` (which has no `project` column).
+/// Finally we delegate to [`scan`] with `source_filter = Some(project)`
+/// and `dry_run = false` — the delete is never dry-run; there is no
+/// way to "preview" reingest without already having committed to the
+/// deletion.
+pub async fn scan_reingest(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    reingest_project: &str,
+) -> Result<ScanOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+
+    // 1. Collect ids for the project from LanceDB (before the delete).
+    let store = Arc::new(
+        CorpusStore::open_or_create(&root, embedder.dim())
+            .await
+            .map_err(|e| anyhow!("open corpus store: {e}"))?,
+    );
+    let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
+
+    let ids = store
+        .chunk_ids_for_project(reingest_project)
+        .await
+        .map_err(|e| anyhow!("chunk_ids_for_project({reingest_project}): {e}"))?;
+    tracing::info!(project = %reingest_project, chunk_count = ids.len(), "reingest: collected ids");
+
+    // 2. Delete from LanceDB.
+    let lance_deleted = store
+        .delete_by_project(reingest_project)
+        .await
+        .map_err(|e| anyhow!("delete_by_project({reingest_project}): {e}"))?;
+    tracing::info!(project = %reingest_project, deleted = lance_deleted, "reingest: lancedb rows removed");
+
+    // 3. Delete corresponding ingest_chunks rows so dedupe doesn't
+    //    short-circuit the rescan on matching content hashes.
+    let ingest_deleted = ingest
+        .delete_by_chunk_ids(&ids)
+        .map_err(|e| anyhow!("delete_by_chunk_ids: {e}"))?;
+    tracing::info!(project = %reingest_project, deleted = ingest_deleted, "reingest: ingest_chunks rows removed");
+
+    println!(
+        "reingest {reingest_project}: deleted {lance_deleted} corpus rows, {ingest_deleted} ingest rows"
+    );
+
+    // 4. Rescan just that source. Drop the local store/ingest handles so
+    //    the inner `scan` opens its own (avoids holding two IngestDb
+    //    `Mutex<Connection>` across an await).
+    drop(store);
+    drop(ingest);
+    scan(config_path, embedder, Some(reingest_project), false).await
+}
+
 /// Fetch a single chunk (plus its parent chain, when any) by id. Used by
 /// `ostk-recall inspect` to dump the full payload — including
 /// scanner-supplied `extra_json` — without going through an MCP client.

@@ -6,9 +6,11 @@ use arrow_array::{
     TimestampMicrosecondArray, UInt32Array,
 };
 use arrow_schema::Schema;
+use futures::TryStreamExt;
 use lancedb::Connection;
 use lancedb::index::Index;
 use lancedb::index::scalar::FtsIndexBuilder;
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use ostk_recall_core::Chunk;
 use thiserror::Error;
 
@@ -132,6 +134,57 @@ impl CorpusStore {
 
         Ok(chunks.len())
     }
+
+    /// Return all `chunk_id`s in the corpus whose `project` column equals
+    /// `project`. Used by the `--reingest` path to collect ids for
+    /// cross-store cleanup before the LanceDB delete fires.
+    pub async fn chunk_ids_for_project(&self, project: &str) -> Result<Vec<String>> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let filter = format!("project = '{}'", escape_sql(project));
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("chunk_id").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "chunk_id column missing in projection".into(),
+                ))
+            })?;
+            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::CastError(
+                    "chunk_id expected to be Utf8".into(),
+                ))
+            })?;
+            let rows = batch.num_rows();
+            ids.reserve(rows);
+            for i in 0..rows {
+                ids.push(arr.value(i).to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Delete every corpus row whose `project` column equals `project`.
+    /// Returns the number of rows removed (computed as `before - after`).
+    pub async fn delete_by_project(&self, project: &str) -> Result<u64> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let before = table.count_rows(None).await?;
+        let filter = format!("project = '{}'", escape_sql(project));
+        table.delete(&filter).await?;
+        let after = table.count_rows(None).await?;
+        Ok(u64::try_from(before.saturating_sub(after)).unwrap_or(0))
+    }
+}
+
+/// Escape single quotes for inlining into a LanceDB filter expression.
+/// Duplicates `'` -> `''`; LanceDB's filter parser is SQL-like.
+fn escape_sql(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn build_record_batch(

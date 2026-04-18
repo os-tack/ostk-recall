@@ -135,6 +135,38 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// Delete ingest rows matching any of the supplied chunk ids. Returns
+    /// the total number of rows removed. Used by the `--reingest` path
+    /// after LanceDB rows for a project have been collected — deleting
+    /// here lets the next scan pass re-ingest those chunks instead of
+    /// short-circuiting on the `content_already_ingested` dedupe check.
+    ///
+    /// `ingest_chunks` has no `project` column, so the caller (the CLI
+    /// reingest wrapper) first queries LanceDB for every chunk_id whose
+    /// `project` matches the flag, then passes those ids here in batches.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn delete_by_chunk_ids(&self, chunk_ids: &[String]) -> Result<u64> {
+        if chunk_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock();
+        let mut total: u64 = 0;
+        for batch in chunk_ids.chunks(1000) {
+            let placeholders = std::iter::repeat_n('?', batch.len())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("DELETE FROM ingest_chunks WHERE chunk_id IN ({placeholders})");
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                batch.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+            let n = conn.execute(&sql, duckdb::params_from_iter(params_refs.iter().copied()))?;
+            total = total.saturating_add(u64::try_from(n).unwrap_or(0));
+        }
+        Ok(total)
+    }
+
     /// Latest `upserted_at` across all ingested chunks, as RFC3339 text.
     /// Returns None if the table is empty.
     #[allow(clippy::significant_drop_tightening)]

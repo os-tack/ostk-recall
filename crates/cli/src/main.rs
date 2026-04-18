@@ -42,9 +42,17 @@ enum Command {
     /// Scan configured sources and ingest chunks.
     Scan {
         /// Optional source project filter; scans all when omitted.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reingest")]
         source: Option<String>,
+        /// Wipe every corpus + ingest row whose `project` matches this
+        /// value, then rescan just that source. Implies `--source=<NAME>`.
+        /// Use when a chunker / parser change needs to propagate to
+        /// already-ingested data without a full `init --force` rebuild.
+        #[arg(long)]
+        reingest: Option<String>,
         /// Report what would be ingested without writing to the store.
+        /// Ignored when combined with `--reingest` (the delete is
+        /// never dry — if you asked for it, we do it).
         #[arg(long)]
         dry_run: bool,
     },
@@ -164,9 +172,17 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Scan { source, dry_run } => {
+        Command::Scan {
+            source,
+            reingest,
+            dry_run,
+        } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            let out = commands::scan(&config_path, embedder, source.as_deref(), dry_run).await?;
+            let out = if let Some(project) = reingest.as_deref() {
+                commands::scan_reingest(&config_path, embedder, project).await?
+            } else {
+                commands::scan(&config_path, embedder, source.as_deref(), dry_run).await?
+            };
             println!("scan summary (dry_run={}):", out.dry_run);
             for (name, s) in &out.per_source {
                 println!(
