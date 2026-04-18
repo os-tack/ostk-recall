@@ -9,6 +9,7 @@ use lancedb::Connection;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::rerankers::rrf::RRFReranker;
+use ostk_recall_core::Source;
 use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_store::CORPUS_TABLE;
 
@@ -30,15 +31,29 @@ pub const DEFAULT_MAX_PER_SOURCE_ID: usize = 3;
 /// mid-pack.
 pub const PREFETCH_MULTIPLIER: usize = 6;
 
+/// Extra candidates pulled from `source = 'code'` when the caller hasn't
+/// filtered by source.
+///
+/// The 442 k-chunk corpus is ~1 % code by volume — without this stratified
+/// prefetch, a top-`PREFETCH_MULTIPLIER * limit` unfiltered query
+/// statistically misses every code candidate. This boost guarantees the
+/// cross-encoder reranker sees code rows whenever they exist for a query.
+pub const STRATIFIED_CODE_PREFETCH: usize = 12;
+
 /// Execute a hybrid recall against the corpus table.
 ///
 /// Pipeline:
 /// 1. Dense + BM25 retrieval, fused by RRF in `LanceDB` → ~`limit *
 ///    PREFETCH_MULTIPLIER` candidates.
-/// 2. Optional cross-encoder rerank: if `reranker` is `Some`, score each
+/// 2. Soft-stratified augmentation: when the caller hasn't filtered by
+///    source, run a second targeted query with `source = 'code'` to pull
+///    [`STRATIFIED_CODE_PREFETCH`] additional candidates. The 442k-chunk
+///    corpus is ~1 % code; without this, code candidates rarely reach
+///    the reranker. Results are merged (dedupe by `chunk_id`).
+/// 3. Optional cross-encoder rerank: if `reranker` is `Some`, score each
 ///    candidate's full text against `query` and reorder by the new score.
 ///    Without a reranker, the RRF-fused order is preserved.
-/// 3. Per-`source_id` diversity filter, truncated to `limit`.
+/// 4. Per-`source_id` diversity filter, truncated to `limit`.
 pub async fn recall(
     conn: &Connection,
     embedder: &dyn ChunkEmbedder,
@@ -66,29 +81,51 @@ pub async fn recall(
 
     let table = conn.open_table(CORPUS_TABLE).execute().await?;
 
-    let filter = build_filter(
+    let primary_filter = build_filter(
         params.project.as_deref(),
         params.source.as_deref(),
         params.since,
     );
 
-    let mut q = table
-        .query()
-        .nearest_to(vec)?
-        .full_text_search(FullTextSearchQuery::new(query_text.to_string()))
-        .rerank(Arc::new(RRFReranker::default()))
-        .limit(fetch_limit);
+    let mut candidates = run_hybrid_query(
+        &table,
+        &vec,
+        query_text,
+        fetch_limit,
+        primary_filter.as_deref(),
+    )
+    .await?;
 
-    if let Some(f) = &filter {
-        q = q.only_if(f);
-    }
-
-    let stream = q.execute().await?;
-    let batches: Vec<_> = stream.try_collect().await?;
-
-    let mut candidates = Vec::new();
-    for b in &batches {
-        candidates.extend(batch_to_hits(b)?);
+    // Soft-stratified augmentation: when the caller hasn't filtered by
+    // source, top up with a code-only prefetch so the reranker always
+    // sees code candidates.
+    if params.source.is_none() {
+        let code_filter = build_filter(
+            params.project.as_deref(),
+            Some(Source::Code.as_str()),
+            params.since,
+        );
+        match run_hybrid_query(
+            &table,
+            &vec,
+            query_text,
+            STRATIFIED_CODE_PREFETCH,
+            code_filter.as_deref(),
+        )
+        .await
+        {
+            Ok(extras) => {
+                tracing::debug!(
+                    primary = candidates.len(),
+                    code_extras = extras.len(),
+                    "stratified prefetch"
+                );
+                merge_dedup(&mut candidates, extras);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "stratified code prefetch failed; continuing with primary candidates");
+            }
+        }
     }
 
     // Cross-encoder pass. The candidate text we score is the snippet that
@@ -103,6 +140,50 @@ pub async fn recall(
     };
 
     Ok(diversify_by_source_id(candidates, limit, max_per_source_id))
+}
+
+/// Issue one hybrid (dense + BM25 + RRF) query against `table`.
+async fn run_hybrid_query(
+    table: &lancedb::Table,
+    vec: &[f32],
+    query_text: &str,
+    fetch_limit: usize,
+    filter: Option<&str>,
+) -> Result<Vec<RecallHit>> {
+    let mut q = table
+        .query()
+        .nearest_to(vec.to_vec())?
+        .full_text_search(FullTextSearchQuery::new(query_text.to_string()))
+        .rerank(Arc::new(RRFReranker::default()))
+        .limit(fetch_limit);
+    if let Some(f) = filter {
+        q = q.only_if(f);
+    }
+    let stream = q.execute().await?;
+    let batches: Vec<_> = stream.try_collect().await?;
+    let mut out = Vec::new();
+    for b in &batches {
+        out.extend(batch_to_hits(b)?);
+    }
+    Ok(out)
+}
+
+/// Merge `extras` into `dest`, skipping any whose `chunk_id` is already
+/// present. Preserves `dest` order; appends new rows at the tail. The
+/// reranker reorders everything, so insertion position only matters when
+/// no reranker is attached — code rows correctly land *after* the primary
+/// candidates in that fallback path.
+fn merge_dedup(dest: &mut Vec<RecallHit>, extras: Vec<RecallHit>) {
+    if extras.is_empty() {
+        return;
+    }
+    let seen: std::collections::HashSet<String> = dest.iter().map(|h| h.chunk_id.clone()).collect();
+    for hit in extras {
+        if seen.contains(&hit.chunk_id) {
+            continue;
+        }
+        dest.push(hit);
+    }
 }
 
 /// Apply the cross-encoder reranker to a candidate pool. Drops candidates
@@ -370,5 +451,21 @@ mod tests {
         let out = rerank_candidates(&TokenOverlapReranker, "alpha", candidates).unwrap();
         assert!(out[0].score >= out[1].score);
         assert_eq!(out[0].chunk_id, "a");
+    }
+
+    #[test]
+    fn merge_dedup_appends_new_skips_existing() {
+        let mut dest = vec![fake_hit("a", "S"), fake_hit("b", "S")];
+        let extras = vec![fake_hit("a", "S"), fake_hit("c", "S")];
+        merge_dedup(&mut dest, extras);
+        let ids: Vec<_> = dest.iter().map(|h| h.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_dedup_empty_extras_noop() {
+        let mut dest = vec![fake_hit("a", "S")];
+        merge_dedup(&mut dest, Vec::new());
+        assert_eq!(dest.len(), 1);
     }
 }

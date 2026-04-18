@@ -82,6 +82,7 @@ dirs = "6"
 shellexpand = "3"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 fastembed = "5"
+which = "7"
 
 # dev
 tempfile = "3.14"

@@ -22,6 +22,8 @@ tracing = { workspace = true }
 globset = { workspace = true }
 shellexpand = { workspace = true }
 zip = { workspace = true }
+thiserror = { workspace = true }
+which = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -254,9 +254,11 @@ pub async fn scan(
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Pipeline::new(store, ingest, Arc::clone(&embedder)).with_dry_run(dry_run);
 
-    // Scanners that are stateless can be reused across sources.
+    // Scanners that are stateless can be reused across sources. The
+    // code scanner now caches per-workspace `fcp-rust` sessions across
+    // `parse` calls; one instance per ingest run lets that cache stick.
     let markdown = MarkdownScanner;
-    let code = CodeScanner;
+    let code = CodeScanner::default();
     let claude_code = ClaudeCodeScanner;
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
