@@ -19,6 +19,16 @@ license = "Apache-2.0"
 repository = "https://github.com/os-tack/ostk-recall"
 authors = ["Scott Meyer"]
 
+[profile.release]
+# Slim the binary: panic-abort drops ~25 MB of unwind tables; thin LTO
+# and codegen-units=1 enable cross-crate dead-code elim; strip removes
+# debug symbols and section names. Tests run under [profile.test] which
+# inherits from dev — no impact on test behavior.
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
