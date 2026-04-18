@@ -73,8 +73,11 @@ pub enum FcpError {
 /// Default per-call request timeout. Used for `symbols`/`def`/etc.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default workspace-indexing wait. Override via env
-/// `OSTK_RECALL_FCP_RUST_INDEX_TIMEOUT` (seconds).
-const DEFAULT_INDEX_TIMEOUT: Duration = Duration::from_secs(60);
+/// `OSTK_RECALL_FCP_RUST_INDEX_TIMEOUT` (seconds). Set generously
+/// because rust-analyzer cold-start on large workspaces (haystack-
+/// scale, ~350 files) measured at ~2 min in practice; 60 s silently
+/// fell back to line-window for every haystack .rs file (→1489).
+const DEFAULT_INDEX_TIMEOUT: Duration = Duration::from_secs(300);
 /// Poll cadence while waiting for `Status: ready`.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -213,19 +216,39 @@ impl FcpRustSession {
     /// symbol). Caller-supplied total-line count keeps the API single-
     /// allocation; pass `0` to leave end-lines bounded by 4 KiB above the
     /// next symbol (a safe default for Rust top-level items).
+    ///
+    /// Retries transparently on rust-analyzer's "not yet loaded" response
+    /// (`! LSP error: JSON error: invalid type: null, expected a sequence`).
+    /// That error fires when `textDocument/documentSymbol` is issued
+    /// before rust-analyzer has scheduled a per-file analysis pass.
+    /// Status can report `ready` while individual files are still cold
+    /// \u2014 warm-up happens lazily on first symbol query, and our response
+    /// races ahead of that. 2 s \u00d7 5 retries is enough on cold workspaces
+    /// in practice; beyond that we surface the error.
     pub fn symbols(&mut self, file: &Path, total_lines: u32) -> Result<Vec<RustSymbol>, FcpError> {
         let rel = self.relativize(file)?;
         let rel_str = rel.to_string_lossy().into_owned();
-        let resp = self.tool_call(
-            "rust_query",
-            json!({"input": format!("symbols {rel_str}")}),
-            DEFAULT_REQUEST_TIMEOUT,
-        )?;
-        let text = extract_text(&resp).unwrap_or_default();
-        if text.starts_with("! LSP error") || text.starts_with("Error:") {
-            return Err(FcpError::Server(text));
+        let mut last_err: Option<FcpError> = None;
+        for attempt in 0..5u8 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            let resp = self.tool_call(
+                "rust_query",
+                json!({"input": format!("symbols {rel_str}")}),
+                DEFAULT_REQUEST_TIMEOUT,
+            )?;
+            let text = extract_text(&resp).unwrap_or_default();
+            if text.contains("invalid type: null, expected a sequence") {
+                last_err = Some(FcpError::Server(text));
+                continue;
+            }
+            if text.starts_with("! LSP error") || text.starts_with("Error:") {
+                return Err(FcpError::Server(text));
+            }
+            return Ok(parse_symbols(&text, total_lines));
         }
-        Ok(parse_symbols(&text, total_lines))
+        Err(last_err.unwrap_or_else(|| FcpError::Server("symbols: exhausted retries".into())))
     }
 
     /// Send `rust_session close` and discard the response. Idempotent —
@@ -529,9 +552,18 @@ pub fn group_by_workspace(
 // itself a single-threaded JSON-RPC peer — concurrent callers would
 // serialize at the stdin pipe regardless.
 
-/// Lines of context to capture before each fcp-rust symbol. Catches doc
-/// comments and `#[attribute]` macros immediately preceding the item.
-pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = 5;
+/// Upper bound on lines scanned backward from a symbol while searching
+/// for its preceding doc-comment / attribute block. Conservative ceiling
+/// — the scan stops as soon as it hits a non-doc / non-attr line. Exists
+/// only to bound the walk on pathological files.
+pub const SYMBOL_DOC_SCAN_MAX: u32 = 200;
+
+/// Max consecutive doc/comment/attr lines to prepend as a synthetic
+/// "module header" chunk. Captures `//!` rustdoc at the top of the file
+/// (where →NEEDLE references, module-level reasoning, and invariants
+/// tend to live). If the file starts with code, no header chunk is
+/// emitted.
+pub const MODULE_HEADER_MAX_LINES: u32 = 200;
 
 /// Module-level session cache. `OnceLock<Mutex<HashMap<...>>>` so the
 /// mutex is initialized lazily (unit tests that never touch fcp-rust
@@ -539,6 +571,15 @@ pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = 5;
 fn session_cache() -> &'static Mutex<HashMap<PathBuf, FcpRustSession>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, FcpRustSession>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Workspaces that have already failed to open. Prevents re-attempting
+/// the 5-minute indexing timeout on every single .rs file in a
+/// workspace where fcp-rust can't get to ready. Keyed by canonicalized
+/// workspace root, same as [`session_cache`].
+fn failed_workspaces() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static FAILED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    FAILED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Cached result of `which::which("fcp-rust")` at module scope. Avoids
@@ -564,8 +605,14 @@ fn fcp_rust_on_path() -> bool {
 /// Ensure the session cache has an entry for `workspace_root`; spawn +
 /// open one if not. Returns `true` on success, `false` if anything in
 /// the spawn/open chain failed (caller falls back to line-window).
+///
+/// Failures are memoized in [`failed_workspaces`] so subsequent `.rs`
+/// files under the same workspace don't re-pay the indexing-timeout
+/// cost (~5 min each under the bumped default). This was the silent
+/// amplifier behind →1489: haystack's 100+ .rs files each tried to
+/// open and time out independently.
 fn ensure_session(workspace_root: &Path) -> bool {
-    // Fast path: already cached.
+    // Fast path: already cached as a live session.
     {
         let Ok(guard) = session_cache().lock() else {
             return false;
@@ -574,21 +621,45 @@ fn ensure_session(workspace_root: &Path) -> bool {
             return true;
         }
     }
+    // Fast path: already known to fail — skip without the open retry.
+    {
+        let Ok(guard) = failed_workspaces().lock() else {
+            return false;
+        };
+        if guard.contains(workspace_root) {
+            return false;
+        }
+    }
     let mut session = match FcpRustSession::spawn() {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "fcp_rust: failed to spawn fcp-rust");
+            if let Ok(mut g) = failed_workspaces().lock() {
+                g.insert(workspace_root.to_path_buf());
+            }
             return false;
         }
     };
-    if let Err(e) = session.open_workspace(workspace_root, index_timeout_from_env()) {
+    let open_start = Instant::now();
+    let wait = index_timeout_from_env();
+    if let Err(e) = session.open_workspace(workspace_root, wait) {
         tracing::warn!(
             error = %e,
             workspace = %workspace_root.display(),
-            "fcp_rust: open_workspace failed; falling back to line-window for this workspace"
+            waited_ms = open_start.elapsed().as_millis(),
+            timeout_s = wait.as_secs(),
+            "fcp_rust: open_workspace failed; falling back to line-window for this workspace (memoized — won't retry)"
         );
+        if let Ok(mut g) = failed_workspaces().lock() {
+            g.insert(workspace_root.to_path_buf());
+        }
         return false;
     }
+    tracing::info!(
+        workspace = %workspace_root.display(),
+        indexed_ms = open_start.elapsed().as_millis(),
+        "fcp_rust: workspace ready"
+    );
     let Ok(mut guard) = session_cache().lock() else {
         return false;
     };
@@ -643,34 +714,93 @@ pub fn chunk_rust_file(
     // JSON-RPC peer, so concurrent callers must serialize regardless
     // — the lock is simply making that explicit. The function-level
     // `#[allow(clippy::significant_drop_tightening)]` covers this.
+    //
+    // Retries on empty. rust-analyzer sometimes returns [] on the first
+    // per-file symbol query while its per-file symbol table is still
+    // warming (see →1489). A short retry loop covers the window between
+    // "Status: ready" and "this file actually has symbols". Most files
+    // resolve on attempt 1; a cold workspace's first-file probe may take
+    // 2-3 attempts. ×5 at 2 s each caps the warmup at 10 s per file.
     let symbols = {
         let mut guard = session_cache().lock().ok()?;
         let session = guard.get_mut(&workspace)?;
-        match session.symbols(file_path, total_lines) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %file_path.display(),
-                    "fcp_rust: symbols query failed; falling back to line-window"
-                );
-                return None;
+        let mut got: Vec<RustSymbol> = Vec::new();
+        for attempt in 0..5u8 {
+            match session.symbols(file_path, total_lines) {
+                Ok(s) if !s.is_empty() => {
+                    got = s;
+                    break;
+                }
+                Ok(_) => {
+                    // Empty result. Could be legitimate (empty file) or
+                    // rust-analyzer still warming. Retry with backoff;
+                    // if still empty after retries, accept it.
+                    if attempt + 1 < 5 {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %file_path.display(),
+                        "fcp_rust: symbols query failed; falling back to line-window"
+                    );
+                    return None;
+                }
             }
         }
+        got
     };
     if symbols.is_empty() {
         return None;
     }
 
     let file_lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let mut chunks = Vec::with_capacity(symbols.len());
-    for (idx, sym) in symbols.iter().enumerate() {
-        let chunk_text = slice_symbol(&file_lines, sym, SYMBOL_LEADING_CONTEXT_LINES);
+    // Capacity: one per symbol, plus (maybe) one module-header chunk.
+    let mut chunks = Vec::with_capacity(symbols.len() + 1);
+
+    // Module-header chunk: `//!` rustdoc + trailing attributes at the
+    // top of the file, up to the first symbol (or MODULE_HEADER_MAX_LINES).
+    // This is where needle references and "why this module exists"
+    // reasoning typically live — they'd otherwise be orphaned because
+    // no per-symbol chunk covers the preamble.
+    let first_symbol_line = symbols.iter().map(|s| s.line_start).min().unwrap_or(1);
+    if let Some(header_body) = slice_module_header(&file_lines, first_symbol_line) {
+        let chunk_index = u32::try_from(chunks.len()).ok()?;
+        let chunk_id = Chunk::make_id(source, source_id, chunk_index);
+        let sha256 = Chunk::content_hash(&header_body);
+        let extra = serde_json::json!({
+            "kind": "module_header",
+            "symbols": [],
+            "line_start": 1u32,
+            "line_end": first_symbol_line.saturating_sub(1),
+            "chunker": "fcp-rust",
+        });
+        chunks.push(Chunk {
+            chunk_id,
+            source,
+            project: project.map(str::to_string),
+            source_id: source_id.to_string(),
+            chunk_index,
+            ts: mtime,
+            role: None,
+            text: header_body,
+            sha256,
+            links: Links {
+                file_path: Some(abs_path.to_string()),
+                ..Links::default()
+            },
+            extra,
+        });
+    }
+
+    for sym in &symbols {
+        let chunk_text = slice_symbol_with_docs(&file_lines, sym, SYMBOL_DOC_SCAN_MAX);
         if chunk_text.trim().is_empty() {
             continue;
         }
         let body = format!("// {} {}\n{}", sym.kind, sym.name, chunk_text);
-        let chunk_index = u32::try_from(idx).ok()?;
+        let chunk_index = u32::try_from(chunks.len()).ok()?;
         let chunk_id = Chunk::make_id(source, source_id, chunk_index);
         let sha256 = Chunk::content_hash(&body);
         let extra = serde_json::json!({
@@ -705,9 +835,110 @@ pub fn chunk_rust_file(
     }
 }
 
+/// Walk backward from `sym.line_start - 1` while lines match a doc-block
+/// pattern (`///`, `//!`, `#[...]`, or blank lines that are part of the
+/// block). Returns the slice `[first_doc_line, sym.line_end]`.
+///
+/// This supersedes a fixed `leading` window: long doc comments (>5 lines,
+/// common on kernel types with invariant explanations or →needle refs)
+/// get captured in full instead of being truncated mid-paragraph.
+#[must_use]
+pub fn slice_symbol_with_docs(lines: &[&str], sym: &RustSymbol, max_scan: u32) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let total = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    // Walk backward from the line just above the symbol, capturing every
+    // doc (`///`, `//!`), attribute (`#[...]` and its continuations), or
+    // blank-inside-block line. Stop at the first code line — that's the
+    // end of the preceding item, so blanks there aren't part of *our*
+    // doc block.
+    let mut start_one = sym.line_start;
+    let scan_limit = start_one.saturating_sub(max_scan).max(1);
+    while start_one > scan_limit {
+        let candidate = start_one - 1;
+        let idx = (candidate - 1) as usize;
+        if idx >= lines.len() {
+            break;
+        }
+        let line = lines[idx].trim_start();
+        let is_doc = line.starts_with("///")
+            || line.starts_with("//!")
+            || line.starts_with("#[")
+            || line.starts_with("#![");
+        // A blank line is part of the doc block only if the line *above*
+        // it is also a doc/attr line — otherwise it's white-space between
+        // the previous item and this one.
+        let is_block_blank = if line.is_empty() && candidate > 1 {
+            let above = lines[(candidate - 2) as usize].trim_start();
+            above.starts_with("///")
+                || above.starts_with("//!")
+                || above.starts_with("#[")
+                || above.starts_with("#![")
+        } else {
+            false
+        };
+        if is_doc || is_block_blank {
+            start_one = candidate;
+        } else {
+            break;
+        }
+    }
+    let start = (start_one - 1) as usize;
+    let end_one = sym.line_end.min(total);
+    let end = end_one as usize;
+    if start >= lines.len() || end <= start {
+        return String::new();
+    }
+    lines[start..end].concat()
+}
+
+/// Build the synthetic module-header chunk body: all `//!` rustdoc + any
+/// top-of-file attributes, stopping at the first non-doc/non-attr line
+/// or at `MODULE_HEADER_MAX_LINES`, whichever comes first. Returns
+/// `None` when the file starts with code (no header content to capture).
+#[must_use]
+pub fn slice_module_header(lines: &[&str], first_symbol_line: u32) -> Option<String> {
+    if lines.is_empty() || first_symbol_line <= 1 {
+        return None;
+    }
+    let cap = MODULE_HEADER_MAX_LINES.min(first_symbol_line.saturating_sub(1)) as usize;
+    let cap = cap.min(lines.len());
+    let mut end = 0usize;
+    for (i, line) in lines.iter().take(cap).enumerate() {
+        let l = line.trim_start();
+        if l.is_empty()
+            || l.starts_with("//!")
+            || l.starts_with("///")
+            || l.starts_with("//")
+            || l.starts_with("#![")
+            || l.starts_with("#[")
+        {
+            end = i + 1;
+        } else {
+            break;
+        }
+    }
+    // Strip trailing blank lines; an empty-or-all-blank header isn't
+    // worth a chunk.
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let body = lines[..end].concat();
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
 /// Slice `[sym.line_start - leading, sym.line_end]` out of `lines`,
-/// clamping to file bounds. Mirrors `code::slice_for_symbol` but lives
-/// next to the shared helper so `code.rs` can delegate here.
+/// clamping to file bounds. Retained for callers / tests that want the
+/// fixed-window behavior; the production chunker uses
+/// [`slice_symbol_with_docs`].
 #[must_use]
 pub fn slice_symbol(lines: &[&str], sym: &RustSymbol, leading: u32) -> String {
     if lines.is_empty() {
