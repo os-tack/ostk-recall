@@ -101,9 +101,13 @@ async fn claude_code_end_to_end() {
         .await
         .unwrap();
     assert_eq!(out.totals.errors, 0);
+    // Per-message chunking (Phase H):
+    //   session-a: user "hi there" + assistant text "let me check" + tool_use + assistant text "done" = 4
+    //   session-b: user "q" + assistant text "a" = 2
+    //   total = 6
     assert_eq!(
-        out.totals.chunks_upserted, 2,
-        "2 sessions = 2 exchange chunks, got {:?}",
+        out.totals.chunks_upserted, 6,
+        "expected 6 per-block chunks, got {:?}",
         out.totals
     );
 

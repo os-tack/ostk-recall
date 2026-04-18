@@ -1,4 +1,4 @@
-//! Shared helper for parsing Anthropic-style session logs into exchange
+//! Shared helper for parsing Anthropic-style session logs into per-block
 //! chunks.
 //!
 //! Two callers share this logic:
@@ -11,19 +11,28 @@
 //!    Messages shape (`{ role, content, timestamp }` at the top level).
 //!
 //! The `content` field can be a plain string or an array of blocks
-//! (`{type: "text"|"tool_use"|"tool_result"}`); all textual blocks are
-//! concatenated.
+//! (`{type: "text"|"tool_use"|"tool_result"}`).
 //!
-//! # Chunking
+//! # Chunking (Phase H)
 //!
-//! One chunk per **exchange** = one assistant response (possibly with
-//! interleaved `tool_use`/`tool_result` blocks) plus the preceding user turn.
-//! Role on the chunk is `"assistant"` (it's semantically an answer). Each
-//! chunk links to the previous exchange's `chunk_id` via
-//! `Links.parent_ids`.
+//! One chunk per **message block**:
 //!
-//! Oversize assistant bodies (> `MAX_EXCHANGE_CHARS`) are paragraph-split
-//! into multiple sibling chunks; the user turn stays with the first slice.
+//! * user `text` (or whole-string content) → one chunk with `role = "user"`
+//! * each assistant `text` block → one chunk with `role = "assistant"`
+//! * each `tool_use` block → one chunk with `role = "tool"`
+//! * each `tool_result` block → one chunk with `role = "tool_result"`
+//!
+//! Tool blocks (`tool_use`, `tool_result`) are still capped at
+//! [`TOOL_RESULT_PREVIEW_CHARS`] characters to keep raw file dumps from
+//! dominating BM25.
+//!
+//! Each chunk's `links.parent_ids` points to the previous chunk in the
+//! session, so `recall_link` can walk backward and reconstruct the
+//! surrounding context. `chunk_index` is monotonic over the entire session.
+//!
+//! Per-block chunking gives the cross-encoder reranker clean, single-
+//! purpose units to score, instead of a hodgepodge "exchange" containing
+//! prose, tool calls, and file listings smeared together.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -32,10 +41,6 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{Chunk, Links, Result, Source};
 use serde::Deserialize;
-
-/// Hard ceiling on a single chunk's text length. Assistant responses that
-/// exceed this are paragraph-split into siblings.
-pub const MAX_EXCHANGE_CHARS: usize = 4000;
 
 /// Cap on rendered tool-block characters retained in a chunk.
 ///
@@ -71,9 +76,42 @@ struct InnerMessage {
     content: Option<serde_json::Value>,
 }
 
+/// Kind of block surfaced as one chunk. Drives the `role` field on the
+/// chunk and the `extra.block_kind` annotation downstream filters key on.
+#[derive(Debug, Clone, Copy)]
+enum BlockKind {
+    UserText,
+    AssistantText,
+    ToolUse,
+    ToolResult,
+}
+
+impl BlockKind {
+    const fn as_role(self) -> &'static str {
+        match self {
+            Self::UserText => "user",
+            Self::AssistantText => "assistant",
+            Self::ToolUse => "tool",
+            Self::ToolResult => "tool_result",
+        }
+    }
+
+    const fn as_block_kind(self) -> &'static str {
+        match self {
+            Self::UserText => "user",
+            Self::AssistantText => "assistant_text",
+            Self::ToolUse => "tool_use",
+            Self::ToolResult => "tool_result",
+        }
+    }
+}
+
+/// One pre-chunk record drawn from a single message block. Held in a Vec
+/// while we walk the session, then materialized into [`Chunk`]s with the
+/// session's parent-chain wiring and chunk-index numbering.
 #[derive(Debug, Clone)]
-struct Turn {
-    role: String,
+struct Block {
+    kind: BlockKind,
     text: String,
     ts: Option<DateTime<Utc>>,
 }
@@ -82,7 +120,7 @@ struct Turn {
 ///
 /// * `source` — concrete `Source` to stamp each chunk with.
 /// * `source_id_base` — base identifier (e.g. session filename); chunk
-///   index is appended by the caller pattern.
+///   index is appended internally.
 /// * `project` — carried onto chunks.
 /// * `path` — absolute path stored in `Links.file_path`.
 /// * `fallback_ts` — used when the first kept line has no `timestamp`.
@@ -102,7 +140,7 @@ pub fn parse_session_file(
         .to_string_lossy()
         .into_owned();
 
-    let mut turns: Vec<Turn> = Vec::new();
+    let mut blocks: Vec<Block> = Vec::new();
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -121,13 +159,11 @@ pub fn parse_session_file(
                 continue;
             }
         };
-        if let Some(turn) = turn_from_line(&parsed) {
-            turns.push(turn);
-        }
+        extract_blocks(&parsed, &mut blocks);
     }
 
-    Ok(build_exchange_chunks(
-        &turns,
+    Ok(build_chunks(
+        &blocks,
         source,
         source_id_base,
         project,
@@ -136,12 +172,13 @@ pub fn parse_session_file(
     ))
 }
 
-fn turn_from_line(line: &LogLine) -> Option<Turn> {
+/// Walk one log line into zero or more [`Block`]s, appending to `out`.
+fn extract_blocks(line: &LogLine, out: &mut Vec<Block>) {
     // Type-level gate: Claude Code files have `type`. Skip anything not
     // user/assistant. Raw Anthropic files have no `type` field.
     if let Some(ty) = line.r#type.as_deref() {
         if ty != "user" && ty != "assistant" {
-            return None;
+            return;
         }
     }
     let (role, content) = line.message.as_ref().map_or_else(
@@ -150,39 +187,59 @@ fn turn_from_line(line: &LogLine) -> Option<Turn> {
     );
     let role = role.unwrap_or_else(|| line.r#type.clone().unwrap_or_default());
     if role != "user" && role != "assistant" {
-        return None;
+        return;
     }
-    let text = content.map(extract_text).unwrap_or_default();
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(Turn {
-        role,
-        text,
-        ts: line.timestamp,
-    })
+    let ts = line.timestamp;
+    let Some(content) = content else { return };
+    blocks_from_content(role.as_str(), content, ts, out);
 }
 
-/// Extract displayable text from an Anthropic `content` field, which may
-/// be a string or an array of content blocks.
-fn extract_text(content: serde_json::Value) -> String {
+/// Translate one message's `content` field into [`Block`]s. A bare string
+/// becomes one block (user text or assistant text depending on role); an
+/// array of blocks is split into one [`Block`] per content block of a
+/// supported type. Empty/whitespace-only blocks are silently dropped.
+fn blocks_from_content(
+    role: &str,
+    content: serde_json::Value,
+    ts: Option<DateTime<Utc>>,
+    out: &mut Vec<Block>,
+) {
     match content {
-        serde_json::Value::String(s) => s,
-        serde_json::Value::Array(blocks) => {
-            let mut out = String::new();
-            for block in blocks {
+        serde_json::Value::String(s) => {
+            if s.trim().is_empty() {
+                return;
+            }
+            let kind = if role == "assistant" {
+                BlockKind::AssistantText
+            } else {
+                BlockKind::UserText
+            };
+            out.push(Block { kind, text: s, ts });
+        }
+        serde_json::Value::Array(items) => {
+            for block in items {
                 let Some(obj) = block.as_object() else {
                     continue;
                 };
                 let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ty {
                     "text" => {
-                        if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
-                            if !out.is_empty() {
-                                out.push_str("\n\n");
-                            }
-                            out.push_str(s);
+                        let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        if text.trim().is_empty() {
+                            continue;
                         }
+                        let kind = if role == "assistant" {
+                            BlockKind::AssistantText
+                        } else {
+                            BlockKind::UserText
+                        };
+                        out.push(Block {
+                            kind,
+                            text: text.to_string(),
+                            ts,
+                        });
                     }
                     "tool_use" => {
                         let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
@@ -191,10 +248,15 @@ fn extract_text(content: serde_json::Value) -> String {
                             .map(|v| serde_json::to_string(v).unwrap_or_default())
                             .unwrap_or_default();
                         let rendered = format!("[tool_use {name}: {input}]");
-                        if !out.is_empty() {
-                            out.push_str("\n\n");
+                        let capped = truncate_tool_block(&rendered);
+                        if capped.trim().is_empty() {
+                            continue;
                         }
-                        out.push_str(&truncate_tool_block(&rendered));
+                        out.push(Block {
+                            kind: BlockKind::ToolUse,
+                            text: capped,
+                            ts,
+                        });
                     }
                     "tool_result" => {
                         let tool_content = obj.get("content").map_or(String::new(), |v| match v {
@@ -202,19 +264,23 @@ fn extract_text(content: serde_json::Value) -> String {
                             other => serde_json::to_string(other).unwrap_or_default(),
                         });
                         let rendered = format!("[tool_result: {tool_content}]");
-                        if !out.is_empty() {
-                            out.push_str("\n\n");
+                        let capped = truncate_tool_block(&rendered);
+                        if capped.trim().is_empty() {
+                            continue;
                         }
-                        out.push_str(&truncate_tool_block(&rendered));
+                        out.push(Block {
+                            kind: BlockKind::ToolResult,
+                            text: capped,
+                            ts,
+                        });
                     }
                     _ => {
-                        // unknown block; keep a marker for debuggability
+                        // unknown block; skip
                     }
                 }
             }
-            out
         }
-        _ => String::new(),
+        _ => {}
     }
 }
 
@@ -232,101 +298,46 @@ fn truncate_tool_block(text: &str) -> String {
     format!("{head}…[truncated {dropped} chars]")
 }
 
-fn build_exchange_chunks(
-    turns: &[Turn],
+/// Materialize blocks into chunks. `chunk_index` is monotonic across the
+/// session; `parent_ids` holds the previous chunk's id so `recall_link`
+/// can chain backward through the session.
+fn build_chunks(
+    blocks: &[Block],
     source: Source,
     source_id_base: &str,
     project: Option<&str>,
     abs_path: &str,
     fallback_ts: Option<DateTime<Utc>>,
 ) -> Vec<Chunk> {
-    // Walk turns left-to-right: every `assistant` turn + the preceding
-    // user turn forms one exchange.
-    let mut out: Vec<Chunk> = Vec::new();
+    let mut out: Vec<Chunk> = Vec::with_capacity(blocks.len());
     let mut chunk_index: u32 = 0;
-    let mut last_user: Option<&Turn> = None;
     let mut prev_chunk_id: Option<String> = None;
-    let first_ts = turns.iter().find_map(|t| t.ts).or(fallback_ts);
+    let first_ts = blocks.iter().find_map(|b| b.ts).or(fallback_ts);
 
-    for turn in turns {
-        match turn.role.as_str() {
-            "user" => {
-                last_user = Some(turn);
-            }
-            "assistant" => {
-                let mut body = String::new();
-                if let Some(u) = last_user {
-                    body.push_str("USER: ");
-                    body.push_str(u.text.trim());
-                    body.push_str("\n\nASSISTANT: ");
-                } else {
-                    body.push_str("ASSISTANT: ");
-                }
-                body.push_str(turn.text.trim());
-                last_user = None;
-
-                let pieces = if body.len() <= MAX_EXCHANGE_CHARS {
-                    vec![body]
-                } else {
-                    paragraph_split(&body, MAX_EXCHANGE_CHARS)
-                };
-
-                for piece in pieces {
-                    let chunk_id = Chunk::make_id(source, source_id_base, chunk_index);
-                    let sha256 = Chunk::content_hash(&piece);
-                    let links = Links {
-                        file_path: Some(abs_path.to_string()),
-                        parent_ids: prev_chunk_id.clone().into_iter().collect(),
-                        ..Links::default()
-                    };
-                    out.push(Chunk {
-                        chunk_id: chunk_id.clone(),
-                        source,
-                        project: project.map(str::to_string),
-                        source_id: source_id_base.to_string(),
-                        chunk_index,
-                        ts: turn.ts.or(first_ts),
-                        role: Some("assistant".into()),
-                        text: piece,
-                        sha256,
-                        links,
-                        extra: serde_json::Value::Null,
-                    });
-                    prev_chunk_id = Some(chunk_id);
-                    chunk_index = chunk_index.saturating_add(1);
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Split on blank-line gaps, greedily packing into ≤`max_chars` pieces.
-fn paragraph_split(text: &str, max_chars: usize) -> Vec<String> {
-    let paras: Vec<&str> = text
-        .split("\n\n")
-        .map(str::trim_end)
-        .filter(|p| !p.trim().is_empty())
-        .collect();
-    if paras.is_empty() {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for p in paras {
-        let candidate = cur.len() + 2 + p.len();
-        if cur.is_empty() {
-            // first paragraph of a fresh chunk
-        } else if candidate <= max_chars {
-            cur.push_str("\n\n");
-        } else {
-            out.push(std::mem::take(&mut cur));
-        }
-        cur.push_str(p);
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
+    for block in blocks {
+        let chunk_id = Chunk::make_id(source, source_id_base, chunk_index);
+        let sha256 = Chunk::content_hash(&block.text);
+        let links = Links {
+            file_path: Some(abs_path.to_string()),
+            parent_ids: prev_chunk_id.clone().into_iter().collect(),
+            ..Links::default()
+        };
+        let extra = serde_json::json!({ "block_kind": block.kind.as_block_kind() });
+        out.push(Chunk {
+            chunk_id: chunk_id.clone(),
+            source,
+            project: project.map(str::to_string),
+            source_id: source_id_base.to_string(),
+            chunk_index,
+            ts: block.ts.or(first_ts),
+            role: Some(block.kind.as_role().to_string()),
+            text: block.text.clone(),
+            sha256,
+            links,
+            extra,
+        });
+        prev_chunk_id = Some(chunk_id);
+        chunk_index = chunk_index.saturating_add(1);
     }
     out
 }
@@ -334,42 +345,134 @@ fn paragraph_split(text: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt::Write as _;
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// 1 user msg + assistant prose + 1 `tool_use` + 1 `tool_result` +
+    /// assistant follow-up text → 5 chunks with the right roles and
+    /// parent chain.
     #[test]
-    fn parses_claude_code_file_with_tool_use() {
+    fn per_message_chunks_roles_and_parent_chain() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("s.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        // Skip: file-history-snapshot
-        writeln!(f, r#"{{"type":"file-history-snapshot","messageId":"x"}}"#).unwrap();
-        // user turn
+        // user
         writeln!(
             f,
             r#"{{"type":"user","message":{{"role":"user","content":"hello there"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
         )
         .unwrap();
-        // assistant turn with interleaved tool_use
+        // assistant: text + tool_use
         writeln!(
             f,
-            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"let me check"}},{{"type":"tool_use","name":"read","input":{{"path":"f.rs"}}}},{{"type":"text","text":"done, here's the answer"}}]}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"let me check"}},{{"type":"tool_use","name":"read","input":{{"path":"f.rs"}}}}]}},"timestamp":"2026-04-17T10:00:01Z"}}"#
         )
         .unwrap();
-        // summary (skip)
-        writeln!(f, r#"{{"type":"summary","content":"session summary"}}"#).unwrap();
+        // user: tool_result
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","content":"file contents"}}]}},"timestamp":"2026-04-17T10:00:02Z"}}"#
+        )
+        .unwrap();
+        // assistant: follow-up text
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"done, here's the answer"}}]}},"timestamp":"2026-04-17T10:00:03Z"}}"#
+        )
+        .unwrap();
 
         let chunks =
             parse_session_file(&path, Source::ClaudeCode, "s.jsonl", Some("proj"), None).unwrap();
-        assert_eq!(chunks.len(), 1);
-        let c = &chunks[0];
-        assert!(c.text.contains("hello there"));
-        assert!(c.text.contains("let me check"));
-        assert!(c.text.contains("done, here's the answer"));
-        assert!(c.text.contains("tool_use read"));
-        assert_eq!(c.role.as_deref(), Some("assistant"));
-        assert_eq!(c.project.as_deref(), Some("proj"));
+        assert_eq!(chunks.len(), 5, "expected 5 chunks, got {}", chunks.len());
+
+        // Roles in order: user, assistant, tool, tool_result, assistant
+        let roles: Vec<&str> = chunks.iter().map(|c| c.role.as_deref().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "tool", "tool_result", "assistant"]
+        );
+
+        // Block-kind annotations on extra
+        let kinds: Vec<&str> = chunks
+            .iter()
+            .map(|c| c.extra.get("block_kind").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user",
+                "assistant_text",
+                "tool_use",
+                "tool_result",
+                "assistant_text"
+            ]
+        );
+
+        // Parent chain: each chunk parents to the previous one's id.
+        assert!(chunks[0].links.parent_ids.is_empty());
+        for i in 1..chunks.len() {
+            assert_eq!(
+                chunks[i].links.parent_ids,
+                vec![chunks[i - 1].chunk_id.clone()],
+                "chunk {i} should parent to chunk {}",
+                i - 1
+            );
+        }
+
+        // chunk_index is monotonic.
+        for (i, c) in chunks.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = i as u32;
+            assert_eq!(c.chunk_index, expected);
+        }
+
+        // Project carried through.
+        assert!(chunks.iter().all(|c| c.project.as_deref() == Some("proj")));
+    }
+
+    /// Consecutive assistant text blocks (text → `tool_use` → text) →
+    /// each text block is its own chunk.
+    #[test]
+    fn consecutive_assistant_text_blocks_split() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"first"}},{{"type":"tool_use","name":"x","input":{{}}}},{{"type":"text","text":"second"}}]}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+        )
+        .unwrap();
+        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].text, "first");
+        assert_eq!(chunks[0].role.as_deref(), Some("assistant"));
+        assert!(chunks[1].text.contains("tool_use x"));
+        assert_eq!(chunks[1].role.as_deref(), Some("tool"));
+        assert_eq!(chunks[2].text, "second");
+        assert_eq!(chunks[2].role.as_deref(), Some("assistant"));
+    }
+
+    /// Empty content blocks are skipped — no zero-text chunks.
+    #[test]
+    fn empty_blocks_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Empty text block, then a real one
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":""}},{{"type":"text","text":"   "}},{{"type":"text","text":"real"}}]}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+        )
+        .unwrap();
+        // Whole-string user content that's just whitespace
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"   "}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(chunks.len(), 1, "expected only the non-empty text chunk");
+        assert_eq!(chunks[0].text, "real");
     }
 
     #[test]
@@ -399,12 +502,16 @@ mod tests {
         .unwrap();
 
         let chunks = parse_session_file(&path, Source::OstkSession, "s.jsonl", None, None).unwrap();
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].text.contains("q1"));
-        assert!(chunks[0].text.contains("a1"));
-        assert!(chunks[1].text.contains("q2"));
-        assert!(chunks[1].text.contains("a2"));
-        // Second chunk parents to first.
+        // 4 messages, each yields one block → 4 chunks.
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].text, "q1");
+        assert_eq!(chunks[0].role.as_deref(), Some("user"));
+        assert_eq!(chunks[1].text, "a1");
+        assert_eq!(chunks[1].role.as_deref(), Some("assistant"));
+        assert_eq!(chunks[2].text, "q2");
+        assert_eq!(chunks[3].text, "a2");
+        // Parent chain reaches across the session.
+        assert_eq!(chunks[3].links.parent_ids, vec![chunks[2].chunk_id.clone()]);
         assert_eq!(chunks[1].links.parent_ids, vec![chunks[0].chunk_id.clone()]);
     }
 
@@ -426,16 +533,11 @@ mod tests {
             },
             "timestamp": "2026-04-17T10:00:00Z"
         });
-        // Seed an assistant turn so an exchange is produced.
         writeln!(f, "{line}").unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","message":{{"role":"assistant","content":"answer"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
-        )
-        .unwrap();
         let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
         assert_eq!(chunks.len(), 1);
         let body = &chunks[0].text;
+        assert_eq!(chunks[0].role.as_deref(), Some("tool_result"));
         assert!(
             body.contains("…[truncated"),
             "expected truncation marker, got: {body}"
@@ -445,10 +547,6 @@ mod tests {
             !body.contains(&"abcdefghij".repeat(500)),
             "5000-char dump leaked through truncation"
         );
-        // Bound the rendered tool-result span (header + 200 chars + marker)
-        // — the body also contains "USER:" / "ASSISTANT:" prose, so check
-        // by char count of the truncate fragment instead of total length.
-        assert!(body.contains("…[truncated 4815 chars]"));
     }
 
     #[test]
@@ -468,11 +566,6 @@ mod tests {
             "timestamp": "2026-04-17T10:00:00Z"
         });
         writeln!(f, "{line}").unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","message":{{"role":"assistant","content":"answer"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
-        )
-        .unwrap();
         let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
         assert_eq!(chunks.len(), 1);
         let body = &chunks[0].text;
@@ -481,14 +574,14 @@ mod tests {
     }
 
     #[test]
-    fn text_only_blocks_unaffected() {
+    fn long_text_block_is_one_chunk() {
+        // Per-message chunking does NOT slice prose into siblings; the
+        // long text is preserved as a single chunk so the cross-encoder
+        // can score the whole semantic unit at once.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("s.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        // Long text block that exceeds TOOL_RESULT_PREVIEW_CHARS but is
-        // user/assistant prose — must not be truncated by the tool-block
-        // cap.
-        let long_text: String = "alpha-bravo ".repeat(100); // 1200 chars
+        let long_text: String = "alpha-bravo ".repeat(1000); // 12000 chars
         let line = serde_json::json!({
             "type": "assistant",
             "message": {
@@ -502,46 +595,26 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         let body = &chunks[0].text;
         assert!(!body.contains("…[truncated"));
-        // Trailing space on the input is trimmed off; check the
-        // 99-repetition prefix instead so trim is a no-op for the assertion.
-        assert!(body.contains(&"alpha-bravo ".repeat(99)));
-        // And every alpha-bravo occurrence is present.
+        // Every alpha-bravo occurrence is preserved.
         let count = body.matches("alpha-bravo").count();
-        assert_eq!(count, 100, "expected 100 occurrences of marker token");
+        assert_eq!(count, 1000);
     }
 
+    /// Skip wrapper types that aren't user/assistant.
     #[test]
-    fn oversize_assistant_splits_into_siblings() {
+    fn skips_non_user_assistant_types() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("s.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        // Build ~12000 chars of paragraphs.
-        let mut big = String::new();
-        for i in 0..60 {
-            let _ = write!(big, "paragraph {i} with some words. ");
-            big.push_str(&"lorem ipsum ".repeat(10));
-            big.push_str("\\n\\n");
-        }
+        writeln!(f, r#"{{"type":"file-history-snapshot","messageId":"x"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"summary","content":"session summary"}}"#).unwrap();
         writeln!(
             f,
-            r#"{{"type":"user","message":{{"role":"user","content":"big one"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"hi"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
         )
         .unwrap();
-        let line = serde_json::json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [ { "type": "text", "text": big.replace("\\n", "\n") } ]
-            },
-            "timestamp": "2026-04-17T10:00:01Z"
-        });
-        writeln!(f, "{line}").unwrap();
-
         let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
-        assert!(
-            chunks.len() >= 2,
-            "expected multi-chunk split, got {}",
-            chunks.len()
-        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hi");
     }
 }

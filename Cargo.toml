@@ -81,6 +81,7 @@ regex = "1.11"
 dirs = "6"
 shellexpand = "3"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+fastembed = "5"
 
 # dev
 tempfile = "3.14"

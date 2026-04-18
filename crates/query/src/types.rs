@@ -55,6 +55,16 @@ pub struct RecallStats {
     pub dim: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scan_at: Option<String>,
+    /// Cross-encoder reranker info, if one is attached. Field is omitted
+    /// from the JSON when `None` so old MCP clients keep parsing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reranker: Option<RerankerStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankerStats {
+    pub model: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

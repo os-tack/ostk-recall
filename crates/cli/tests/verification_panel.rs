@@ -656,9 +656,11 @@ fn print_table(results: &[PanelResult]) {
 async fn run_panel(embedder: Arc<dyn ChunkEmbedder>) {
     // Keep handles alive to preserve tempdirs until the test ends.
     let (_corpus, _cfg_dir, cfg_path, _zip_dir) = build_corpus(Arc::clone(&embedder)).await;
-    let engine = commands::build_query_engine(&cfg_path, Arc::clone(&embedder))
-        .await
-        .expect("build_query_engine");
+    // Skip the reranker attach to keep this offline test ONNX-free.
+    let engine =
+        commands::build_query_engine_with_reranker(&cfg_path, Arc::clone(&embedder), false)
+            .await
+            .expect("build_query_engine");
 
     let yaml_text = fs::read_to_string(queries_yaml_path()).expect("read tests/queries.yaml");
     let entries = parse_yaml_panel(&yaml_text);

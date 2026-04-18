@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ostk_recall_cli::commands::{self, InitOutcome};
+use ostk_recall_cli::commands::{self, InitOptions, InitOutcome};
 use ostk_recall_embed::Embedder;
 use ostk_recall_pipeline::ChunkEmbedder;
 use tracing_subscriber::EnvFilter;
@@ -139,7 +139,12 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init { force } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            let outcome = commands::init_with_options(&config_path, embedder, force).await?;
+            // Production init: prefetch the reranker so the first `serve`
+            // doesn't pay the download latency mid-session.
+            let opts = InitOptions::default()
+                .with_force(force)
+                .with_prefetch_reranker(true);
+            let outcome = commands::init_with_options(&config_path, embedder, opts).await?;
             match outcome {
                 InitOutcome::WroteStarter { path } => {
                     println!(

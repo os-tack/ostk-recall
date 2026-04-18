@@ -5,6 +5,6 @@
 pub mod commands;
 
 pub use commands::{
-    InitOutcome, ScanOutcome, VerifyOutcome, default_config_path, init, init_with_options, scan,
-    starter_config, verify,
+    InitOptions, InitOutcome, ScanOutcome, VerifyOutcome, default_config_path, init,
+    init_with_options, scan, starter_config, verify,
 };

@@ -205,14 +205,21 @@ mod tests {
         for item in scanner.discover(&cfg).filter_map(Result::ok) {
             all_chunks.extend(scanner.parse(item).unwrap());
         }
-        assert_eq!(all_chunks.len(), 2);
-        // Both sessions should yield one chunk each.
-        let with_tool = all_chunks
+        // Per-message chunking (Phase H):
+        //   simple session: user "hello" + assistant text "hi back" = 2
+        //   tool_use session: user + assistant text "start" + tool_use + assistant text "end" = 4
+        assert_eq!(all_chunks.len(), 6, "expected 6 per-block chunks");
+
+        let tool_chunk = all_chunks
             .iter()
             .find(|c| c.text.contains("tool_use read"))
             .expect("tool_use chunk present");
-        assert!(with_tool.text.contains("start"));
-        assert!(with_tool.text.contains("end"));
-        assert_eq!(with_tool.project.as_deref(), Some("foo"));
+        assert_eq!(tool_chunk.role.as_deref(), Some("tool"));
+        assert_eq!(tool_chunk.project.as_deref(), Some("foo"));
+
+        // The "start" / "end" prose now lives in their own assistant_text
+        // chunks rather than smeared together with the tool_use.
+        assert!(all_chunks.iter().any(|c| c.text == "start"));
+        assert!(all_chunks.iter().any(|c| c.text == "end"));
     }
 }

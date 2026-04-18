@@ -13,6 +13,11 @@ pub struct Config {
     pub embedder: EmbedderConfig,
     #[serde(default, rename = "sources")]
     pub sources: Vec<SourceConfig>,
+    /// Optional cross-encoder reranker. Omit to keep the default
+    /// (enabled, default model). Set `enabled = false` to skip the
+    /// rerank pass entirely.
+    #[serde(default)]
+    pub reranker: Option<RerankerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +32,50 @@ pub struct CorpusConfig {
 pub struct EmbedderConfig {
     /// model2vec-rs model id, e.g. `potion-retrieval-32M`.
     pub model: String,
+}
+
+/// Cross-encoder reranker configuration. The reranker is opt-out:
+/// omitting the `[reranker]` block means "enabled, default model".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankerConfig {
+    /// When false, hybrid recall returns RRF-fused order without a
+    /// second cross-encoder pass.
+    #[serde(default = "default_reranker_enabled")]
+    pub enabled: bool,
+    /// fastembed reranker model identifier. Accepted aliases:
+    /// `jina-reranker-v1-turbo-en` (default), `jina-reranker-v2-base-multilingual`,
+    /// `bge-reranker-base`, `bge-reranker-v2-m3`. The legacy
+    /// `ms-marco-MiniLM-L-6-v2` alias maps to the JINA Turbo English
+    /// model (closest equivalent in fastembed v5).
+    #[serde(default = "default_reranker_model")]
+    pub model: String,
+}
+
+const fn default_reranker_enabled() -> bool {
+    true
+}
+
+fn default_reranker_model() -> String {
+    "jina-reranker-v1-turbo-en".to_string()
+}
+
+impl Default for RerankerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reranker_enabled(),
+            model: default_reranker_model(),
+        }
+    }
+}
+
+impl RerankerConfig {
+    /// Resolve the effective reranker config: returns the explicit
+    /// block when present, otherwise the default (enabled).
+    #[must_use]
+    pub fn resolve(slot: Option<&Self>) -> Self {
+        slot.cloned().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +221,52 @@ extensions = ["rs"]
         let cfg: Config = toml::from_str(body).unwrap();
         assert_eq!(cfg.sources.len(), 1);
         assert_eq!(cfg.sources[0].ignore, vec!["vendor/**", "fixtures/"]);
+    }
+
+    #[test]
+    fn reranker_omitted_means_default_enabled() {
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        let r = RerankerConfig::resolve(cfg.reranker.as_ref());
+        assert!(r.enabled);
+        assert_eq!(r.model, "jina-reranker-v1-turbo-en");
+    }
+
+    #[test]
+    fn reranker_explicit_disabled() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[reranker]
+enabled = false
+model = "bge-reranker-base"
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let r = cfg.reranker.unwrap();
+        assert!(!r.enabled);
+        assert_eq!(r.model, "bge-reranker-base");
+    }
+
+    #[test]
+    fn reranker_block_partial_uses_defaults() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[reranker]
+enabled = false
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let r = cfg.reranker.unwrap();
+        assert!(!r.enabled);
+        // model field omitted → default kicks in via serde default fn.
+        assert_eq!(r.model, "jina-reranker-v1-turbo-en");
     }
 
     #[test]

@@ -923,7 +923,8 @@ mod tests {
             "failure + decision-event"
         );
         assert_eq!(count(Source::OstkConversation), 1, "conversation count");
-        assert_eq!(count(Source::OstkSession), 2, "session exchanges");
+        // Per-message chunking (Phase H): 4 anthropic messages → 4 chunks.
+        assert_eq!(count(Source::OstkSession), 4, "per-message session chunks");
         assert_eq!(count(Source::OstkMemory), 1, "memory page");
         assert!(count(Source::OstkSpec) >= 1, "spec chunks");
         assert!(count(Source::Code) >= 1, "code chunks");

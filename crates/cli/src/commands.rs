@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use ostk_recall_core::{Config, Scanner, SourceKind};
+use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceKind};
 use ostk_recall_mcp::Server;
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
-use ostk_recall_query::QueryEngine;
+use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
 use ostk_recall_scan::code::CodeScanner;
 use ostk_recall_scan::file_glob::FileGlobScanner;
@@ -73,6 +73,31 @@ pub struct VerifyOutcome {
     pub report: VerifyReport,
 }
 
+/// Options accepted by [`init_with_options`].
+///
+/// Builder defaults match the pre-Phase H behaviour: `force = false`,
+/// `prefetch_reranker = false`. Production callers (the binary) explicitly
+/// turn the prefetch on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitOptions {
+    pub force: bool,
+    pub prefetch_reranker: bool,
+}
+
+impl InitOptions {
+    #[must_use]
+    pub const fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_prefetch_reranker(mut self, prefetch: bool) -> Self {
+        self.prefetch_reranker = prefetch;
+        self
+    }
+}
+
 /// Initialize a corpus.
 ///
 /// If `config_path` doesn't exist, write a starter and return
@@ -82,21 +107,29 @@ pub struct VerifyOutcome {
 ///
 /// `embedder` is passed in so tests can supply a fake — the binary wraps
 /// `Embedder::load` around the real one.
+///
+/// Note: `init` does not prefetch the reranker model; the binary calls
+/// [`init_with_options`] with `prefetch_reranker = true` for the production
+/// path so the first `serve` doesn't pay the download latency.
 pub async fn init(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Result<InitOutcome> {
-    init_with_options(config_path, embedder, false).await
+    init_with_options(config_path, embedder, InitOptions::default()).await
 }
 
-/// Like [`init`] but optionally wipes the corpus first.
+/// Like [`init`] but with explicit options (force-wipe + reranker prefetch).
 ///
-/// When `force` is true, deletes `corpus.lance/`, `ingest.duckdb`, and
+/// When `opts.force` is true, deletes `corpus.lance/`, `ingest.duckdb`, and
 /// `events.duckdb` from the resolved corpus root before opening the store.
 /// Each removal is best-effort and guarded by `.exists()` — missing files
 /// are not errors. A `forcing re-init` warning is printed (stderr) before
 /// each deletion.
+///
+/// When `opts.prefetch_reranker` is true and the reranker is enabled in
+/// config, the cross-encoder ONNX model is downloaded into the corpus's
+/// `models/` cache. Failures are logged to stderr but do not error the init.
 pub async fn init_with_options(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
-    force: bool,
+    opts: InitOptions,
 ) -> Result<InitOutcome> {
     if !config_path.exists() {
         if let Some(parent) = config_path.parent() {
@@ -116,7 +149,7 @@ pub async fn init_with_options(
     std::fs::create_dir_all(&root)
         .with_context(|| format!("creating corpus root {}", root.display()))?;
 
-    if force {
+    if opts.force {
         force_wipe_corpus(&root)?;
     }
 
@@ -130,11 +163,51 @@ pub async fn init_with_options(
         .map_err(|e| anyhow!("ensure fts index: {e}"))?;
     let _ingest = IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?;
 
+    // Pre-download the reranker so the first `serve` doesn't pay the
+    // download latency. Only runs when the caller opts in (the production
+    // binary does; tests do not) and the user hasn't disabled rerank in
+    // config. Failures are logged but do not fail init.
+    if opts.prefetch_reranker {
+        let reranker_cfg = RerankerConfig::resolve(cfg.reranker.as_ref());
+        if reranker_cfg.enabled && !skip_reranker_for_tests() {
+            if let Err(e) = prefetch_reranker_model(&root, &reranker_cfg.model) {
+                eprintln!("warning: reranker prefetch failed ({e}); will retry on first serve");
+            }
+        }
+    }
+
     Ok(InitOutcome::Initialized {
         root,
         model_id: cfg.embedder.model.clone(),
         dim,
     })
+}
+
+/// Test escape hatch. Returns true when we should skip every reranker
+/// network operation: explicit `OSTK_RECALL_SKIP_RERANKER=1` for
+/// subprocesses, or `OSTK_RECALL_FAKE_EMBEDDER=...` (which already marks
+/// the run as a test that must not touch real models).
+fn skip_reranker_for_tests() -> bool {
+    std::env::var("OSTK_RECALL_SKIP_RERANKER").is_ok()
+        || std::env::var("OSTK_RECALL_FAKE_EMBEDDER").is_ok()
+}
+
+/// Best-effort: load the reranker so the ONNX file lands in the corpus's
+/// `models/` cache. Prints a "downloading reranker model..." line to
+/// stderr so the user understands what's happening on a cold cache.
+fn prefetch_reranker_model(root: &Path, model_spec: &str) -> Result<()> {
+    let model = Reranker::resolve_model(model_spec).ok_or_else(|| {
+        anyhow!("unknown reranker model {model_spec:?}; see config docs for accepted aliases")
+    })?;
+    let cache_dir = root.join("models");
+    std::fs::create_dir_all(&cache_dir)?;
+    eprintln!(
+        "downloading reranker model {model_spec} into {}...",
+        cache_dir.display()
+    );
+    let _ = Reranker::load_with_model(&cache_dir, model)
+        .map_err(|e| anyhow!("load reranker {model_spec}: {e}"))?;
+    Ok(())
 }
 
 /// Best-effort delete of corpus artifacts under `root`. Prints a warning to
@@ -269,6 +342,17 @@ pub async fn build_query_engine(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
 ) -> Result<QueryEngine> {
+    build_query_engine_with_reranker(config_path, embedder, true).await
+}
+
+/// Like [`build_query_engine`] but lets the caller force-disable the
+/// reranker even if config says otherwise. Tests pass `attach_reranker
+/// = false` so they don't pull ONNX.
+pub async fn build_query_engine_with_reranker(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    attach_reranker: bool,
+) -> Result<QueryEngine> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let root = cfg.expanded_root()?;
@@ -279,13 +363,33 @@ pub async fn build_query_engine(
     );
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let events = events_db_if_wanted(&cfg, &root)?;
-    Ok(QueryEngine::new(
-        store,
-        ingest,
-        events,
-        embedder,
-        cfg.embedder.model.clone(),
-    ))
+    let mut engine = QueryEngine::new(store, ingest, events, embedder, cfg.embedder.model.clone());
+    if attach_reranker && !skip_reranker_for_tests() {
+        let reranker_cfg = RerankerConfig::resolve(cfg.reranker.as_ref());
+        if reranker_cfg.enabled {
+            match load_reranker(&root, &reranker_cfg.model) {
+                Ok(r) => {
+                    tracing::info!(model = %reranker_cfg.model, "reranker attached");
+                    engine = engine.with_reranker(r);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "reranker load failed; falling back to RRF order");
+                }
+            }
+        }
+    }
+    Ok(engine)
+}
+
+fn load_reranker(root: &Path, model_spec: &str) -> Result<Arc<dyn RerankerLike>> {
+    let model = Reranker::resolve_model(model_spec).ok_or_else(|| {
+        anyhow!("unknown reranker model {model_spec:?}; see config docs for accepted aliases")
+    })?;
+    let cache_dir = root.join("models");
+    std::fs::create_dir_all(&cache_dir)?;
+    let r: Arc<Reranker> = Reranker::load_with_model(&cache_dir, model)
+        .map_err(|e| anyhow!("load reranker {model_spec}: {e}"))?;
+    Ok(r)
 }
 
 fn events_db_if_wanted(cfg: &Config, root: &Path) -> Result<Option<Arc<EventsDb>>> {
@@ -386,9 +490,13 @@ mod tests {
         assert!(sentinel.exists());
 
         // Second init with force: must wipe the table dir before reopen.
-        init_with_options(&cfg_path, Arc::clone(&emb), true)
-            .await
-            .expect("forced re-init");
+        init_with_options(
+            &cfg_path,
+            Arc::clone(&emb),
+            InitOptions::default().with_force(true),
+        )
+        .await
+        .expect("forced re-init");
         assert!(
             !sentinel.exists(),
             "force should have wiped corpus.lance/sentinel.txt"
@@ -411,7 +519,7 @@ mod tests {
         write_min_config(&cfg_path, corpus.path());
 
         let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
-        let outcome = init_with_options(&cfg_path, emb, true)
+        let outcome = init_with_options(&cfg_path, emb, InitOptions::default().with_force(true))
             .await
             .expect("force init on empty root");
         assert!(matches!(outcome, InitOutcome::Initialized { .. }));

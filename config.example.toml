@@ -14,6 +14,18 @@ root = "~/.local/share/ostk-recall"
 # Switching models requires `ostk-recall init --force` + full re-scan.
 model = "potion-retrieval-32M"
 
+# Cross-encoder reranker (Phase H). After hybrid (dense + BM25 + RRF) returns
+# a top-N candidate pool, the reranker scores each (query, doc) pair jointly
+# and re-orders. Adds ~150 ms per query (CPU) and ~80 MB to the model cache.
+# Omit this block to keep the default (enabled, JINA Turbo English).
+[reranker]
+enabled = true                              # set false to skip the rerank pass
+model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
+                                            # also accepts: jina-reranker-v2-base-multilingual,
+                                            # bge-reranker-base, bge-reranker-v2-m3.
+                                            # Legacy "ms-marco-MiniLM-L-6-v2" maps to JINA
+                                            # Turbo English (closest equivalent in v5).
+
 # One [[sources]] table per logical corpus slice.
 # `project` is a free-text tag — namespace your corpora however you like.
 

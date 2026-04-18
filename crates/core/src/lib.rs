@@ -10,7 +10,7 @@ pub mod scanner;
 pub mod source;
 
 pub use chunk::{Chunk, Links};
-pub use config::{Config, CorpusConfig, EmbedderConfig, SourceConfig};
+pub use config::{Config, CorpusConfig, EmbedderConfig, RerankerConfig, SourceConfig};
 pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};
 pub use source::{Source, SourceKind};

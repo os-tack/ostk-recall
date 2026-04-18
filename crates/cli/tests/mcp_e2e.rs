@@ -112,6 +112,8 @@ async fn serve_stdio_initialize_tools_list_tools_call_recall_stats() {
     // and never interleaved with the JSON-RPC frames on stdout.
     let mut child = Command::new(cargo_bin())
         .env("OSTK_RECALL_FAKE_EMBEDDER", FAKE_DIM.to_string())
+        // Don't pull the ONNX reranker in e2e — keeps the test offline.
+        .env("OSTK_RECALL_SKIP_RERANKER", "1")
         .env("RUST_LOG", "info")
         .arg("--config")
         .arg(&cfg_path)
@@ -212,6 +214,8 @@ async fn serve_stdio_keeps_stdout_clean_of_logs() {
 
     let mut child = Command::new(cargo_bin())
         .env("OSTK_RECALL_FAKE_EMBEDDER", FAKE_DIM.to_string())
+        // Don't pull the ONNX reranker in e2e — keeps the test offline.
+        .env("OSTK_RECALL_SKIP_RERANKER", "1")
         // Crank logging up — every subsystem will try to write something.
         .env("RUST_LOG", "trace")
         .arg("--config")
