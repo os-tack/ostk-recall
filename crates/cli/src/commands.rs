@@ -258,7 +258,7 @@ pub async fn scan(
     // code scanner now caches per-workspace `fcp-rust` sessions across
     // `parse` calls; one instance per ingest run lets that cache stick.
     let markdown = MarkdownScanner;
-    let code = CodeScanner::default();
+    let code = CodeScanner;
     let claude_code = ClaudeCodeScanner;
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
@@ -309,6 +309,11 @@ pub async fn scan(
         totals = totals.merge(stats);
         per_source.push((label, stats));
     }
+
+    // Close every cached fcp-rust subprocess so they don't linger
+    // between ingests. Safe to call even when no `.rs` files were
+    // scanned (the cache is simply empty).
+    ostk_recall_scan::fcp_rust::drain_session_cache();
 
     Ok(ScanOutcome {
         per_source,

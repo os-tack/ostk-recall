@@ -44,13 +44,15 @@ pub const STRATIFIED_CODE_PREFETCH: usize = 12;
 /// [`is_identifier_query`] flags the query as identifier-shaped (a
 /// `snake_case` / `CamelCase` symbol name or a single short token).
 ///
-/// Tuning: 1.5 is roughly one full RRF/BM25 score-class — enough to push
-/// the actual definition above the conversation transcripts that mention
-/// the symbol, without swamping legitimate prose answers when an
-/// identifier-shaped query happens to also match a doc heading.
+/// Tuning: 1.5 wasn't enough to overcome cross-encoder's strong
+/// preference for conversation transcripts that contain the literal
+/// identifier many times. 3.0 ensures code chunks win for identifier
+/// queries while staying low enough that irrelevant code (other files
+/// with similar tokens) stays below prose answers for non-identifier
+/// queries.
 ///
 /// Set to `0.0` to disable the heuristic without removing the call site.
-pub const IDENTIFIER_CODE_BOOST: f32 = 1.5;
+pub const IDENTIFIER_CODE_BOOST: f32 = 3.0;
 
 /// Execute a hybrid recall against the corpus table.
 ///
@@ -612,8 +614,9 @@ mod tests {
         ];
         let out = boost_code_for_identifier_queries("alloc_page", candidates);
         assert_eq!(out[0].chunk_id, "code1", "code hit should win after boost");
-        // Boost lifted 4.0 -> 5.5, above the 5.0 conversation row.
-        assert!((out[0].score - 5.5).abs() < f32::EPSILON);
+        // Boost lifted 4.0 by IDENTIFIER_CODE_BOOST (3.0) → 7.0, comfortably
+        // above the 5.0 conversation row.
+        assert!((out[0].score - (4.0 + IDENTIFIER_CODE_BOOST)).abs() < f32::EPSILON);
     }
 
     #[test]

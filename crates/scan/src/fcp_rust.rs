@@ -27,8 +27,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+use ostk_recall_core::{Chunk, Links, Source};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -508,6 +511,239 @@ pub fn group_by_workspace(
         by_ws.entry(ws).or_default().push(path);
     }
     by_ws
+}
+
+// ─────────────────────── shared chunking helper ─────────────────────────
+//
+// Both `code::CodeScanner` and `ostk_project::scan_code` dispatch Rust
+// files through [`chunk_rust_file`] so the fcp-rust symbol chunker is
+// applied uniformly. The session cache lives at module scope (one entry
+// per Cargo workspace) because rust-analyzer cold start is ~30-60 s on
+// large workspaces — we want every `.rs` file in haystack to share the
+// same session.
+//
+// Thread-safety: a single `Mutex<HashMap<PathBuf, FcpRustSession>>`
+// behind a `OnceLock`. The pipeline parses sources sequentially today,
+// but rayon may parallelize within a source in the future. Holding the
+// mutex across fcp-rust round trips is acceptable because fcp-rust is
+// itself a single-threaded JSON-RPC peer — concurrent callers would
+// serialize at the stdin pipe regardless.
+
+/// Lines of context to capture before each fcp-rust symbol. Catches doc
+/// comments and `#[attribute]` macros immediately preceding the item.
+pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = 5;
+
+/// Module-level session cache. `OnceLock<Mutex<HashMap<...>>>` so the
+/// mutex is initialized lazily (unit tests that never touch fcp-rust
+/// pay nothing). Keyed by canonicalized workspace root.
+fn session_cache() -> &'static Mutex<HashMap<PathBuf, FcpRustSession>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, FcpRustSession>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cached result of `which::which("fcp-rust")` at module scope. Avoids
+/// paying the PATH walk cost for every file parse. Set to `Some(true)`
+/// or `Some(false)` on first use.
+fn fcp_rust_on_path() -> bool {
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    *PRESENT.get_or_init(|| {
+        let ok = which::which("fcp-rust").is_ok();
+        if ok {
+            tracing::info!(
+                "fcp_rust: fcp-rust detected on PATH; using semantic chunker for .rs files"
+            );
+        } else {
+            tracing::info!(
+                "fcp_rust: fcp-rust not on PATH; falling back to line-window chunking for .rs files"
+            );
+        }
+        ok
+    })
+}
+
+/// Ensure the session cache has an entry for `workspace_root`; spawn +
+/// open one if not. Returns `true` on success, `false` if anything in
+/// the spawn/open chain failed (caller falls back to line-window).
+fn ensure_session(workspace_root: &Path) -> bool {
+    // Fast path: already cached.
+    {
+        let Ok(guard) = session_cache().lock() else {
+            return false;
+        };
+        if guard.contains_key(workspace_root) {
+            return true;
+        }
+    }
+    let mut session = match FcpRustSession::spawn() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "fcp_rust: failed to spawn fcp-rust");
+            return false;
+        }
+    };
+    if let Err(e) = session.open_workspace(workspace_root, index_timeout_from_env()) {
+        tracing::warn!(
+            error = %e,
+            workspace = %workspace_root.display(),
+            "fcp_rust: open_workspace failed; falling back to line-window for this workspace"
+        );
+        return false;
+    }
+    let Ok(mut guard) = session_cache().lock() else {
+        return false;
+    };
+    guard.entry(workspace_root.to_path_buf()).or_insert(session);
+    true
+}
+
+/// Build per-symbol chunks for a single Rust file via the shared
+/// fcp-rust session cache.
+///
+/// Returns `Some(chunks)` only when every step succeeds: fcp-rust is on
+/// PATH, a Cargo workspace ancestor is found, the session opens, and
+/// the symbols query returns a non-empty list. In every other case
+/// returns `None` so the caller falls back to line-window chunking.
+///
+/// * `abs_path`       — canonicalized file path; the resulting
+///   `Chunk.links.file_path` uses this verbatim.
+/// * `file_path`      — the actual Rust file being chunked. Used both
+///   for the fcp-rust `symbols` query and for `find_cargo_workspace`.
+/// * `text`           — the file body.
+/// * `source`         — which `Source` variant to stamp on each chunk.
+///   Callers pass [`Source::Code`] for both the standalone `code`
+///   scanner and the `ostk_project` composite code subscan.
+/// * `source_id`      — the relative path string used as chunk
+///   `source_id` (e.g. `"crates/scan/src/code.rs"`).
+/// * `project`        — optional project label from `SourceConfig`.
+/// * `mtime`          — file mtime stamped on each chunk's `ts`.
+// The `symbols` call genuinely needs to hold the session-cache lock
+// across the stdio round-trip (fcp-rust is a single-threaded peer).
+// Clippy's drop-tightening lint fires on the block scope regardless;
+// silence it at function scope rather than re-acquiring the lock twice.
+#[allow(clippy::significant_drop_tightening)]
+pub fn chunk_rust_file(
+    file_path: &Path,
+    text: &str,
+    source: Source,
+    source_id: &str,
+    project: Option<&str>,
+    mtime: Option<DateTime<Utc>>,
+    abs_path: &str,
+) -> Option<Vec<Chunk>> {
+    if !fcp_rust_on_path() {
+        return None;
+    }
+    let workspace = find_cargo_workspace(file_path)?;
+    if !ensure_session(&workspace) {
+        return None;
+    }
+
+    let total_lines = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
+    // Hold the lock across the `symbols` call. fcp-rust is a stdio
+    // JSON-RPC peer, so concurrent callers must serialize regardless
+    // — the lock is simply making that explicit. The function-level
+    // `#[allow(clippy::significant_drop_tightening)]` covers this.
+    let symbols = {
+        let mut guard = session_cache().lock().ok()?;
+        let session = guard.get_mut(&workspace)?;
+        match session.symbols(file_path, total_lines) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %file_path.display(),
+                    "fcp_rust: symbols query failed; falling back to line-window"
+                );
+                return None;
+            }
+        }
+    };
+    if symbols.is_empty() {
+        return None;
+    }
+
+    let file_lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut chunks = Vec::with_capacity(symbols.len());
+    for (idx, sym) in symbols.iter().enumerate() {
+        let chunk_text = slice_symbol(&file_lines, sym, SYMBOL_LEADING_CONTEXT_LINES);
+        if chunk_text.trim().is_empty() {
+            continue;
+        }
+        let body = format!("// {} {}\n{}", sym.kind, sym.name, chunk_text);
+        let chunk_index = u32::try_from(idx).ok()?;
+        let chunk_id = Chunk::make_id(source, source_id, chunk_index);
+        let sha256 = Chunk::content_hash(&body);
+        let extra = serde_json::json!({
+            "kind": sym.kind,
+            "symbols": [sym.name.clone()],
+            "line_start": sym.line_start,
+            "line_end": sym.line_end,
+            "chunker": "fcp-rust",
+        });
+        let links = Links {
+            file_path: Some(abs_path.to_string()),
+            ..Links::default()
+        };
+        chunks.push(Chunk {
+            chunk_id,
+            source,
+            project: project.map(str::to_string),
+            source_id: source_id.to_string(),
+            chunk_index,
+            ts: mtime,
+            role: None,
+            text: body,
+            sha256,
+            links,
+            extra,
+        });
+    }
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks)
+    }
+}
+
+/// Slice `[sym.line_start - leading, sym.line_end]` out of `lines`,
+/// clamping to file bounds. Mirrors `code::slice_for_symbol` but lives
+/// next to the shared helper so `code.rs` can delegate here.
+#[must_use]
+pub fn slice_symbol(lines: &[&str], sym: &RustSymbol, leading: u32) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let total = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    let start_one = sym.line_start.saturating_sub(leading).max(1);
+    let start = (start_one - 1) as usize;
+    let end_one = sym.line_end.min(total);
+    let end = end_one as usize;
+    if start >= lines.len() || end <= start {
+        return String::new();
+    }
+    lines[start..end].concat()
+}
+
+/// Close every cached `fcp-rust` session and empty the cache.
+///
+/// The CLI calls this at the end of each scan run so rust-analyzer
+/// subprocesses don't linger between ingests. Safe to call even when
+/// the cache is empty or has never been initialized.
+pub fn drain_session_cache() {
+    let Ok(mut guard) = session_cache().lock() else {
+        return;
+    };
+    let count = guard.len();
+    if count == 0 {
+        return;
+    }
+    // Drain drops each `FcpRustSession`, which triggers graceful
+    // shutdown via its `Drop` impl (close_workspace + reap child).
+    guard.clear();
+    tracing::info!(
+        count,
+        "fcp_rust: drained session cache; closed all fcp-rust subprocesses"
+    );
 }
 
 #[cfg(test)]

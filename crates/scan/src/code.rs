@@ -4,11 +4,15 @@
 //! `paths`. Output strategy depends on the file extension and tooling:
 //!
 //! * `.rs` files in a Cargo workspace, when `fcp-rust` is on `$PATH`:
-//!   delegated to [`crate::fcp_rust`] for symbol-bounded chunking. Each
-//!   top-level item (fn, struct, enum, trait, impl, mod, const) becomes
-//!   one chunk that includes the preceding ~5 lines (catches doc
-//!   comments and attribute macros) and a synthetic header
-//!   `// <kind> <name>` so BM25 surfaces symbol-name queries.
+//!   delegated to [`crate::fcp_rust::chunk_rust_file`] for symbol-
+//!   bounded chunking. Each top-level item (fn, struct, enum, trait,
+//!   impl, mod, const) becomes one chunk that includes the preceding
+//!   ~5 lines (catches doc comments and attribute macros) and a
+//!   synthetic header `// <kind> <name>` so BM25 surfaces symbol-name
+//!   queries. The fcp-rust session cache is module-level in
+//!   `fcp_rust.rs` so every `.rs` file in a given Cargo workspace
+//!   reuses the same rust-analyzer subprocess regardless of which
+//!   scanner (`code` or `ostk_project`) is walking.
 //! * Other extensions (and `.rs` fallback paths): 200-line windows with
 //!   20-line overlap.
 //!
@@ -17,189 +21,34 @@
 //! without a semantic adapter, plus standalone `.rs` files outside any
 //! Cargo workspace.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{
     Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
 };
 
-use crate::fcp_rust::{self, FcpRustSession, RustSymbol, index_timeout_from_env};
+use crate::fcp_rust::{self, RustSymbol};
 use crate::walk::walk_filtered;
 
 /// Lines per window (line-window fallback strategy).
 pub const WINDOW_LINES: usize = 200;
 /// Line overlap between adjacent windows.
 pub const OVERLAP_LINES: usize = 20;
-/// Lines of context to capture before each fcp-rust symbol. Catches doc
-/// comments and `#[attribute]` macros immediately preceding the item.
-pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = 5;
 
-/// Scanner for source-code trees. Holds a per-workspace cache of
-/// `fcp-rust` sessions so successive `parse` calls amortize the
-/// rust-analyzer cold-start cost.
-#[derive(Default)]
-pub struct CodeScanner {
-    fcp_sessions: Mutex<HashMap<PathBuf, FcpRustSession>>,
-    /// `Some(true)` once we've checked `$PATH` and found `fcp-rust`,
-    /// `Some(false)` if absent. Lazy so unit tests don't pay for it.
-    fcp_available: OnceLock<bool>,
-}
+/// Re-export so existing call sites (`code::SYMBOL_LEADING_CONTEXT_LINES`)
+/// keep compiling. New code should reach for the canonical constant in
+/// `crate::fcp_rust`.
+pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = fcp_rust::SYMBOL_LEADING_CONTEXT_LINES;
 
-impl std::fmt::Debug for CodeScanner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let session_count = self.fcp_sessions.lock().map(|g| g.len()).unwrap_or(0);
-        f.debug_struct("CodeScanner")
-            .field("fcp_sessions", &session_count)
-            .field("fcp_available", &self.fcp_available.get())
-            .finish()
-    }
-}
-
-impl CodeScanner {
-    /// Returns true exactly once we've confirmed `fcp-rust` is on `$PATH`.
-    /// Cached for the scanner's lifetime — installing fcp-rust mid-run
-    /// won't take effect until the next ingest.
-    fn fcp_rust_available(&self) -> bool {
-        *self.fcp_available.get_or_init(|| {
-            if which::which("fcp-rust").is_ok() {
-                tracing::info!(
-                    "code: fcp-rust detected on PATH; using semantic chunker for .rs files"
-                );
-                true
-            } else {
-                tracing::info!(
-                    "code: fcp-rust not on PATH; falling back to line-window chunking for .rs files"
-                );
-                false
-            }
-        })
-    }
-
-    /// Borrow (or open) the fcp-rust session for `workspace_root`.
-    /// Returns `None` if spawn or workspace-open fails — the caller
-    /// should fall back to line-window chunking.
-    fn session_for(&self, workspace_root: &Path) -> Option<()> {
-        // Check under the lock, then drop it before any expensive
-        // spawn/open work — keeps other parse calls unblocked.
-        {
-            let guard = self.fcp_sessions.lock().ok()?;
-            if guard.contains_key(workspace_root) {
-                return Some(());
-            }
-        }
-        let mut session = match FcpRustSession::spawn() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "code: failed to spawn fcp-rust");
-                return None;
-            }
-        };
-        if let Err(e) = session.open_workspace(workspace_root, index_timeout_from_env()) {
-            tracing::warn!(
-                error = %e,
-                workspace = %workspace_root.display(),
-                "code: fcp-rust open_workspace failed; falling back to line-window for this workspace"
-            );
-            return None;
-        }
-        // Re-acquire to insert. If a parallel parse won the race, drop
-        // our duplicate session — the existing one is fine.
-        {
-            let mut guard = self.fcp_sessions.lock().ok()?;
-            guard.entry(workspace_root.to_path_buf()).or_insert(session);
-        }
-        Some(())
-    }
-
-    /// Run `f` against the cached session for `workspace_root`. Returns
-    /// `None` if no session is available. Holds the session lock for the
-    /// duration of `f`; callers are expected to keep `f` short and
-    /// non-recursive (no nested fcp-rust calls).
-    fn with_session<F, R>(&self, workspace_root: &Path, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut FcpRustSession) -> R,
-    {
-        let mut guard = self.fcp_sessions.lock().ok()?;
-        let session = guard.get_mut(workspace_root)?;
-        let out = f(session);
-        drop(guard);
-        Some(out)
-    }
-
-    /// Build chunks for a single Rust file using fcp-rust symbols.
-    /// Returns `None` if fcp-rust isn't available, the workspace can't
-    /// be opened, or the symbols query failed — caller falls back to
-    /// line-window chunking.
-    fn parse_rust_with_fcp(
-        &self,
-        item: &SourceItem,
-        path: &Path,
-        text: &str,
-        mtime: Option<DateTime<Utc>>,
-        abs_path: &str,
-    ) -> Option<Vec<Chunk>> {
-        if !self.fcp_rust_available() {
-            return None;
-        }
-        let workspace = fcp_rust::find_cargo_workspace(path)?;
-        self.session_for(&workspace)?;
-
-        let total_lines = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
-        let symbols = self
-            .with_session(&workspace, |s| s.symbols(path, total_lines))?
-            .ok()?;
-        if symbols.is_empty() {
-            // Empty symbols list: probably a tiny module declaration file.
-            // Fall back to line-window so we still get a chunk.
-            return None;
-        }
-
-        let file_lines: Vec<&str> = text.split_inclusive('\n').collect();
-        let mut chunks = Vec::with_capacity(symbols.len());
-        for (idx, sym) in symbols.iter().enumerate() {
-            let chunk_text = slice_for_symbol(&file_lines, sym, SYMBOL_LEADING_CONTEXT_LINES);
-            if chunk_text.trim().is_empty() {
-                continue;
-            }
-            let body = format!("// {} {}\n{}", sym.kind, sym.name, chunk_text);
-            let chunk_index = u32::try_from(idx).ok()?;
-            let chunk_id = Chunk::make_id(Source::Code, &item.source_id, chunk_index);
-            let sha256 = Chunk::content_hash(&body);
-            let extra = serde_json::json!({
-                "kind": sym.kind,
-                "symbols": [sym.name.clone()],
-                "line_start": sym.line_start,
-                "line_end": sym.line_end,
-                "chunker": "fcp-rust",
-            });
-            let links = Links {
-                file_path: Some(abs_path.to_string()),
-                ..Links::default()
-            };
-            chunks.push(Chunk {
-                chunk_id,
-                source: Source::Code,
-                project: item.project.clone(),
-                source_id: item.source_id.clone(),
-                chunk_index,
-                ts: mtime,
-                role: None,
-                text: body,
-                sha256,
-                links,
-                extra,
-            });
-        }
-        if chunks.is_empty() {
-            None
-        } else {
-            Some(chunks)
-        }
-    }
-}
+/// Scanner for source-code trees.
+///
+/// The fcp-rust session cache is module-level in [`crate::fcp_rust`],
+/// shared with `ostk_project`, so this type is effectively stateless —
+/// it's kept as a struct for trait-object reuse and future per-run
+/// configuration.
+#[derive(Default, Debug)]
+pub struct CodeScanner;
 
 impl Scanner for CodeScanner {
     fn kind(&self) -> SourceKind {
@@ -257,13 +106,22 @@ impl Scanner for CodeScanner {
             .into_owned();
 
         // Rust path: try fcp-rust first; on any failure, fall through to
-        // the line-window strategy below.
+        // the line-window strategy below. The shared helper handles
+        // session caching, PATH probing, and workspace discovery.
         let is_rust = path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
         if is_rust {
-            if let Some(chunks) = self.parse_rust_with_fcp(&item, path, &text, mtime, &abs_path) {
+            if let Some(chunks) = fcp_rust::chunk_rust_file(
+                path,
+                &text,
+                Source::Code,
+                &item.source_id,
+                item.project.as_deref(),
+                mtime,
+                &abs_path,
+            ) {
                 return Ok(chunks);
             }
         }
@@ -305,21 +163,13 @@ impl Scanner for CodeScanner {
 
 /// Build the chunk body for a single symbol: pull `[line_start - leading,
 /// line_end]` from `lines`, clamping to file bounds.
+///
+/// Thin wrapper over [`crate::fcp_rust::slice_symbol`] kept for API
+/// stability — the canonical implementation now lives alongside the
+/// rest of the shared Rust-chunking code.
 #[must_use]
 pub fn slice_for_symbol(lines: &[&str], sym: &RustSymbol, leading: u32) -> String {
-    if lines.is_empty() {
-        return String::new();
-    }
-    let total = u32::try_from(lines.len()).unwrap_or(u32::MAX);
-    // Convert to 0-based indexing for slicing.
-    let start_one = sym.line_start.saturating_sub(leading).max(1);
-    let start = (start_one - 1) as usize;
-    let end_one = sym.line_end.min(total);
-    let end = end_one as usize;
-    if start >= lines.len() || end <= start {
-        return String::new();
-    }
-    lines[start..end].concat()
+    fcp_rust::slice_symbol(lines, sym, leading)
 }
 
 fn extension_matches(path: &Path, exts: &[String]) -> bool {
@@ -452,7 +302,7 @@ mod tests {
         std::fs::write(tmp.path().join("src/b.rs"), "fn b() {}\n").unwrap();
         std::fs::write(tmp.path().join("src/c.txt"), "skipped\n").unwrap();
 
-        let scanner = CodeScanner::default();
+        let scanner = CodeScanner;
         let cfg = cfg_with(tmp.path(), &["rs"]);
         let items: Vec<_> = scanner.discover(&cfg).filter_map(Result::ok).collect();
         assert_eq!(items.len(), 2);
@@ -465,7 +315,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("main.rs");
         std::fs::write(&file, "fn main() {}\nfn other() {}\n").unwrap();
-        let scanner = CodeScanner::default();
+        let scanner = CodeScanner;
         let cfg = cfg_with(tmp.path(), &["rs"]);
         let item = scanner.discover(&cfg).next().unwrap().unwrap();
         let chunks = scanner.parse(item).unwrap();
@@ -492,7 +342,7 @@ mod tests {
             let _ = writeln!(body, "// line {i}");
         }
         std::fs::write(&file, &body).unwrap();
-        let scanner = CodeScanner::default();
+        let scanner = CodeScanner;
         let cfg = cfg_with(tmp.path(), &["rs"]);
         let item = scanner.discover(&cfg).next().unwrap().unwrap();
         let chunks = scanner.parse(item).unwrap();
@@ -551,7 +401,7 @@ mod tests {
             eprintln!("skipping: fixture file missing");
             return;
         }
-        let scanner = CodeScanner::default();
+        let scanner = CodeScanner;
         let item = SourceItem {
             source_id: "crates/scan/src/code.rs".into(),
             path: Some(target),
