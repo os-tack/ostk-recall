@@ -201,7 +201,9 @@ async fn main() -> Result<()> {
             }
         }
         Command::Inspect { chunk_id } => {
-            println!("TODO: phase C — inspect {chunk_id}");
+            let embedder = resolve_embedder(cli.config.as_ref())?;
+            let result = commands::inspect(&config_path, embedder, &chunk_id).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Serve { stdio } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;

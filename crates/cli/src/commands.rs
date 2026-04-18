@@ -322,6 +322,21 @@ pub async fn scan(
     })
 }
 
+/// Fetch a single chunk (plus its parent chain, when any) by id. Used by
+/// `ostk-recall inspect` to dump the full payload — including
+/// scanner-supplied `extra_json` — without going through an MCP client.
+pub async fn inspect(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    chunk_id: &str,
+) -> Result<ostk_recall_query::RecallLinkResult> {
+    let engine = build_query_engine_with_reranker(config_path, embedder, false).await?;
+    engine
+        .recall_link(chunk_id)
+        .await
+        .map_err(|e| anyhow!("recall_link {chunk_id}: {e}"))
+}
+
 /// Verify: compare corpus row count vs ingest chunk count. Phase B: totals
 /// only (per-source comparison is deferred).
 pub async fn verify(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Result<VerifyOutcome> {
