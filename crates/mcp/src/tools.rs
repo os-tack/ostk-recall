@@ -14,7 +14,13 @@ pub fn tool_recall() -> Value {
                 "project": { "type": "string" },
                 "source": { "type": "string" },
                 "since": { "type": "string", "format": "date-time" },
-                "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": 100 }
+                "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": 100 },
+                "max_per_source_id": {
+                    "type": "integer",
+                    "default": 3,
+                    "minimum": 0,
+                    "description": "Cap on hits sharing the same source_id after RRF rerank. 0 disables the diversity filter."
+                }
             },
             "required": ["query"]
         }

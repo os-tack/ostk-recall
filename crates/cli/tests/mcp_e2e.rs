@@ -106,9 +106,13 @@ async fn serve_stdio_initialize_tools_list_tools_call_recall_stats() {
 
     // Spawn the real binary with the fake-embedder escape hatch so the
     // subprocess doesn't need a real model on disk.
+    //
+    // NOTE: RUST_LOG=info forces the tracing subscriber to actually emit
+    // log records — this is the gate that proves they're routed to stderr
+    // and never interleaved with the JSON-RPC frames on stdout.
     let mut child = Command::new(cargo_bin())
         .env("OSTK_RECALL_FAKE_EMBEDDER", FAKE_DIM.to_string())
-        .env("RUST_LOG", "off")
+        .env("RUST_LOG", "info")
         .arg("--config")
         .arg(&cfg_path)
         .arg("serve")
@@ -182,4 +186,65 @@ async fn serve_stdio_initialize_tools_list_tools_call_recall_stats() {
     drop(stdin);
     let exit = child.wait().expect("child exit");
     assert!(exit.success(), "child exit {exit:?}");
+}
+
+/// Stdout in `serve --stdio` must be reserved for JSON-RPC frames. A live
+/// MCP client (Claude Desktop / Cursor / Claude Code) parses each line as
+/// JSON; a stray log line breaks the session immediately.
+///
+/// We boot the server with `RUST_LOG=trace` (so the subscriber actually
+/// emits records), send a real `initialize`, and assert the FIRST line on
+/// stdout parses as JSON and is a valid JSON-RPC response.
+#[tokio::test]
+async fn serve_stdio_keeps_stdout_clean_of_logs() {
+    let fixture = TempDir::new().unwrap();
+    write_fixture(fixture.path());
+
+    let corpus = TempDir::new().unwrap();
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.toml");
+    write_config(&cfg_path, corpus.path(), fixture.path());
+
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
+    commands::init(&cfg_path, Arc::clone(&embedder))
+        .await
+        .expect("init");
+
+    let mut child = Command::new(cargo_bin())
+        .env("OSTK_RECALL_FAKE_EMBEDDER", FAKE_DIM.to_string())
+        // Crank logging up — every subsystem will try to write something.
+        .env("RUST_LOG", "trace")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("serve")
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ostk-recall serve --stdio");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize","params":{}
+        }),
+    );
+    let line = read_line(&mut stdout);
+
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+        panic!("first line of stdout must parse as JSON (logs leaked?): {e}\nline = {line:?}");
+    });
+    assert_eq!(v["jsonrpc"], "2.0", "expected JSON-RPC envelope, got {v}");
+    assert_eq!(v["id"], 1);
+    assert!(
+        v["result"].is_object(),
+        "expected initialize result, got {v}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
 }

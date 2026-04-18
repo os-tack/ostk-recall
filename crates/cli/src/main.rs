@@ -32,7 +32,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Initialize a new ostk-recall corpus using the resolved config.
-    Init,
+    Init {
+        /// Wipe `corpus.lance/`, `ingest.duckdb`, `events.duckdb` from the
+        /// configured corpus root before re-initializing. Best-effort —
+        /// missing files are not an error.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scan configured sources and ingest chunks.
     Scan {
         /// Optional source project filter; scans all when omitted.
@@ -114,10 +120,14 @@ fn resolve_embedder(config: Option<&PathBuf>) -> Result<Arc<dyn ChunkEmbedder>> 
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Stdout is reserved for tool output (and JSON-RPC frames in
+    // `serve --stdio`); logs go to stderr unconditionally so MCP clients
+    // never see interleaved log noise on stdout.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -127,9 +137,9 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Command::Init => {
+        Command::Init { force } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            let outcome = commands::init(&config_path, embedder).await?;
+            let outcome = commands::init_with_options(&config_path, embedder, force).await?;
             match outcome {
                 InitOutcome::WroteStarter { path } => {
                     println!(

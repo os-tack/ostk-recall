@@ -25,7 +25,6 @@
 //! Oversize assistant bodies (> `MAX_EXCHANGE_CHARS`) are paragraph-split
 //! into multiple sibling chunks; the user turn stays with the first slice.
 
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -37,6 +36,14 @@ use serde::Deserialize;
 /// Hard ceiling on a single chunk's text length. Assistant responses that
 /// exceed this are paragraph-split into siblings.
 pub const MAX_EXCHANGE_CHARS: usize = 4000;
+
+/// Cap on rendered tool-block characters retained in a chunk.
+///
+/// Tool-result and tool-use blocks are auxiliary signal — full file dumps
+/// dominate BM25 hits without adding query-relevant prose. Truncating to
+/// 200 chars lets an error-snippet still leak through while a 5000-char
+/// file listing doesn't.
+pub const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
 /// Shape recognised by the parser. One line yields one `Record`.
 #[derive(Debug, Deserialize)]
@@ -183,20 +190,22 @@ fn extract_text(content: serde_json::Value) -> String {
                             .get("input")
                             .map(|v| serde_json::to_string(v).unwrap_or_default())
                             .unwrap_or_default();
+                        let rendered = format!("[tool_use {name}: {input}]");
                         if !out.is_empty() {
                             out.push_str("\n\n");
                         }
-                        let _ = write!(out, "[tool_use {name}: {input}]");
+                        out.push_str(&truncate_tool_block(&rendered));
                     }
                     "tool_result" => {
                         let tool_content = obj.get("content").map_or(String::new(), |v| match v {
                             serde_json::Value::String(s) => s.clone(),
                             other => serde_json::to_string(other).unwrap_or_default(),
                         });
+                        let rendered = format!("[tool_result: {tool_content}]");
                         if !out.is_empty() {
                             out.push_str("\n\n");
                         }
-                        let _ = write!(out, "[tool_result: {tool_content}]");
+                        out.push_str(&truncate_tool_block(&rendered));
                     }
                     _ => {
                         // unknown block; keep a marker for debuggability
@@ -207,6 +216,20 @@ fn extract_text(content: serde_json::Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Truncate a rendered `tool_use`/`tool_result` block to
+/// [`TOOL_RESULT_PREVIEW_CHARS`] *characters* (not bytes), appending a
+/// truncation marker. Pass-through if already short enough. Char-counting
+/// keeps multi-byte codepoints intact.
+fn truncate_tool_block(text: &str) -> String {
+    let char_count = text.chars().count();
+    if char_count <= TOOL_RESULT_PREVIEW_CHARS {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
+    let dropped = char_count - TOOL_RESULT_PREVIEW_CHARS;
+    format!("{head}…[truncated {dropped} chars]")
 }
 
 fn build_exchange_chunks(
@@ -311,6 +334,7 @@ fn paragraph_split(text: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -382,6 +406,108 @@ mod tests {
         assert!(chunks[1].text.contains("a2"));
         // Second chunk parents to first.
         assert_eq!(chunks[1].links.parent_ids, vec![chunks[0].chunk_id.clone()]);
+    }
+
+    #[test]
+    fn tool_result_over_cap_is_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Build a 5000-char tool_result blob — this is the exact pattern
+        // that was dominating BM25 hits with raw file listings.
+        let big_content: String = "abcdefghij".repeat(500); // 5000 chars
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "content": big_content }
+                ]
+            },
+            "timestamp": "2026-04-17T10:00:00Z"
+        });
+        // Seed an assistant turn so an exchange is produced.
+        writeln!(f, "{line}").unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"answer"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let body = &chunks[0].text;
+        assert!(
+            body.contains("…[truncated"),
+            "expected truncation marker, got: {body}"
+        );
+        // Full 5000-char string must not survive.
+        assert!(
+            !body.contains(&"abcdefghij".repeat(500)),
+            "5000-char dump leaked through truncation"
+        );
+        // Bound the rendered tool-result span (header + 200 chars + marker)
+        // — the body also contains "USER:" / "ASSISTANT:" prose, so check
+        // by char count of the truncate fragment instead of total length.
+        assert!(body.contains("…[truncated 4815 chars]"));
+    }
+
+    #[test]
+    fn small_tool_result_is_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let small = "ok"; // 2 chars
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "content": small }
+                ]
+            },
+            "timestamp": "2026-04-17T10:00:00Z"
+        });
+        writeln!(f, "{line}").unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"answer"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let body = &chunks[0].text;
+        assert!(body.contains("[tool_result: ok]"));
+        assert!(!body.contains("…[truncated"));
+    }
+
+    #[test]
+    fn text_only_blocks_unaffected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Long text block that exceeds TOOL_RESULT_PREVIEW_CHARS but is
+        // user/assistant prose — must not be truncated by the tool-block
+        // cap.
+        let long_text: String = "alpha-bravo ".repeat(100); // 1200 chars
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [ { "type": "text", "text": long_text } ]
+            },
+            "timestamp": "2026-04-17T10:00:00Z"
+        });
+        writeln!(f, "{line}").unwrap();
+        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let body = &chunks[0].text;
+        assert!(!body.contains("…[truncated"));
+        // Trailing space on the input is trimmed off; check the
+        // 99-repetition prefix instead so trim is a no-op for the assertion.
+        assert!(body.contains(&"alpha-bravo ".repeat(99)));
+        // And every alpha-bravo occurrence is present.
+        let count = body.matches("alpha-bravo").count();
+        assert_eq!(count, 100, "expected 100 occurrences of marker token");
     }
 
     #[test]

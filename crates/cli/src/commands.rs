@@ -83,6 +83,21 @@ pub struct VerifyOutcome {
 /// `embedder` is passed in so tests can supply a fake — the binary wraps
 /// `Embedder::load` around the real one.
 pub async fn init(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Result<InitOutcome> {
+    init_with_options(config_path, embedder, false).await
+}
+
+/// Like [`init`] but optionally wipes the corpus first.
+///
+/// When `force` is true, deletes `corpus.lance/`, `ingest.duckdb`, and
+/// `events.duckdb` from the resolved corpus root before opening the store.
+/// Each removal is best-effort and guarded by `.exists()` — missing files
+/// are not errors. A `forcing re-init` warning is printed (stderr) before
+/// each deletion.
+pub async fn init_with_options(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    force: bool,
+) -> Result<InitOutcome> {
     if !config_path.exists() {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)
@@ -101,6 +116,10 @@ pub async fn init(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Resul
     std::fs::create_dir_all(&root)
         .with_context(|| format!("creating corpus root {}", root.display()))?;
 
+    if force {
+        force_wipe_corpus(&root)?;
+    }
+
     let dim = embedder.dim();
     let store = CorpusStore::open_or_create(&root, dim)
         .await
@@ -116,6 +135,24 @@ pub async fn init(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Resul
         model_id: cfg.embedder.model.clone(),
         dim,
     })
+}
+
+/// Best-effort delete of corpus artifacts under `root`. Prints a warning to
+/// stderr before each removal; absence is not an error.
+fn force_wipe_corpus(root: &Path) -> Result<()> {
+    let lance = root.join("corpus.lance");
+    if lance.exists() {
+        eprintln!("forcing re-init: removing {}", lance.display());
+        std::fs::remove_dir_all(&lance).with_context(|| format!("removing {}", lance.display()))?;
+    }
+    for db_name in ["ingest.duckdb", "events.duckdb"] {
+        let p = root.join(db_name);
+        if p.exists() {
+            eprintln!("forcing re-init: removing {}", p.display());
+            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Scan configured sources.
@@ -294,4 +331,89 @@ pub async fn serve(
         .map_err(|e| anyhow!("mcp stdio: {e}"))?;
     tracing::info!("mcp serve exited cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ostk_recall_pipeline::ChunkEmbedder;
+    use tempfile::TempDir;
+
+    struct FakeEmbedder;
+    impl ChunkEmbedder for FakeEmbedder {
+        fn dim(&self) -> usize {
+            8
+        }
+        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|t| {
+                    let mut v = vec![0.0; 8];
+                    let bucket = t.len() % 8;
+                    v[bucket] = 1.0;
+                    v
+                })
+                .collect()
+        }
+    }
+
+    fn write_min_config(cfg_path: &Path, root: &Path) {
+        let body = format!(
+            "[corpus]\nroot = \"{}\"\n\n[embedder]\nmodel = \"unused-in-tests\"\n",
+            root.display()
+        );
+        std::fs::write(cfg_path, body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn init_force_wipes_existing_corpus() {
+        let cfg_dir = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        let cfg_path = cfg_dir.path().join("config.toml");
+        write_min_config(&cfg_path, corpus.path());
+
+        // First init: creates corpus.lance/ and ingest.duckdb.
+        let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
+        init(&cfg_path, Arc::clone(&emb)).await.expect("first init");
+        let lance = corpus.path().join("corpus.lance");
+        let ingest = corpus.path().join("ingest.duckdb");
+        assert!(lance.exists(), "first init should create corpus.lance");
+        assert!(ingest.exists(), "first init should create ingest.duckdb");
+
+        // Drop a sentinel into corpus.lance so we can prove it was wiped.
+        let sentinel = lance.join("sentinel.txt");
+        std::fs::write(&sentinel, "before-force").unwrap();
+        assert!(sentinel.exists());
+
+        // Second init with force: must wipe the table dir before reopen.
+        init_with_options(&cfg_path, Arc::clone(&emb), true)
+            .await
+            .expect("forced re-init");
+        assert!(
+            !sentinel.exists(),
+            "force should have wiped corpus.lance/sentinel.txt"
+        );
+        // And the store is healthy again afterward.
+        assert!(lance.exists(), "force re-init should recreate corpus.lance");
+        assert!(
+            ingest.exists(),
+            "force re-init should recreate ingest.duckdb"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_force_tolerates_missing_artifacts() {
+        // A clean corpus root has no corpus.lance / ingest.duckdb yet —
+        // force must not error.
+        let cfg_dir = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        let cfg_path = cfg_dir.path().join("config.toml");
+        write_min_config(&cfg_path, corpus.path());
+
+        let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
+        let outcome = init_with_options(&cfg_path, emb, true)
+            .await
+            .expect("force init on empty root");
+        assert!(matches!(outcome, InitOutcome::Initialized { .. }));
+    }
 }

@@ -14,6 +14,12 @@ pub struct RecallParams {
     pub since: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Cap on hits sharing the same `source_id` after RRF reranking.
+    /// Stops one chatty session from monopolizing top-K. `None` falls back
+    /// to [`hybrid::DEFAULT_MAX_PER_SOURCE_ID`] (3); `Some(0)` disables the
+    /// filter entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_source_id: Option<usize>,
 }
 
 /// One retrieval row, shaped for MCP consumers.
