@@ -42,7 +42,25 @@ pub const fn starter_config() -> &'static str {
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/ostk-recall/config.toml`.
+///
+/// Honours the XDG Base Directory spec on every platform — including
+/// macOS, where `dirs::config_dir()` would otherwise return
+/// `~/Library/Application Support/`. We want a single config location
+/// developers can reason about (and ship dotfiles for) regardless of OS.
+/// Falls back to the OS-specific `dirs::config_dir()` when neither
+/// `$XDG_CONFIG_HOME` nor `$HOME` is set.
 pub fn default_config_path() -> Result<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg).join("ostk-recall").join("config.toml"));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        return Ok(home
+            .join(".config")
+            .join("ostk-recall")
+            .join("config.toml"));
+    }
     let base = dirs::config_dir()
         .ok_or_else(|| anyhow!("could not determine config dir (no $XDG_CONFIG_HOME, no $HOME)"))?;
     Ok(base.join("ostk-recall").join("config.toml"))
