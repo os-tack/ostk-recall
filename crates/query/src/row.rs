@@ -28,6 +28,7 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
 
     let project = col_str_opt(batch, "project");
     let links_json = col_str_opt(batch, "links_json");
+    let extra_json = col_str_opt(batch, "extra_json");
     let ts = col_ts_opt(batch, "ts");
 
     // Pick a score column. `_relevance_score` is the post-rerank column;
@@ -53,6 +54,22 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
             }
         });
 
+        // Decode `extra_json` if the column exists. Empty/null/unparseable
+        // strings degrade to `Value::Null` so a corrupt row doesn't fail
+        // the whole batch — the field is advisory metadata for the UI.
+        let extra: serde_json::Value = extra_json.map_or(serde_json::Value::Null, |arr| {
+            if arr.is_null(i) {
+                serde_json::Value::Null
+            } else {
+                let raw = arr.value(i);
+                if raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(raw).unwrap_or(serde_json::Value::Null)
+                }
+            }
+        });
+
         let snippet = snippet_of(text.value(i));
         let score_value = score
             .as_ref()
@@ -73,6 +90,7 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
             snippet,
             score: score_value,
             links,
+            extra,
         });
     }
 

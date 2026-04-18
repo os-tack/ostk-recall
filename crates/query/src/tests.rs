@@ -311,6 +311,101 @@ async fn recall_stratified_surfaces_code_when_unfiltered() {
     );
 }
 
+/// A chunk's `extra` JSON (e.g. `{"symbols": ["foo"], "kind": "function"}`)
+/// must round-trip through upsert -> hybrid query -> response. Phase A
+/// wrote `extra_json` to the corpus, but the row decoder dropped it on
+/// the floor — hits came back with the field empty even when the
+/// corpus had it. Guards against that regression.
+#[tokio::test]
+async fn recall_round_trips_extra_symbols() {
+    let dim = 8;
+    let (_tmp, engine) = build_engine(dim).await;
+
+    let mut c = code_chunk("tier2", "fn tier2_line_rebase() { /* body */ }", Some("p"));
+    c.extra = serde_json::json!({
+        "symbols": ["tier2_line_rebase"],
+        "kind": "function",
+        "chunker": "fcp-rust",
+    });
+    let chunks = vec![c];
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let vs = engine.embedder.encode_batch(&texts);
+    engine.store.upsert(&chunks, &vs).await.unwrap();
+
+    let hits = engine
+        .recall(RecallParams {
+            query: "tier2_line_rebase".into(),
+            limit: Some(5),
+            max_per_source_id: Some(0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let hit = hits
+        .iter()
+        .find(|h| h.chunk_id == "tier2")
+        .expect("expected the code chunk in results");
+    let symbols = hit
+        .extra
+        .get("symbols")
+        .and_then(|v| v.as_array())
+        .expect("expected extra.symbols array");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].as_str(), Some("tier2_line_rebase"));
+    assert_eq!(
+        hit.extra.get("kind").and_then(|v| v.as_str()),
+        Some("function")
+    );
+}
+
+/// Identifier-mode boost: a single code chunk should out-rank a
+/// pile of conversation chunks that mention the same symbol when the
+/// query is identifier-shaped. Without the boost, the conversation
+/// chunks (5x more matches) win on raw rerank score.
+#[tokio::test]
+async fn recall_identifier_boost_promotes_code_chunk() {
+    let dim = 8;
+    let (_tmp, mut engine) = build_engine(dim).await;
+    engine = engine.with_reranker(Arc::new(CountOverlapReranker));
+
+    // 5 conversation chunks, each containing the symbol once.
+    let mut chunks: Vec<Chunk> = (0..5)
+        .map(|i| {
+            chunk(
+                &format!("conv{i}"),
+                "we talked about tier2_line_rebase yesterday in the meeting",
+                Some("p"),
+            )
+        })
+        .collect();
+    // 1 code chunk: the actual definition.
+    chunks.push(code_chunk(
+        "code1",
+        "fn tier2_line_rebase() { /* body */ }",
+        Some("p"),
+    ));
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let vs = engine.embedder.encode_batch(&texts);
+    engine.store.upsert(&chunks, &vs).await.unwrap();
+
+    let hits = engine
+        .recall(RecallParams {
+            query: "tier2_line_rebase".into(),
+            limit: Some(6),
+            max_per_source_id: Some(0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(!hits.is_empty(), "expected hits");
+    assert_eq!(
+        hits[0].chunk_id, "code1",
+        "identifier boost must put code definition first; got {hits:#?}"
+    );
+}
+
 /// When the user explicitly filters by source, single-source retrieval
 /// is the intent — the stratified path must not silently inject other
 /// sources back in.

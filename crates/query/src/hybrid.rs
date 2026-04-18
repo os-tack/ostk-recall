@@ -40,6 +40,18 @@ pub const PREFETCH_MULTIPLIER: usize = 6;
 /// cross-encoder reranker sees code rows whenever they exist for a query.
 pub const STRATIFIED_CODE_PREFETCH: usize = 12;
 
+/// Additive boost applied to `source = "code"` post-rerank scores when
+/// [`is_identifier_query`] flags the query as identifier-shaped (a
+/// `snake_case` / `CamelCase` symbol name or a single short token).
+///
+/// Tuning: 1.5 is roughly one full RRF/BM25 score-class — enough to push
+/// the actual definition above the conversation transcripts that mention
+/// the symbol, without swamping legitimate prose answers when an
+/// identifier-shaped query happens to also match a doc heading.
+///
+/// Set to `0.0` to disable the heuristic without removing the call site.
+pub const IDENTIFIER_CODE_BOOST: f32 = 1.5;
+
 /// Execute a hybrid recall against the corpus table.
 ///
 /// Pipeline:
@@ -139,7 +151,82 @@ pub async fn recall(
         candidates
     };
 
+    // Identifier-mode boost: when the query reads like a symbol name
+    // (snake_case, CamelCase, or a single short token), bias actual code
+    // definitions above conversation transcripts that merely mention the
+    // identifier. Bumps post-rerank scores in place, then re-sorts.
+    let candidates = boost_code_for_identifier_queries(query_text, candidates);
+
     Ok(diversify_by_source_id(candidates, limit, max_per_source_id))
+}
+
+/// Returns true when the query reads like a code identifier.
+///
+/// Identifier-shaped means a single short token, `snake_case`, or
+/// `CamelCase`. For these queries, the user almost certainly wants the
+/// actual definition over conversation transcripts that mention the
+/// symbol.
+///
+/// Heuristic, in order:
+/// * Empty / >3 tokens → `false` (likely natural language).
+/// * Any token containing `_` → `true` (snake_case-ish).
+/// * Any token with a non-leading uppercase char → `true` (CamelCase-ish).
+/// * Single token, all alphanumeric/underscore → `true` (bare symbol).
+/// * Otherwise → `false`.
+///
+/// Tune by widening the token cap (currently 3) or by adjusting
+/// [`IDENTIFIER_CODE_BOOST`].
+#[must_use]
+pub fn is_identifier_query(q: &str) -> bool {
+    let q = q.trim();
+    if q.is_empty() {
+        return false;
+    }
+    let tokens: Vec<&str> = q.split_whitespace().collect();
+    if tokens.len() > 3 {
+        return false;
+    }
+    // Any token with underscore -> snake_case-like
+    if tokens.iter().any(|t| t.contains('_')) {
+        return true;
+    }
+    // Any token with mid-word uppercase -> CamelCase-like
+    if tokens.iter().any(|t| {
+        t.chars()
+            .enumerate()
+            .any(|(i, c)| i > 0 && c.is_ascii_uppercase())
+    }) {
+        return true;
+    }
+    // Single token, all alphanumeric/underscore — likely a bare symbol
+    // name like "alloc_page" or "memcpy".
+    if tokens.len() == 1 && tokens[0].chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return true;
+    }
+    false
+}
+
+/// If `query` looks like an identifier, add [`IDENTIFIER_CODE_BOOST`] to
+/// every `source == "code"` candidate's score and re-sort by descending
+/// score. Otherwise returns `candidates` unchanged.
+fn boost_code_for_identifier_queries(
+    query: &str,
+    mut candidates: Vec<RecallHit>,
+) -> Vec<RecallHit> {
+    if !is_identifier_query(query) || IDENTIFIER_CODE_BOOST == 0.0 {
+        return candidates;
+    }
+    for hit in &mut candidates {
+        if hit.source == Source::Code.as_str() {
+            hit.score += IDENTIFIER_CODE_BOOST;
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates
 }
 
 /// Issue one hybrid (dense + BM25 + RRF) query against `table`.
@@ -332,6 +419,7 @@ mod tests {
             snippet: String::new(),
             score: 1.0,
             links: Links::default(),
+            extra: serde_json::Value::Null,
         }
     }
 
@@ -420,6 +508,7 @@ mod tests {
             snippet: text.to_string(),
             score: 0.0,
             links: Links::default(),
+            extra: serde_json::Value::Null,
         }
     }
 
@@ -467,5 +556,96 @@ mod tests {
         let mut dest = vec![fake_hit("a", "S")];
         merge_dedup(&mut dest, Vec::new());
         assert_eq!(dest.len(), 1);
+    }
+
+    #[test]
+    fn is_identifier_snake_case() {
+        assert!(is_identifier_query("tier2_line_rebase"));
+        assert!(is_identifier_query("alloc_page"));
+    }
+
+    #[test]
+    fn is_identifier_camel_case() {
+        assert!(is_identifier_query("MemoryRegion"));
+    }
+
+    #[test]
+    fn is_identifier_single_short_token() {
+        assert!(is_identifier_query("memcpy"));
+    }
+
+    #[test]
+    fn is_identifier_natural_language_false() {
+        assert!(!is_identifier_query("fleet heartbeat"));
+        assert!(!is_identifier_query("what is X"));
+        assert!(!is_identifier_query(""));
+        assert!(!is_identifier_query(
+            "how do we wire the reranker into recall"
+        ));
+    }
+
+    #[test]
+    fn boost_promotes_code_when_identifier_query() {
+        let candidates = vec![
+            RecallHit {
+                chunk_id: "conv1".into(),
+                project: None,
+                source: "anthropic_session".into(),
+                source_id: "s1".into(),
+                ts: None,
+                snippet: "we discussed alloc_page".into(),
+                score: 5.0,
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            },
+            RecallHit {
+                chunk_id: "code1".into(),
+                project: None,
+                source: "code".into(),
+                source_id: "src/mm.rs".into(),
+                ts: None,
+                snippet: "fn alloc_page() {}".into(),
+                score: 4.0,
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            },
+        ];
+        let out = boost_code_for_identifier_queries("alloc_page", candidates);
+        assert_eq!(out[0].chunk_id, "code1", "code hit should win after boost");
+        // Boost lifted 4.0 -> 5.5, above the 5.0 conversation row.
+        assert!((out[0].score - 5.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn boost_noop_for_natural_language_query() {
+        let candidates = vec![
+            RecallHit {
+                chunk_id: "conv1".into(),
+                project: None,
+                source: "anthropic_session".into(),
+                source_id: "s1".into(),
+                ts: None,
+                snippet: "answer text".into(),
+                score: 5.0,
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            },
+            RecallHit {
+                chunk_id: "code1".into(),
+                project: None,
+                source: "code".into(),
+                source_id: "src/mm.rs".into(),
+                ts: None,
+                snippet: "fn x() {}".into(),
+                score: 4.0,
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            },
+        ];
+        let out = boost_code_for_identifier_queries("how do we wire the reranker", candidates);
+        // Order untouched, scores untouched.
+        assert_eq!(out[0].chunk_id, "conv1");
+        assert!((out[0].score - 5.0).abs() < f32::EPSILON);
+        assert!((out[1].score - 4.0).abs() < f32::EPSILON);
     }
 }

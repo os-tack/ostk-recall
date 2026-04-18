@@ -33,6 +33,13 @@ pub struct RecallHit {
     pub snippet: String,
     pub score: f32,
     pub links: Links,
+    /// Scanner-supplied side-channel metadata (e.g. `symbols`, `kind`,
+    /// `chunker`). Round-trips through the corpus `extra_json` column so
+    /// MCP clients can show symbol-aware UX (file path + identifier
+    /// plus its rust-analyzer kind). Defaults to `Value::Null` when the
+    /// scanner didn't populate anything; serializes as JSON `null`.
+    #[serde(default)]
+    pub extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
