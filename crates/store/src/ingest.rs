@@ -45,6 +45,19 @@ impl IngestDb {
         })
     }
 
+    /// Open in read-only mode. The serve path uses this so multiple
+    /// `serve --stdio` processes (or a serve that starts during a write)
+    /// don't collide on the DuckDB single-writer lock. Skips `migrate`
+    /// because schema DDL is a write; the caller must ensure `init` ran
+    /// first.
+    pub fn open_read_only(root: &Path) -> Result<Self> {
+        let path = root.join("ingest.duckdb");
+        let conn = crate::duckdb_open::open_read_only(&path)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn
             .lock()
