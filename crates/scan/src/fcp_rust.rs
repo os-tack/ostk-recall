@@ -553,13 +553,16 @@ pub fn group_by_workspace(
 // serialize at the stdin pipe regardless.
 
 /// Upper bound on lines scanned backward from a symbol while searching
-/// for its preceding doc-comment / attribute block. Conservative ceiling
-/// — the scan stops as soon as it hits a non-doc / non-attr line. Exists
-/// only to bound the walk on pathological files.
+/// for its preceding doc-comment / attribute block.
+///
+/// Conservative ceiling — the scan stops as soon as it hits a non-doc /
+/// non-attr line. Exists only to bound the walk on pathological files.
 pub const SYMBOL_DOC_SCAN_MAX: u32 = 200;
 
 /// Max consecutive doc/comment/attr lines to prepend as a synthetic
-/// "module header" chunk. Captures `//!` rustdoc at the top of the file
+/// "module header" chunk.
+///
+/// Captures `//!` rustdoc at the top of the file
 /// (where →NEEDLE references, module-level reasoning, and invariants
 /// tend to live). If the file starts with code, no header chunk is
 /// emitted.
@@ -691,7 +694,7 @@ fn ensure_session(workspace_root: &Path) -> bool {
 // across the stdio round-trip (fcp-rust is a single-threaded peer).
 // Clippy's drop-tightening lint fires on the block scope regardless;
 // silence it at function scope rather than re-acquiring the lock twice.
-#[allow(clippy::significant_drop_tightening)]
+#[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
 pub fn chunk_rust_file(
     file_path: &Path,
     text: &str,
@@ -893,10 +896,12 @@ pub fn slice_symbol_with_docs(lines: &[&str], sym: &RustSymbol, max_scan: u32) -
     lines[start..end].concat()
 }
 
-/// Build the synthetic module-header chunk body: all `//!` rustdoc + any
-/// top-of-file attributes, stopping at the first non-doc/non-attr line
-/// or at `MODULE_HEADER_MAX_LINES`, whichever comes first. Returns
-/// `None` when the file starts with code (no header content to capture).
+/// Build the synthetic module-header chunk body.
+///
+/// Collects all `//!` rustdoc + any top-of-file attributes, stopping at
+/// the first non-doc/non-attr line or at `MODULE_HEADER_MAX_LINES`,
+/// whichever comes first. Returns `None` when the file starts with code
+/// (no header content to capture).
 #[must_use]
 pub fn slice_module_header(lines: &[&str], first_symbol_line: u32) -> Option<String> {
     if lines.is_empty() || first_symbol_line <= 1 {
@@ -936,9 +941,10 @@ pub fn slice_module_header(lines: &[&str], first_symbol_line: u32) -> Option<Str
 }
 
 /// Slice `[sym.line_start - leading, sym.line_end]` out of `lines`,
-/// clamping to file bounds. Retained for callers / tests that want the
-/// fixed-window behavior; the production chunker uses
-/// [`slice_symbol_with_docs`].
+/// clamping to file bounds.
+///
+/// Retained for callers / tests that want the fixed-window behavior; the
+/// production chunker uses [`slice_symbol_with_docs`].
 #[must_use]
 pub fn slice_symbol(lines: &[&str], sym: &RustSymbol, leading: u32) -> String {
     if lines.is_empty() {

@@ -37,9 +37,11 @@ pub const WINDOW_LINES: usize = 200;
 pub const OVERLAP_LINES: usize = 20;
 
 /// Legacy re-export kept so existing call sites (tests, external
-/// scanners) continue to compile. Production chunking uses
-/// `fcp_rust::slice_symbol_with_docs`, which walks the doc block
-/// backward until it hits code instead of using a fixed window.
+/// scanners) continue to compile.
+///
+/// Production chunking uses `fcp_rust::slice_symbol_with_docs`, which
+/// walks the doc block backward until it hits code instead of using a
+/// fixed window.
 #[allow(dead_code)]
 pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = 5;
 

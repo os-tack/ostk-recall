@@ -2,7 +2,7 @@
 //!
 //! The serve path opens both `ingest.duckdb` and `events.duckdb` in
 //! read-only mode so multiple `ostk-recall serve --stdio` processes can
-//! share a corpus without fighting over the DuckDB single-writer lock.
+//! share a corpus without fighting over the `DuckDB` single-writer lock.
 //! A short retry loop handles the transient case where a writer (scan /
 //! ingest) holds the lock at startup.
 
@@ -21,7 +21,7 @@ const OPEN_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Open a `DuckDB` connection at `path` in read-only mode. Retries briefly
 /// on lock-contention errors so serve processes that start during a write
 /// don't hard-fail. Non-lock errors bubble up on the first attempt.
-pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
+pub fn open_read_only(path: &Path) -> Result<Connection> {
     let mut attempts: u32 = 0;
     loop {
         attempts += 1;

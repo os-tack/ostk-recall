@@ -340,8 +340,8 @@ pub async fn scan(
 /// Wipe every corpus row whose `project = reingest_project` and the
 /// matching `ingest_chunks` entries, then rescan that source.
 ///
-/// LanceDB holds the `project` column, so we ask it for the doomed
-/// chunk ids first, delete from LanceDB, then delete those ids from
+/// `LanceDB` holds the `project` column, so we ask it for the doomed
+/// chunk ids first, delete from `LanceDB`, then delete those ids from
 /// `ingest.duckdb::ingest_chunks` (which has no `project` column).
 /// Finally we delegate to [`scan`] with `source_filter = Some(project)`
 /// and `dry_run = false` — the delete is never dry-run; there is no
