@@ -252,3 +252,91 @@ async fn serve_stdio_keeps_stdout_clean_of_logs() {
     drop(stdin);
     let _ = child.wait();
 }
+
+/// Two `serve --stdio` processes against the same corpus must coexist.
+/// Before the read-only open path, the second process crashed with a
+/// `DuckDB` lock error on `ingest.duckdb`. This test pins the invariant:
+/// both children initialize, list tools, and answer a `recall_stats` call.
+#[tokio::test]
+async fn two_serves_share_corpus_read_only() {
+    let fixture = TempDir::new().unwrap();
+    write_fixture(fixture.path());
+
+    let corpus = TempDir::new().unwrap();
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.toml");
+    write_config(&cfg_path, corpus.path(), fixture.path());
+
+    let embedder: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
+
+    match commands::init(&cfg_path, Arc::clone(&embedder))
+        .await
+        .expect("init")
+    {
+        InitOutcome::Initialized { .. } => {}
+        InitOutcome::WroteStarter { path } => {
+            panic!("unexpected init outcome: wrote starter at {path:?}");
+        }
+    }
+    let scan = commands::scan(&cfg_path, Arc::clone(&embedder), None, false)
+        .await
+        .expect("scan");
+    assert!(scan.totals.chunks_upserted > 0);
+
+    let spawn_serve = || {
+        Command::new(cargo_bin())
+            .env("OSTK_RECALL_FAKE_EMBEDDER", FAKE_DIM.to_string())
+            .env("OSTK_RECALL_SKIP_RERANKER", "1")
+            .env("RUST_LOG", "info")
+            .arg("--config")
+            .arg(&cfg_path)
+            .arg("serve")
+            .arg("--stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ostk-recall serve --stdio")
+    };
+
+    let mut a = spawn_serve();
+    let mut b = spawn_serve();
+
+    let mut a_in = a.stdin.take().unwrap();
+    let mut a_out = BufReader::new(a.stdout.take().unwrap());
+    let mut b_in = b.stdin.take().unwrap();
+    let mut b_out = BufReader::new(b.stdout.take().unwrap());
+
+    // Drive both through initialize + recall_stats in lockstep.
+    for (inp, out, id) in [(&mut a_in, &mut a_out, 1i64), (&mut b_in, &mut b_out, 2i64)] {
+        send(
+            inp,
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":id,"method":"initialize","params":{}
+            }),
+        );
+        let line = read_line(out);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["result"]["serverInfo"]["name"], "ostk-recall");
+
+        send(
+            inp,
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":id + 100,"method":"tools/call",
+                "params": {"name":"recall_stats","arguments":{}}
+            }),
+        );
+        let line = read_line(out);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        let stats: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(stats["total"].as_u64().unwrap() >= 1);
+    }
+
+    drop(a_in);
+    drop(b_in);
+    let ea = a.wait().expect("child a exit");
+    let eb = b.wait().expect("child b exit");
+    assert!(ea.success(), "child a exit {ea:?}");
+    assert!(eb.success(), "child b exit {eb:?}");
+}

@@ -65,6 +65,17 @@ impl EventsDb {
         })
     }
 
+    /// Read-only companion to [`EventsDb::open`]. See
+    /// [`IngestDb::open_read_only`](crate::ingest::IngestDb::open_read_only)
+    /// for the rationale.
+    pub fn open_read_only(root: &Path) -> Result<Self> {
+        let path = root.join("events.duckdb");
+        let conn = crate::duckdb_open::open_read_only(&path)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn
             .lock()

@@ -137,7 +137,7 @@ impl CorpusStore {
 
     /// Return all `chunk_id`s in the corpus whose `project` column equals
     /// `project`. Used by the `--reingest` path to collect ids for
-    /// cross-store cleanup before the LanceDB delete fires.
+    /// cross-store cleanup before the `LanceDB` delete fires.
     pub async fn chunk_ids_for_project(&self, project: &str) -> Result<Vec<String>> {
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         let filter = format!("project = '{}'", escape_sql(project));
@@ -181,8 +181,8 @@ impl CorpusStore {
     }
 }
 
-/// Escape single quotes for inlining into a LanceDB filter expression.
-/// Duplicates `'` -> `''`; LanceDB's filter parser is SQL-like.
+/// Escape single quotes for inlining into a `LanceDB` filter expression.
+/// Duplicates `'` -> `''`; `LanceDB`'s filter parser is SQL-like.
 fn escape_sql(value: &str) -> String {
     value.replace('\'', "''")
 }

@@ -56,10 +56,7 @@ pub fn default_config_path() -> Result<PathBuf> {
         }
     }
     if let Some(home) = dirs::home_dir() {
-        return Ok(home
-            .join(".config")
-            .join("ostk-recall")
-            .join("config.toml"));
+        return Ok(home.join(".config").join("ostk-recall").join("config.toml"));
     }
     let base = dirs::config_dir()
         .ok_or_else(|| anyhow!("could not determine config dir (no $XDG_CONFIG_HOME, no $HOME)"))?;
@@ -343,8 +340,8 @@ pub async fn scan(
 /// Wipe every corpus row whose `project = reingest_project` and the
 /// matching `ingest_chunks` entries, then rescan that source.
 ///
-/// LanceDB holds the `project` column, so we ask it for the doomed
-/// chunk ids first, delete from LanceDB, then delete those ids from
+/// `LanceDB` holds the `project` column, so we ask it for the doomed
+/// chunk ids first, delete from `LanceDB`, then delete those ids from
 /// `ingest.duckdb::ingest_chunks` (which has no `project` column).
 /// Finally we delegate to [`scan`] with `source_filter = Some(project)`
 /// and `dry_run = false` — the delete is never dry-run; there is no
@@ -437,11 +434,12 @@ pub async fn verify(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Res
 
 /// Build the query engine from config + embedder. Shared between `serve` and
 /// integration tests so spawning the real MCP server stays a one-liner.
+/// Opens the underlying `DuckDB` files in read-write mode.
 pub async fn build_query_engine(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
 ) -> Result<QueryEngine> {
-    build_query_engine_with_reranker(config_path, embedder, true).await
+    build_query_engine_inner(config_path, embedder, true, false).await
 }
 
 /// Like [`build_query_engine`] but lets the caller force-disable the
@@ -452,6 +450,25 @@ pub async fn build_query_engine_with_reranker(
     embedder: Arc<dyn ChunkEmbedder>,
     attach_reranker: bool,
 ) -> Result<QueryEngine> {
+    build_query_engine_inner(config_path, embedder, attach_reranker, false).await
+}
+
+/// Read-only build of the query engine. Used by `serve --stdio` so
+/// multiple MCP processes can share one corpus without fighting over
+/// the `DuckDB` single-writer lock. The reranker is still attached.
+pub async fn build_query_engine_read_only(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+) -> Result<QueryEngine> {
+    build_query_engine_inner(config_path, embedder, true, true).await
+}
+
+async fn build_query_engine_inner(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    attach_reranker: bool,
+    read_only: bool,
+) -> Result<QueryEngine> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let root = cfg.expanded_root()?;
@@ -460,8 +477,12 @@ pub async fn build_query_engine_with_reranker(
             .await
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
-    let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
-    let events = events_db_if_wanted(&cfg, &root)?;
+    let ingest = Arc::new(if read_only {
+        IngestDb::open_read_only(&root).map_err(|e| anyhow!("open ingest db (ro): {e}"))?
+    } else {
+        IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?
+    });
+    let events = events_db_if_wanted(&cfg, &root, read_only)?;
     let mut engine = QueryEngine::new(store, ingest, events, embedder, cfg.embedder.model.clone());
     if attach_reranker && !skip_reranker_for_tests() {
         let reranker_cfg = RerankerConfig::resolve(cfg.reranker.as_ref());
@@ -491,15 +512,22 @@ fn load_reranker(root: &Path, model_spec: &str) -> Result<Arc<dyn RerankerLike>>
     Ok(r)
 }
 
-fn events_db_if_wanted(cfg: &Config, root: &Path) -> Result<Option<Arc<EventsDb>>> {
+fn events_db_if_wanted(
+    cfg: &Config,
+    root: &Path,
+    read_only: bool,
+) -> Result<Option<Arc<EventsDb>>> {
     if cfg
         .sources
         .iter()
         .any(|s| matches!(s.kind, SourceKind::OstkProject))
     {
-        Ok(Some(Arc::new(
-            EventsDb::open(root).map_err(|e| anyhow!("open events db: {e}"))?,
-        )))
+        let db = if read_only {
+            EventsDb::open_read_only(root).map_err(|e| anyhow!("open events db (ro): {e}"))?
+        } else {
+            EventsDb::open(root).map_err(|e| anyhow!("open events db: {e}"))?
+        };
+        Ok(Some(Arc::new(db)))
     } else {
         Ok(None)
     }
@@ -520,7 +548,7 @@ pub async fn serve(
             "only stdio transport is currently supported; pass --stdio"
         ));
     }
-    let engine = build_query_engine(config_path, embedder).await?;
+    let engine = build_query_engine_read_only(config_path, embedder).await?;
     tracing::info!(
         model = %engine.model(),
         dim = engine.store().dim(),

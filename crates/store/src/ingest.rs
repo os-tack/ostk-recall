@@ -45,6 +45,19 @@ impl IngestDb {
         })
     }
 
+    /// Open in read-only mode. The serve path uses this so multiple
+    /// `serve --stdio` processes (or a serve that starts during a write)
+    /// don't collide on the `DuckDB` single-writer lock. Skips `migrate`
+    /// because schema DDL is a write; the caller must ensure `init` ran
+    /// first.
+    pub fn open_read_only(root: &Path) -> Result<Self> {
+        let path = root.join("ingest.duckdb");
+        let conn = crate::duckdb_open::open_read_only(&path)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn
             .lock()
@@ -137,12 +150,12 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source
 
     /// Delete ingest rows matching any of the supplied chunk ids. Returns
     /// the total number of rows removed. Used by the `--reingest` path
-    /// after LanceDB rows for a project have been collected — deleting
+    /// after `LanceDB` rows for a project have been collected — deleting
     /// here lets the next scan pass re-ingest those chunks instead of
     /// short-circuiting on the `content_already_ingested` dedupe check.
     ///
     /// `ingest_chunks` has no `project` column, so the caller (the CLI
-    /// reingest wrapper) first queries LanceDB for every chunk_id whose
+    /// reingest wrapper) first queries `LanceDB` for every `chunk_id` whose
     /// `project` matches the flag, then passes those ids here in batches.
     #[allow(clippy::significant_drop_tightening)]
     pub fn delete_by_chunk_ids(&self, chunk_ids: &[String]) -> Result<u64> {
