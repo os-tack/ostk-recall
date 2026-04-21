@@ -1160,8 +1160,7 @@ mod tests {
             return;
         }
         let lines = std::fs::read_to_string(&file)
-            .map(|s| u32::try_from(s.lines().count()).unwrap_or(u32::MAX))
-            .unwrap_or(0);
+            .map_or(0, |s| u32::try_from(s.lines().count()).unwrap_or(u32::MAX));
         let syms = session.symbols(&file, lines).expect("symbols query failed");
         assert!(!syms.is_empty(), "expected at least one symbol in code.rs");
         assert!(
