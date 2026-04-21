@@ -56,10 +56,7 @@ pub fn default_config_path() -> Result<PathBuf> {
         }
     }
     if let Some(home) = dirs::home_dir() {
-        return Ok(home
-            .join(".config")
-            .join("ostk-recall")
-            .join("config.toml"));
+        return Ok(home.join(".config").join("ostk-recall").join("config.toml"));
     }
     let base = dirs::config_dir()
         .ok_or_else(|| anyhow!("could not determine config dir (no $XDG_CONFIG_HOME, no $HOME)"))?;

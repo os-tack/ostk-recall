@@ -253,7 +253,6 @@ async fn serve_stdio_keeps_stdout_clean_of_logs() {
     let _ = child.wait();
 }
 
-
 /// Two `serve --stdio` processes against the same corpus must coexist.
 /// Before the read-only open path, the second process crashed with a
 /// `DuckDB` lock error on `ingest.duckdb`. This test pins the invariant:
@@ -309,10 +308,7 @@ async fn two_serves_share_corpus_read_only() {
     let mut b_out = BufReader::new(b.stdout.take().unwrap());
 
     // Drive both through initialize + recall_stats in lockstep.
-    for (inp, out, id) in [
-        (&mut a_in, &mut a_out, 1i64),
-        (&mut b_in, &mut b_out, 2i64),
-    ] {
+    for (inp, out, id) in [(&mut a_in, &mut a_out, 1i64), (&mut b_in, &mut b_out, 2i64)] {
         send(
             inp,
             &serde_json::json!({
