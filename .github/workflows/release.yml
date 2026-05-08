@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Allow manual runs against an existing tag (e.g. v0.1.0 was pushed before
+  # this workflow existed). Pick the tag from the GH UI; the matrix builds
+  # native binaries for Linux + macOS and uploads them as release assets.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build artifacts for (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-upload:
+    name: Build and upload (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Linux + macOS only. ostk-recall does not build on Windows because the
+      # workspace pulls in tokio's Unix-only paths via the CLI's serve socket.
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-amd64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_suffix: macos-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_suffix: macos-arm64
+
+    steps:
+      - name: Checkout (tag from input or push)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install protoc (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} --bin ostk-recall --bin ostk-recall-mcp
+
+      - name: Package binaries
+        id: package
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          stage="ostk-recall-${tag}-${{ matrix.asset_suffix }}"
+          mkdir "$stage"
+          cp "target/${{ matrix.target }}/release/ostk-recall" "$stage/"
+          cp "target/${{ matrix.target }}/release/ostk-recall-mcp" "$stage/"
+          # Provenance + license alongside the binaries.
+          [ -f README.md ] && cp README.md "$stage/" || true
+          [ -f LICENSE ] && cp LICENSE "$stage/" || true
+          tar -czf "${stage}.tar.gz" "$stage"
+          echo "asset_path=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ steps.package.outputs.asset_path }}
+          asset_name: ${{ steps.package.outputs.asset_name }}
+          tag: ${{ inputs.tag || github.ref_name }}
+          overwrite: true
