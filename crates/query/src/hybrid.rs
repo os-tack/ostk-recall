@@ -9,7 +9,7 @@ use lancedb::Connection;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::rerankers::rrf::RRFReranker;
-use ostk_recall_core::Source;
+use ostk_recall_core::{RecallIntent, Source};
 use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_store::CORPUS_TABLE;
 
@@ -422,6 +422,8 @@ mod tests {
             score: 1.0,
             links: Links::default(),
             extra: serde_json::Value::Null,
+            stale: false,
+            role: None,
         }
     }
 
@@ -511,6 +513,8 @@ mod tests {
             score: 0.0,
             links: Links::default(),
             extra: serde_json::Value::Null,
+            stale: false,
+            role: None,
         }
     }
 
@@ -599,6 +603,8 @@ mod tests {
                 score: 5.0,
                 links: Links::default(),
                 extra: serde_json::Value::Null,
+                stale: false,
+                role: None,
             },
             RecallHit {
                 chunk_id: "code1".into(),
@@ -610,6 +616,8 @@ mod tests {
                 score: 4.0,
                 links: Links::default(),
                 extra: serde_json::Value::Null,
+                stale: false,
+                role: None,
             },
         ];
         let out = boost_code_for_identifier_queries("alloc_page", candidates);
@@ -632,6 +640,8 @@ mod tests {
                 score: 5.0,
                 links: Links::default(),
                 extra: serde_json::Value::Null,
+                stale: false,
+                role: None,
             },
             RecallHit {
                 chunk_id: "code1".into(),
@@ -643,6 +653,8 @@ mod tests {
                 score: 4.0,
                 links: Links::default(),
                 extra: serde_json::Value::Null,
+                stale: false,
+                role: None,
             },
         ];
         let out = boost_code_for_identifier_queries("how do we wire the reranker", candidates);
