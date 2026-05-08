@@ -209,8 +209,18 @@ pub fn is_identifier_query(q: &str) -> bool {
 }
 
 /// If `query` looks like an identifier, add [`IDENTIFIER_CODE_BOOST`] to
-/// every `source == "code"` candidate's score and re-sort by descending
-/// score. Otherwise returns `candidates` unchanged.
+/// every `source == "code"` candidate **whose snippet actually contains
+/// the query token** and re-sort by descending score. Otherwise returns
+/// `candidates` unchanged.
+///
+/// The substring check is case-insensitive and only applied to code-source
+/// candidates. It exists so that snake_case queries with no code match in
+/// the corpus (e.g. a markdown-only term that happens to look like an
+/// identifier) do not crowd out the genuine non-code matches with an
+/// undeserved +3.0. Code candidates that *do* contain the identifier still
+/// get the full boost. Pre-fix, an identifier query would lift every code
+/// candidate equally, which broke the markdown/file_glob branches of the
+/// verification panel.
 fn boost_code_for_identifier_queries(
     query: &str,
     mut candidates: Vec<RecallHit>,
@@ -218,8 +228,9 @@ fn boost_code_for_identifier_queries(
     if !is_identifier_query(query) || IDENTIFIER_CODE_BOOST == 0.0 {
         return candidates;
     }
+    let needle = query.trim().to_lowercase();
     for hit in &mut candidates {
-        if hit.source == Source::Code.as_str() {
+        if hit.source == Source::Code.as_str() && hit.snippet.to_lowercase().contains(&needle) {
             hit.score += IDENTIFIER_CODE_BOOST;
         }
     }
