@@ -1,46 +1,17 @@
-//! Full audit-event firehose → `events.duckdb`.
-//!
-//! The `ostk_project` scanner ingests every row from `.ostk/audit.jsonl`
-//! into this `DuckDB` file, regardless of whether the event is significant
-//! enough for the semantic corpus. Queries that need "what was happening
-//! at ts=X" can join against this table without touching the `LanceDB`
-//! corpus.
-//!
-//! Schema:
-//!
-//! ```sql
-//! CREATE TABLE audit_events (
-//!     row_key VARCHAR PRIMARY KEY,  -- project:ts:prev_hash
-//!     project VARCHAR,
-//!     ts TIMESTAMP,
-//!     event VARCHAR,
-//!     tool VARCHAR,
-//!     agent VARCHAR,
-//!     success BOOLEAN,
-//!     exit_code INTEGER,
-//!     duration_ms INTEGER,
-//!     raw JSON
-//! );
-//! ```
-//!
-//! Inserts are streamed through a single prepared statement wrapped in an
-//! explicit transaction so large audit files don't blow out memory or
-//! commit latency.
-
 use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use duckdb::{Connection, params};
+use rusqlite::{Connection, params};
 
 use crate::corpus::Result;
 
-/// Events store (handle to `<root>/events.duckdb`).
+/// Events store (handle to <root>/events.sqlite).
 pub struct EventsDb {
     conn: Mutex<Connection>,
 }
 
-/// One row as it lands in `audit_events`.
+/// One row as it lands in audit_events.
 #[derive(Debug, Clone)]
 pub struct AuditEventRow {
     pub row_key: String,
@@ -57,23 +28,34 @@ pub struct AuditEventRow {
 
 impl EventsDb {
     pub fn open(root: &Path) -> Result<Self> {
-        let path = root.join("events.duckdb");
+        let path = root.join("events.sqlite");
         let conn = Connection::open(path)?;
+        Self::setup_connection(&conn)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Read-only companion to [`EventsDb::open`]. See
-    /// [`IngestDb::open_read_only`](crate::ingest::IngestDb::open_read_only)
-    /// for the rationale.
     pub fn open_read_only(root: &Path) -> Result<Self> {
-        let path = root.join("events.duckdb");
-        let conn = crate::duckdb_open::open_read_only(&path)?;
+        let path = root.join("events.sqlite");
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Self::setup_connection(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn setup_connection(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;"
+        )?;
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -86,16 +68,16 @@ impl EventsDb {
         conn.execute_batch(
             r"
 CREATE TABLE IF NOT EXISTS audit_events (
-    row_key VARCHAR PRIMARY KEY,
-    project VARCHAR,
-    ts TIMESTAMP,
-    event VARCHAR,
-    tool VARCHAR,
-    agent VARCHAR,
-    success BOOLEAN,
+    row_key TEXT PRIMARY KEY,
+    project TEXT,
+    ts TEXT,
+    event TEXT,
+    tool TEXT,
+    agent TEXT,
+    success INTEGER,
     exit_code INTEGER,
     duration_ms INTEGER,
-    raw JSON
+    raw TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts
@@ -107,9 +89,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         Ok(())
     }
 
-    /// Ingest a batch of rows inside a single transaction. Uses
-    /// `INSERT OR IGNORE` on `row_key` so repeated runs don't duplicate.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn ingest_batch(&self, rows: &[AuditEventRow]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
@@ -131,7 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
                     row.event,
                     row.tool,
                     row.agent,
-                    row.success,
+                    row.success.map(|b| if b { 1i32 } else { 0i32 }),
                     row.exit_code,
                     row.duration_ms,
                     row.raw,
@@ -143,127 +122,78 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         Ok(inserted)
     }
 
-    /// Count rows. Mostly for tests.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn row_count(&self) -> Result<u64> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM audit_events")?;
         let n: i64 = stmt.query_row([], |r| r.get(0))?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        Ok(n as u64)
     }
 
-    /// Run a raw SELECT-only SQL statement and return (columns, rows) as
-    /// JSON values. Rejects anything that isn't a single SELECT. Used by the
-    /// `recall_audit` MCP tool; the caller is responsible for higher-level
-    /// policy (rate limiting, etc.).
-    #[allow(clippy::significant_drop_tightening)]
     pub fn execute_select(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
         let conn = self.lock();
         let mut stmt = conn.prepare(sql)?;
+        let column_count = stmt.column_count();
+        let columns: Vec<String> = stmt.column_names().into_iter().map(ToString::to_string).collect();
+        
         let mut rows = stmt.query([])?;
-        let mut out: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut columns: Vec<String> = Vec::new();
-        let mut column_count = 0usize;
+        let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            if columns.is_empty() {
-                let stmt_ref: &duckdb::Statement<'_> = r.as_ref();
-                column_count = stmt_ref.column_count();
-                columns = (0..column_count)
-                    .map(|i| {
-                        stmt_ref
-                            .column_name(i)
-                            .map(ToString::to_string)
-                            .unwrap_or_default()
-                    })
-                    .collect();
-            }
             let mut row = Vec::with_capacity(column_count);
             for i in 0..column_count {
-                let v: duckdb::types::Value = r.get(i)?;
-                row.push(duck_value_to_json(v));
+                let v: rusqlite::types::Value = r.get(i)?;
+                row.push(sql_value_to_json(v));
             }
             out.push(row);
-        }
-        // If empty result set, we still want to attempt to read column meta
-        // off the statement via the Rows handle.
-        if columns.is_empty() {
-            if let Some(stmt_ref) = rows.as_ref() {
-                columns = (0..stmt_ref.column_count())
-                    .map(|i| {
-                        stmt_ref
-                            .column_name(i)
-                            .map(ToString::to_string)
-                            .unwrap_or_default()
-                    })
-                    .collect();
-            }
         }
         Ok((columns, out))
     }
 
-    /// Look up a single row by `row_key`.
-    #[allow(clippy::significant_drop_tightening)]
     pub fn get(&self, row_key: &str) -> Result<Option<AuditEventRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT row_key, project, CAST(ts AS VARCHAR), event, tool, agent,
+            "SELECT row_key, project, ts, event, tool, agent,
                     success, exit_code, duration_ms, raw
              FROM audit_events WHERE row_key = ? LIMIT 1",
         )?;
-        let mut rows = stmt.query(params![row_key])?;
-        if let Some(r) = rows.next()? {
+        let res = stmt.query_row(params![row_key], |r| {
             let ts_str: Option<String> = r.get(2)?;
             let ts = ts_str.as_deref().and_then(parse_ts);
-            Ok(Some(AuditEventRow {
+            let success_int: Option<i32> = r.get(6)?;
+            let success = success_int.map(|n| n != 0);
+            Ok(AuditEventRow {
                 row_key: r.get(0)?,
                 project: r.get(1)?,
                 ts,
                 event: r.get(3)?,
                 tool: r.get(4)?,
                 agent: r.get(5)?,
-                success: r.get(6)?,
+                success,
                 exit_code: r.get(7)?,
                 duration_ms: r.get(8)?,
                 raw: r.get(9)?,
-            }))
-        } else {
-            Ok(None)
+            })
+        });
+        match res {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 }
 
-// NOTE: `StoreError: From<duckdb::Error>` is defined once in `ingest.rs`
-// and applies throughout this crate.
-
-fn duck_value_to_json(v: duckdb::types::Value) -> serde_json::Value {
-    use duckdb::types::Value as V;
+fn sql_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
+    use rusqlite::types::Value as V;
     use serde_json::Value as J;
     match v {
         V::Null => J::Null,
-        V::Boolean(b) => J::Bool(b),
-        V::TinyInt(n) => J::from(i64::from(n)),
-        V::SmallInt(n) => J::from(i64::from(n)),
-        V::Int(n) => J::from(i64::from(n)),
-        V::BigInt(n) => J::from(n),
-        V::HugeInt(n) => J::String(n.to_string()),
-        V::UTinyInt(n) => J::from(u64::from(n)),
-        V::USmallInt(n) => J::from(u64::from(n)),
-        V::UInt(n) => J::from(u64::from(n)),
-        V::UBigInt(n) => J::from(n),
-        V::Float(f) => serde_json::Number::from_f64(f64::from(f)).map_or(J::Null, J::Number),
-        V::Double(f) => serde_json::Number::from_f64(f).map_or(J::Null, J::Number),
-        V::Text(s) | V::Enum(s) => J::String(s),
+        V::Integer(n) => J::from(n),
+        V::Real(f) => serde_json::Number::from_f64(f).map_or(J::Null, J::Number),
+        V::Text(s) => J::String(s),
         V::Blob(b) => J::String(hex::encode(b)),
-        V::Date32(d) => J::from(i64::from(d)),
-        V::Time64(_, t) | V::Timestamp(_, t) => J::from(t),
-        V::Decimal(d) => J::String(d.to_string()),
-        other => J::String(format!("{other:?}")),
     }
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    // Accept either RFC3339 (`2026-04-17T10:00:00Z`) or DuckDB's default
-    // timestamp rendering (`2026-04-17 10:00:00` / `…+00`).
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
@@ -314,7 +244,7 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(db.row_count().unwrap(), 3);
 
-        // Re-insert → dedup via PK.
+        // Re-insert -> dedup via PK.
         db.ingest_batch(&rows).unwrap();
         assert_eq!(db.row_count().unwrap(), 3);
     }

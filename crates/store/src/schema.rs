@@ -24,6 +24,7 @@ pub fn corpus_schema(dim: usize) -> Arc<Schema> {
         Field::new("sha256", DataType::Utf8, false),
         Field::new("links_json", DataType::Utf8, false),
         Field::new("extra_json", DataType::Utf8, false),
+        Field::new("stale", DataType::Boolean, false),
         Field::new(
             "embedding",
             DataType::FixedSizeList(
@@ -47,6 +48,7 @@ mod tests {
         assert!(names.contains(&"embedding"));
         assert!(names.contains(&"text"));
         assert!(names.contains(&"links_json"));
+        assert!(names.contains(&"stale"));
     }
 
     #[test]

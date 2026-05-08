@@ -57,8 +57,8 @@ lancedb = "0.27.2"
 arrow = "57"
 arrow-array = "57"
 arrow-schema = "57"
-duckdb = { version = "1.10502.0", features = ["bundled", "json"] }
-tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync", "net"] }
 futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

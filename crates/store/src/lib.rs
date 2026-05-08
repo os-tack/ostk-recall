@@ -2,7 +2,6 @@
 //! (`events.duckdb` for audit firehose, `ingest.duckdb` for idempotency).
 
 pub mod corpus;
-mod duckdb_open;
 pub mod events;
 pub mod ingest;
 pub mod schema;

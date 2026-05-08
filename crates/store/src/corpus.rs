@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-    TimestampMicrosecondArray, UInt32Array,
+    TimestampMicrosecondArray, UInt32Array, BooleanArray,
 };
 use arrow_schema::Schema;
 use futures::TryStreamExt;
@@ -179,6 +179,46 @@ impl CorpusStore {
         let after = table.count_rows(None).await?;
         Ok(u64::try_from(before.saturating_sub(after)).unwrap_or(0))
     }
+
+    /// Delete a batch of chunks by their unique `chunk_id`.
+    pub async fn delete_chunks(&self, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let before = table.count_rows(None).await?;
+        
+        let ids_joined = ids.iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({})", ids_joined);
+        
+        table.delete(&filter).await?;
+        let after = table.count_rows(None).await?;
+        Ok(u64::try_from(before.saturating_sub(after)).unwrap_or(0))
+    }
+
+    /// Mark a batch of chunks as stale by their unique `chunk_id`.
+    pub async fn mark_chunks_stale(&self, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        
+        let ids_joined = ids.iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({})", ids_joined);
+        
+        table.update()
+            .only_if(&filter)
+            .column("stale", "true")
+            .execute()
+            .await?;
+        Ok(ids.len() as u64)
+    }
 }
 
 /// Escape single quotes for inlining into a `LanceDB` filter expression.
@@ -222,6 +262,9 @@ fn build_record_batch(
         .map(|c| serde_json::to_string(&c.extra).expect("extra serialize"))
         .collect();
     let extra_json = StringArray::from_iter_values(extra_json_strings.iter().map(String::as_str));
+    
+    // New chunks are NEVER stale by default.
+    let stale = BooleanArray::from(vec![false; chunks.len()]);
 
     let mut builder = FixedSizeListBuilder::new(
         Float32Builder::new(),
@@ -256,6 +299,7 @@ fn build_record_batch(
             Arc::new(sha256),
             Arc::new(links_json),
             Arc::new(extra_json),
+            Arc::new(stale),
             Arc::new(embedding) as Arc<FixedSizeListArray>,
         ],
     )?;
@@ -320,5 +364,67 @@ mod tests {
         let embs = vec![vec![1.0, 2.0]]; // dim=2 != store dim=4
         let err = store.upsert(&chunks, &embs).await.unwrap_err();
         assert!(matches!(err, StoreError::DimMismatch { .. }));
+    }
+
+    async fn read_stale_for(store: &CorpusStore, chunk_id: &str) -> bool {
+        use arrow_array::BooleanArray;
+        let table = store.conn.open_table(CORPUS_TABLE).execute().await.unwrap();
+        let filter = format!("chunk_id = '{}'", chunk_id);
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "stale".into()]))
+            .execute()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        for batch in &batches {
+            let stale_col = batch
+                .column_by_name("stale")
+                .expect("stale column present");
+            let arr = stale_col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("stale is Boolean");
+            if batch.num_rows() > 0 {
+                return arr.value(0);
+            }
+        }
+        panic!("no row found for chunk_id={}", chunk_id);
+    }
+
+    #[tokio::test]
+    async fn mark_chunks_stale() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let chunks = vec![
+            sample_chunk("a", "alpha"),
+            sample_chunk("b", "beta"),
+            sample_chunk("c", "gamma"),
+        ];
+        let embs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        // Sanity: nothing is stale on insert.
+        assert!(!read_stale_for(&store, "a").await);
+        assert!(!read_stale_for(&store, "b").await);
+        assert!(!read_stale_for(&store, "c").await);
+
+        let n = store
+            .mark_chunks_stale(&["a".into(), "c".into()])
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+
+        // Targeted rows flipped, untouched row stayed false.
+        assert!(read_stale_for(&store, "a").await, "a should be stale");
+        assert!(!read_stale_for(&store, "b").await, "b should NOT be stale");
+        assert!(read_stale_for(&store, "c").await, "c should be stale");
     }
 }
