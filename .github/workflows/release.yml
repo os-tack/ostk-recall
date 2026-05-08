@@ -27,16 +27,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Linux + macOS only. ostk-recall does not build on Windows because the
-      # workspace pulls in tokio's Unix-only paths via the CLI's serve socket.
+      # Linux + macOS (arm64) only. Windows is excluded because the workspace
+      # pulls in tokio's Unix-only paths via the CLI's serve socket.
+      # x86_64-apple-darwin is excluded because `ort-sys` (ONNX Runtime) does
+      # not ship prebuilt binaries for that target — the only Mac slice we can
+      # build without a from-source ONNX build is aarch64-apple-darwin.
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_suffix: linux-amd64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset_suffix: macos-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_suffix: macos-arm64
