@@ -9,7 +9,7 @@ use lancedb::Connection;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::rerankers::rrf::RRFReranker;
-use ostk_recall_core::{RecallIntent, Source};
+use ostk_recall_core::Source;
 use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_store::CORPUS_TABLE;
 
