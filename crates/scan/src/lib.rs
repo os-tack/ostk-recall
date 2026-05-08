@@ -6,6 +6,7 @@
 //!
 //! * [`claude_code`]  — `~/.claude/projects/*.jsonl` session logs
 //! * [`code`]         — source-code trees (line-window chunks)
+//! * [`gemini`]       — Gemini session logs
 //! * [`file_glob`]    — generic text files by glob
 //! * [`zip_export`]   — Claude.ai `claude-data-export-*.zip`
 //! * [`ostk_project`] — composite scanner for haystack-style `.ostk/` roots
@@ -16,6 +17,7 @@
 pub mod anthropic_session;
 pub mod claude_code;
 pub mod code;
+pub mod gemini;
 pub mod fcp_rust;
 pub mod file_glob;
 pub mod markdown;
