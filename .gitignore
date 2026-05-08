@@ -7,6 +7,10 @@ Cargo.lock.user
 *.lance/
 *.duckdb
 *.duckdb.wal
+*.sqlite
+*.sqlite-journal
+/.ostk/
+/test_corpus/
 
 # editor
 .idea/
