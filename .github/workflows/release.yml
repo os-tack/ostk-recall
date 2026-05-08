@@ -74,10 +74,13 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} --bin ostk-recall --bin ostk-recall-mcp
+      - name: Build release binary
+        # ostk-recall is the single binary in the workspace. The mcp crate
+        # is a library exposed via the CLI's subcommand surface, not its own
+        # binary target.
+        run: cargo build --release --target ${{ matrix.target }} --bin ostk-recall
 
-      - name: Package binaries
+      - name: Package binary
         id: package
         shell: bash
         run: |
@@ -85,8 +88,7 @@ jobs:
           stage="ostk-recall-${tag}-${{ matrix.asset_suffix }}"
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/ostk-recall" "$stage/"
-          cp "target/${{ matrix.target }}/release/ostk-recall-mcp" "$stage/"
-          # Provenance + license alongside the binaries.
+          # Provenance + license alongside the binary.
           [ -f README.md ] && cp README.md "$stage/" || true
           [ -f LICENSE ] && cp LICENSE "$stage/" || true
           tar -czf "${stage}.tar.gz" "$stage"
