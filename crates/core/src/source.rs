@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// Policy for orphan management (what happens when a source file is removed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionPolicy {
+    /// Physically delete from vector store and metadata cache.
+    Delete,
+    /// Keep in vector store and metadata cache; never delete.
+    Keep,
+    /// Keep but mark as stale/deprioritized.
+    Stale,
+}
+
 /// Kind of source declared in the user's config.toml.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +21,7 @@ pub enum SourceKind {
     OstkProject,
     FileGlob,
     ZipExport,
+    Gemini,
 }
 
 impl SourceKind {
@@ -21,6 +33,38 @@ impl SourceKind {
             Self::OstkProject => "ostk_project",
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Returns the list of concrete [`Source`] variants this kind can produce.
+    /// Used during orphan sweeps to ensure all related subtypes are cleaned.
+    pub fn sources(self) -> Vec<Source> {
+        match self {
+            Self::Markdown => vec![Source::Markdown],
+            Self::Code => vec![Source::Code],
+            Self::ClaudeCode => vec![Source::ClaudeCode],
+            Self::OstkProject => vec![
+                Source::OstkDecision,
+                Source::OstkNeedle,
+                Source::OstkAuditSignificant,
+                Source::OstkConversation,
+                Source::OstkSession,
+                Source::OstkMemory,
+                Source::OstkSpec,
+            ],
+            Self::FileGlob => vec![Source::FileGlob],
+            Self::ZipExport => vec![Source::ZipExport],
+            Self::Gemini => vec![Source::Gemini],
+        }
+    }
+
+    /// Returns the retention policy for this source kind.
+    pub fn retention_policy(self) -> RetentionPolicy {
+        match self {
+            Self::Code => RetentionPolicy::Delete,
+            Self::Markdown | Self::FileGlob => RetentionPolicy::Stale,
+            _ => RetentionPolicy::Keep, // Gemini, ClaudeCode, ZipExport, OstkProject
         }
     }
 }
@@ -43,6 +87,7 @@ pub enum Source {
     OstkSpec,
     FileGlob,
     ZipExport,
+    Gemini,
 }
 
 impl Source {
@@ -60,6 +105,7 @@ impl Source {
             Self::OstkSpec => "ostk_spec",
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -83,6 +129,7 @@ mod tests {
             SourceKind::OstkProject,
             SourceKind::FileGlob,
             SourceKind::ZipExport,
+            SourceKind::Gemini,
         ] {
             let w = Wrap { kind };
             let s = toml::to_string(&w).unwrap();

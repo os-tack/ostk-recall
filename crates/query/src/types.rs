@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ostk_recall_core::Links;
+use ostk_recall_core::{ContextRole, Links, RecallIntent};
 use serde::{Deserialize, Serialize};
 
 /// Parameters for the `recall` tool.
@@ -20,6 +20,9 @@ pub struct RecallParams {
     /// filter entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_source_id: Option<usize>,
+    /// Intent-driven weighting for retrieval.
+    #[serde(default)]
+    pub intent: RecallIntent,
 }
 
 /// One retrieval row, shaped for MCP consumers.
@@ -40,6 +43,13 @@ pub struct RecallHit {
     /// scanner didn't populate anything; serializes as JSON `null`.
     #[serde(default)]
     pub extra: serde_json::Value,
+    /// Indicates if this chunk is from an orphan source that was marked stale
+    /// rather than being physically deleted.
+    #[serde(default)]
+    pub stale: bool,
+    /// The role this hit plays in a synthesized page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ContextRole>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

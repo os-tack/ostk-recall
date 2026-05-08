@@ -79,10 +79,11 @@ fn record(engine: &QueryEngine, chunks: &[Chunk]) {
             .record_chunk(&IngestChunkRow {
                 chunk_id: c.chunk_id.clone(),
                 source: c.source.as_str().to_string(),
+                project: c.project.as_deref().unwrap_or("default").to_string(),
                 source_id: c.source_id.clone(),
                 chunk_index: c.chunk_index,
                 content_sha256: c.sha256.clone(),
-            })
+            }, None)
             .unwrap();
     }
 }
@@ -307,7 +308,7 @@ async fn recall_stratified_surfaces_code_when_unfiltered() {
     let code_hits = hits.iter().filter(|h| h.source == "code").count();
     assert!(
         code_hits >= 1,
-        "stratified prefetch should surface ≥1 code hit; got {hits:#?}"
+        "stratified prefetch should surface at least 1 code hit; got {hits:#?}"
     );
 }
 
@@ -439,7 +440,6 @@ async fn recall_filtered_does_not_inject_other_sources() {
     assert!(!hits.is_empty(), "expected markdown hits");
     assert!(
         hits.iter().all(|h| h.source == "markdown"),
-        "single-source filter must not bleed in other sources, got {:?}",
-        hits.iter().map(|h| &h.source).collect::<Vec<_>>()
+        "single-source filter must not bleed in other sources"
     );
 }
