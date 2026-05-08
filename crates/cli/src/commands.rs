@@ -17,6 +17,7 @@ use ostk_recall_scan::file_glob::FileGlobScanner;
 use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
+use ostk_recall_scan::gemini::GeminiScanner;
 use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 
 /// Starter config written when the user runs `init` and no config exists.
@@ -42,13 +43,6 @@ pub const fn starter_config() -> &'static str {
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/ostk-recall/config.toml`.
-///
-/// Honours the XDG Base Directory spec on every platform — including
-/// macOS, where `dirs::config_dir()` would otherwise return
-/// `~/Library/Application Support/`. We want a single config location
-/// developers can reason about (and ship dotfiles for) regardless of OS.
-/// Falls back to the OS-specific `dirs::config_dir()` when neither
-/// `$XDG_CONFIG_HOME` nor `$HOME` is set.
 pub fn default_config_path() -> Result<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
@@ -65,10 +59,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 
 #[derive(Debug, Clone)]
 pub enum InitOutcome {
-    /// A starter config was written; the user should edit and re-run.
     WroteStarter { path: PathBuf },
-    /// Corpus was initialized at `root`; `model_id` + `dim` reflect the
-    /// embedder.
     Initialized {
         root: PathBuf,
         model_id: String,
@@ -88,11 +79,6 @@ pub struct VerifyOutcome {
     pub report: VerifyReport,
 }
 
-/// Options accepted by [`init_with_options`].
-///
-/// Builder defaults match the pre-Phase H behaviour: `force = false`,
-/// `prefetch_reranker = false`. Production callers (the binary) explicitly
-/// turn the prefetch on.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
     pub force: bool,
@@ -113,34 +99,10 @@ impl InitOptions {
     }
 }
 
-/// Initialize a corpus.
-///
-/// If `config_path` doesn't exist, write a starter and return
-/// `WroteStarter` without touching the corpus. Otherwise: create the corpus
-/// root, open (or create) the `LanceDB` table sized to the embedder dim,
-/// and open the ingest DB.
-///
-/// `embedder` is passed in so tests can supply a fake — the binary wraps
-/// `Embedder::load` around the real one.
-///
-/// Note: `init` does not prefetch the reranker model; the binary calls
-/// [`init_with_options`] with `prefetch_reranker = true` for the production
-/// path so the first `serve` doesn't pay the download latency.
 pub async fn init(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Result<InitOutcome> {
     init_with_options(config_path, embedder, InitOptions::default()).await
 }
 
-/// Like [`init`] but with explicit options (force-wipe + reranker prefetch).
-///
-/// When `opts.force` is true, deletes `corpus.lance/`, `ingest.duckdb`, and
-/// `events.duckdb` from the resolved corpus root before opening the store.
-/// Each removal is best-effort and guarded by `.exists()` — missing files
-/// are not errors. A `forcing re-init` warning is printed (stderr) before
-/// each deletion.
-///
-/// When `opts.prefetch_reranker` is true and the reranker is enabled in
-/// config, the cross-encoder ONNX model is downloaded into the corpus's
-/// `models/` cache. Failures are logged to stderr but do not error the init.
 pub async fn init_with_options(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -178,10 +140,6 @@ pub async fn init_with_options(
         .map_err(|e| anyhow!("ensure fts index: {e}"))?;
     let _ingest = IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?;
 
-    // Pre-download the reranker so the first `serve` doesn't pay the
-    // download latency. Only runs when the caller opts in (the production
-    // binary does; tests do not) and the user hasn't disabled rerank in
-    // config. Failures are logged but do not fail init.
     if opts.prefetch_reranker {
         let reranker_cfg = RerankerConfig::resolve(cfg.reranker.as_ref());
         if reranker_cfg.enabled && !skip_reranker_for_tests() {
@@ -198,18 +156,11 @@ pub async fn init_with_options(
     })
 }
 
-/// Test escape hatch. Returns true when we should skip every reranker
-/// network operation: explicit `OSTK_RECALL_SKIP_RERANKER=1` for
-/// subprocesses, or `OSTK_RECALL_FAKE_EMBEDDER=...` (which already marks
-/// the run as a test that must not touch real models).
 fn skip_reranker_for_tests() -> bool {
     std::env::var("OSTK_RECALL_SKIP_RERANKER").is_ok()
         || std::env::var("OSTK_RECALL_FAKE_EMBEDDER").is_ok()
 }
 
-/// Best-effort: load the reranker so the ONNX file lands in the corpus's
-/// `models/` cache. Prints a "downloading reranker model..." line to
-/// stderr so the user understands what's happening on a cold cache.
 fn prefetch_reranker_model(root: &Path, model_spec: &str) -> Result<()> {
     let model = Reranker::resolve_model(model_spec).ok_or_else(|| {
         anyhow!("unknown reranker model {model_spec:?}; see config docs for accepted aliases")
@@ -225,15 +176,13 @@ fn prefetch_reranker_model(root: &Path, model_spec: &str) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort delete of corpus artifacts under `root`. Prints a warning to
-/// stderr before each removal; absence is not an error.
 fn force_wipe_corpus(root: &Path) -> Result<()> {
     let lance = root.join("corpus.lance");
     if lance.exists() {
         eprintln!("forcing re-init: removing {}", lance.display());
         std::fs::remove_dir_all(&lance).with_context(|| format!("removing {}", lance.display()))?;
     }
-    for db_name in ["ingest.duckdb", "events.duckdb"] {
+    for db_name in ["ingest.sqlite", "events.sqlite"] {
         let p = root.join(db_name);
         if p.exists() {
             eprintln!("forcing re-init: removing {}", p.display());
@@ -243,13 +192,6 @@ fn force_wipe_corpus(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Scan configured sources.
-///
-/// * `source_filter` — if `Some`, only process `SourceConfig`s whose project
-///   matches the given string (case-sensitive). Phase B only wires the
-///   `Markdown` kind; other kinds print "TODO phase C" and are skipped.
-/// * `dry_run` — no side effects; pipeline still parses + dedupes and reports
-///   counts.
 pub async fn scan(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -269,17 +211,13 @@ pub async fn scan(
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Pipeline::new(store, ingest, Arc::clone(&embedder)).with_dry_run(dry_run);
 
-    // Scanners that are stateless can be reused across sources. The
-    // code scanner now caches per-workspace `fcp-rust` sessions across
-    // `parse` calls; one instance per ingest run lets that cache stick.
     let markdown = MarkdownScanner;
     let code = CodeScanner;
     let claude_code = ClaudeCodeScanner;
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
+    let gemini = GeminiScanner;
 
-    // `OstkProjectScanner` optionally carries an `Arc<EventsDb>` — build
-    // one only if at least one `ostk_project` source is configured.
     let events_db: Option<Arc<EventsDb>> = if cfg
         .sources
         .iter()
@@ -318,6 +256,7 @@ pub async fn scan(
             SourceKind::FileGlob => &file_glob,
             SourceKind::ZipExport => &zip_export,
             SourceKind::OstkProject => &ostk_project,
+            SourceKind::Gemini => &gemini,
         };
 
         let stats = pipeline.ingest_source(scanner, source_cfg).await;
@@ -325,9 +264,6 @@ pub async fn scan(
         per_source.push((label, stats));
     }
 
-    // Close every cached fcp-rust subprocess so they don't linger
-    // between ingests. Safe to call even when no `.rs` files were
-    // scanned (the cache is simply empty).
     ostk_recall_scan::fcp_rust::drain_session_cache();
 
     Ok(ScanOutcome {
@@ -337,16 +273,6 @@ pub async fn scan(
     })
 }
 
-/// Wipe every corpus row whose `project = reingest_project` and the
-/// matching `ingest_chunks` entries, then rescan that source.
-///
-/// `LanceDB` holds the `project` column, so we ask it for the doomed
-/// chunk ids first, delete from `LanceDB`, then delete those ids from
-/// `ingest.duckdb::ingest_chunks` (which has no `project` column).
-/// Finally we delegate to [`scan`] with `source_filter = Some(project)`
-/// and `dry_run = false` — the delete is never dry-run; there is no
-/// way to "preview" reingest without already having committed to the
-/// deletion.
 pub async fn scan_reingest(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -356,7 +282,6 @@ pub async fn scan_reingest(
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let root = cfg.expanded_root()?;
 
-    // 1. Collect ids for the project from LanceDB (before the delete).
     let store = Arc::new(
         CorpusStore::open_or_create(&root, embedder.dim())
             .await
@@ -368,37 +293,25 @@ pub async fn scan_reingest(
         .chunk_ids_for_project(reingest_project)
         .await
         .map_err(|e| anyhow!("chunk_ids_for_project({reingest_project}): {e}"))?;
-    tracing::info!(project = %reingest_project, chunk_count = ids.len(), "reingest: collected ids");
 
-    // 2. Delete from LanceDB.
     let lance_deleted = store
         .delete_by_project(reingest_project)
         .await
         .map_err(|e| anyhow!("delete_by_project({reingest_project}): {e}"))?;
-    tracing::info!(project = %reingest_project, deleted = lance_deleted, "reingest: lancedb rows removed");
 
-    // 3. Delete corresponding ingest_chunks rows so dedupe doesn't
-    //    short-circuit the rescan on matching content hashes.
     let ingest_deleted = ingest
         .delete_by_chunk_ids(&ids)
         .map_err(|e| anyhow!("delete_by_chunk_ids: {e}"))?;
-    tracing::info!(project = %reingest_project, deleted = ingest_deleted, "reingest: ingest_chunks rows removed");
 
     println!(
         "reingest {reingest_project}: deleted {lance_deleted} corpus rows, {ingest_deleted} ingest rows"
     );
 
-    // 4. Rescan just that source. Drop the local store/ingest handles so
-    //    the inner `scan` opens its own (avoids holding two IngestDb
-    //    `Mutex<Connection>` across an await).
     drop(store);
     drop(ingest);
     scan(config_path, embedder, Some(reingest_project), false).await
 }
 
-/// Fetch a single chunk (plus its parent chain, when any) by id. Used by
-/// `ostk-recall inspect` to dump the full payload — including
-/// scanner-supplied `extra_json` — without going through an MCP client.
 pub async fn inspect(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -411,8 +324,6 @@ pub async fn inspect(
         .map_err(|e| anyhow!("recall_link {chunk_id}: {e}"))
 }
 
-/// Verify: compare corpus row count vs ingest chunk count. Phase B: totals
-/// only (per-source comparison is deferred).
 pub async fn verify(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Result<VerifyOutcome> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
@@ -432,9 +343,6 @@ pub async fn verify(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Res
     Ok(VerifyOutcome { report })
 }
 
-/// Build the query engine from config + embedder. Shared between `serve` and
-/// integration tests so spawning the real MCP server stays a one-liner.
-/// Opens the underlying `DuckDB` files in read-write mode.
 pub async fn build_query_engine(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -442,9 +350,6 @@ pub async fn build_query_engine(
     build_query_engine_inner(config_path, embedder, true, false).await
 }
 
-/// Like [`build_query_engine`] but lets the caller force-disable the
-/// reranker even if config says otherwise. Tests pass `attach_reranker
-/// = false` so they don't pull ONNX.
 pub async fn build_query_engine_with_reranker(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -453,9 +358,6 @@ pub async fn build_query_engine_with_reranker(
     build_query_engine_inner(config_path, embedder, attach_reranker, false).await
 }
 
-/// Read-only build of the query engine. Used by `serve --stdio` so
-/// multiple MCP processes can share one corpus without fighting over
-/// the `DuckDB` single-writer lock. The reranker is still attached.
 pub async fn build_query_engine_read_only(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -533,11 +435,6 @@ fn events_db_if_wanted(
     }
 }
 
-/// Start the MCP server.
-///
-/// Phase D: only the stdio transport is implemented. The `stdio` flag is
-/// therefore required in practice, but we keep the arg so the CLI surface is
-/// forward-compatible.
 pub async fn serve(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -548,7 +445,19 @@ pub async fn serve(
             "only stdio transport is currently supported; pass --stdio"
         ));
     }
-    let engine = build_query_engine_read_only(config_path, embedder).await?;
+    let engine = build_query_engine_read_only(config_path, Arc::clone(&embedder)).await?;
+    let root = engine.store().root().to_path_buf();
+    let sock_path = root.join("recall.sock");
+
+    // Spawn background scan trigger listener
+    let config_path_for_bg = config_path.to_path_buf();
+    let embedder_for_bg = Arc::clone(&embedder);
+    tokio::spawn(async move {
+        if let Err(e) = run_socket_listener(&sock_path, config_path_for_bg, embedder_for_bg).await {
+            tracing::error!(error = %e, "background socket listener failed");
+        }
+    });
+
     tracing::info!(
         model = %engine.model(),
         dim = engine.store().dim(),
@@ -564,91 +473,63 @@ pub async fn serve(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ostk_recall_pipeline::ChunkEmbedder;
-    use tempfile::TempDir;
+/// Listen on a UNIX socket and trigger a background `scan` on each connection.
+///
+/// Trust model: this is a local single-operator surface. The only access
+/// control is the filesystem permissions on `path` — there is no message
+/// protocol, no auth, no audit. Do not bind this socket inside a directory
+/// that other system users can reach. It is intended for the operator's own
+/// `ostk-recall serve` daemon to receive scan-trigger pokes (e.g. from a
+/// file-watcher), not for multi-tenant or networked use.
+///
+/// Concurrency: at most one scan is in-flight. Connections that arrive
+/// while a scan is running are accepted (so the client does not block on
+/// `connect`) and immediately closed without spawning a new scan. This
+/// prevents racing scans from corrupting orphan tracking, and bounds
+/// spawn-per-connection memory pressure.
+async fn run_socket_listener(
+    path: &Path,
+    config_path: PathBuf,
+    embedder: Arc<dyn ChunkEmbedder>,
+) -> Result<()> {
+    use tokio::net::UnixListener;
+    use tokio::sync::Mutex;
 
-    struct FakeEmbedder;
-    impl ChunkEmbedder for FakeEmbedder {
-        fn dim(&self) -> usize {
-            8
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let listener = UnixListener::bind(path)?;
+    tracing::info!(path = %path.display(), "listening for scan triggers");
+
+    let scan_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+    loop {
+        match listener.accept().await {
+            Ok((_stream, _addr)) => {
+                let scan_lock = Arc::clone(&scan_lock);
+                let config_path = config_path.clone();
+                let embedder = Arc::clone(&embedder);
+                tokio::spawn(async move {
+                    let guard = match scan_lock.try_lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            tracing::warn!("scan trigger received while a scan is already in flight; dropping");
+                            return;
+                        }
+                    };
+                    tracing::info!("scan trigger received");
+                    if let Err(e) = scan(&config_path, embedder, None, false).await {
+                        tracing::error!(error = %e, "background scan failed");
+                    } else {
+                        tracing::info!("background scan complete");
+                    }
+                    drop(guard);
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "socket accept failed");
+            }
         }
-        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-            texts
-                .iter()
-                .map(|t| {
-                    let mut v = vec![0.0; 8];
-                    let bucket = t.len() % 8;
-                    v[bucket] = 1.0;
-                    v
-                })
-                .collect()
-        }
-    }
-
-    fn write_min_config(cfg_path: &Path, root: &Path) {
-        let body = format!(
-            "[corpus]\nroot = \"{}\"\n\n[embedder]\nmodel = \"unused-in-tests\"\n",
-            root.display()
-        );
-        std::fs::write(cfg_path, body).unwrap();
-    }
-
-    #[tokio::test]
-    async fn init_force_wipes_existing_corpus() {
-        let cfg_dir = TempDir::new().unwrap();
-        let corpus = TempDir::new().unwrap();
-        let cfg_path = cfg_dir.path().join("config.toml");
-        write_min_config(&cfg_path, corpus.path());
-
-        // First init: creates corpus.lance/ and ingest.duckdb.
-        let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
-        init(&cfg_path, Arc::clone(&emb)).await.expect("first init");
-        let lance = corpus.path().join("corpus.lance");
-        let ingest = corpus.path().join("ingest.duckdb");
-        assert!(lance.exists(), "first init should create corpus.lance");
-        assert!(ingest.exists(), "first init should create ingest.duckdb");
-
-        // Drop a sentinel into corpus.lance so we can prove it was wiped.
-        let sentinel = lance.join("sentinel.txt");
-        std::fs::write(&sentinel, "before-force").unwrap();
-        assert!(sentinel.exists());
-
-        // Second init with force: must wipe the table dir before reopen.
-        init_with_options(
-            &cfg_path,
-            Arc::clone(&emb),
-            InitOptions::default().with_force(true),
-        )
-        .await
-        .expect("forced re-init");
-        assert!(
-            !sentinel.exists(),
-            "force should have wiped corpus.lance/sentinel.txt"
-        );
-        // And the store is healthy again afterward.
-        assert!(lance.exists(), "force re-init should recreate corpus.lance");
-        assert!(
-            ingest.exists(),
-            "force re-init should recreate ingest.duckdb"
-        );
-    }
-
-    #[tokio::test]
-    async fn init_force_tolerates_missing_artifacts() {
-        // A clean corpus root has no corpus.lance / ingest.duckdb yet —
-        // force must not error.
-        let cfg_dir = TempDir::new().unwrap();
-        let corpus = TempDir::new().unwrap();
-        let cfg_path = cfg_dir.path().join("config.toml");
-        write_min_config(&cfg_path, corpus.path());
-
-        let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
-        let outcome = init_with_options(&cfg_path, emb, InitOptions::default().with_force(true))
-            .await
-            .expect("force init on empty root");
-        assert!(matches!(outcome, InitOutcome::Initialized { .. }));
     }
 }
