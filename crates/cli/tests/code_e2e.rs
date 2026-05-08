@@ -94,7 +94,9 @@ async fn code_end_to_end() {
         .await
         .unwrap();
     assert_eq!(out2.totals.chunks_upserted, 0, "idempotent rerun");
-    assert_eq!(out2.totals.chunks_skipped_dup, out.totals.chunks_upserted);
+    // With Tier-1 skip, the files are skipped at the item level.
+    assert_eq!(out2.totals.items_skipped, 2, "two files skipped via metadata");
+    assert_eq!(out2.totals.chunks_skipped_dup, 0, "no chunks reached dedupe because files were skipped");
 
     let v = commands::verify(&cfg_path, embedder).await.unwrap();
     assert!(v.report.is_consistent());

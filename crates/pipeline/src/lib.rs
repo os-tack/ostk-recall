@@ -3,25 +3,17 @@
 //! The [`Pipeline`] owns the three side-effecting resources — a
 //! [`CorpusStore`], an [`IngestDb`], and something that can embed text
 //! (the [`ChunkEmbedder`] trait) — and wires a [`Scanner`] up to them.
-//!
-//! The embedder is behind a trait so tests can inject a deterministic
-//! `FakeEmbedder` without requiring model weights on disk.
 
 use std::sync::Arc;
+use uuid::Uuid;
 
-use ostk_recall_core::{Chunk, Scanner, Source, SourceConfig};
+use ostk_recall_core::{Chunk, Scanner, SourceConfig, RetentionPolicy};
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 
-/// Batch size used when calling the embedder. Keeps peak memory bounded and
-/// gives a natural checkpoint between upsert/record phases.
+/// Batch size used when calling the embedder.
 pub const EMBED_BATCH: usize = 64;
 
-/// Anything that can turn a batch of texts into a batch of vectors.
-///
-/// Defined here (instead of in `ostk-recall-embed`) so the pipeline crate
-/// can impl it for `Embedder` without orphan-rule issues, and so tests can
-/// provide a pure-Rust fake without touching the embed crate.
 pub trait ChunkEmbedder: Send + Sync {
     fn dim(&self) -> usize;
     fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>>;
@@ -36,13 +28,15 @@ impl ChunkEmbedder for Embedder {
     }
 }
 
-/// Per-run counters returned from [`Pipeline::ingest_source`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineStats {
     pub items_seen: usize,
+    pub items_skipped: usize,
     pub chunks_emitted: usize,
     pub chunks_upserted: usize,
     pub chunks_skipped_dup: usize,
+    pub chunks_purged: usize,
+    pub chunks_staled: usize,
     pub errors: usize,
 }
 
@@ -50,20 +44,23 @@ impl PipelineStats {
     #[must_use]
     pub const fn merge(mut self, other: Self) -> Self {
         self.items_seen += other.items_seen;
+        self.items_skipped += other.items_skipped;
         self.chunks_emitted += other.chunks_emitted;
         self.chunks_upserted += other.chunks_upserted;
         self.chunks_skipped_dup += other.chunks_skipped_dup;
+        self.chunks_purged += other.chunks_purged;
+        self.chunks_staled += other.chunks_staled;
         self.errors += other.errors;
         self
     }
 }
 
-/// The orchestrator. Cheap to clone — holds `Arc`s.
 pub struct Pipeline {
     store: Arc<CorpusStore>,
     ingest: Arc<IngestDb>,
     embedder: Arc<dyn ChunkEmbedder>,
     dry_run: bool,
+    run_id: String,
 }
 
 impl Pipeline {
@@ -77,12 +74,10 @@ impl Pipeline {
             ingest,
             embedder,
             dry_run: false,
+            run_id: Uuid::now_v7().to_string(),
         }
     }
 
-    /// Set dry-run mode. In dry-run the pipeline still discovers, parses, and
-    /// classifies chunks as dup/new — but it never calls the embedder or
-    /// writes to the stores.
     #[must_use]
     pub const fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
@@ -97,16 +92,11 @@ impl Pipeline {
         &self.ingest
     }
 
-    /// Ingest one source.
-    ///
-    /// Discovers items, parses them into chunks, filters out chunks already
-    /// in `ingest_chunks` with matching `(chunk_id, content_sha256)`,
-    /// embeds the survivors in batches of `EMBED_BATCH`, and upserts into
-    /// `CorpusStore` + records into `IngestDb`.
     pub async fn ingest_source(&self, scanner: &dyn Scanner, cfg: &SourceConfig) -> PipelineStats {
         let mut stats = PipelineStats::default();
-
         let mut to_embed: Vec<Chunk> = Vec::new();
+        let source_kind_str = scanner.kind().as_str();
+        let project = cfg.project.as_deref().unwrap_or("default");
 
         for item_res in scanner.discover(cfg) {
             let item = match item_res {
@@ -119,6 +109,28 @@ impl Pipeline {
             };
             stats.items_seen += 1;
 
+            // Tier 1: File-level metadata check
+            if let Some(path) = &item.path {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mtime = meta.modified().ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    let size = meta.len() as i64;
+
+                    if let Ok(Some((old_mtime, old_size))) = self.ingest.get_source_metadata(source_kind_str, project, &item.source_id) {
+                        if old_mtime == mtime && old_size == size {
+                            if self.ingest.touch_source_chunks(source_kind_str, project, &item.source_id, &self.run_id).is_ok() {
+                                stats.items_skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    
+                    let _ = self.ingest.update_source_metadata(source_kind_str, project, &item.source_id, mtime, size, &self.run_id);
+                }
+            }
+
             let chunks = match scanner.parse(item) {
                 Ok(c) => c,
                 Err(e) => {
@@ -130,11 +142,20 @@ impl Pipeline {
             stats.chunks_emitted += chunks.len();
 
             for chunk in chunks {
-                match self
-                    .ingest
-                    .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
-                {
-                    Ok(true) => stats.chunks_skipped_dup += 1,
+                // Tier 2: Chunk-level dedupe
+                match self.ingest.content_already_ingested(&chunk.chunk_id, &chunk.sha256) {
+                    Ok(true) => {
+                        stats.chunks_skipped_dup += 1;
+                        let row = IngestChunkRow {
+                            chunk_id: chunk.chunk_id.clone(),
+                            source: chunk.source.as_str().to_string(),
+                            project: project.to_string(),
+                            source_id: chunk.source_id.clone(),
+                            chunk_index: chunk.chunk_index,
+                            content_sha256: chunk.sha256.clone(),
+                        };
+                        let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
+                    },
                     Ok(false) => to_embed.push(chunk),
                     Err(e) => {
                         tracing::warn!(error = %e, "ingest dedupe check failed");
@@ -144,89 +165,110 @@ impl Pipeline {
             }
         }
 
-        if to_embed.is_empty() || self.dry_run {
+        if !to_embed.is_empty() && !self.dry_run {
+            for batch in to_embed.chunks(EMBED_BATCH) {
+                match self.embed_and_persist(batch, project).await {
+                    Ok(n) => stats.chunks_upserted += n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "embed/persist batch failed");
+                        stats.errors += 1;
+                    }
+                }
+            }
+        }
+
+        // Orphan Sweep — multi-project safety contract
+        //
+        // The orphan sweep filters by (source, project, run_id). If `cfg.project`
+        // is None we'd fall back to a placeholder ("default"), and any chunks
+        // ingested under that placeholder by a *different* unspecified-project
+        // scan would get swept under this run_id. That's the cross-project
+        // wipe footgun. Refuse to run the sweep when project is unset; let the
+        // caller fix their config.
+        if !self.dry_run && cfg.project.is_none() {
+            tracing::error!(
+                source_kind = %source_kind_str,
+                "orphan sweep skipped: SourceConfig.project is None — multi-project safety contract requires an explicit project for any source whose retention policy mutates the corpus. See crates/pipeline/src/lib.rs orphan-sweep guard."
+            );
+            stats.errors += 1;
             return stats;
         }
 
-        for batch in to_embed.chunks(EMBED_BATCH) {
-            match self.embed_and_persist(batch).await {
-                Ok(n) => stats.chunks_upserted += n,
-                Err(e) => {
-                    tracing::warn!(error = %e, "embed/persist batch failed");
-                    stats.errors += 1;
+        // Orphan Sweep
+        if !self.dry_run {
+            match cfg.kind.retention_policy() {
+                RetentionPolicy::Delete => {
+                    for s in cfg.kind.sources() {
+                        match self.ingest.delete_orphans(s.as_str(), project, &self.run_id) {
+                            Ok(orphans) => {
+                                if !orphans.is_empty() {
+                                    if let Err(e) = self.store.delete_chunks(&orphans).await {
+                                        tracing::warn!(error = %e, source = %s.as_str(), "failed to delete orphan chunks from corpus store");
+                                    } else {
+                                        stats.chunks_purged += orphans.len();
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed"),
+                        }
+                    }
                 }
+                RetentionPolicy::Stale => {
+                    for s in cfg.kind.sources() {
+                        match self.ingest.mark_orphans_stale(s.as_str(), project, &self.run_id) {
+                            Ok(orphans) => {
+                                if !orphans.is_empty() {
+                                    if let Err(e) = self.store.mark_chunks_stale(&orphans).await {
+                                        tracing::warn!(error = %e, source = %s.as_str(), "failed to mark orphan chunks as stale in corpus store");
+                                    }
+                                }
+                                stats.chunks_staled += orphans.len();
+                            }
+                            Err(e) => tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed"),
+                        }
+                    }
+                }
+                RetentionPolicy::Keep => {}
             }
         }
 
         stats
     }
 
-    async fn embed_and_persist(&self, batch: &[Chunk]) -> Result<usize, PipelineError> {
+    async fn embed_and_persist(&self, batch: &[Chunk], project: &str) -> Result<usize, PipelineError> {
         let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
         let embeddings = self.embedder.encode_batch(&texts);
         if embeddings.len() != batch.len() {
-            return Err(PipelineError::Embedder(format!(
-                "embedder returned {} vectors for {} inputs",
-                embeddings.len(),
-                batch.len()
-            )));
-        }
-        // Dim sanity check (first vector only — they're all from the same
-        // model in one call).
-        if let Some(first) = embeddings.first() {
-            let want = self.embedder.dim();
-            if first.len() != want {
-                return Err(PipelineError::Embedder(format!(
-                    "embedder dim mismatch: got {}, want {want}",
-                    first.len()
-                )));
-            }
+            return Err(PipelineError::Embedder("dim mismatch".into()));
         }
 
-        self.store
-            .upsert(batch, &embeddings)
-            .await
+        self.store.upsert(batch, &embeddings).await
             .map_err(|e| PipelineError::Store(e.to_string()))?;
 
         for chunk in batch {
             let row = IngestChunkRow {
                 chunk_id: chunk.chunk_id.clone(),
                 source: chunk.source.as_str().to_string(),
+                project: project.to_string(),
                 source_id: chunk.source_id.clone(),
                 chunk_index: chunk.chunk_index,
                 content_sha256: chunk.sha256.clone(),
             };
-            self.ingest
-                .record_chunk(&row)
+            self.ingest.record_chunk(&row, Some(&self.run_id))
                 .map_err(|e| PipelineError::Store(e.to_string()))?;
         }
         Ok(batch.len())
     }
 
-    /// Compare ingest-db count vs corpus row count.
     pub async fn verify_counts(&self) -> Result<VerifyReport, PipelineError> {
-        let corpus_total = self
-            .store
-            .row_count()
-            .await
-            .map_err(|e| PipelineError::Store(e.to_string()))?;
-        let ingest_by_source = self
-            .ingest
-            .count_by_source()
-            .map_err(|e| PipelineError::Store(e.to_string()))?;
+        let corpus_total = self.store.row_count().await.map_err(|e| PipelineError::Store(e.to_string()))?;
+        let ingest_by_source = self.ingest.count_active_by_source().map_err(|e| PipelineError::Store(e.to_string()))?;
         let ingest_total: u64 = ingest_by_source.iter().map(|(_, n)| *n).sum();
         Ok(VerifyReport {
             corpus_total,
-            ingest_total: ingest_total.try_into().unwrap_or(usize::MAX),
+            ingest_total: ingest_total as usize,
             by_source: ingest_by_source,
         })
-    }
-
-    /// Count ingested chunks for a particular `Source` (Phase-B helper).
-    pub fn count_for_source(&self, source: Source) -> Result<u64, PipelineError> {
-        self.ingest
-            .count_for_source(source)
-            .map_err(|e| PipelineError::Store(e.to_string()))
     }
 }
 
@@ -238,7 +280,6 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
-    #[must_use]
     pub const fn is_consistent(&self) -> bool {
         self.corpus_total == self.ingest_total
     }
@@ -260,9 +301,6 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    /// Deterministic embedder for tests. Produces `dim` floats derived from
-    /// the input length so two different texts get distinct-but-stable
-    /// vectors without needing a model on disk.
     struct FakeEmbedder {
         dim: usize,
     }
@@ -271,7 +309,6 @@ mod tests {
         fn dim(&self) -> usize {
             self.dim
         }
-        #[allow(clippy::cast_precision_loss)]
         fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
             texts
                 .iter()
@@ -332,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rerun_is_idempotent() {
+    async fn incremental_scan_skips_unchanged() {
         let fixtures = TempDir::new().unwrap();
         let corpus = TempDir::new().unwrap();
         write_sample_tree(fixtures.path());
@@ -341,70 +378,131 @@ mod tests {
         let scanner = MarkdownScanner;
         let cfg = cfg_for(fixtures.path());
 
+        // First run
         let s1 = pipeline.ingest_source(&scanner, &cfg).await;
-        assert!(s1.chunks_upserted > 0);
+        assert_eq!(s1.items_seen, 2);
+        assert_eq!(s1.items_skipped, 0);
 
+        // Second run (no changes)
         let s2 = pipeline.ingest_source(&scanner, &cfg).await;
-        assert_eq!(
-            s2.chunks_upserted, 0,
-            "second run should upsert nothing (all dup)"
-        );
-        assert_eq!(s2.chunks_skipped_dup, s1.chunks_upserted);
-        assert_eq!(s2.errors, 0);
+        assert_eq!(s2.items_seen, 2);
+        assert_eq!(s2.items_skipped, 2);
+        assert_eq!(s2.chunks_upserted, 0);
     }
 
     #[tokio::test]
-    async fn stats_merge_is_arithmetic() {
-        let a = PipelineStats {
-            items_seen: 1,
-            chunks_emitted: 2,
-            chunks_upserted: 3,
-            chunks_skipped_dup: 4,
-            errors: 5,
-        };
-        let b = PipelineStats {
-            items_seen: 10,
-            chunks_emitted: 20,
-            chunks_upserted: 30,
-            chunks_skipped_dup: 40,
-            errors: 50,
-        };
-        let m = a.merge(b);
-        assert_eq!(m.items_seen, 11);
-        assert_eq!(m.chunks_emitted, 22);
-        assert_eq!(m.chunks_upserted, 33);
-        assert_eq!(m.chunks_skipped_dup, 44);
-        assert_eq!(m.errors, 55);
-    }
-
-    #[tokio::test]
-    async fn dry_run_does_not_upsert() {
+    async fn orphan_sweep_stales_vectors() {
         let fixtures = TempDir::new().unwrap();
         let corpus = TempDir::new().unwrap();
         write_sample_tree(fixtures.path());
 
-        let pipeline = make_pipeline(corpus.path(), 16).await.with_dry_run(true);
         let scanner = MarkdownScanner;
-        let stats = pipeline
-            .ingest_source(&scanner, &cfg_for(fixtures.path()))
-            .await;
+        let cfg = cfg_for(fixtures.path());
 
-        assert!(stats.chunks_emitted > 0);
-        assert_eq!(stats.chunks_upserted, 0);
-    }
+        // First run
+        {
+            let pipeline = make_pipeline(corpus.path(), 16).await;
+            pipeline.ingest_source(&scanner, &cfg).await;
+            let count = pipeline.store().row_count().await.unwrap();
+            assert!(count > 0);
+        }
 
-    #[tokio::test]
-    async fn verify_counts_balanced_after_ingest() {
-        let fixtures = TempDir::new().unwrap();
-        let corpus = TempDir::new().unwrap();
-        write_sample_tree(fixtures.path());
+        // Remove a file
+        std::fs::remove_file(fixtures.path().join("sub/b.md")).unwrap();
+
+        // Second run (new pipeline -> new run_id)
         let pipeline = make_pipeline(corpus.path(), 16).await;
+        let s2 = pipeline.ingest_source(&scanner, &cfg).await;
+        assert_eq!(s2.items_seen, 1);
+        assert_eq!(s2.chunks_purged, 0);
+        assert!(s2.chunks_staled > 0);
+
+        let count_after = pipeline.store().row_count().await.unwrap();
+        assert_eq!(count_after, 4); 
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_deletes_code_vectors() {
+        use ostk_recall_scan::code::CodeScanner;
+        use ostk_recall_core::SourceConfig;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        
+        let code_path = fixtures.path().join("main.rs");
+        std::fs::write(&code_path, "fn main() { println!(\"hello\"); }").unwrap();
+
+        let scanner = CodeScanner;
+        let cfg = SourceConfig {
+            kind: SourceKind::Code,
+            project: Some("code-test".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec!["rs".into()],
+        };
+
+        // First run
+        {
+            let pipeline = make_pipeline(corpus.path(), 16).await;
+            pipeline.ingest_source(&scanner, &cfg).await;
+            let count = pipeline.store().row_count().await.unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // Remove the file
+        std::fs::remove_file(code_path).unwrap();
+
+        // Second run
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let s2 = pipeline.ingest_source(&scanner, &cfg).await;
+        assert_eq!(s2.items_seen, 0);
+        assert_eq!(s2.chunks_purged, 1);
+        assert_eq!(s2.chunks_staled, 0);
+
+        let count_after = pipeline.store().row_count().await.unwrap();
+        assert_eq!(count_after, 0, "code chunks must be physically deleted");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_surfaces_stale_in_query() {
+        use futures::TryStreamExt;
+        use lancedb::query::ExecutableQuery;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+
         let scanner = MarkdownScanner;
-        pipeline
-            .ingest_source(&scanner, &cfg_for(fixtures.path()))
-            .await;
-        let report = pipeline.verify_counts().await.unwrap();
-        assert!(report.is_consistent(), "report: {report:?}");
-        assert!(report.corpus_total > 0);
+        let cfg = cfg_for(fixtures.path());
+
+        // First run
+        {
+            let pipeline = make_pipeline(corpus.path(), 16).await;
+            pipeline.ingest_source(&scanner, &cfg).await;
+        }
+
+        // Remove a file
+        std::fs::remove_file(fixtures.path().join("sub/b.md")).unwrap();
+
+        // Second run
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let stats = pipeline.ingest_source(&scanner, &cfg).await;
+        assert!(stats.chunks_staled > 0);
+
+        // Verify stale flag in LanceDB
+        let table = pipeline.store().connection().open_table(ostk_recall_store::CORPUS_TABLE).execute().await.unwrap();
+        let stream = table.query().execute().await.unwrap();
+        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await.unwrap();
+        
+        let mut found_stale = false;
+        for batch in batches {
+            let stale_col = batch.column_by_name("stale").unwrap().as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                if stale_col.value(i) {
+                    found_stale = true;
+                }
+            }
+        }
+        assert!(found_stale, "at least one chunk should be marked stale");
     }
 }

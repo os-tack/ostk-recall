@@ -114,7 +114,9 @@ async fn markdown_end_to_end() {
         "rerun must upsert zero; got {:?}",
         out2.totals
     );
-    assert_eq!(out2.totals.chunks_skipped_dup, out1.totals.chunks_upserted);
+    // With Tier-1 skip, files are skipped at the item level.
+    assert!(out2.totals.items_skipped > 0);
+    assert_eq!(out2.totals.chunks_skipped_dup, 0);
 
     // 4. verify — totals consistent between corpus + ingest.
     let ver = commands::verify(&config_path, Arc::clone(&embedder))
