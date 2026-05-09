@@ -75,12 +75,29 @@ uninstall: ## remove ~/.cargo/bin/ostk-recall
 # `make scan-local` to run from target/release/ instead.
 
 .PHONY: scan
-scan: $(INSTALLED_BIN) ## scan all configured sources (uses installed binary)
+scan: $(INSTALLED_BIN) ## scan all configured sources (incremental)
 	$(INSTALLED_BIN) scan
 
-.PHONY: scan-rebuild
-scan-rebuild: $(INSTALLED_BIN) ## full rescan — purges + rebuilds the corpus
-	$(INSTALLED_BIN) scan --force
+.PHONY: scan-dry
+scan-dry: $(INSTALLED_BIN) ## report what would be ingested without writing
+	$(INSTALLED_BIN) scan --dry-run
+
+.PHONY: scan-source
+scan-source: $(INSTALLED_BIN) ## scan one project: make scan-source SOURCE=<project>
+	@if [ -z "$(SOURCE)" ]; then echo "usage: make scan-source SOURCE=<project-name>"; exit 2; fi
+	$(INSTALLED_BIN) scan --source $(SOURCE)
+
+.PHONY: reingest
+reingest: $(INSTALLED_BIN) ## wipe + rescan one project: make reingest SOURCE=<project>
+	@if [ -z "$(SOURCE)" ]; then echo "usage: make reingest SOURCE=<project-name>"; exit 2; fi
+	$(INSTALLED_BIN) scan --reingest $(SOURCE)
+
+.PHONY: rebuild
+rebuild: $(INSTALLED_BIN) ## nuke + reinitialize + full scan (asks for confirm)
+	@printf "This wipes corpus.lance and the ingest manifest. Continue? [y/N] " && \
+		read ans && [ "$$ans" = "y" ] || [ "$$ans" = "Y" ]
+	$(INSTALLED_BIN) init --force
+	$(INSTALLED_BIN) scan
 
 .PHONY: scan-local
 scan-local: release ## scan using the just-built target/release binary
@@ -100,8 +117,12 @@ inspect: $(INSTALLED_BIN) ## inspect a chunk by id: make inspect ID=<chunk_id>
 	$(INSTALLED_BIN) inspect $(ID)
 
 .PHONY: init
-init: $(INSTALLED_BIN) ## create a fresh corpus from $(CONFIG)
+init: $(INSTALLED_BIN) ## create a fresh corpus (no-op if one exists)
 	$(INSTALLED_BIN) init
+
+.PHONY: init-force
+init-force: $(INSTALLED_BIN) ## wipe corpus + manifest, then re-init (no scan)
+	$(INSTALLED_BIN) init --force
 
 # ── config ────────────────────────────────────────────────────────────
 

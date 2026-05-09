@@ -101,7 +101,9 @@ The Makefile wraps the same loop:
 ```
 make install                    # build + install the binary
 make scan                       # incremental ingest (uses installed binary)
-make scan-rebuild               # full re-ingest from scratch
+make scan-source SOURCE=<name>  # only one project from config
+make reingest    SOURCE=<name>  # wipe + rescan one project (chunker change, etc.)
+make rebuild                    # nuke corpus + manifest, full re-init + scan (prompts)
 make verify
 make serve
 ```
