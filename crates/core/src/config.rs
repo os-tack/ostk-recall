@@ -111,8 +111,33 @@ pub struct WatchConfig {
     pub projects: Vec<String>,
 }
 
+/// Per-platform debounce defaults. The OS event backends differ enough
+/// in granularity and latency that a single number is wrong somewhere:
+///
+/// - **Linux (inotify)** — sub-ms per-event, 5–10 events per editor save.
+///   Debounce is doing real coalescing; 800 ms catches IntelliJ-style
+///   "save the world" bursts without making interactive workflows feel
+///   sluggish.
+/// - **macOS (FSEvents)** — the kernel already coalesces at ~30 ms;
+///   notify-debouncer-full receives mostly-batched events. Lower windows
+///   have no upside (FSEvents floor dominates) and risk split bursts on
+///   slow disks. 1500 ms is the safe middle.
+/// - **Windows (ReadDirectoryChangesW)** — per-event with IOCP batching
+///   at the OS layer; AV filter drivers (Defender et al.) can stretch
+///   delivery another 100–200 ms. 1200 ms absorbs that without going
+///   macOS-conservative.
+///
+/// Other targets fall back to the macOS value (the most conservative).
+/// Users always override via `[watch].debounce_ms` in config.
 const fn default_debounce_ms() -> u64 {
-    1500
+    if cfg!(target_os = "linux") {
+        800
+    } else if cfg!(target_os = "windows") {
+        1200
+    } else {
+        // macos + everything else: 1500 ms.
+        1500
+    }
 }
 
 impl Default for WatchConfig {
@@ -356,7 +381,22 @@ enabled = false
         assert!(cfg.watch.is_none());
         let resolved = cfg.watch.unwrap_or_default();
         assert!(!resolved.is_active());
-        assert_eq!(resolved.debounce_ms, 1500);
+        assert_eq!(resolved.debounce_ms, default_debounce_ms());
+    }
+
+    #[test]
+    fn debounce_default_per_platform() {
+        // Pin the per-platform defaults so a tuning change is a deliberate
+        // diff with this test, not a silent drift.
+        let got = default_debounce_ms();
+        let expected = if cfg!(target_os = "linux") {
+            800
+        } else if cfg!(target_os = "windows") {
+            1200
+        } else {
+            1500
+        };
+        assert_eq!(got, expected);
     }
 
     #[test]
