@@ -247,4 +247,9 @@ OSTK_RECALL_E2E=1 cargo test --workspace     # network-enabled tests (model down
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+Dual-licensed under either:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE) (with [`NOTICE`](NOTICE))
+
+at your option. Contributions are accepted under the same terms (Apache-2.0 §5).

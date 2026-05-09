@@ -114,7 +114,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/ostk-recall" "$stage/"
           # Provenance + license alongside the binary.
           [ -f README.md ] && cp README.md "$stage/" || true
-          [ -f LICENSE ] && cp LICENSE "$stage/" || true
+          [ -f LICENSE-MIT ] && cp LICENSE-MIT "$stage/" || true
+          [ -f LICENSE-APACHE ] && cp LICENSE-APACHE "$stage/" || true
           tar -czf "${stage}.tar.gz" "$stage"
           echo "asset_path=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "asset_name=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -128,8 +129,9 @@ jobs:
           $stage = "ostk-recall-$tag-${{ matrix.asset_suffix }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/ostk-recall.exe" "$stage/"
-          if (Test-Path "README.md") { Copy-Item "README.md" "$stage/" }
-          if (Test-Path "LICENSE")   { Copy-Item "LICENSE"   "$stage/" }
+          if (Test-Path "README.md")      { Copy-Item "README.md"      "$stage/" }
+          if (Test-Path "LICENSE-MIT")    { Copy-Item "LICENSE-MIT"    "$stage/" }
+          if (Test-Path "LICENSE-APACHE") { Copy-Item "LICENSE-APACHE" "$stage/" }
           Compress-Archive -Path "$stage" -DestinationPath "$stage.zip"
           "asset_path=$stage.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "asset_name=$stage.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
