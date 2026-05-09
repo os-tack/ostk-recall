@@ -89,17 +89,18 @@ async fn initialize_returns_server_info() {
 }
 
 #[tokio::test]
-async fn tools_list_includes_all_four() {
+async fn tools_list_includes_all_five() {
     let (_tmp, server) = build_server().await;
     let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
     let resp = server.handle_request(req).await.unwrap();
     let r = resp.result.unwrap();
     let tools = r["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 5);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"recall"));
     assert!(names.contains(&"recall_link"));
     assert!(names.contains(&"recall_stats"));
+    assert!(names.contains(&"recall_fault"));
     assert!(names.contains(&"recall_audit"));
 }
 

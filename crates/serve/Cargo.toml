@@ -10,6 +10,10 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "ostk_recall_serve"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ostk-recall-serve"
 path = "src/main.rs"

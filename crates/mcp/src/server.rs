@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ostk_recall_query::{QueryEngine, QueryError, RecallParams};
+use ostk_recall_query::{QueryEngine, QueryError, RecallParams, Synthesizer, SynthesizedPage};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};
@@ -173,6 +173,25 @@ impl Server {
                 serde_json::to_value(out)
                     .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?
             }
+            "recall_fault" => {
+                // →1848 cut #3: synthesize-style recall for haystack
+                // `mem.fault_recall`. Embed + recall + Synthesizer::collapse;
+                // return (name, content) pairs for the caller to write into
+                // its page table. The daemon does NOT touch any page table.
+                let p: RecallParams = serde_json::from_value(args.clone())
+                    .map_err(|e| JsonRpcError::invalid_params(format!("recall_fault args: {e}")))?;
+                if p.query.is_empty() {
+                    return Err(JsonRpcError::invalid_params("query must be non-empty"));
+                }
+                let hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                let pages = Synthesizer::collapse(hits);
+                let named: Vec<Value> = pages
+                    .iter()
+                    .map(named_page_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| JsonRpcError::internal(format!("serialize page: {e}")))?;
+                json!({ "pages": named })
+            }
             other => {
                 return Err(JsonRpcError::method_not_found(&format!(
                     "tools/call/{other}"
@@ -214,4 +233,19 @@ fn query_error_to_rpc(err: QueryError) -> JsonRpcError {
         QueryError::Decode(m) => JsonRpcError::internal(format!("decode: {m}")),
         other => JsonRpcError::internal(other.to_string()),
     }
+}
+
+/// Build the `{name, content}` pair for one synthesized page. The name
+/// is the kernel page-table key; content is the JSON-encoded
+/// `SynthesizedPage` the kernel writes via `store_page_owned`.
+fn named_page_value(page: &SynthesizedPage) -> std::result::Result<Value, serde_json::Error> {
+    let slug = page
+        .head
+        .source_id
+        .replace('/', ":")
+        .replace('\\', ":")
+        .replace(' ', "_");
+    let name = format!("recall:{slug}");
+    let content = serde_json::to_string(page)?;
+    Ok(json!({ "name": name, "content": content }))
 }

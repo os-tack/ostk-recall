@@ -1,11 +1,35 @@
 # `ostk-recall-serve` driver protocol
 
-Wire protocol between the haystack kernel (client) and `ostk-recall-serve`
-(peer-process daemon). Spec for haystack →1846 cut #3 (→1848).
+Wire protocol between the haystack kernel (client) and the recall daemon
+(`ostk-recall serve --stdio`). Spec for haystack →1846 cut #3 (→1848).
 
 ## Status
 
-`v0.1` — draft. First implementation lands with `ostk-recall` v0.2.0.
+**`v0.2` — pivoted to MCP tool surface.** The original `v0.1` draft below
+specified a custom JSON-RPC method namespace (`recall.fault`,
+`initialize`, `ping`). Reading `haystack/src/serve/dispatch.rs:5247`
+revealed the kernel driver protocol IS MCP and the daemon entry point
+IS the existing `ostk-recall serve --stdio` MCP server (not a separate
+binary). The pivot: instead of a custom method, expose `recall_fault`
+as an MCP **tool** alongside the existing `recall` / `recall_link` /
+`recall_stats` / `recall_audit` tools. See decision
+`cut3_pivot_to_mcp_tool_2026_05_09`.
+
+The text below is the original `v0.1` draft, retained for context. The
+authoritative protocol is now: **MCP 2025-06-18 with a `recall_fault`
+tool**, params `{ query, intent?, limit?, max_per_source_id? }`,
+result `{ pages: [{ name, content }, ...] }` wrapped in MCP
+`content[0].text` JSON. The lifecycle / transport / framing sections
+below remain accurate for MCP-over-stdio.
+
+A doc-rewrite pass is filed as a follow-up; the new tool is already
+implemented in `crates/mcp/src/tools.rs::tool_recall_fault` and
+`crates/mcp/src/server.rs` `recall_fault` handler, and tested in
+`tools_list_includes_all_five`.
+
+---
+
+## Original v0.1 draft
 
 ## Transport
 
