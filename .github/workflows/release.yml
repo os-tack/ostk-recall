@@ -6,7 +6,8 @@ on:
       - "v*.*.*"
   # Allow manual runs against an existing tag (e.g. v0.1.0 was pushed before
   # this workflow existed). Pick the tag from the GH UI; the matrix builds
-  # native binaries for Linux + macOS and uploads them as release assets.
+  # native binaries for Linux + macOS + Windows and uploads them as release
+  # assets.
   workflow_dispatch:
     inputs:
       tag:
@@ -20,6 +21,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Windows MSVC: force dynamic CRT (/MD) so esaxx-rs (sentencepiece via
+  # cc-rs) links cleanly against ort-sys's prebuilt onnxruntime_c_api.obj
+  # (/MD). Target-scoped suffix means Linux/macOS jobs ignore these. Mirrors
+  # ci.yml — see commits dbf1e90 / bdd5707 for the original investigation.
+  RUSTFLAGS: "-C target-feature=-crt-static"
+  CFLAGS_x86_64_pc_windows_msvc: "-MD"
+  CXXFLAGS_x86_64_pc_windows_msvc: "-MD"
+  # Windows MSVC: use rust-lld instead of link.exe — ~30-50% faster link on
+  # this dep tree (ort, lance, datafusion, tokenizers). Bundled with rustup,
+  # no install step needed.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: "rust-lld"
 
 jobs:
   build-and-upload:
@@ -27,11 +39,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Linux + macOS (arm64) only. Windows is excluded because the workspace
-      # pulls in tokio's Unix-only paths via the CLI's serve socket.
-      # x86_64-apple-darwin is excluded because `ort-sys` (ONNX Runtime) does
-      # not ship prebuilt binaries for that target — the only Mac slice we can
-      # build without a from-source ONNX build is aarch64-apple-darwin.
+      # Linux + macOS (arm64) + Windows. x86_64-apple-darwin is excluded
+      # because `ort-sys` (ONNX Runtime) does not ship prebuilt binaries for
+      # that target — the only Mac slice we can build without a from-source
+      # ONNX build is aarch64-apple-darwin. Windows MSVC works via the env
+      # block above (dynamic CRT + rust-lld).
       matrix:
         include:
           - os: ubuntu-latest
@@ -40,6 +52,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_suffix: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_suffix: windows-amd64
 
     steps:
       - name: Checkout (tag from input or push)
@@ -64,6 +79,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        # chocolatey ships protoc and pre-installs on windows-latest, so the
+        # action installs idempotently and exposes it on PATH.
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -80,8 +103,9 @@ jobs:
         # binary target.
         run: cargo build --release --target ${{ matrix.target }} --bin ostk-recall
 
-      - name: Package binary
-        id: package
+      - name: Package binary (unix)
+        if: runner.os != 'Windows'
+        id: package_unix
         shell: bash
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
@@ -95,11 +119,26 @@ jobs:
           echo "asset_path=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "asset_name=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
 
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        id: package_win
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          $stage = "ostk-recall-$tag-${{ matrix.asset_suffix }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ostk-recall.exe" "$stage/"
+          if (Test-Path "README.md") { Copy-Item "README.md" "$stage/" }
+          if (Test-Path "LICENSE")   { Copy-Item "LICENSE"   "$stage/" }
+          Compress-Archive -Path "$stage" -DestinationPath "$stage.zip"
+          "asset_path=$stage.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "asset_name=$stage.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: Upload to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ${{ steps.package.outputs.asset_path }}
-          asset_name: ${{ steps.package.outputs.asset_name }}
+          file: ${{ steps.package_unix.outputs.asset_path || steps.package_win.outputs.asset_path }}
+          asset_name: ${{ steps.package_unix.outputs.asset_name || steps.package_win.outputs.asset_name }}
           tag: ${{ inputs.tag || github.ref_name }}
           overwrite: true
