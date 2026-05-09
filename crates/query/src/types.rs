@@ -1,91 +1,15 @@
-use chrono::{DateTime, Utc};
-use ostk_recall_core::{ContextRole, Links, RecallIntent};
-use serde::{Deserialize, Serialize};
+//! Result/parameter types — moved to `ostk_recall_core::types` in v0.1.5.
+//!
+//! This module is kept as a backward-compatible re-export shim so existing
+//! consumers using `ostk_recall_query::types::*` or
+//! `ostk_recall_query::{RecallHit, RecallParams, ...}` keep compiling.
+//!
+//! New callers should import directly from `ostk_recall_core` instead;
+//! cut #3 (→1848) ships ostk-recall-serve as a peer-process daemon, and
+//! haystack consumes types via `ostk_recall_core` so it can drop the
+//! ostk-recall-query dep entirely.
 
-/// Parameters for the `recall` tool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RecallParams {
-    pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    /// Cap on hits sharing the same `source_id` after RRF reranking.
-    /// Stops one chatty session from monopolizing top-K. `None` falls back
-    /// to [`hybrid::DEFAULT_MAX_PER_SOURCE_ID`] (3); `Some(0)` disables the
-    /// filter entirely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_per_source_id: Option<usize>,
-    /// Intent-driven weighting for retrieval.
-    #[serde(default)]
-    pub intent: RecallIntent,
-}
-
-/// One retrieval row, shaped for MCP consumers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecallHit {
-    pub chunk_id: String,
-    pub project: Option<String>,
-    pub source: String,
-    pub source_id: String,
-    pub ts: Option<DateTime<Utc>>,
-    pub snippet: String,
-    pub score: f32,
-    pub links: Links,
-    /// Scanner-supplied side-channel metadata (e.g. `symbols`, `kind`,
-    /// `chunker`). Round-trips through the corpus `extra_json` column so
-    /// MCP clients can show symbol-aware UX (file path + identifier
-    /// plus its rust-analyzer kind). Defaults to `Value::Null` when the
-    /// scanner didn't populate anything; serializes as JSON `null`.
-    #[serde(default)]
-    pub extra: serde_json::Value,
-    /// Indicates if this chunk is from an orphan source that was marked stale
-    /// rather than being physically deleted.
-    #[serde(default)]
-    pub stale: bool,
-    /// The role this hit plays in a synthesized page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<ContextRole>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecallLinkResult {
-    pub chunk: RecallHit,
-    pub parents: Vec<RecallHit>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceCount {
-    pub source: String,
-    pub count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecallStats {
-    pub total: usize,
-    pub by_source: Vec<SourceCount>,
-    pub model: String,
-    pub dim: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_scan_at: Option<String>,
-    /// Cross-encoder reranker info, if one is attached. Field is omitted
-    /// from the JSON when `None` so old MCP clients keep parsing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reranker: Option<RerankerStats>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RerankerStats {
-    pub model: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<serde_json::Value>>,
-}
+pub use ostk_recall_core::{
+    AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats,
+    SourceCount,
+};

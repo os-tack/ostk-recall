@@ -24,16 +24,16 @@ pub mod types;
 
 pub use error::{QueryError, Result};
 pub use hybrid::recall;
-pub use ostk_recall_core::{Chunk, Links, RecallIntent, Source};
+pub use ostk_recall_core::{
+    AuditResult, Chunk, Links, RecallHit, RecallIntent, RecallLinkResult, RecallParams,
+    RecallStats, RerankerStats, Source, SourceCount, SynthesizedPage,
+};
 pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
 pub use rerank::{RerankerError, RerankerLike};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
-pub use synthesis::{SynthesizedPage, Synthesizer};
-pub use types::{
-    AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats, SourceCount,
-};
+pub use synthesis::Synthesizer;
 
 /// Orchestrator that owns the resources needed to answer recall queries.
 ///

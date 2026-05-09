@@ -1,26 +1,5 @@
-use crate::types::RecallHit;
-use ostk_recall_core::ContextRole;
-use serde::{Deserialize, Serialize};
+use ostk_recall_core::{ContextRole, RecallHit, SynthesizedPage};
 use std::collections::HashMap;
-
-/// A structured memory object compatible with ostk L1.5 page tables.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SynthesizedPage {
-    /// e.g., "Symbol: alloc_page" or "Page: src/main.rs"
-    pub title: String,
-    /// The Primary hit
-    pub head: RecallHit,
-    /// Evolution (stale chunks)
-    pub lineage: Vec<RecallHit>,
-    /// Usage (transcripts/probes)
-    pub evidence: Vec<RecallHit>,
-    /// Count of total lineage hits found (for lazy loading)
-    pub total_lineage: usize,
-    /// Count of total evidence hits found (for lazy loading)
-    pub total_evidence: usize,
-    /// A 1-sentence synthesis bridging the roles
-    pub summary: String,
-}
 
 pub struct Synthesizer;
 

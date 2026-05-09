@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## v0.1.5 — Move serde result/parameter types to `ostk-recall-core` (cut #3 prep)
+
+Preparation for haystack →1846 cut #3 (daemonize the recall surface as a
+peer-process driver). Haystack will eventually drop the `ostk-recall-query`
+dep entirely and consume only schema-only types via `ostk-recall-core`;
+this release moves the types it needs into the right home.
+
+### Added
+
+- `ostk_recall_core::types` — new module containing the serde-only result
+  and parameter types previously defined in `ostk_recall_query`:
+  `RecallParams`, `RecallHit`, `RecallLinkResult`, `SourceCount`,
+  `RecallStats`, `RerankerStats`, `AuditResult`, and the data shape
+  `SynthesizedPage` (the runtime `Synthesizer` impl stays in `query`).
+- `ostk_recall_core` now re-exports all of these at crate root.
+
+### Changed
+
+- `ostk_recall_query::types` is now a thin re-export shim of
+  `ostk_recall_core::types`. No source-level breaking change for
+  existing consumers — `ostk_recall_query::{RecallHit, RecallParams, …}`
+  still resolves through the re-export.
+- `ostk_recall_query::SynthesizedPage` is now re-exported from
+  `ostk_recall_core` as well; `ostk_recall_query::synthesis` keeps the
+  `Synthesizer` runtime impl that builds them.
+
+### Why
+
+Cut #3 ships `ostk-recall-serve` as a peer-process daemon that owns
+`CorpusStore` + `Synthesizer` + `Reranker` + the lance/lancedb runtime.
+Haystack dispatches `recall` / `recall_search` / `recall_outline` opcodes
+over the kernel sock and only needs to deserialize results — for which
+the schema-only types live in `core`. This is the minimum upstream change
+that lets haystack switch its dep from `ostk-recall-query` to
+`ostk-recall-core` and drop the entire lance/lancedb/datafusion/arrow
+chain (~30–42 MB binary).
+
+### Compatibility
+
+Additive: no public API removed. `ostk-recall-{cli,mcp}` consumers see
+no change. Workspace-internal code paths still resolve through the same
+`use ostk_recall_query::…` imports.
+
+### Also included in v0.1.5
+
+Two commits from parallel work landed on `main` between v0.1.4 and
+v0.1.5 and ship as part of this release:
+
+- **`feat(cli): file-watcher subcommand drives scan-trigger socket`**
+  (`09cc7fd`). Adds `ostk-recall watch` — a thin watcher that pokes the
+  running `serve` daemon's scan-trigger socket whenever a debounced
+  batch of events lands under any configured source path. Uses
+  `notify-debouncer-full`. Opt-in via `[watch].enabled = true`.
+- **`feat(watch): per-platform debounce defaults`** (`11f4d58`).
+  Lifts the debounce window into a `cfg!()` block (Linux/inotify 800 ms;
+  other platforms tuned to match their fs-event characteristics).
+
 ## v0.1.4 — Feature-gate Reranker; downstream haystack drops ORT
 
 ### Changed

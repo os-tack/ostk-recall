@@ -10,12 +10,17 @@ pub mod config;
 pub mod error;
 pub mod scanner;
 pub mod source;
+pub mod types;
 
 pub use chunk::{Chunk, Links};
 pub use config::{Config, CorpusConfig, EmbedderConfig, RerankerConfig, SourceConfig, WatchConfig};
 pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};
+pub use types::{
+    AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats,
+    SourceCount, SynthesizedPage,
+};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
