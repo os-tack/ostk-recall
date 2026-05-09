@@ -1,0 +1,13 @@
+# Windows MSVC: switch to dynamic CRT so esaxx-rs (sentencepiece, built
+# from C++ via cc-rs and defaulting to /MT) links cleanly against
+# ort-sys's prebuilt onnxruntime_c_api.obj (which uses /MD). Without
+# this, the link step fails with:
+#
+#   error LNK2038: mismatch detected for 'RuntimeLibrary':
+#     value 'MT_StaticRelease' doesn't match value 'MD_DynamicRelease'
+#
+# Setting `target-feature=-crt-static` makes rustc emit /MD and cc-rs
+# follows suit (it reads CARGO_CFG_TARGET_FEATURE). The flag is scoped
+# to the windows-msvc target so Linux/macOS builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=-crt-static"]
