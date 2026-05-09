@@ -35,7 +35,7 @@ impl ChunkEmbedder for FakeEmbedder {
 fn write_config(path: &Path, corpus_root: &Path, glob_pattern: &str) {
     let body = format!(
         r#"[corpus]
-root = "{corpus}"
+root = '{corpus}'
 
 [embedder]
 model = "unused-in-tests"
@@ -43,7 +43,7 @@ model = "unused-in-tests"
 [[sources]]
 kind = "zip_export"
 project = "claudeai"
-paths = ["{glob_pattern}"]
+paths = ['{glob_pattern}']
 "#,
         corpus = corpus_root.display(),
     );

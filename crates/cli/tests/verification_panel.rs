@@ -277,7 +277,7 @@ fn write_config(
 ) {
     let body = format!(
         r#"[corpus]
-root = "{corpus}"
+root = '{corpus}'
 
 [embedder]
 model = "unused-in-tests"
@@ -285,33 +285,33 @@ model = "unused-in-tests"
 [[sources]]
 kind = "markdown"
 project = "notes"
-paths = ["{markdown}"]
+paths = ['{markdown}']
 
 [[sources]]
 kind = "code"
 project = "code"
-paths = ["{code}"]
+paths = ['{code}']
 extensions = ["rs"]
 
 [[sources]]
 kind = "claude_code"
 project = "demo"
-paths = ["{claude_code}"]
+paths = ['{claude_code}']
 
 [[sources]]
 kind = "file_glob"
 project = "glob"
-paths = ["{file_glob_pat}"]
+paths = ['{file_glob_pat}']
 
 [[sources]]
 kind = "zip_export"
 project = "claudeai"
-paths = ["{zip_pat}"]
+paths = ['{zip_pat}']
 
 [[sources]]
 kind = "ostk_project"
 project = "panelproj"
-paths = ["{ostk_project}"]
+paths = ['{ostk_project}']
 "#,
         corpus = corpus_root.display(),
         markdown = markdown.display(),
