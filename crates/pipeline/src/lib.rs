@@ -109,7 +109,20 @@ impl Pipeline {
             };
             stats.items_seen += 1;
 
-            // Tier 1: File-level metadata check
+            // Tier 1: File-level metadata check.
+            //
+            // A `--dry-run` invocation in v0.1.0 wrote to ingest_sources
+            // without ever persisting the corresponding chunks. Future
+            // scans then matched the cached mtime and silently skipped
+            // parse, leaving the corpus permanently empty for that
+            // source. v0.1.1 fixes this with two guards:
+            //
+            //   1. Dry-runs never write to ingest_sources at all
+            //      (observation-only).
+            //   2. The skip path only fires when chunks for this
+            //      source_id actually exist in ingest_chunks — so a
+            //      previously-interrupted scan won't poison the cache
+            //      either.
             if let Some(path) = &item.path {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mtime = meta.modified().ok()
@@ -120,14 +133,27 @@ impl Pipeline {
 
                     if let Ok(Some((old_mtime, old_size))) = self.ingest.get_source_metadata(source_kind_str, project, &item.source_id) {
                         if old_mtime == mtime && old_size == size {
-                            if self.ingest.touch_source_chunks(source_kind_str, project, &item.source_id, &self.run_id).is_ok() {
-                                stats.items_skipped += 1;
-                                continue;
+                            // Defensive: a metadata row with no chunks
+                            // means the previous run wrote metadata but
+                            // never persisted any chunks (typical of an
+                            // interrupted scan or a v0.1.0 dry-run).
+                            // Re-parse instead of silently skipping.
+                            let has_chunks = self
+                                .ingest
+                                .has_chunks_for_source(source_kind_str, project, &item.source_id)
+                                .unwrap_or(false);
+                            if has_chunks {
+                                if self.ingest.touch_source_chunks(source_kind_str, project, &item.source_id, &self.run_id).is_ok() {
+                                    stats.items_skipped += 1;
+                                    continue;
+                                }
                             }
                         }
                     }
-                    
-                    let _ = self.ingest.update_source_metadata(source_kind_str, project, &item.source_id, mtime, size, &self.run_id);
+
+                    if !self.dry_run {
+                        let _ = self.ingest.update_source_metadata(source_kind_str, project, &item.source_id, mtime, size, &self.run_id);
+                    }
                 }
             }
 
@@ -461,6 +487,82 @@ mod tests {
 
         let count_after = pipeline.store().row_count().await.unwrap();
         assert_eq!(count_after, 0, "code chunks must be physically deleted");
+    }
+
+    /// Regression: v0.1.0 dry-runs wrote source metadata before the
+    /// dry-run gate, which meant a subsequent dry-run (or a real run)
+    /// matched the cached mtime, hit the metadata-skip path, and
+    /// emitted zero chunks even though the corpus was empty. The fix
+    /// is two-pronged: dry-runs no longer write metadata, and the
+    /// skip-path requires the chunks table to actually contain rows
+    /// for the source_id.
+    #[tokio::test]
+    async fn dry_run_does_not_poison_metadata_cache() {
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+
+        let scanner = MarkdownScanner;
+        let cfg = cfg_for(fixtures.path());
+
+        // First run: dry-run only. Discovers items but should NOT
+        // populate ingest_sources (which would poison cache).
+        {
+            let pipeline = make_pipeline(corpus.path(), 16).await.with_dry_run(true);
+            let s = pipeline.ingest_source(&scanner, &cfg).await;
+            assert_eq!(s.items_seen, 2);
+            assert_eq!(s.items_skipped, 0);
+            // No actual ingest happened.
+            assert_eq!(s.chunks_upserted, 0);
+        }
+
+        // Second run: real ingest. If dry-run poisoned the cache, this
+        // would items_skipped=2 chunks_emitted=0 — the v0.1.0 bug. With
+        // the fix it parses fresh.
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let s2 = pipeline.ingest_source(&scanner, &cfg).await;
+        assert_eq!(s2.items_seen, 2);
+        assert_eq!(s2.items_skipped, 0, "dry-run must not poison metadata cache");
+        assert!(s2.chunks_emitted > 0, "second run must emit chunks");
+        assert!(s2.chunks_upserted > 0);
+    }
+
+    /// Regression: a run that wrote metadata but crashed before
+    /// recording any chunks (or v0.1.0 in dry-run mode) leaves
+    /// `ingest_sources` populated and `ingest_chunks` empty. v0.1.1
+    /// detects that mismatch and re-parses instead of skipping.
+    #[tokio::test]
+    async fn metadata_without_chunks_re_parses() {
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = MarkdownScanner;
+        let cfg = cfg_for(fixtures.path());
+
+        // Manually simulate the broken state: write metadata for one of
+        // the items but never record chunks.
+        let path = fixtures.path().join("a.md");
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let size = meta.len() as i64;
+        pipeline
+            .ingest
+            .update_source_metadata("markdown", "test", "a.md", mtime, size, "stale-run-id")
+            .unwrap();
+
+        // Now run normally. The skip-path must NOT trigger for a.md
+        // because the chunks table is empty.
+        let s = pipeline.ingest_source(&scanner, &cfg).await;
+        assert_eq!(s.items_seen, 2);
+        assert_eq!(s.items_skipped, 0, "must not skip when chunks table is empty");
+        assert!(s.chunks_emitted > 0);
     }
 
     #[tokio::test]

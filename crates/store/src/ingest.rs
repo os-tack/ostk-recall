@@ -114,6 +114,28 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         Ok(exists)
     }
 
+    /// Defensive companion to [`get_source_metadata`]. v0.1.0 ingested
+    /// the source metadata BEFORE deciding whether to embed/persist
+    /// chunks; in `--dry-run` mode the chunks were never persisted, so
+    /// every subsequent dry-run silently skipped parsing because the
+    /// metadata cache claimed "this source is already up to date." The
+    /// pipeline now consults this method before honoring a metadata-
+    /// match short-circuit, refusing to skip a source whose chunks
+    /// table is empty.
+    pub fn has_chunks_for_source(
+        &self,
+        source: &str,
+        project: &str,
+        source_id: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM ingest_chunks WHERE source = ? AND project = ? AND source_id = ? LIMIT 1",
+        )?;
+        let exists = stmt.exists(params![source, project, source_id])?;
+        Ok(exists)
+    }
+
     pub fn record_chunk(&self, row: &IngestChunkRow, run_id: Option<&str>) -> Result<()> {
         let conn = self.lock();
         conn.execute(
