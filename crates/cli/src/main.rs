@@ -69,6 +69,11 @@ enum Command {
         #[arg(long)]
         stdio: bool,
     },
+    /// Watch configured source paths and poke the running `serve`'s
+    /// scan-trigger socket whenever a debounced batch of events lands.
+    /// Requires `[watch].enabled = true` in config; reuses each
+    /// `[[sources]].paths` and `extensions`.
+    Watch,
 }
 
 fn load_embedder(model_id: &str) -> Result<Arc<dyn ChunkEmbedder>> {
@@ -224,6 +229,9 @@ async fn main() -> Result<()> {
         Command::Serve { stdio } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
             commands::serve(&config_path, embedder, stdio).await?;
+        }
+        Command::Watch => {
+            commands::watch(&config_path).await?;
         }
     }
 

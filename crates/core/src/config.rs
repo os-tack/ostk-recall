@@ -18,6 +18,11 @@ pub struct Config {
     /// rerank pass entirely.
     #[serde(default)]
     pub reranker: Option<RerankerConfig>,
+    /// Optional file-watcher tuning. Omit to disable. The watcher
+    /// itself is always opt-in (`enabled = true`); when omitted or
+    /// disabled, `ostk-recall watch` exits at startup.
+    #[serde(default)]
+    pub watch: Option<WatchConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +80,82 @@ impl RerankerConfig {
     #[must_use]
     pub fn resolve(slot: Option<&Self>) -> Self {
         slot.cloned().unwrap_or_default()
+    }
+}
+
+/// File-watcher tuning. The watcher reuses each `[[sources]].paths`
+/// (and `extensions`) — it does not declare its own paths. When a debounced
+/// batch contains any event under a watched source path, the watcher pokes
+/// the scan-trigger socket once. The scan does the real filtering; the
+/// watcher's only job is "did anything we care about change recently?".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchConfig {
+    /// Opt-in switch. When false (or `[watch]` omitted), `ostk-recall
+    /// watch` exits at startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Coalescing window in milliseconds. Longer windows trade trigger
+    /// latency for fewer redundant scans during bursty edits.
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Optional override for the trigger socket path. Defaults to
+    /// `corpus.root/recall.sock` — same path `serve` binds to.
+    #[serde(default)]
+    pub socket: Option<String>,
+    /// Optional `[[sources]].project` allowlist. When empty, every
+    /// source is watched. When set, only sources whose `project` matches
+    /// drive the watcher (lets you skip noisy sources like `zip_export`
+    /// or `claude_code` that scan often anyway).
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+const fn default_debounce_ms() -> u64 {
+    1500
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debounce_ms: default_debounce_ms(),
+            socket: None,
+            projects: Vec::new(),
+        }
+    }
+}
+
+impl WatchConfig {
+    /// True when `[watch]` is present AND `enabled = true`. Used by the
+    /// watcher subcommand entry point to bail early on misconfiguration
+    /// rather than silently doing nothing.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    /// Resolve the trigger socket path. Falls back to
+    /// `corpus_root/recall.sock` (the same default `serve` binds to)
+    /// when no override is set.
+    pub fn resolve_socket(&self, corpus_root: &Path) -> Result<PathBuf> {
+        match &self.socket {
+            Some(s) => expand_path(s),
+            None => Ok(corpus_root.join("recall.sock")),
+        }
+    }
+
+    /// True when this source's `project` should be watched given the
+    /// configured `projects` allowlist. Empty allowlist = watch all.
+    #[must_use]
+    pub fn watches_project(&self, project: Option<&str>) -> bool {
+        if self.projects.is_empty() {
+            return true;
+        }
+        match project {
+            Some(p) => self.projects.iter().any(|s| s == p),
+            None => false,
+        }
     }
 }
 
@@ -267,6 +348,106 @@ enabled = false
         assert!(!r.enabled);
         // model field omitted → default kicks in via serde default fn.
         assert_eq!(r.model, "jina-reranker-v1-turbo-en");
+    }
+
+    #[test]
+    fn watch_omitted_means_disabled() {
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        assert!(cfg.watch.is_none());
+        let resolved = cfg.watch.unwrap_or_default();
+        assert!(!resolved.is_active());
+        assert_eq!(resolved.debounce_ms, 1500);
+    }
+
+    #[test]
+    fn watch_block_round_trip() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+debounce_ms = 800
+projects = ["notes", "haystack"]
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let w = cfg.watch.unwrap();
+        assert!(w.is_active());
+        assert_eq!(w.debounce_ms, 800);
+        assert_eq!(w.projects, vec!["notes", "haystack"]);
+        assert!(w.socket.is_none());
+    }
+
+    #[test]
+    fn watch_socket_override_expands() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+socket = "~/.local/share/ostk-recall/custom.sock"
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let w = cfg.watch.unwrap();
+        let p = w.resolve_socket(Path::new("/tmp")).unwrap();
+        assert!(!p.to_string_lossy().starts_with('~'));
+        assert!(p.to_string_lossy().ends_with("custom.sock"));
+    }
+
+    #[test]
+    fn watch_socket_default_under_corpus_root() {
+        let w = WatchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = w.resolve_socket(Path::new("/var/data/recall")).unwrap();
+        assert_eq!(p, PathBuf::from("/var/data/recall/recall.sock"));
+    }
+
+    #[test]
+    fn watch_project_filter_matches() {
+        let w = WatchConfig {
+            enabled: true,
+            projects: vec!["notes".to_string()],
+            ..Default::default()
+        };
+        assert!(w.watches_project(Some("notes")));
+        assert!(!w.watches_project(Some("haystack")));
+        assert!(!w.watches_project(None));
+    }
+
+    #[test]
+    fn watch_empty_filter_watches_all() {
+        let w = WatchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(w.watches_project(Some("anything")));
+        assert!(w.watches_project(None));
+    }
+
+    #[test]
+    fn watch_rejects_unknown_field() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+mystery = 7
+"#;
+        let err = toml::from_str::<Config>(body).unwrap_err().to_string();
+        assert!(err.contains("mystery") || err.contains("unknown field"), "got: {err}");
     }
 
     #[test]

@@ -92,6 +92,7 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 # binary cross-compile under musl without libssl-dev/pkg-config.
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls", "image-models"] }
 which = "7"
+notify-debouncer-full = "0.7"
 
 # dev
 tempfile = "3.14"

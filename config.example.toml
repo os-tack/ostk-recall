@@ -68,3 +68,17 @@ paths = ["~/Documents/papers/**/*.txt"]
 kind = "zip_export"
 project = "claude-ai-exports"
 paths = ["~/Downloads/claude-data-export-*.zip"]
+
+# Optional file-watcher. Pokes the running `ostk-recall serve` daemon's
+# scan-trigger socket whenever a debounced batch of events lands under
+# any watched source path. Run with `ostk-recall watch` (separate
+# process from `serve`). When omitted, the watcher is disabled and
+# `ostk-recall watch` exits at startup.
+#
+# [watch]
+# enabled = true            # opt in (default false)
+# debounce_ms = 1500        # coalesce bursty edits into one trigger
+# # socket = "..."          # rare; defaults to corpus.root/recall.sock
+# # projects = ["notes"]    # optional [[sources]].project allowlist;
+# #                         # empty/omitted = watch every source.
+

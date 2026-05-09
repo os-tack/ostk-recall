@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
-use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceKind};
+use anyhow::{Context, Result, anyhow, bail};
+use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind};
 use ostk_recall_mcp::Server;
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
@@ -562,6 +562,196 @@ async fn run_socket_listener(
                 }
             }
         }
+    }
+}
+
+/// `ostk-recall watch` — run a file-watcher that pokes the scan-trigger
+/// socket whenever a debounced batch of events touches a configured
+/// source path. Reuses each `[[sources]].paths` (and `extensions`) — the
+/// watcher does not declare its own paths. The scan does the real
+/// filtering; the watcher's job is just "did anything we care about
+/// change recently?".
+///
+/// Behavior:
+/// - Loads `[watch]` from config; bails if absent or `enabled = false`.
+/// - Resolves the trigger socket via `WatchConfig::resolve_socket`
+///   (defaults to `corpus.root/recall.sock` — same path `serve` binds).
+/// - For every `[[sources]]` whose `project` passes the optional
+///   `[watch].projects` allowlist, registers each expanded path with a
+///   recursive debouncer (`notify-debouncer-full`).
+/// - Drains debounced batches; on any batch that contains a path under
+///   one of the watched roots (and matching the source's `extensions`,
+///   if any), connects to the socket and immediately closes the
+///   connection. The serve daemon's accept-loop treats that as a poke
+///   and runs `scan`.
+///
+/// Connect failures (e.g. serve not running yet) are warnings, not
+/// fatal — the watcher keeps running so the next save after `serve`
+/// starts will fire. Errors from the underlying notify backend are
+/// surfaced through `tracing::warn`.
+pub async fn watch(config_path: &Path) -> Result<()> {
+    use std::time::Duration;
+
+    use notify_debouncer_full::{
+        DebounceEventResult, new_debouncer, notify::RecursiveMode,
+    };
+
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+
+    let watch_cfg = cfg
+        .watch
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!(
+                "no [watch] block in config — add one with `enabled = true` to enable the watcher"
+            )
+        })?
+        .clone();
+    if !watch_cfg.is_active() {
+        bail!("[watch].enabled = false — nothing to do");
+    }
+
+    let corpus_root = cfg.expanded_root().context("expanding corpus root")?;
+    let socket_path = watch_cfg
+        .resolve_socket(&corpus_root)
+        .context("resolving trigger socket path")?;
+
+    // Resolve which sources to watch and expand each declared path.
+    // Skip sources that don't pass the project allowlist; skip individual
+    // paths that don't exist (logged at warn so misconfig is visible).
+    let mut watched_roots: Vec<(PathBuf, SourceConfig)> = Vec::new();
+    for source in &cfg.sources {
+        if !watch_cfg.watches_project(source.project.as_deref()) {
+            continue;
+        }
+        for raw in &source.paths {
+            let expanded = match ostk_recall_core::config::expand_path(raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(path = %raw, error = %e, "failed to expand watch path; skipping");
+                    continue;
+                }
+            };
+            if !expanded.exists() {
+                tracing::warn!(
+                    path = %expanded.display(),
+                    "watch path does not exist; skipping (will not retry until restart)"
+                );
+                continue;
+            }
+            watched_roots.push((expanded, source.clone()));
+        }
+    }
+    if watched_roots.is_empty() {
+        bail!(
+            "no watchable source paths after applying [watch].projects filter — refine the filter or add sources"
+        );
+    }
+
+    // Tokio mpsc as the bridge: the debouncer's std-style closure can call
+    // UnboundedSender::send (non-blocking, no async needed), and the main
+    // task awaits on the receiver.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DebounceEventResult>();
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(watch_cfg.debounce_ms),
+        None,
+        move |result: DebounceEventResult| {
+            let _ = tx.send(result);
+        },
+    )
+    .context("creating filesystem debouncer")?;
+
+    for (root, _) in &watched_roots {
+        debouncer
+            .watch(root, RecursiveMode::Recursive)
+            .with_context(|| format!("registering watch on {}", root.display()))?;
+        tracing::info!(path = %root.display(), "watching");
+    }
+    tracing::info!(
+        socket = %socket_path.display(),
+        debounce_ms = watch_cfg.debounce_ms,
+        sources = watched_roots.len(),
+        "scan-trigger watcher started"
+    );
+
+    while let Some(result) = rx.recv().await {
+        match result {
+            Ok(events) => {
+                let interesting = events.iter().any(|ev| {
+                    ev.event
+                        .paths
+                        .iter()
+                        .any(|p| matches_watched_root(p, &watched_roots))
+                });
+                if !interesting {
+                    continue;
+                }
+                if let Err(e) = kick_trigger_socket(&socket_path).await {
+                    tracing::warn!(
+                        socket = %socket_path.display(),
+                        error = %e,
+                        "scan-trigger kick failed; will retry on next event"
+                    );
+                } else {
+                    tracing::info!("scan-trigger kicked");
+                }
+            }
+            Err(errors) => {
+                for e in errors {
+                    tracing::warn!(error = %e, "watch backend error");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True if `path` falls under one of the watched roots AND, if that
+/// root's source has a non-empty `extensions` filter, the path's
+/// extension is in the filter. Roots without an extensions filter
+/// match every path under them.
+fn matches_watched_root(path: &Path, roots: &[(PathBuf, SourceConfig)]) -> bool {
+    for (root, source) in roots {
+        if !path.starts_with(root) {
+            continue;
+        }
+        if source.extensions.is_empty() {
+            return true;
+        }
+        let ext_ok = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| source.extensions.iter().any(|x| x == ext));
+        if ext_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Connect to the scan-trigger surface and immediately close. Any
+/// successful connect counts as a poke (the serve listener accept-loop
+/// drops the stream and spawns the scan).
+async fn kick_trigger_socket(socket: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connect {}", socket.display()))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let stem = socket
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("trigger");
+        let pipe_name = format!(r"\\.\pipe\ostk-recall-{stem}");
+        let _client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&pipe_name)
+            .with_context(|| format!("open pipe {pipe_name}"))?;
+        Ok(())
     }
 }
 

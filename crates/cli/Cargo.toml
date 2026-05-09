@@ -33,6 +33,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 serde_json = { workspace = true }
+notify-debouncer-full = { workspace = true }
 
 [dev-dependencies]
 ostk-recall-store = { workspace = true }
