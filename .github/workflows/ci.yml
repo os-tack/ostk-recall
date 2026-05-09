@@ -8,6 +8,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Windows MSVC: force dynamic CRT (/MD) so esaxx-rs (sentencepiece via
+  # cc-rs) links cleanly against ort-sys's prebuilt onnxruntime_c_api.obj
+  # (/MD). The .cargo/config.toml at repo root sets the same flag for
+  # rustc, but in CI the env var is more reliable — it's read by both
+  # rustc and cc-rs (via CFLAGS/CXXFLAGS env passthrough). Target-scoped
+  # via the suffix so Linux/macOS jobs ignore these.
+  RUSTFLAGS: "-C target-feature=-crt-static"
+  CFLAGS_x86_64_pc_windows_msvc: "-MD"
+  CXXFLAGS_x86_64_pc_windows_msvc: "-MD"
 
 jobs:
   check:
