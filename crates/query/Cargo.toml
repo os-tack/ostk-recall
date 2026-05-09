@@ -26,7 +26,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-fastembed = { workspace = true }
+fastembed = { workspace = true, optional = true }
+
+[features]
+default = ["reranker"]
+reranker = ["dep:fastembed"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -27,7 +27,9 @@ pub use hybrid::recall;
 pub use ostk_recall_core::{Chunk, Links, RecallIntent, Source};
 pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
-pub use rerank::{Reranker, RerankerError, RerankerLike};
+pub use rerank::{RerankerError, RerankerLike};
+#[cfg(feature = "reranker")]
+pub use rerank::Reranker;
 pub use synthesis::{SynthesizedPage, Synthesizer};
 pub use types::{
     AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats, SourceCount,

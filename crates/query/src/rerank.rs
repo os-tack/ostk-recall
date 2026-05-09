@@ -26,9 +26,12 @@
 //! real ONNX-backed [`Reranker`] is one impl, but tests can supply a
 //! deterministic fake without pulling the model.
 
+#[cfg(feature = "reranker")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "reranker")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "reranker")]
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 use thiserror::Error;
 
@@ -64,11 +67,13 @@ pub trait RerankerLike: Send + Sync {
 /// Holds an ONNX-backed `fastembed::TextRerank` behind a `Mutex` so the
 /// engine can share an `Arc<Self>` across async tasks. The mutex is held
 /// only for the duration of one `rerank` call; latency dominates.
+#[cfg(feature = "reranker")]
 pub struct Reranker {
     inner: Mutex<TextRerank>,
     model_id: String,
 }
 
+#[cfg(feature = "reranker")]
 impl std::fmt::Debug for Reranker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reranker")
@@ -77,6 +82,7 @@ impl std::fmt::Debug for Reranker {
     }
 }
 
+#[cfg(feature = "reranker")]
 impl Reranker {
     /// Default model identifier surfaced to config / `recall_stats`.
     pub const DEFAULT_MODEL_ID: &'static str = "jina-reranker-v1-turbo-en";
@@ -141,6 +147,7 @@ impl Reranker {
     }
 }
 
+#[cfg(feature = "reranker")]
 impl RerankerLike for Reranker {
     fn rerank(&self, query: &str, docs: &[String], top_k: usize) -> Result<Vec<RerankedHit>> {
         if docs.is_empty() || top_k == 0 {
@@ -174,6 +181,7 @@ impl RerankerLike for Reranker {
     }
 }
 
+#[cfg(feature = "reranker")]
 const fn model_to_id(m: &RerankerModel) -> &'static str {
     match m {
         RerankerModel::JINARerankerV1TurboEn => "jina-reranker-v1-turbo-en",
@@ -206,6 +214,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "reranker")]
     #[test]
     fn resolve_model_known_aliases() {
         assert!(Reranker::resolve_model("jina-reranker-v1-turbo-en").is_some());
@@ -228,6 +237,7 @@ mod tests {
 
     /// E2E test gated on `OSTK_RECALL_E2E=1` since it pulls the ONNX
     /// reranker model (~80 MB).
+    #[cfg(feature = "reranker")]
     #[test]
     #[ignore = "requires network / model download — set OSTK_RECALL_E2E=1 to run"]
     fn loads_real_reranker_and_scores() {

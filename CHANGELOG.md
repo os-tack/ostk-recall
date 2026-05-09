@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## v0.1.4 — Feature-gate Reranker; downstream haystack drops ORT
+
+### Changed
+- **`Reranker` (and its `fastembed` / ORT dependency) now sits behind a
+  cargo feature `reranker`, default-on.** Consumers that set
+  `default-features = false` on `ostk-recall-query` drop the entire
+  ORT runtime + fastembed graph from their build (haystack v5.2.0 is
+  the immediate beneficiary — its v5.0.x saga was driven by ORT's
+  glibc / cross-build constraints).
+- Trait surface unchanged: `RerankerLike`, `RerankerError`, and
+  `RerankerStats` are always-on so default-features-off callers can
+  still type their reranker-injection code paths and inject their own
+  `Arc<dyn RerankerLike>` implementations.
+- Workspace consumers (`ostk-recall` CLI, `ostk-recall-mcp`) consume
+  default features and are unaffected — fastembed remains in their
+  dependency tree exactly as before.
+
+Closes →1847.
+
 ## [0.1.3] - 2026-05-09 — switch fastembed to rustls (downstream cross-musl unblock)
 
 ### Changed

@@ -4261,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4283,7 +4283,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "hex",
@@ -4298,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-embed"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "model2vec-rs",
  "ostk-recall-core",
@@ -4309,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-mcp"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "ostk-recall-core",
  "ostk-recall-pipeline",
@@ -4325,7 +4325,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-pipeline"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow-array",
  "chrono",
@@ -4344,7 +4344,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-query"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-scan"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "globset",
@@ -4387,7 +4387,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-store"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "arrow-array",
