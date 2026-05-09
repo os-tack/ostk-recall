@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, params};
 use ostk_recall_core::Source;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::corpus::{Result, StoreError};
@@ -58,7 +58,7 @@ impl IngestDb {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;"
+             PRAGMA synchronous = NORMAL;",
         )?;
         Ok(())
     }
@@ -97,11 +97,17 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
     ON ingest_chunks(source, project, source_id);
 ",
         )?;
-        
+
         // Migration for existing table
-        let _ = conn.execute("ALTER TABLE ingest_sources ADD COLUMN project TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE ingest_chunks ADD COLUMN project TEXT NOT NULL DEFAULT ''", []);
-        
+        let _ = conn.execute(
+            "ALTER TABLE ingest_sources ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE ingest_chunks ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
         Ok(())
     }
 
@@ -133,7 +139,12 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         Ok(())
     }
 
-    pub fn get_source_metadata(&self, source: &str, project: &str, source_id: &str) -> Result<Option<(i64, i64)>> {
+    pub fn get_source_metadata(
+        &self,
+        source: &str,
+        project: &str,
+        source_id: &str,
+    ) -> Result<Option<(i64, i64)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT mtime_micros, size_bytes FROM ingest_sources WHERE source = ? AND project = ? AND source_id = ?"
@@ -150,7 +161,13 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         }
     }
 
-    pub fn touch_source_chunks(&self, source: &str, project: &str, source_id: &str, run_id: &str) -> Result<()> {
+    pub fn touch_source_chunks(
+        &self,
+        source: &str,
+        project: &str,
+        source_id: &str,
+        run_id: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE ingest_sources SET last_run_id = ? WHERE source = ? AND project = ? AND source_id = ?",
@@ -163,7 +180,15 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         Ok(())
     }
 
-    pub fn update_source_metadata(&self, source: &str, project: &str, source_id: &str, mtime: i64, size: i64, run_id: &str) -> Result<()> {
+    pub fn update_source_metadata(
+        &self,
+        source: &str,
+        project: &str,
+        source_id: &str,
+        mtime: i64,
+        size: i64,
+        run_id: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO ingest_sources (source, project, source_id, mtime_micros, size_bytes, last_run_id)
@@ -173,7 +198,12 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         Ok(())
     }
 
-    pub fn delete_orphans(&self, source: &str, project: &str, current_run_id: &str) -> Result<Vec<String>> {
+    pub fn delete_orphans(
+        &self,
+        source: &str,
+        project: &str,
+        current_run_id: &str,
+    ) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut ids = Vec::new();
         {
@@ -186,7 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
                 ids.push(id);
             }
         }
-        
+
         conn.execute(
             "DELETE FROM ingest_chunks WHERE source = ? AND project = ? AND (last_run_id != ? OR last_run_id IS NULL)",
             params![source, project, current_run_id]
@@ -196,11 +226,16 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
             "DELETE FROM ingest_sources WHERE source = ? AND project = ? AND (last_run_id != ? OR last_run_id IS NULL)",
             params![source, project, current_run_id]
         )?;
-        
+
         Ok(ids)
     }
 
-    pub fn mark_orphans_stale(&self, source: &str, project: &str, current_run_id: &str) -> Result<Vec<String>> {
+    pub fn mark_orphans_stale(
+        &self,
+        source: &str,
+        project: &str,
+        current_run_id: &str,
+    ) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut ids = Vec::new();
         let mut stmt = conn.prepare(
@@ -247,8 +282,14 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         let conn = self.lock();
         let mut total: u64 = 0;
         for batch in chunk_ids.chunks(999) {
-            let placeholders = std::iter::repeat("?").take(batch.len()).collect::<Vec<_>>().join(",");
-            let sql = format!("DELETE FROM ingest_chunks WHERE chunk_id IN ({})", placeholders);
+            let placeholders = std::iter::repeat("?")
+                .take(batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "DELETE FROM ingest_chunks WHERE chunk_id IN ({})",
+                placeholders
+            );
             let mut stmt = conn.prepare(&sql)?;
             let n = stmt.execute(rusqlite::params_from_iter(batch))?;
             total += n as u64;
@@ -258,8 +299,7 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
 
     pub fn latest_upserted_at(&self) -> Result<Option<String>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT MAX(upserted_at) FROM ingest_chunks")?;
+        let mut stmt = conn.prepare("SELECT MAX(upserted_at) FROM ingest_chunks")?;
         let s: Option<String> = stmt.query_row([], |r| r.get(0))?;
         Ok(s)
     }

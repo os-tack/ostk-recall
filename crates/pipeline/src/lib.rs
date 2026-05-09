@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use uuid::Uuid;
 
-use ostk_recall_core::{Chunk, Scanner, SourceConfig, RetentionPolicy};
+use ostk_recall_core::{Chunk, RetentionPolicy, Scanner, SourceConfig};
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 
@@ -112,22 +112,43 @@ impl Pipeline {
             // Tier 1: File-level metadata check
             if let Some(path) = &item.path {
                 if let Ok(meta) = std::fs::metadata(path) {
-                    let mtime = meta.modified().ok()
+                    let mtime = meta
+                        .modified()
+                        .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_micros() as i64)
                         .unwrap_or(0);
                     let size = meta.len() as i64;
 
-                    if let Ok(Some((old_mtime, old_size))) = self.ingest.get_source_metadata(source_kind_str, project, &item.source_id) {
+                    if let Ok(Some((old_mtime, old_size))) =
+                        self.ingest
+                            .get_source_metadata(source_kind_str, project, &item.source_id)
+                    {
                         if old_mtime == mtime && old_size == size {
-                            if self.ingest.touch_source_chunks(source_kind_str, project, &item.source_id, &self.run_id).is_ok() {
+                            if self
+                                .ingest
+                                .touch_source_chunks(
+                                    source_kind_str,
+                                    project,
+                                    &item.source_id,
+                                    &self.run_id,
+                                )
+                                .is_ok()
+                            {
                                 stats.items_skipped += 1;
                                 continue;
                             }
                         }
                     }
-                    
-                    let _ = self.ingest.update_source_metadata(source_kind_str, project, &item.source_id, mtime, size, &self.run_id);
+
+                    let _ = self.ingest.update_source_metadata(
+                        source_kind_str,
+                        project,
+                        &item.source_id,
+                        mtime,
+                        size,
+                        &self.run_id,
+                    );
                 }
             }
 
@@ -143,7 +164,10 @@ impl Pipeline {
 
             for chunk in chunks {
                 // Tier 2: Chunk-level dedupe
-                match self.ingest.content_already_ingested(&chunk.chunk_id, &chunk.sha256) {
+                match self
+                    .ingest
+                    .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
+                {
                     Ok(true) => {
                         stats.chunks_skipped_dup += 1;
                         let row = IngestChunkRow {
@@ -155,7 +179,7 @@ impl Pipeline {
                             content_sha256: chunk.sha256.clone(),
                         };
                         let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
-                    },
+                    }
                     Ok(false) => to_embed.push(chunk),
                     Err(e) => {
                         tracing::warn!(error = %e, "ingest dedupe check failed");
@@ -199,7 +223,10 @@ impl Pipeline {
             match cfg.kind.retention_policy() {
                 RetentionPolicy::Delete => {
                     for s in cfg.kind.sources() {
-                        match self.ingest.delete_orphans(s.as_str(), project, &self.run_id) {
+                        match self
+                            .ingest
+                            .delete_orphans(s.as_str(), project, &self.run_id)
+                        {
                             Ok(orphans) => {
                                 if !orphans.is_empty() {
                                     if let Err(e) = self.store.delete_chunks(&orphans).await {
@@ -209,13 +236,18 @@ impl Pipeline {
                                     }
                                 }
                             }
-                            Err(e) => tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed")
+                            }
                         }
                     }
                 }
                 RetentionPolicy::Stale => {
                     for s in cfg.kind.sources() {
-                        match self.ingest.mark_orphans_stale(s.as_str(), project, &self.run_id) {
+                        match self
+                            .ingest
+                            .mark_orphans_stale(s.as_str(), project, &self.run_id)
+                        {
                             Ok(orphans) => {
                                 if !orphans.is_empty() {
                                     if let Err(e) = self.store.mark_chunks_stale(&orphans).await {
@@ -224,7 +256,9 @@ impl Pipeline {
                                 }
                                 stats.chunks_staled += orphans.len();
                             }
-                            Err(e) => tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed")
+                            }
                         }
                     }
                 }
@@ -235,14 +269,20 @@ impl Pipeline {
         stats
     }
 
-    async fn embed_and_persist(&self, batch: &[Chunk], project: &str) -> Result<usize, PipelineError> {
+    async fn embed_and_persist(
+        &self,
+        batch: &[Chunk],
+        project: &str,
+    ) -> Result<usize, PipelineError> {
         let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
         let embeddings = self.embedder.encode_batch(&texts);
         if embeddings.len() != batch.len() {
             return Err(PipelineError::Embedder("dim mismatch".into()));
         }
 
-        self.store.upsert(batch, &embeddings).await
+        self.store
+            .upsert(batch, &embeddings)
+            .await
             .map_err(|e| PipelineError::Store(e.to_string()))?;
 
         for chunk in batch {
@@ -254,15 +294,23 @@ impl Pipeline {
                 chunk_index: chunk.chunk_index,
                 content_sha256: chunk.sha256.clone(),
             };
-            self.ingest.record_chunk(&row, Some(&self.run_id))
+            self.ingest
+                .record_chunk(&row, Some(&self.run_id))
                 .map_err(|e| PipelineError::Store(e.to_string()))?;
         }
         Ok(batch.len())
     }
 
     pub async fn verify_counts(&self) -> Result<VerifyReport, PipelineError> {
-        let corpus_total = self.store.row_count().await.map_err(|e| PipelineError::Store(e.to_string()))?;
-        let ingest_by_source = self.ingest.count_active_by_source().map_err(|e| PipelineError::Store(e.to_string()))?;
+        let corpus_total = self
+            .store
+            .row_count()
+            .await
+            .map_err(|e| PipelineError::Store(e.to_string()))?;
+        let ingest_by_source = self
+            .ingest
+            .count_active_by_source()
+            .map_err(|e| PipelineError::Store(e.to_string()))?;
         let ingest_total: u64 = ingest_by_source.iter().map(|(_, n)| *n).sum();
         Ok(VerifyReport {
             corpus_total,
@@ -418,17 +466,17 @@ mod tests {
         assert!(s2.chunks_staled > 0);
 
         let count_after = pipeline.store().row_count().await.unwrap();
-        assert_eq!(count_after, 4); 
+        assert_eq!(count_after, 4);
     }
 
     #[tokio::test]
     async fn orphan_sweep_deletes_code_vectors() {
-        use ostk_recall_scan::code::CodeScanner;
         use ostk_recall_core::SourceConfig;
+        use ostk_recall_scan::code::CodeScanner;
 
         let fixtures = TempDir::new().unwrap();
         let corpus = TempDir::new().unwrap();
-        
+
         let code_path = fixtures.path().join("main.rs");
         std::fs::write(&code_path, "fn main() { println!(\"hello\"); }").unwrap();
 
@@ -490,13 +538,24 @@ mod tests {
         assert!(stats.chunks_staled > 0);
 
         // Verify stale flag in LanceDB
-        let table = pipeline.store().connection().open_table(ostk_recall_store::CORPUS_TABLE).execute().await.unwrap();
+        let table = pipeline
+            .store()
+            .connection()
+            .open_table(ostk_recall_store::CORPUS_TABLE)
+            .execute()
+            .await
+            .unwrap();
         let stream = table.query().execute().await.unwrap();
         let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await.unwrap();
-        
+
         let mut found_stale = false;
         for batch in batches {
-            let stale_col = batch.column_by_name("stale").unwrap().as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
+            let stale_col = batch
+                .column_by_name("stale")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .unwrap();
             for i in 0..batch.num_rows() {
                 if stale_col.value(i) {
                     found_stale = true;

@@ -14,10 +14,10 @@ use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
 use ostk_recall_scan::code::CodeScanner;
 use ostk_recall_scan::file_glob::FileGlobScanner;
+use ostk_recall_scan::gemini::GeminiScanner;
 use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
-use ostk_recall_scan::gemini::GeminiScanner;
 use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 
 /// Starter config written when the user runs `init` and no config exists.
@@ -59,7 +59,9 @@ pub fn default_config_path() -> Result<PathBuf> {
 
 #[derive(Debug, Clone)]
 pub enum InitOutcome {
-    WroteStarter { path: PathBuf },
+    WroteStarter {
+        path: PathBuf,
+    },
     Initialized {
         root: PathBuf,
         model_id: String,

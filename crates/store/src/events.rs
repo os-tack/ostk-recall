@@ -53,7 +53,7 @@ impl EventsDb {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;"
+             PRAGMA synchronous = NORMAL;",
         )?;
         Ok(())
     }
@@ -133,8 +133,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         let conn = self.lock();
         let mut stmt = conn.prepare(sql)?;
         let column_count = stmt.column_count();
-        let columns: Vec<String> = stmt.column_names().into_iter().map(ToString::to_string).collect();
-        
+        let columns: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {

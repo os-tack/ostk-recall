@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{
-    FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-    TimestampMicrosecondArray, UInt32Array, BooleanArray,
+    BooleanArray, FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray, TimestampMicrosecondArray, UInt32Array,
 };
 use arrow_schema::Schema;
 use futures::TryStreamExt;
@@ -187,13 +187,14 @@ impl CorpusStore {
         }
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         let before = table.count_rows(None).await?;
-        
-        let ids_joined = ids.iter()
+
+        let ids_joined = ids
+            .iter()
             .map(|id| format!("'{}'", escape_sql(id)))
             .collect::<Vec<_>>()
             .join(", ");
         let filter = format!("chunk_id IN ({})", ids_joined);
-        
+
         table.delete(&filter).await?;
         let after = table.count_rows(None).await?;
         Ok(u64::try_from(before.saturating_sub(after)).unwrap_or(0))
@@ -205,14 +206,16 @@ impl CorpusStore {
             return Ok(0);
         }
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
-        
-        let ids_joined = ids.iter()
+
+        let ids_joined = ids
+            .iter()
             .map(|id| format!("'{}'", escape_sql(id)))
             .collect::<Vec<_>>()
             .join(", ");
         let filter = format!("chunk_id IN ({})", ids_joined);
-        
-        table.update()
+
+        table
+            .update()
             .only_if(&filter)
             .column("stale", "true")
             .execute()
@@ -262,7 +265,7 @@ fn build_record_batch(
         .map(|c| serde_json::to_string(&c.extra).expect("extra serialize"))
         .collect();
     let extra_json = StringArray::from_iter_values(extra_json_strings.iter().map(String::as_str));
-    
+
     // New chunks are NEVER stale by default.
     let stale = BooleanArray::from(vec![false; chunks.len()]);
 
@@ -379,9 +382,7 @@ mod tests {
             .unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         for batch in &batches {
-            let stale_col = batch
-                .column_by_name("stale")
-                .expect("stale column present");
+            let stale_col = batch.column_by_name("stale").expect("stale column present");
             let arr = stale_col
                 .as_any()
                 .downcast_ref::<BooleanArray>()

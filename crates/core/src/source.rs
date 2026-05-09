@@ -60,7 +60,7 @@ impl SourceKind {
     }
 
     /// Returns the retention policy for this source kind.
-    pub fn retention_policy(self) -> RetentionPolicy {
+    pub const fn retention_policy(self) -> RetentionPolicy {
         match self {
             Self::Code => RetentionPolicy::Delete,
             Self::Markdown | Self::FileGlob => RetentionPolicy::Stale,

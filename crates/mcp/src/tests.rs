@@ -60,14 +60,17 @@ async fn build_server() -> (TempDir, Server) {
         .await
         .unwrap();
     ingest
-        .record_chunk(&IngestChunkRow {
-            chunk_id: chunk.chunk_id.clone(),
-            source: chunk.source.as_str().to_string(),
-            project: chunk.project.as_deref().unwrap_or("default").to_string(),
-            source_id: chunk.source_id.clone(),
-            chunk_index: chunk.chunk_index,
-            content_sha256: chunk.sha256.clone(),
-        }, None)
+        .record_chunk(
+            &IngestChunkRow {
+                chunk_id: chunk.chunk_id.clone(),
+                source: chunk.source.as_str().to_string(),
+                project: chunk.project.as_deref().unwrap_or("default").to_string(),
+                source_id: chunk.source_id.clone(),
+                chunk_index: chunk.chunk_index,
+                content_sha256: chunk.sha256.clone(),
+            },
+            None,
+        )
         .unwrap();
 
     let engine = QueryEngine::new(store, ingest, Some(events), emb, "test");

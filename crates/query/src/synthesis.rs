@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::types::RecallHit;
 use ostk_recall_core::ContextRole;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A structured memory object compatible with ostk L1.5 page tables.
@@ -34,7 +34,9 @@ impl Synthesizer {
         // Identity Resolution: Group hits by symbol_name (if present) or source_id
         let mut groups: HashMap<String, Vec<RecallHit>> = HashMap::new();
         for hit in candidates {
-            let key = hit.extra.get("symbol_name")
+            let key = hit
+                .extra
+                .get("symbol_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&hit.source_id)
                 .to_string();
@@ -44,7 +46,11 @@ impl Synthesizer {
         let mut pages = Vec::new();
         for (group_key, mut group) in groups {
             // Sort by score descending within each group to pick the best Primary
-            group.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            group.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             let mut head = None;
             let mut lineage = Vec::new();
@@ -96,9 +102,11 @@ impl Synthesizer {
                     evidence.truncate(3);
                 }
 
-                let summary = format!("Synthesized memory for {} with {} evolution and {} evidence points.", 
-                    group_key, total_lineage, total_evidence);
-                
+                let summary = format!(
+                    "Synthesized memory for {} with {} evolution and {} evidence points.",
+                    group_key, total_lineage, total_evidence
+                );
+
                 pages.push(SynthesizedPage {
                     title,
                     head: h,
@@ -112,7 +120,12 @@ impl Synthesizer {
         }
 
         // Re-sort pages by the head score to maintain global ranking relevance
-        pages.sort_by(|a, b| b.head.score.partial_cmp(&a.head.score).unwrap_or(std::cmp::Ordering::Equal));
+        pages.sort_by(|a, b| {
+            b.head
+                .score
+                .partial_cmp(&a.head.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         pages
     }
 
@@ -133,7 +146,13 @@ mod tests {
     use ostk_recall_core::{ContextRole, Links};
     use serde_json::json;
 
-    fn fake_hit(chunk_id: &str, source_id: &str, score: f32, source: &str, stale: bool) -> RecallHit {
+    fn fake_hit(
+        chunk_id: &str,
+        source_id: &str,
+        score: f32,
+        source: &str,
+        stale: bool,
+    ) -> RecallHit {
         RecallHit {
             chunk_id: chunk_id.to_string(),
             project: None,
@@ -159,8 +178,11 @@ mod tests {
 
         let pages = Synthesizer::collapse(hits);
         assert_eq!(pages.len(), 2);
-        
-        let main_page = pages.iter().find(|p| p.head.source_id == "src/main.rs").unwrap();
+
+        let main_page = pages
+            .iter()
+            .find(|p| p.head.source_id == "src/main.rs")
+            .unwrap();
         assert_eq!(main_page.head.chunk_id, "c1");
         assert_eq!(main_page.lineage.len(), 1);
         assert_eq!(main_page.total_lineage, 1);
@@ -168,7 +190,10 @@ mod tests {
         assert_eq!(main_page.head.role, Some(ContextRole::Primary));
         assert_eq!(main_page.lineage[0].role, Some(ContextRole::Evolution));
 
-        let t_page = pages.iter().find(|p| p.head.source_id == "transcript1").unwrap();
+        let t_page = pages
+            .iter()
+            .find(|p| p.head.source_id == "transcript1")
+            .unwrap();
         assert_eq!(t_page.head.role, Some(ContextRole::Usage));
     }
 
@@ -176,13 +201,13 @@ mod tests {
     fn collapse_groups_by_symbol_name() {
         let mut h1 = fake_hit("c1", "src/main.rs", 0.9, "code", false);
         h1.extra = json!({"symbol_name": "main"});
-        
+
         let mut h2 = fake_hit("c2", "src/old.rs", 0.8, "code", false);
         h2.extra = json!({"symbol_name": "main"});
 
         let hits = vec![h1, h2];
         let pages = Synthesizer::collapse(hits);
-        
+
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].title, "Symbol: main");
         assert_eq!(pages[0].head.chunk_id, "c1");
@@ -192,9 +217,7 @@ mod tests {
 
     #[test]
     fn collapse_truncates_for_lazy_loading() {
-        let mut hits = vec![
-            fake_hit("p", "S", 1.0, "code", false),
-        ];
+        let mut hits = vec![fake_hit("p", "S", 1.0, "code", false)];
         for i in 0..10 {
             hits.push(fake_hit(&format!("l{}", i), "S", 0.5, "code", true));
         }

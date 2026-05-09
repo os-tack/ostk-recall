@@ -1,7 +1,8 @@
 //! Decode Arrow `RecordBatch` rows from the corpus table into `RecallHit`s.
 
 use arrow::array::{
-    Array, Float32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, BooleanArray,
+    Array, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use ostk_recall_core::Links;
@@ -30,8 +31,9 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
     let links_json = col_str_opt(batch, "links_json");
     let extra_json = col_str_opt(batch, "extra_json");
     let ts = col_ts_opt(batch, "ts");
-    
-    let stale_col = batch.column_by_name("stale")
+
+    let stale_col = batch
+        .column_by_name("stale")
         .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
 
     // Pick a score column. `_relevance_score` is the post-rerank column;
@@ -77,7 +79,7 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
         let score_value = score
             .as_ref()
             .map_or(0.0, |a| if a.is_null(i) { 0.0 } else { a.value(i) });
-            
+
         let is_stale = stale_col.map_or(false, |a| if a.is_null(i) { false } else { a.value(i) });
 
         out.push(RecallHit {

@@ -17,9 +17,9 @@
 pub mod anthropic_session;
 pub mod claude_code;
 pub mod code;
-pub mod gemini;
 pub mod fcp_rust;
 pub mod file_glob;
+pub mod gemini;
 pub mod markdown;
 pub mod ostk_project;
 pub mod walk;

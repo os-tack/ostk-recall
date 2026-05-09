@@ -76,14 +76,17 @@ fn record(engine: &QueryEngine, chunks: &[Chunk]) {
     for c in chunks {
         engine
             .ingest
-            .record_chunk(&IngestChunkRow {
-                chunk_id: c.chunk_id.clone(),
-                source: c.source.as_str().to_string(),
-                project: c.project.as_deref().unwrap_or("default").to_string(),
-                source_id: c.source_id.clone(),
-                chunk_index: c.chunk_index,
-                content_sha256: c.sha256.clone(),
-            }, None)
+            .record_chunk(
+                &IngestChunkRow {
+                    chunk_id: c.chunk_id.clone(),
+                    source: c.source.as_str().to_string(),
+                    project: c.project.as_deref().unwrap_or("default").to_string(),
+                    source_id: c.source_id.clone(),
+                    chunk_index: c.chunk_index,
+                    content_sha256: c.sha256.clone(),
+                },
+                None,
+            )
             .unwrap();
     }
 }

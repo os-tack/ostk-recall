@@ -22,11 +22,11 @@ pub mod stats;
 pub mod synthesis;
 pub mod types;
 
-pub use hybrid::recall;
-pub use ostk_recall_core::{RecallIntent, Chunk, Source, Links};
-pub use ostk_recall_store::CorpusStore;
-pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use error::{QueryError, Result};
+pub use hybrid::recall;
+pub use ostk_recall_core::{Chunk, Links, RecallIntent, Source};
+pub use ostk_recall_pipeline::ChunkEmbedder;
+pub use ostk_recall_store::CorpusStore;
 pub use rerank::{Reranker, RerankerError, RerankerLike};
 pub use synthesis::{SynthesizedPage, Synthesizer};
 pub use types::{

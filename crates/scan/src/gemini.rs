@@ -2,7 +2,7 @@ use std::fs;
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{
-    Chunk, Error, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind, Links,
+    Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
 };
 use serde::Deserialize;
 
@@ -61,8 +61,8 @@ impl Scanner for GeminiScanner {
                 .filter_map(std::result::Result::ok)
                 .filter(|e| e.file_type().is_file())
                 .filter(|e| {
-                    e.file_name().to_string_lossy().starts_with("session-") &&
-                    e.path().extension().is_some_and(|x| x == "json")
+                    e.file_name().to_string_lossy().starts_with("session-")
+                        && e.path().extension().is_some_and(|x| x == "json")
                 })
                 .map(move |entry| {
                     let path = entry.path().to_path_buf();
@@ -80,7 +80,10 @@ impl Scanner for GeminiScanner {
     }
 
     fn parse(&self, item: SourceItem) -> Result<Vec<Chunk>> {
-        let path = item.path.as_ref().ok_or_else(|| Error::Parse("gemini: path missing".into()))?;
+        let path = item
+            .path
+            .as_ref()
+            .ok_or_else(|| Error::Parse("gemini: path missing".into()))?;
         let content = fs::read_to_string(path)?;
         let session: GeminiSession = serde_json::from_str(&content)
             .map_err(|e| Error::Parse(format!("gemini json: {e}")))?;
@@ -95,24 +98,28 @@ impl Scanner for GeminiScanner {
                 if let Some(user) = user_msg {
                     let user_text = extract_text(user);
                     let gemini_text = extract_text(msg);
-                    
-                    let combined_text = format!("### User\n{}\n\n### Gemini\n{}", user_text, gemini_text);
+
+                    let combined_text =
+                        format!("### User\n{}\n\n### Gemini\n{}", user_text, gemini_text);
                     let ts = DateTime::parse_from_rfc3339(&user.timestamp)
                         .or_else(|_| DateTime::parse_from_rfc3339(&msg.timestamp))
                         .ok()
                         .map(|dt| dt.with_timezone(&Utc));
-                    
+
                     let chunk_index = chunks.len() as u32;
                     let chunk_id = Chunk::make_id(Source::Gemini, &item.source_id, chunk_index);
-                    
+
                     let mut extra = serde_json::json!({
                         "session_id": session.session_id,
                         "project_hash": session.project_hash,
                     });
-                    
+
                     if let Some(tokens) = &msg.tokens {
                         if let Some(thoughts) = tokens.thoughts {
-                             extra.as_object_mut().unwrap().insert("thought_tokens".into(), thoughts.into());
+                            extra
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("thought_tokens".into(), thoughts.into());
                         }
                     }
 
@@ -129,7 +136,7 @@ impl Scanner for GeminiScanner {
                         links: Links::default(),
                         extra,
                     });
-                    
+
                     user_msg = None;
                 }
             }
@@ -140,7 +147,8 @@ impl Scanner for GeminiScanner {
 }
 
 fn extract_text(msg: &GeminiMessage) -> String {
-    msg.content.iter()
+    msg.content
+        .iter()
         .filter_map(|p| p.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n")

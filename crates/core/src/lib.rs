@@ -20,11 +20,11 @@ pub use source::{RetentionPolicy, Source, SourceKind};
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecallIntent {
-    /// Prioritizes definitions, SourceKind::Code, and symbol-bounded chunks.
+    /// Prioritizes definitions, `SourceKind::Code`, and symbol-bounded chunks.
     Symbol,
-    /// Prioritizes \"Why\" logic, SourceKind::Markdown, and project specs.
+    /// Prioritizes \"Why\" logic, `SourceKind::Markdown`, and project specs.
     Narrative,
-    /// Prioritizes execution evidence, SourceKind::Probe, and error logs.
+    /// Prioritizes execution evidence, `SourceKind::Probe`, and error logs.
     Trace,
     /// The default balanced hybrid weight.
     #[default]
