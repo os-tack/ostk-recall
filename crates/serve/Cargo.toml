@@ -1,0 +1,32 @@
+[package]
+name = "ostk-recall-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ostk-recall-serve"
+path = "src/main.rs"
+
+[dependencies]
+ostk-recall-core = { workspace = true }
+ostk-recall-embed = { workspace = true }
+ostk-recall-store = { workspace = true }
+ostk-recall-pipeline = { workspace = true }
+ostk-recall-query = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

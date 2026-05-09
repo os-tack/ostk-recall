@@ -9,6 +9,7 @@ members = [
     "crates/query",
     "crates/mcp",
     "crates/cli",
+    "crates/serve",
 ]
 
 [workspace.package]
