@@ -97,6 +97,10 @@ mod tests {
                     .unwrap_or_else(|_| e.path())
                     .to_string_lossy()
                     .into_owned()
+                    // Windows: walkdir returns native separators (\); tests
+                    // assert against POSIX-style paths. Normalize so the same
+                    // assertions work on both platforms.
+                    .replace('\\', "/")
             })
             .collect();
         names.sort();
