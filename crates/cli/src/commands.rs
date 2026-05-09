@@ -473,12 +473,22 @@ pub async fn serve(
     Ok(())
 }
 
-/// Listen on a UNIX socket and trigger a background `scan` on each connection.
+/// Listen for scan-trigger pokes from a local single-operator surface and
+/// trigger a background `scan` on each connection.
 ///
-/// Trust model: this is a local single-operator surface. The only access
-/// control is the filesystem permissions on `path` — there is no message
-/// protocol, no auth, no audit. Do not bind this socket inside a directory
-/// that other system users can reach. It is intended for the operator's own
+/// Transport branches by platform:
+/// - **Unix**: `AF_UNIX` socket bound at `path`. Filesystem permissions on
+///   `path` are the only access control — do not bind inside a directory
+///   that other system users can reach.
+/// - **Windows**: Named pipe at `\\.\pipe\ostk-recall-{stem}`, where
+///   `{stem}` is `path.file_stem()`. Named pipes are the closest semantic
+///   match to `AF_UNIX` (local-only, no other-user reach by default) and
+///   tokio supports them natively. The `path` itself is not created on
+///   disk; it just seeds the pipe name so different daemons get different
+///   pipes.
+///
+/// In both cases this is a single-operator local surface — no message
+/// protocol, no auth, no audit. It is intended for the operator's own
 /// `ostk-recall serve` daemon to receive scan-trigger pokes (e.g. from a
 /// file-watcher), not for multi-tenant or networked use.
 ///
@@ -492,44 +502,89 @@ async fn run_socket_listener(
     config_path: PathBuf,
     embedder: Arc<dyn ChunkEmbedder>,
 ) -> Result<()> {
-    use tokio::net::UnixListener;
     use tokio::sync::Mutex;
-
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-
-    let listener = UnixListener::bind(path)?;
-    tracing::info!(path = %path.display(), "listening for scan triggers");
-
     let scan_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
-    loop {
-        match listener.accept().await {
-            Ok((_stream, _addr)) => {
-                let scan_lock = Arc::clone(&scan_lock);
-                let config_path = config_path.clone();
-                let embedder = Arc::clone(&embedder);
-                tokio::spawn(async move {
-                    let guard = match scan_lock.try_lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            tracing::warn!("scan trigger received while a scan is already in flight; dropping");
-                            return;
-                        }
-                    };
-                    tracing::info!("scan trigger received");
-                    if let Err(e) = scan(&config_path, embedder, None, false).await {
-                        tracing::error!(error = %e, "background scan failed");
-                    } else {
-                        tracing::info!("background scan complete");
-                    }
-                    drop(guard);
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "socket accept failed");
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixListener;
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let listener = UnixListener::bind(path)?;
+        tracing::info!(path = %path.display(), "listening for scan triggers (unix socket)");
+
+        loop {
+            match listener.accept().await {
+                Ok((_stream, _addr)) => {
+                    spawn_scan_trigger(&scan_lock, &config_path, &embedder);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "socket accept failed");
+                }
             }
         }
     }
+
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("trigger");
+        let pipe_name = format!(r"\\.\pipe\ostk-recall-{stem}");
+        // first_pipe_instance(true) on the FIRST create only; subsequent
+        // instances inherit security from the existing pipe namespace and
+        // must omit it (tokio doc-comment behavior). Each accepted connect
+        // consumes the current server instance, so we immediately spin up
+        // the next one before handing the connected pipe to the spawn.
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
+        tracing::info!(pipe = %pipe_name, "listening for scan triggers (named pipe)");
+
+        loop {
+            match server.connect().await {
+                Ok(()) => {
+                    let connected = server;
+                    server = ServerOptions::new().create(&pipe_name)?;
+                    spawn_scan_trigger(&scan_lock, &config_path, &embedder);
+                    drop(connected);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "named pipe connect failed");
+                    // Re-create the listener so a transient error doesn't
+                    // wedge the loop on a half-broken instance.
+                    server = ServerOptions::new().create(&pipe_name)?;
+                }
+            }
+        }
+    }
+}
+
+/// Shared scan-trigger handler — used by both the `AF_UNIX` and Named Pipe
+/// listeners. Spawns a tokio task that grabs the `scan_lock` (`try_lock` so
+/// we drop concurrent triggers instead of queueing them) and runs `scan`.
+fn spawn_scan_trigger(
+    scan_lock: &Arc<tokio::sync::Mutex<()>>,
+    config_path: &Path,
+    embedder: &Arc<dyn ChunkEmbedder>,
+) {
+    let scan_lock = Arc::clone(scan_lock);
+    let config_path = config_path.to_path_buf();
+    let embedder = Arc::clone(embedder);
+    tokio::spawn(async move {
+        let Ok(guard) = scan_lock.try_lock() else {
+            tracing::warn!("scan trigger received while a scan is already in flight; dropping");
+            return;
+        };
+        tracing::info!("scan trigger received");
+        if let Err(e) = scan(&config_path, embedder, None, false).await {
+            tracing::error!(error = %e, "background scan failed");
+        } else {
+            tracing::info!("background scan complete");
+        }
+        drop(guard);
+    });
 }
