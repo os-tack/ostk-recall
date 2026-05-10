@@ -19,32 +19,47 @@ your data off-box.
 
 ## Status
 
-Pre-alpha. Core plumbing is in.
+Pre-alpha but functional. Used in production by the maintainer's own stack.
 
 Works today:
 
 - Seven source scanners (markdown, code, claude_code, file_glob, zip_export,
   gemini, ostk_project composite).
-- Four MCP tools (`recall`, `recall_link`, `recall_stats`, `recall_audit`).
+- Five MCP tools — `recall`, `recall_link`, `recall_stats`, `recall_audit`,
+  and `recall_fault` (synthesizes hits into virtual-memory pages for
+  haystack's [`mem.fault_recall`](https://github.com/os-tack/haystack)
+  driver-relay path).
 - Hybrid retrieval with RRF fusion over LanceDB's dense and Tantivy BM25
   indexes, plus an optional cross-encoder rerank pass (fastembed-rs;
   default `jina-reranker-v1-turbo-en`).
 - Idempotent re-ingest via `chunk_id = sha256(source:source_id:chunk_index)`
   and LanceDB `merge_insert`.
+- File-watcher (`ostk-recall watch`) that pokes a running `serve` whenever
+  edits land under any configured source path. Path-aware incremental
+  ingest: ~250 ms from save to corpus, opt-in via `[watch].mode = "incremental"`
+  in config (default `legacy` runs a full re-scan per kick for safe
+  rollout).
+- Two daemon modes that share `corpus.lance` via Lance MVCC: read-only
+  driver mode (`ostk-recall serve --stdio`, kernel-managed by haystack)
+  and read-write standalone mode (`ostk-recall serve`, operator-managed
+  with the scan-trigger socket the watcher pokes).
 
 Deferred:
 
 - Tree-sitter aware code chunking (line-window fallback today).
 - ChatGPT export scanner (zip layout differs from Claude exports).
-- Live ingest / file-watcher (scan is one-shot today).
+- Per-file offset cursors for incremental scan of `claude_code` and
+  `gemini` (append-only JSONL falls back to full-source scan when poked
+  via the watcher; everything else gets the per-path speedup).
 
 ## Install
 
 ### From a release tarball
 
-Pre-built binaries (Linux x86_64, macOS arm64) ship with every tagged
-release: <https://github.com/os-tack/ostk-recall/releases>. Untar, drop
-the binary on `$PATH`, done.
+Pre-built binaries for Linux x86_64, macOS arm64, and Windows x86_64 ship
+with every tagged release:
+<https://github.com/os-tack/ostk-recall/releases>. Untar (or unzip on
+Windows), drop the binary on `$PATH`, done.
 
 ### From source
 
@@ -93,7 +108,25 @@ and all tunables.
 ostk-recall init                # create corpus root, download model
 ostk-recall scan                # ingest configured sources
 ostk-recall verify              # reconcile counts across store + manifest
-ostk-recall serve --stdio       # MCP server on stdio
+ostk-recall serve --stdio       # MCP server on stdio (driver mode, RO)
+ostk-recall serve               # standalone w/ scan-trigger socket (RW)
+ostk-recall watch               # file-watcher → poke standalone serve
+```
+
+### Live updates
+
+`serve` (no `--stdio`) binds a Unix socket at `corpus.root/recall.sock`
+that accepts scan-trigger pokes. Run `watch` next to it and edits under
+any configured source path get debounced and re-ingested without
+manual re-scan. Add to your config:
+
+```toml
+[watch]
+enabled = true
+# debounce_ms defaults: 800 ms (Linux), 1200 ms (Windows), 1500 ms (macOS).
+# projects = ["notes", "docs"]   # optional allowlist; defaults to all sources.
+mode = "incremental"             # opt-in path-aware ingest (~250 ms save → corpus).
+                                 # default "legacy" runs a full re-scan per kick.
 ```
 
 The Makefile wraps the same loop:
@@ -127,6 +160,7 @@ make serve
 | `recall`       | `{ query: string, project?: string, source?: string, since?: rfc3339, limit?: 1..100 }`                      |
 | `recall_link`  | `{ chunk_id: string }` — returns the chunk plus its parent chain                                             |
 | `recall_stats` | `{}` — returns total count, breakdown by source, model info, last-scan timestamp                             |
+| `recall_fault` | `{ query: string, intent?: "symbol"\|"narrative"\|"trace"\|"general", limit?: int, max_per_source_id?: int }` — synthesizes hits into named virtual-memory pages; haystack's `mem.fault_recall` calls this |
 | `recall_audit` | `{ sql: string }` — raw SELECT over the SQLite `audit_events` table (ostk_project sources only; single statement) |
 
 ## Hook into clients
@@ -179,14 +213,20 @@ Edit `.mcp.json` at user or project level:
 
 ### haystack (llmOS)
 
-Add one line to your HUMANFILE (`~/.ostk/HUMANFILE` or project-local):
+**haystack v6.0.0+** ships with `fcp-recall` baked into the driver
+defaults — `mem.fault_recall` and the `recall` family route through
+`ostk-recall serve --stdio` automatically. Just have `ostk-recall` on
+`$PATH`. No HUMANFILE entry needed.
+
+For pre-v6 haystack or other ostk-shaped projects, register manually
+via HUMANFILE (`~/.ostk/HUMANFILE` or project-local):
 
 ```
 DRIVER mine fcp ostk-recall serve --stdio
 ```
 
-haystack's `ostk _relay` already wraps any stdio MCP subprocess into a Unix
-socket — no kernel change needed. The `mine` verb shows up on next boot.
+haystack's driver-relay wraps any stdio MCP subprocess into a Unix
+socket — no kernel change needed. The verb shows up on next boot.
 
 ## Embedder options
 
@@ -216,24 +256,47 @@ query on CPU, ~80 MB to the model cache. Opt out with
 ## Architecture
 
 ```
-  sources ──► scanners ──► pipeline ──► store ──► query ──► MCP
-   (fs)       (.rs x7)    (embed +     (LanceDB   (hybrid   (stdio
-                          chunk +       + SQLite)  + RRF +   server)
-                          merge)                   rerank)
+                                           ┌─► MCP (stdio, RO)  ──► clients
+  sources ──► scanners ──► pipeline ──► store
+   (fs)       (.rs x7)    (embed +     (LanceDB   ▲
+              ▲           chunk +      + SQLite)  │
+              │           merge)                  │
+              │                                   │
+              └─── scan_paths ◄─── trigger.sock ◄─┘
+                   (per-path)      (line-delim    │
+                                    UTF-8)        │
+                                                  │
+              fs events ──► watch ────────────────┘
+              (debounced)
 ```
 
-Embedder (model2vec-rs) ▶ Store (LanceDB vector + Tantivy BM25; SQLite
-manifest + audit) ▶ Pipeline (scan ▶ chunk ▶ embed ▶ `merge_insert`) ▶
-Query (dense + BM25 with RRF fusion, then optional fastembed-rs
-cross-encoder rerank) ▶ MCP (stdio server, four tools).
+**Read path** (kernel agents → corpus): `serve --stdio` runs as the
+`fcp-recall` driver under haystack; `recall_fault` MCP tool synthesizes
+hits into virtual-memory pages.
 
-See [`docs/architecture.md`](./docs/architecture.md) for the full writeup.
+**Write path** (operator edits → corpus): `serve` (no `--stdio`) binds
+`recall.sock`; `watch` debounces filesystem events and pokes the socket
+with the changed paths; `Pipeline::scan_paths` does per-path ingest.
+Read and write daemons share `corpus.lance` via Lance MVCC.
+
+Stack: model2vec-rs (embedder) ▶ LanceDB vector + Tantivy BM25 (store)
++ SQLite (manifest + audit) ▶ pipeline (scan ▶ chunk ▶ embed ▶
+`merge_insert`) ▶ query (dense + BM25 with RRF fusion, then optional
+fastembed-rs cross-encoder rerank) ▶ MCP server (five tools).
+
+See [`docs/architecture.md`](./docs/architecture.md) and
+[`docs/spec/driver-protocol.md`](./docs/spec/driver-protocol.md) for the
+full writeups.
 
 ## Roadmap
 
 - Tree-sitter aware code chunking.
 - ChatGPT export scanner.
-- Live file-watcher ingest loop.
+- Per-file offset cursors so `claude_code` and `gemini` benefit from
+  path-aware incremental scan (today they fall back to full-source
+  scan on watcher kicks).
+- Flip `[watch].mode` default from `legacy` to `incremental` after
+  field bake-in.
 - Alternate embedder backends (ONNX, Candle).
 
 ## Development
