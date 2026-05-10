@@ -48,12 +48,14 @@ pub trait Scanner: Send + Sync {
         cfg: &'a SourceConfig,
         paths: &'a [PathBuf],
     ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
-        Box::new(self.discover(cfg).filter(move |item| match item {
-            Ok(it) => it
-                .path
-                .as_deref()
-                .is_some_and(|p| paths.iter().any(|q| q == p)),
-            Err(_) => true, // propagate errors so caller sees them
+        Box::new(self.discover(cfg).filter(move |item| {
+            match item {
+                Ok(it) => it
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| paths.iter().any(|q| q == p)),
+                Err(_) => true, // propagate errors so caller sees them
+            }
         }))
     }
 }
