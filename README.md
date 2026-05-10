@@ -290,13 +290,12 @@ full writeups.
 
 ## Roadmap
 
-- Tree-sitter aware code chunking.
-- ChatGPT export scanner.
-- Per-file offset cursors so `claude_code` and `gemini` benefit from
-  path-aware incremental scan (today they fall back to full-source
-  scan on watcher kicks).
-- Flip `[watch].mode` default from `legacy` to `incremental` after
-  field bake-in.
+- Symbol-aware chunking for non-Rust source ([#11](https://github.com/os-tack/ostk-recall/issues/11)). Rust is already done — `code` scanner shells out to `fcp-rust` (rust-analyzer) for symbol-bounded chunks. Python / Go / JS are next; tree-sitter is the likely vehicle.
+- ChatGPT export scanner ([#12](https://github.com/os-tack/ostk-recall/issues/12)). Today's `zip_export` only handles Claude.ai exports; ChatGPT's zip layout differs.
+- Per-file offset cursors so `claude_code` and `gemini` benefit from path-aware incremental scan ([#13](https://github.com/os-tack/ostk-recall/issues/13)). Speed item, not correctness — content-addressed chunk_ids mean today's full re-parse is idempotent, just wasteful.
+- MCP transport diversity — HTTP / SSE per the 2025-06-18 spec ([#14](https://github.com/os-tack/ostk-recall/issues/14)). stdio-only today.
+- Retrieval feedback loop — query log + citation tracking, future personal reranker ([#15](https://github.com/os-tack/ostk-recall/issues/15)).
+- Flip `[watch].mode` default from `legacy` to `incremental` after field bake-in.
 - Alternate embedder backends (ONNX, Candle).
 
 ## Development
