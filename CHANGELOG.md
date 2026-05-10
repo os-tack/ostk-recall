@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## v0.1.7 — Path-aware incremental scan (EPIC gh#8)
+
+Closes the loop between editor save and `recall_fault`: the watcher now
+emits debounced changed paths over the trigger socket, and `serve`
+dispatches per-path ingest instead of full corpus re-scan. Save → 200 ms
+debounce → ~50 ms scan of the changed file → corpus updated. Kernel
+agents calling `recall_fault` from any session see the fresh chunk
+within ~250 ms of the save.
+
+### Added
+
+- `Scanner::discover_paths(cfg, paths)` trait method on
+  `ostk_recall_core::Scanner`. Default impl walks `discover()` and
+  filters by component-wise path match (`q == p || q.starts_with(p)`),
+  so directory-yielding scanners (`OstkProjectScanner`-style) work
+  correctly even without an override. Per-scanner overrides on
+  markdown / code / file_glob / ostk_project / zip_export skip the
+  walk for O(|paths|) instead of O(|tree|). `claude_code` and
+  `gemini` defer to default-filter — append-only JSONL needs the
+  per-file offset cursor follow-up.
+
+- `Pipeline::scan_paths(sources, paths)` — async per-path ingest. Groups
+  paths by `[[sources]]` they fall under (a single path can match
+  multiple sources, e.g. `code` + `markdown` rooted at the same
+  directory; both fire). Honors `RetentionPolicy` for delete events:
+  `Delete` purges corpus rows, `Stale` marks chunks inactive, `Keep`
+  tombstones ledger only.
+
+- `commands::scan_paths` CLI wrapper mirroring `commands::scan` for
+  remote callers (the trigger-socket dispatch path).
+
+- `WatchConfig::mode: WatchMode` (`Legacy | Incremental`, default
+  `Legacy`). When `Incremental`, the watcher writes line-delimited
+  matched paths over the trigger socket and `serve` dispatches
+  `Pipeline::scan_paths`. Empty body = legacy "scan all" remains the
+  fallback in both directions, so old↔new mixes degrade cleanly to
+  full re-scan instead of silent under-indexing.
+
+- `IngestDb::tombstone_chunks_by_path` — public helper used by the
+  delete-event branch in `Pipeline::scan_paths`.
+
+### Changed
+
+- `kick_trigger_socket` in `crates/cli/src/commands.rs` now writes
+  paths + half-shutdown to signal EOF when called with a non-empty
+  slice. The `kick_trigger_socket(_, &[])` shape is the explicit
+  legacy poke (empty body), preserving the v0.1.6 wire shape.
+
+- Scan-trigger listener (`run_socket_listener`) now reads the connected
+  stream up to EOF (2 s deadline, 64 KiB cap) and dispatches to
+  `Pipeline::scan_paths` when paths are present, falls back to
+  `scan(...)` on empty body, read error, timeout, oversize frame, or
+  non-UTF-8 byte. Legacy fallback is load-bearing in 5 places — any
+  malformed frame degrades to full re-scan, never silent
+  under-indexing of the changed file.
+
+### Migration
+
+`[watch].mode = "incremental"` is opt-in for this release. Existing
+configs without a `mode` field default to `Legacy` (current behavior).
+The default flips to `Incremental` in a follow-up minor version after
+field bake-in.
+
 ## v0.1.6 — Remove redundant `crates/serve` proof-of-concept
 
 Cleanup release. No public API change.
