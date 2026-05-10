@@ -53,9 +53,100 @@ pub trait Scanner: Send + Sync {
                 Ok(it) => it
                     .path
                     .as_deref()
-                    .is_some_and(|p| paths.iter().any(|q| q == p)),
+                    .is_some_and(|p| paths.iter().any(|q| q == p || q.starts_with(p))),
                 Err(_) => true, // propagate errors so caller sees them
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::SourceKind;
+
+    /// Scratch scanner whose `discover` yields one directory-level item.
+    /// Used to verify the trait default's `starts_with` branch — without
+    /// the refinement (gh#10), `discover_paths` would silently drop the
+    /// directory item when callers ask about files inside it.
+    struct DirYieldingScanner {
+        dir: PathBuf,
+    }
+
+    impl Scanner for DirYieldingScanner {
+        fn kind(&self) -> SourceKind {
+            SourceKind::OstkProject
+        }
+
+        fn discover<'a>(
+            &'a self,
+            _cfg: &'a SourceConfig,
+        ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
+            Box::new(std::iter::once(Ok(SourceItem {
+                source_id: self.dir.to_string_lossy().into_owned(),
+                path: Some(self.dir.clone()),
+                ..SourceItem::default()
+            })))
+        }
+
+        fn parse(&self, _item: SourceItem) -> Result<Vec<Chunk>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn discover_paths_default_matches_directory_for_inner_files() {
+        let dir = PathBuf::from("/tmp/X");
+        let scanner = DirYieldingScanner { dir: dir.clone() };
+        let cfg = SourceConfig {
+            kind: SourceKind::OstkProject,
+            project: Some("scratch".into()),
+            paths: vec![dir.to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec![],
+        };
+
+        let requested = vec![dir.join("a.txt"), dir.join("b.txt")];
+        let yielded: Vec<SourceItem> = scanner
+            .discover_paths(&cfg, &requested)
+            .filter_map(Result::ok)
+            .collect();
+
+        assert_eq!(
+            yielded.len(),
+            1,
+            "directory item matches inner-file requests exactly once"
+        );
+        assert_eq!(yielded[0].path.as_deref(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn discover_paths_default_does_not_match_unrelated_paths() {
+        let dir = PathBuf::from("/tmp/X");
+        let scanner = DirYieldingScanner { dir: dir.clone() };
+        let cfg = SourceConfig {
+            kind: SourceKind::OstkProject,
+            project: Some("scratch".into()),
+            paths: vec![dir.to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec![],
+        };
+
+        // /tmp/Y/a.txt is unrelated; /tmp/Xtra/a.txt would byte-prefix
+        // /tmp/X but `Path::starts_with` is component-wise so it must
+        // also be rejected.
+        let requested = vec![
+            PathBuf::from("/tmp/Y/a.txt"),
+            PathBuf::from("/tmp/Xtra/a.txt"),
+        ];
+        let yielded: Vec<SourceItem> = scanner
+            .discover_paths(&cfg, &requested)
+            .filter_map(Result::ok)
+            .collect();
+
+        assert!(
+            yielded.is_empty(),
+            "no inner-file matches => no item yielded"
+        );
     }
 }
