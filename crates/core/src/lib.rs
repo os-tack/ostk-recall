@@ -13,7 +13,9 @@ pub mod source;
 pub mod types;
 
 pub use chunk::{Chunk, Links};
-pub use config::{Config, CorpusConfig, EmbedderConfig, RerankerConfig, SourceConfig, WatchConfig};
+pub use config::{
+    Config, CorpusConfig, EmbedderConfig, RerankerConfig, SourceConfig, WatchConfig, WatchMode,
+};
 pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};

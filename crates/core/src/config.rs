@@ -109,6 +109,32 @@ pub struct WatchConfig {
     /// or `claude_code` that scan often anyway).
     #[serde(default)]
     pub projects: Vec<String>,
+    /// Trigger wire mode. `legacy` (default this release) sends
+    /// connect-and-close pokes — server runs a full scan. `incremental`
+    /// sends the debounced changed paths over the socket as line-delimited
+    /// UTF-8; the server scans only those paths via `Pipeline::scan_paths`.
+    #[serde(default)]
+    pub mode: WatchMode,
+}
+
+/// Wire-format selector for the watcher → serve scan-trigger socket.
+///
+/// Default is [`WatchMode::Legacy`] for the first release that ships path
+/// frames so users opt in explicitly. The default flips to `Incremental`
+/// in a follow-up release once the per-path scan path bakes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub enum WatchMode {
+    /// Connect-and-close. Server treats this as "scan all sources" — the
+    /// behavior shipped before path-aware triggers existed. Reading the
+    /// stream on the server side observes empty body and falls back to
+    /// the legacy full-pipeline scan.
+    #[default]
+    Legacy,
+    /// Send the debounced changed paths over the socket as line-delimited
+    /// UTF-8, terminated by EOF. The server reads the frame and dispatches
+    /// to `Pipeline::scan_paths` for a per-path scan.
+    Incremental,
 }
 
 /// Per-platform debounce defaults. The OS event backends differ enough
@@ -147,6 +173,7 @@ impl Default for WatchConfig {
             debounce_ms: default_debounce_ms(),
             socket: None,
             projects: Vec::new(),
+            mode: WatchMode::default(),
         }
     }
 }
@@ -510,5 +537,76 @@ extensions = ["rs"]
 "#;
         let cfg: Config = toml::from_str(body).unwrap();
         assert!(cfg.sources[0].ignore.is_empty());
+    }
+
+    #[test]
+    fn watch_mode_defaults_to_legacy() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let w = cfg.watch.unwrap();
+        assert_eq!(w.mode, WatchMode::Legacy);
+    }
+
+    #[test]
+    fn watch_mode_legacy_round_trip() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+mode = "legacy"
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert_eq!(cfg.watch.unwrap().mode, WatchMode::Legacy);
+    }
+
+    #[test]
+    fn watch_mode_incremental_round_trip() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+mode = "incremental"
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert_eq!(cfg.watch.unwrap().mode, WatchMode::Incremental);
+    }
+
+    #[test]
+    fn watch_mode_unknown_value_rejected() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[watch]
+enabled = true
+mode = "burst"
+"#;
+        let err = toml::from_str::<Config>(body).unwrap_err().to_string();
+        assert!(
+            err.contains("burst") || err.contains("unknown") || err.contains("variant"),
+            "got: {err}"
+        );
     }
 }

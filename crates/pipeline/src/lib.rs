@@ -302,9 +302,7 @@ impl Pipeline {
             if matched.is_empty() {
                 continue;
             }
-            let stats = self
-                .ingest_paths_for_source(*scanner, cfg, &matched)
-                .await;
+            let stats = self.ingest_paths_for_source(*scanner, cfg, &matched).await;
             out.push((label, stats));
         }
         Ok(out)
@@ -785,10 +783,7 @@ mod tests {
         ];
         let per = pipeline
             .scan_paths(
-                &[
-                    (&md_scanner, &md_cfg),
-                    (&code_scanner, &code_cfg),
-                ],
+                &[(&md_scanner, &md_cfg), (&code_scanner, &code_cfg)],
                 &paths,
             )
             .await
@@ -839,7 +834,10 @@ mod tests {
         assert!(per.is_empty(), "no source matched, no per-source entry");
 
         let after = pipeline.store().row_count().await.unwrap();
-        assert_eq!(after, before, "no upserts when path lies outside every source");
+        assert_eq!(
+            after, before,
+            "no upserts when path lies outside every source"
+        );
     }
 
     #[tokio::test]

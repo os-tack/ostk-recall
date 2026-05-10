@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind};
+use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode};
 use ostk_recall_mcp::Server;
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
@@ -580,10 +580,18 @@ pub async fn serve(
 /// `ostk-recall serve` daemon to receive scan-trigger pokes (e.g. from a
 /// file-watcher), not for multi-tenant or networked use.
 ///
+/// Wire format: line-delimited UTF-8 paths, terminated by writer EOF.
+/// Empty body = legacy "scan all sources" (back-compat with the
+/// pre-path-frame watcher). Non-empty body = scan only those paths via
+/// [`Pipeline::scan_paths`]. Frame is capped at [`MAX_TRIGGER_FRAME_BYTES`]
+/// — anything larger logs a warning and falls back to legacy scan-all
+/// (defensive; the watcher's debounce + per-batch split should never
+/// produce that much).
+///
 /// Concurrency: at most one scan is in-flight. Connections that arrive
 /// while a scan is running are accepted (so the client does not block on
-/// `connect`) and immediately closed without spawning a new scan. This
-/// prevents racing scans from corrupting orphan tracking, and bounds
+/// `connect`); the body is read but the spawn drops if the lock is held,
+/// preventing racing scans from corrupting orphan tracking and bounding
 /// spawn-per-connection memory pressure.
 async fn run_socket_listener(
     path: &Path,
@@ -604,8 +612,9 @@ async fn run_socket_listener(
 
         loop {
             match listener.accept().await {
-                Ok((_stream, _addr)) => {
-                    spawn_scan_trigger(&scan_lock, &config_path, &embedder);
+                Ok((mut stream, _addr)) => {
+                    let paths = read_trigger_paths(&mut stream).await;
+                    spawn_scan_trigger(&scan_lock, &config_path, &embedder, paths);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "socket accept failed");
@@ -635,9 +644,10 @@ async fn run_socket_listener(
         loop {
             match server.connect().await {
                 Ok(()) => {
-                    let connected = server;
+                    let mut connected = server;
                     server = ServerOptions::new().create(&pipe_name)?;
-                    spawn_scan_trigger(&scan_lock, &config_path, &embedder);
+                    let paths = read_trigger_paths(&mut connected).await;
+                    spawn_scan_trigger(&scan_lock, &config_path, &embedder, paths);
                     drop(connected);
                 }
                 Err(e) => {
@@ -649,6 +659,90 @@ async fn run_socket_listener(
             }
         }
     }
+}
+
+/// Maximum trigger frame size in bytes. Frames larger than this log a
+/// warning and fall back to legacy scan-all. Sized to absorb a few
+/// hundred path lines — well above any debounced batch the watcher
+/// produces in practice (debounced + per-source filter + per-batch
+/// split in `kick_trigger_socket`).
+const MAX_TRIGGER_FRAME_BYTES: usize = 64 * 1024;
+
+/// Read a single scan-trigger frame off `stream`, capped at
+/// [`MAX_TRIGGER_FRAME_BYTES`]. The frame is one UTF-8 path per line,
+/// LF-terminated, with writer EOF closing the frame. Returns the paths
+/// in the order they were written.
+///
+/// Empty body (immediate writer close) returns an empty vec — the
+/// caller treats that as a legacy "scan all sources" poke.
+///
+/// Errors and oversize frames are converted to "empty paths" with a
+/// warning log — the legacy fallback is the right behavior on every
+/// observable error mode (read error, oversize, non-UTF-8 byte, missing
+/// final newline). The escape hatch is load-bearing for backward compat:
+/// a malformed body should never wedge the daemon.
+///
+/// Read deadline: 2 s after first byte of the body. The watcher writes
+/// the whole frame and shuts down its write half immediately (a single
+/// syscall worth of bytes for any realistic batch); 2 s is generous
+/// even on a swap-thrashing host. Without a deadline a hung writer
+/// could pin the accept thread; with the deadline we just fall back to
+/// legacy scan-all and accept the next connection.
+async fn read_trigger_paths<R>(stream: &mut R) -> Vec<PathBuf>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::with_capacity(1024);
+    let read_result = tokio::time::timeout(Duration::from_secs(2), async {
+        // read_to_end on a tokio reader returns Ok when the writer half
+        // shuts down (EOF). Cap collected bytes ourselves rather than
+        // using take(N).read_to_end, so we can detect overflow vs honest
+        // exact-N frames.
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > MAX_TRIGGER_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trigger frame exceeded cap",
+                ));
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "trigger frame read failed; falling back to legacy scan-all");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!("trigger frame read timed out; falling back to legacy scan-all");
+            return Vec::new();
+        }
+    }
+
+    let body = match std::str::from_utf8(&buf) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "trigger frame contained non-UTF-8 bytes; falling back to legacy scan-all");
+            return Vec::new();
+        }
+    };
+
+    body.lines()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// `ostk-recall watch` — run a file-watcher that pokes the scan-trigger
@@ -759,26 +853,39 @@ pub async fn watch(config_path: &Path) -> Result<()> {
         "scan-trigger watcher started"
     );
 
+    let mode = watch_cfg.mode;
     while let Some(result) = rx.recv().await {
         match result {
             Ok(events) => {
-                let interesting = events.iter().any(|ev| {
-                    ev.event
-                        .paths
-                        .iter()
-                        .any(|p| matches_watched_root(p, &watched_roots))
-                });
-                if !interesting {
+                // Collect every matched path across the debounced batch.
+                // The same predicate that decides whether to kick decides
+                // which paths go on the wire. Dedup preserves first-seen
+                // order — line-delimited frame is order-insensitive but a
+                // stable order makes test assertions and log output
+                // friendlier.
+                let mut matched: Vec<PathBuf> = Vec::new();
+                for ev in &events {
+                    for p in &ev.event.paths {
+                        if matches_watched_root(p, &watched_roots) && !matched.contains(p) {
+                            matched.push(p.clone());
+                        }
+                    }
+                }
+                if matched.is_empty() {
                     continue;
                 }
-                if let Err(e) = kick_trigger_socket(&socket_path).await {
+                let frame: &[PathBuf] = match mode {
+                    WatchMode::Legacy => &[],
+                    WatchMode::Incremental => &matched,
+                };
+                if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
                     tracing::warn!(
                         socket = %socket_path.display(),
                         error = %e,
                         "scan-trigger kick failed; will retry on next event"
                     );
                 } else {
-                    tracing::info!("scan-trigger kicked");
+                    tracing::info!(paths = frame.len(), "scan-trigger kicked");
                 }
             }
             Err(errors) => {
@@ -814,17 +921,91 @@ fn matches_watched_root(path: &Path, roots: &[(PathBuf, SourceConfig)]) -> bool 
     false
 }
 
-/// Connect to the scan-trigger surface and immediately close. Any
-/// successful connect counts as a poke (the serve listener accept-loop
-/// drops the stream and spawns the scan).
-async fn kick_trigger_socket(socket: &Path) -> Result<()> {
+/// Connect to the scan-trigger surface, write `paths` line-delimited
+/// (UTF-8 + LF), then half-close the writer to signal EOF. Empty `paths`
+/// is the legacy "scan all" poke (server reads zero bytes, treats as
+/// legacy). Non-empty paths drive the server's per-path scan.
+///
+/// Frame size is capped at [`MAX_TRIGGER_FRAME_BYTES`]; if `paths` would
+/// overflow, the batch is split across multiple connects (each connect
+/// is its own frame from the server's perspective). Paths containing
+/// embedded newlines are skipped — line-delimited frames cannot
+/// represent them.
+async fn kick_trigger_socket(socket: &Path, paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        // Legacy poke: connect-and-close, server reads empty body and
+        // runs full scan. Preserved for `[watch].mode = "legacy"` and as
+        // the cross-version compat wire.
+        kick_trigger_once(socket, &[]).await?;
+        return Ok(());
+    }
+
+    let mut batch: Vec<&PathBuf> = Vec::new();
+    let mut batch_bytes: usize = 0;
+    for p in paths {
+        let s = match p.to_str() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(path = %p.display(), "skipping non-UTF-8 path in trigger frame");
+                continue;
+            }
+        };
+        if s.contains('\n') {
+            tracing::warn!(
+                path = %p.display(),
+                "skipping path with embedded newline (line-delimited frame can't represent it)"
+            );
+            continue;
+        }
+        let line_bytes = s.len() + 1;
+        if line_bytes > MAX_TRIGGER_FRAME_BYTES {
+            // A single line over the cap can never fit in any frame.
+            tracing::warn!(
+                path = %p.display(),
+                len = line_bytes,
+                cap = MAX_TRIGGER_FRAME_BYTES,
+                "skipping path larger than trigger frame cap"
+            );
+            continue;
+        }
+        if batch_bytes + line_bytes > MAX_TRIGGER_FRAME_BYTES {
+            // Flush current batch before adding this line.
+            kick_trigger_once(socket, &batch).await?;
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch.push(p);
+        batch_bytes += line_bytes;
+    }
+    if !batch.is_empty() {
+        kick_trigger_once(socket, &batch).await?;
+    }
+    Ok(())
+}
+
+/// Write a single trigger frame: each path UTF-8 + `\n`, then half-close
+/// the writer so the server sees EOF and dispatches.
+async fn kick_trigger_once(socket: &Path, paths: &[&PathBuf]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     #[cfg(unix)]
     {
-        let _stream = tokio::net::UnixStream::connect(socket)
+        let mut stream = tokio::net::UnixStream::connect(socket)
             .await
             .with_context(|| format!("connect {}", socket.display()))?;
+        for p in paths {
+            if let Some(s) = p.to_str() {
+                stream.write_all(s.as_bytes()).await?;
+                stream.write_all(b"\n").await?;
+            }
+        }
+        // Half-close the writer so the server's reader observes EOF.
+        // Errors here are non-fatal — the bytes are already in the kernel
+        // buffer.
+        let _ = stream.shutdown().await;
         Ok(())
     }
+
     #[cfg(windows)]
     {
         let stem = socket
@@ -832,20 +1013,32 @@ async fn kick_trigger_socket(socket: &Path) -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("trigger");
         let pipe_name = format!(r"\\.\pipe\ostk-recall-{stem}");
-        let _client = tokio::net::windows::named_pipe::ClientOptions::new()
+        let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
             .open(&pipe_name)
             .with_context(|| format!("open pipe {pipe_name}"))?;
+        for p in paths {
+            if let Some(s) = p.to_str() {
+                client.write_all(s.as_bytes()).await?;
+                client.write_all(b"\n").await?;
+            }
+        }
+        // Named pipes don't have shutdown(); dropping the client closes
+        // the write side, which the server's read_to_end observes as EOF.
+        let _ = client.shutdown().await;
         Ok(())
     }
 }
 
 /// Shared scan-trigger handler — used by both the `AF_UNIX` and Named Pipe
 /// listeners. Spawns a tokio task that grabs the `scan_lock` (`try_lock` so
-/// we drop concurrent triggers instead of queueing them) and runs `scan`.
+/// we drop concurrent triggers instead of queueing them) and runs the
+/// appropriate scan: empty `paths` → legacy [`scan`] (back-compat poke);
+/// non-empty → [`scan_paths`] for the per-path code path.
 fn spawn_scan_trigger(
     scan_lock: &Arc<tokio::sync::Mutex<()>>,
     config_path: &Path,
     embedder: &Arc<dyn ChunkEmbedder>,
+    paths: Vec<PathBuf>,
 ) {
     let scan_lock = Arc::clone(scan_lock);
     let config_path = config_path.to_path_buf();
@@ -855,12 +1048,229 @@ fn spawn_scan_trigger(
             tracing::warn!("scan trigger received while a scan is already in flight; dropping");
             return;
         };
-        tracing::info!("scan trigger received");
-        if let Err(e) = scan(&config_path, embedder, None, false).await {
+        let result = if paths.is_empty() {
+            tracing::info!("scan trigger received (legacy scan-all)");
+            scan(&config_path, embedder, None, false).await.map(|_| ())
+        } else {
+            tracing::info!(paths = paths.len(), "scan trigger received (per-path)");
+            scan_paths(&config_path, embedder, &paths, false)
+                .await
+                .map(|_| ())
+        };
+        if let Err(e) = result {
             tracing::error!(error = %e, "background scan failed");
         } else {
             tracing::info!("background scan complete");
         }
         drop(guard);
     });
+}
+
+#[cfg(all(test, unix))]
+mod trigger_wire_tests {
+    //! Wire-protocol tests for the scan-trigger socket. Cover the
+    //! line-delimited path frame end-to-end: read side, write side, and
+    //! a round-trip via a real Unix socket.
+    //!
+    //! Unix-only: the Windows arm uses Named Pipes which need a `serve`
+    //! daemon's `ServerOptions::create` to even bind. The protocol is
+    //! identical (read until EOF on writer half-shutdown), so the
+    //! Unix-side tests cover the wire contract.
+
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{UnixListener, UnixStream};
+
+    #[tokio::test]
+    async fn read_trigger_paths_empty_body_returns_empty_vec() {
+        // Simulate connect-and-close: writer shuts down without sending
+        // any bytes. This is the legacy poke shape.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_trigger_paths(&mut stream).await
+        });
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        client.shutdown().await.unwrap();
+        drop(client);
+
+        let paths = server.await.unwrap();
+        assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_trigger_paths_three_paths_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_trigger_paths(&mut stream).await
+        });
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        client
+            .write_all(b"/a/b.rs\n/c/d.md\n/e/f.txt\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        drop(client);
+
+        let paths = server.await.unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/a/b.rs"),
+                PathBuf::from("/c/d.md"),
+                PathBuf::from("/e/f.txt"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_trigger_paths_oversized_frame_falls_back_to_legacy() {
+        // 64 KiB + 1 of payload should trip the cap and return Vec::new().
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_trigger_paths(&mut stream).await
+        });
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        // One absurdly long path line — easier to trip the cap than
+        // 64 KiB of small lines and verifies the cap, not the line count.
+        let mut huge = vec![b'x'; MAX_TRIGGER_FRAME_BYTES + 1];
+        huge.push(b'\n');
+        let _ = client.write_all(&huge).await;
+        let _ = client.shutdown().await;
+        drop(client);
+
+        let paths = server.await.unwrap();
+        assert!(
+            paths.is_empty(),
+            "oversize frame should fall back to legacy scan-all"
+        );
+    }
+
+    #[tokio::test]
+    async fn kick_trigger_socket_legacy_writes_empty_body() {
+        // Watcher in legacy mode passes an empty path slice. The server
+        // should observe a connection with zero body bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_trigger_paths(&mut stream).await
+        });
+
+        kick_trigger_socket(&sock, &[]).await.unwrap();
+
+        let paths = server.await.unwrap();
+        assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kick_trigger_socket_writes_each_path_line_delimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_trigger_paths(&mut stream).await
+        });
+
+        let payload = vec![
+            PathBuf::from("/tmp/one.rs"),
+            PathBuf::from("/tmp/two.md"),
+            PathBuf::from("/tmp/three.txt"),
+        ];
+        kick_trigger_socket(&sock, &payload).await.unwrap();
+
+        let paths = server.await.unwrap();
+        assert_eq!(paths, payload);
+    }
+
+    #[tokio::test]
+    async fn kick_trigger_socket_skips_paths_with_embedded_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_trigger_paths(&mut stream).await
+        });
+
+        // Path with embedded \n must be filtered so the line-delimited
+        // frame stays parseable on the server side.
+        let bad = PathBuf::from("/tmp/a\nfile.rs");
+        let good = PathBuf::from("/tmp/clean.rs");
+        kick_trigger_socket(&sock, &[bad, good.clone()])
+            .await
+            .unwrap();
+
+        let paths = server.await.unwrap();
+        assert_eq!(paths, vec![good]);
+    }
+
+    #[tokio::test]
+    async fn kick_trigger_socket_splits_oversized_batch_across_connects() {
+        // 100 paths × ~1 KiB each easily exceeds the 64 KiB cap. Each
+        // batch must arrive whole on its own connect; sum should equal
+        // input.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("trigger.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Each path is ~750 bytes — 100 of them is ~75 KiB, must split
+        // into ≥2 connects.
+        let prefix = "/tmp/split/".to_string() + &"x".repeat(700);
+        let payload: Vec<PathBuf> = (0..100)
+            .map(|i| PathBuf::from(format!("{prefix}/{i:03}.rs")))
+            .collect();
+        let total = payload.len();
+
+        let server = tokio::spawn(async move {
+            let mut all = Vec::new();
+            let mut connect_count = 0usize;
+            // Each connect is a full frame. Stop accepting once we've
+            // received every input path or hit a generous safety cap.
+            while all.len() < total && connect_count < 8 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let batch = read_trigger_paths(&mut stream).await;
+                all.extend(batch);
+                connect_count += 1;
+            }
+            (all, connect_count)
+        });
+
+        kick_trigger_socket(&sock, &payload).await.unwrap();
+
+        let (got, connects) = server.await.unwrap();
+        assert!(connects >= 2, "expected ≥2 connects, got {connects}");
+        assert_eq!(got, payload);
+    }
+}
+
+#[cfg(test)]
+mod watch_mode_tests {
+    use super::WatchMode;
+    use ostk_recall_core::WatchConfig;
+
+    #[test]
+    fn watch_mode_default_is_legacy() {
+        let w = WatchConfig::default();
+        assert_eq!(w.mode, WatchMode::Legacy);
+    }
 }
