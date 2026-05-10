@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## v0.1.6 — Remove redundant `crates/serve` proof-of-concept
+
+Cleanup release. No public API change.
+
+### Removed
+
+- `crates/serve/` workspace member. This was a standalone
+  `ostk-recall-serve` binary speaking a custom JSON-RPC `recall.fault`
+  protocol, built mid-development before the maintainer realized the
+  haystack kernel-driver protocol IS MCP and that `ostk-recall serve
+  --stdio` (the existing CLI subcommand backed by `crates/mcp`) was the
+  correct daemon entry point. The `recall_fault` MCP tool added to
+  `crates/mcp` in v0.1.5 superseded the standalone binary; nothing in
+  the production stack ever called `ostk-recall-serve`.
+
+The CLI subcommand `ostk-recall serve --stdio` (in `crates/cli`) is
+unchanged — that's the production daemon haystack v6.0.0 spawns.
+
 ## v0.1.5 — Move serde result/parameter types to `ostk-recall-core` (cut #3 prep)
 
 Preparation for haystack →1846 cut #3 (daemonize the recall surface as a
