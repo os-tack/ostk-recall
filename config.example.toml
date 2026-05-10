@@ -5,7 +5,10 @@
 # See `ostk-recall --help` for CLI.
 
 [corpus]
-# Where the LanceDB table and DuckDB files live.
+# Where the LanceDB corpus, SQLite ingest manifest, and audit event log
+# live. The path is shell-expanded (`~` → home, `$VAR` → env). The serve
+# daemon also binds `<root>/recall.sock` for scan-trigger pokes from the
+# watcher (see [watch] below).
 root = "~/.local/share/ostk-recall"
 
 [embedder]
@@ -14,10 +17,10 @@ root = "~/.local/share/ostk-recall"
 # Switching models requires `ostk-recall init --force` + full re-scan.
 model = "potion-retrieval-32M"
 
-# Cross-encoder reranker (Phase H). After hybrid (dense + BM25 + RRF) returns
-# a top-N candidate pool, the reranker scores each (query, doc) pair jointly
+# Cross-encoder reranker. After hybrid (dense + BM25 + RRF) returns a
+# top-N candidate pool, the reranker scores each (query, doc) pair jointly
 # and re-orders. Adds ~150 ms per query (CPU) and ~80 MB to the model cache.
-# Omit this block to keep the default (enabled, JINA Turbo English).
+# Omit this block entirely to keep the default (enabled, JINA Turbo English).
 [reranker]
 enabled = true                              # set false to skip the rerank pass
 model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
@@ -40,10 +43,17 @@ project = "claude-code-history"
 paths = ["~/.claude/projects"]      # scanner walks every <slug>/*.jsonl
 
 [[sources]]
+kind = "gemini"
+project = "gemini-cli-history"
+paths = ["~/.gemini/tmp"]           # walks every <hash>/chats/session-*.json
+
+[[sources]]
 kind = "ostk_project"
 project = "haystack"
-paths = ["~/projects/haystack"]     # expands to decisions, needles, audit,
-                                     # conversations, specs, code under .ostk/
+paths = ["~/projects/haystack"]     # composite — expands to decisions,
+                                     # needles, audit, conversations,
+                                     # sessions, memory, specs, code
+                                     # under .ostk/
 
 [[sources]]
 kind = "code"
@@ -69,16 +79,59 @@ kind = "zip_export"
 project = "claude-ai-exports"
 paths = ["~/Downloads/claude-data-export-*.zip"]
 
+# ──────────────────────────────────────────────────────────────────────
 # Optional file-watcher. Pokes the running `ostk-recall serve` daemon's
-# scan-trigger socket whenever a debounced batch of events lands under
-# any watched source path. Run with `ostk-recall watch` (separate
-# process from `serve`). When omitted, the watcher is disabled and
-# `ostk-recall watch` exits at startup.
+# scan-trigger socket whenever a debounced batch of FS events lands
+# under any watched source path. Run with `ostk-recall watch` in a
+# separate process from `ostk-recall serve` (the writer-side daemon
+# that binds <corpus.root>/recall.sock).
+#
+# When omitted, the watcher is disabled and `ostk-recall watch` exits
+# at startup with a clear message.
+#
+# Recommended-source guidance (best practice — see comments below):
+# include sources where saves represent intent to re-index (codebases,
+# notes, plans). EXCLUDE sources whose files are written continuously
+# by the LLM tools you're using — claude_code, gemini, and the
+# self-writing parts of ostk_project (.ostk/journal.jsonl, epoch
+# seals) — otherwise the watcher fires constantly.
 #
 # [watch]
-# enabled = true            # opt in (default false)
-# debounce_ms = 1500        # coalesce bursty edits into one trigger
-# # socket = "..."          # rare; defaults to corpus.root/recall.sock
-# # projects = ["notes"]    # optional [[sources]].project allowlist;
-# #                         # empty/omitted = watch every source.
+# enabled = true
+#
+# # `mode` (v0.1.7+) gates the per-path scan path:
+# #   "legacy"      (default) — every kick runs a full scan(...). Safe
+# #                 fallback that always picks up every source. Use
+# #                 while the path-aware path bakes.
+# #   "incremental" — kick passes the changed paths to scan_paths(...);
+# #                 ~250 ms save → corpus on Linux/Windows, slightly
+# #                 longer on macOS due to FSEvents floor. Per-path
+# #                 ingest. Empty body still falls back to legacy
+# #                 scan-all on either side, so old↔new versions
+# #                 across the wire degrade gracefully.
+# mode = "legacy"
+#
+# # Debounce window (ms). When omitted, defaults are per-platform —
+# # Linux 800 (inotify is precise; saves are the burst), macOS 1500
+# # (FSEvents adds a ~30 ms floor), Windows 1200 (ReadDirChangesW +
+# # IOCP batching + AV filter latency). Override only if your editor's
+# # save pattern doesn't behave well at the default.
+# # debounce_ms = 1500
+#
+# # Optional `[[sources]].project` allowlist. When empty/omitted, watches
+# # every source. When set, ONLY sources whose `project` tag matches drive
+# # the watcher — useful for skipping the noisy auto-writers above.
+# projects = [
+#     "notes",
+#     "experiments",
+#     "claude-plans",         # if you index ~/.claude/plans, watch it
+#     # NOT "claude-code-history"   — JSONL appends every LLM turn
+#     # NOT "gemini-cli-history"    — same churn pattern
+#     # NOT "haystack"               — .ostk/ self-writes on every verb
+# ]
+#
+# # Override the trigger socket path. Defaults to <corpus.root>/recall.sock
+# # which is the same path `serve` binds. Rare to need this — set only if
+# # you're running multiple corpora or non-default deployments.
+# # socket = "~/.local/share/ostk-recall/recall.sock"
 
