@@ -46,6 +46,124 @@ const CODE_EXTENSIONS: &[&str] = &["rs", "py", "ts", "tsx", "js", "go", "md"];
 /// Batch size used when streaming audit rows into `DuckDB`.
 const AUDIT_BATCH: usize = 500;
 
+/// Prefix marker on `SourceItem::source_id` signaling a path-routed
+/// single-file sub-scan. Format: `__route__:<sub_area>:<project_root>`.
+/// `path` carries the actual file path. The marker is opaque to peers
+/// and contained to this module.
+const ROUTE_PREFIX: &str = "__route__:";
+
+/// Sub-areas of a `.ostk/` project that `discover_paths` can route to.
+/// Each variant maps to one of the eight chunker entry points already
+/// invoked by `parse()` for a project-root SourceItem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubArea {
+    Decisions,
+    Needles,
+    Audit,
+    Conversations,
+    Sessions,
+    Memory,
+    Spec,
+    Code,
+}
+
+impl SubArea {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Decisions => "decisions",
+            Self::Needles => "needles",
+            Self::Audit => "audit",
+            Self::Conversations => "conversations",
+            Self::Sessions => "sessions",
+            Self::Memory => "memory",
+            Self::Spec => "spec",
+            Self::Code => "code",
+        }
+    }
+
+    fn from_marker(s: &str) -> Option<Self> {
+        match s {
+            "decisions" => Some(Self::Decisions),
+            "needles" => Some(Self::Needles),
+            "audit" => Some(Self::Audit),
+            "conversations" => Some(Self::Conversations),
+            "sessions" => Some(Self::Sessions),
+            "memory" => Some(Self::Memory),
+            "spec" => Some(Self::Spec),
+            "code" => Some(Self::Code),
+            _ => None,
+        }
+    }
+}
+
+/// Classify a path as belonging to one of the project's sub-areas, or
+/// `None` if it doesn't fall under any. `path` must be inside `root`.
+fn classify(root: &Path, path: &Path) -> Option<SubArea> {
+    let rel = path.strip_prefix(root).ok()?;
+    let comps: Vec<_> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match comps.as_slice() {
+        [first, rest @ ..] if first == ".ostk" => match rest {
+            [name] if name == "decisions.jsonl" => Some(SubArea::Decisions),
+            [name] if name == "audit.jsonl" || name == "journal.jsonl" => Some(SubArea::Audit),
+            [first2, ..] if first2 == "needles" => Some(SubArea::Needles),
+            [first2, ..] if first2 == "conversations" => Some(SubArea::Conversations),
+            [first2, ..] if first2 == "sessions" => Some(SubArea::Sessions),
+            [first2, ..] if first2 == "memory" => Some(SubArea::Memory),
+            _ => None,
+        },
+        [first, ..] if first == "docs" => {
+            // docs/spec/** or docs/draft/** with .md extension
+            if comps.len() >= 3 && (comps[1] == "spec" || comps[1] == "draft") && is_md(path) {
+                Some(SubArea::Spec)
+            } else {
+                None
+            }
+        }
+        [first, ..] if first == "src" || first == "crates" || first == "lib" => {
+            if has_code_extension(path) {
+                Some(SubArea::Code)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_md(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+}
+
+fn has_code_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|ext| CODE_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
+
+/// Build the `__route__:<sub_area>:<project_root>` source_id marker for
+/// a single-file sub-scan SourceItem.
+fn route_source_id(sub: SubArea, project_root: &Path) -> String {
+    format!(
+        "{ROUTE_PREFIX}{}:{}",
+        sub.marker(),
+        project_root.to_string_lossy()
+    )
+}
+
+/// Parse a route marker, returning `(sub_area, project_root)` if `s`
+/// has the expected shape.
+fn parse_route(s: &str) -> Option<(SubArea, PathBuf)> {
+    let rest = s.strip_prefix(ROUTE_PREFIX)?;
+    let (marker, root_str) = rest.split_once(':')?;
+    let sub = SubArea::from_marker(marker)?;
+    Some((sub, PathBuf::from(root_str)))
+}
+
 /// Composite `.ostk/` project scanner.
 ///
 /// Optional `events` sink receives the full audit firehose (not just
@@ -106,7 +224,59 @@ impl Scanner for OstkProjectScanner {
         Box::new(iter)
     }
 
+    /// Path-filtered override: classify each input path into one of the
+    /// project's sub-areas (decisions / needles / audit / conversations
+    /// / sessions / memory / spec / code) and yield a single-file
+    /// SourceItem tagged with a `__route__:<sub_area>:<root>` marker.
+    /// `parse` reads the marker and runs only the matching sub-routine
+    /// on that one file. Paths that don't classify under any sub-area
+    /// are dropped silently.
+    fn discover_paths<'a>(
+        &'a self,
+        cfg: &'a SourceConfig,
+        paths: &'a [PathBuf],
+    ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
+        let roots = match cfg.expanded_paths() {
+            Ok(v) => v,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
+        let project = cfg.project.clone();
+        let ignore_patterns = cfg.ignore.clone();
+
+        let owned_paths: Vec<PathBuf> = paths.to_vec();
+        let iter = owned_paths.into_iter().filter_map(move |path| {
+            if !path.is_file() {
+                return None;
+            }
+            let root = roots.iter().find(|r| path.starts_with(r))?;
+            let sub = classify(root, &path)?;
+            Some(Ok(SourceItem {
+                source_id: route_source_id(sub, root),
+                path: Some(path),
+                project: project.clone(),
+                bytes: None,
+                ignore: ignore_patterns.clone(),
+            }))
+        });
+        Box::new(iter)
+    }
+
     fn parse(&self, item: SourceItem) -> Result<Vec<Chunk>> {
+        // Path-routed dispatch: when source_id carries a route marker
+        // (set by `discover_paths`), `path` is a single file under the
+        // recorded project root and we only run the matching sub-routine.
+        if let Some((sub, root)) = parse_route(&item.source_id) {
+            let file = item
+                .path
+                .ok_or_else(|| Error::Parse("ostk_project: routed item missing path".into()))?;
+            let project = item
+                .project
+                .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()));
+            return self.parse_routed(sub, &root, &file, project.as_deref(), &item.ignore);
+        }
+
+        // Legacy `discover` flow: SourceItem.path is the project root,
+        // walk all eight sub-areas.
         let ignore_patterns = item.ignore.clone();
         let root = item
             .path
@@ -139,6 +309,34 @@ impl Scanner for OstkProjectScanner {
         out.extend(scan_code(&root, project.as_deref(), &ignore_patterns));
 
         Ok(out)
+    }
+}
+
+impl OstkProjectScanner {
+    /// Single-sub-area dispatch for path-routed SourceItems. Only the
+    /// chunker matching `sub` is invoked; sub-areas that already process
+    /// whole files (decisions, needles, audit, memory) re-read the
+    /// canonical project file (the input path is expected to point at
+    /// it). Sub-areas that walk a directory (conversations, sessions,
+    /// spec, code) parse exactly the requested file.
+    fn parse_routed(
+        &self,
+        sub: SubArea,
+        root: &Path,
+        file: &Path,
+        project: Option<&str>,
+        ignore_patterns: &[String],
+    ) -> Result<Vec<Chunk>> {
+        match sub {
+            SubArea::Decisions => scan_decisions(root, project),
+            SubArea::Needles => scan_needles(root, project),
+            SubArea::Audit => scan_audit(root, project, self.events.as_deref()),
+            SubArea::Memory => scan_memory(root, project),
+            SubArea::Conversations => scan_one_conversation(file, project),
+            SubArea::Sessions => scan_one_session(file, project),
+            SubArea::Spec => Ok(scan_one_spec(root, file, project)),
+            SubArea::Code => Ok(scan_one_code(root, file, project, ignore_patterns)),
+        }
     }
 }
 
@@ -580,6 +778,66 @@ fn scan_conversations(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> 
     Ok(chunks)
 }
 
+/// Single-file path-routed variant of `scan_conversations`. Parses
+/// exactly the requested `.jsonl` file; identical chunking shape.
+fn scan_one_conversation(path: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let abs = absolute(path);
+    let text = std::fs::read_to_string(path)?;
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut chunk_index: u32 = 0;
+    for (lineno, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: ConversationRow = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(line = lineno, error = %e, "conversations: bad jsonl");
+                continue;
+            }
+        };
+        let from = row.from.clone().unwrap_or_default();
+        let to = row.to.clone().unwrap_or_default();
+        let msg = row.msg.clone().unwrap_or_default();
+        if msg.trim().is_empty() {
+            continue;
+        }
+        let body = format!("{from} → {to}: {msg}");
+        let source_id = format!(
+            "{stem}:{}",
+            row.turn.unwrap_or_else(|| u64::from(chunk_index))
+        );
+        let chunk_id = Chunk::make_id(Source::OstkConversation, &source_id, chunk_index);
+        let sha256 = Chunk::content_hash(&body);
+        let links = Links {
+            file_path: Some(abs.clone()),
+            ..Links::default()
+        };
+        chunks.push(Chunk {
+            chunk_id,
+            source: Source::OstkConversation,
+            project: project.map(str::to_string),
+            source_id,
+            chunk_index,
+            ts: row.ts,
+            role: None,
+            text: body,
+            sha256,
+            links,
+            extra: serde_json::Value::Null,
+        });
+        chunk_index = chunk_index.saturating_add(1);
+    }
+    Ok(chunks)
+}
+
 // ─────────────────────────────── sessions ───────────────────────────────
 
 fn scan_sessions(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
@@ -605,6 +863,21 @@ fn scan_sessions(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
         chunks.extend(session_chunks);
     }
     Ok(chunks)
+}
+
+/// Single-file path-routed variant of `scan_sessions`. Parses exactly
+/// the requested `.jsonl` session file via the shared anthropic-session
+/// chunker; identical output shape.
+fn scan_one_session(path: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let source_id = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mtime = file_mtime_utc(path).ok();
+    parse_session_file(path, Source::OstkSession, &source_id, project, mtime)
 }
 
 // ──────────────────────────────── memory ────────────────────────────────
@@ -744,6 +1017,53 @@ fn scan_specs(root: &Path, project: Option<&str>, ignore_patterns: &[String]) ->
     chunks
 }
 
+/// Single-file path-routed variant of `scan_specs`. Parses exactly the
+/// requested `.md` file under `docs/spec` or `docs/draft`; identical
+/// chunking shape.
+fn scan_one_spec(root: &Path, path: &Path, project: Option<&str>) -> Vec<Chunk> {
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let source_id = path.strip_prefix(root).map_or_else(
+        |_| path.to_string_lossy().into_owned(),
+        |p| p.to_string_lossy().into_owned(),
+    );
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "specs: read");
+            return Vec::new();
+        }
+    };
+    let mtime = file_mtime_utc(path).ok();
+    let abs = absolute(path);
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut chunk_index: u32 = 0;
+    for seg in split_markdown(&text) {
+        let chunk_id = Chunk::make_id(Source::OstkSpec, &source_id, chunk_index);
+        let sha256 = Chunk::content_hash(&seg);
+        let links = Links {
+            file_path: Some(abs.clone()),
+            ..Links::default()
+        };
+        chunks.push(Chunk {
+            chunk_id,
+            source: Source::OstkSpec,
+            project: project.map(str::to_string),
+            source_id: source_id.clone(),
+            chunk_index,
+            ts: mtime,
+            role: None,
+            text: seg,
+            sha256,
+            links,
+            extra: serde_json::Value::Null,
+        });
+        chunk_index = chunk_index.saturating_add(1);
+    }
+    chunks
+}
+
 // ──────────────────────────────── code ──────────────────────────────────
 
 fn scan_code(root: &Path, project: Option<&str>, ignore_patterns: &[String]) -> Vec<Chunk> {
@@ -835,6 +1155,78 @@ fn scan_code(root: &Path, project: Option<&str>, ignore_patterns: &[String]) -> 
                 chunk_index = chunk_index.saturating_add(1);
             }
         }
+    }
+    chunks
+}
+
+/// Single-file path-routed variant of `scan_code`. Parses exactly the
+/// requested file using the same fcp-rust-then-line-window strategy
+/// as the multi-file walker. Drops files whose extension isn't allowed
+/// or that fail to read.
+fn scan_one_code(
+    root: &Path,
+    path: &Path,
+    project: Option<&str>,
+    _ignore_patterns: &[String],
+) -> Vec<Chunk> {
+    if !path.is_file() || !has_code_extension(path) {
+        return Vec::new();
+    }
+    let source_id = path.strip_prefix(root).map_or_else(
+        |_| path.to_string_lossy().into_owned(),
+        |p| p.to_string_lossy().into_owned(),
+    );
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "code: read");
+            return Vec::new();
+        }
+    };
+    let mtime = file_mtime_utc(path).ok();
+    let abs = absolute(path);
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut chunk_index: u32 = 0;
+
+    let is_rust = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| x.eq_ignore_ascii_case("rs"));
+    if is_rust {
+        if let Some(rust_chunks) =
+            fcp_rust::chunk_rust_file(path, &text, Source::Code, &source_id, project, mtime, &abs)
+        {
+            for mut c in rust_chunks {
+                c.chunk_index = chunk_index;
+                c.chunk_id = Chunk::make_id(Source::Code, &source_id, chunk_index);
+                chunks.push(c);
+                chunk_index = chunk_index.saturating_add(1);
+            }
+            return chunks;
+        }
+    }
+
+    for window in walk_and_window(&text, crate::code::WINDOW_LINES, crate::code::OVERLAP_LINES) {
+        let chunk_id = Chunk::make_id(Source::Code, &source_id, chunk_index);
+        let sha256 = Chunk::content_hash(&window);
+        let links = Links {
+            file_path: Some(abs.clone()),
+            ..Links::default()
+        };
+        chunks.push(Chunk {
+            chunk_id,
+            source: Source::Code,
+            project: project.map(str::to_string),
+            source_id: source_id.clone(),
+            chunk_index,
+            ts: mtime,
+            role: None,
+            text: window,
+            sha256,
+            links,
+            extra: serde_json::Value::Null,
+        });
+        chunk_index = chunk_index.saturating_add(1);
     }
     chunks
 }
@@ -1005,6 +1397,127 @@ mod tests {
                 .iter()
                 .any(|c| c.source == Source::OstkAuditSignificant)
         );
+    }
+
+    #[test]
+    fn discover_paths_routes_single_sub_area_spec() {
+        let tmp = TempDir::new().unwrap();
+        write_fixture(tmp.path());
+        // Add two more spec files so we can pass 3 paths for the same
+        // sub-area (the canonical fixture only has one).
+        std::fs::write(tmp.path().join("docs/spec/two.md"), "# two\n\nbody\n").unwrap();
+        std::fs::write(tmp.path().join("docs/spec/three.md"), "# three\n\nbody\n").unwrap();
+
+        let scanner = OstkProjectScanner::new();
+        let cfg = cfg_for(tmp.path(), Some("p"));
+        let paths = vec![
+            tmp.path().join("docs/spec/overview.md"),
+            tmp.path().join("docs/spec/two.md"),
+            tmp.path().join("docs/spec/three.md"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 3);
+        assert!(
+            items
+                .iter()
+                .all(|i| i.source_id.starts_with("__route__:spec:"))
+        );
+
+        // Each item parses to ≥1 chunk, all from the spec sub-area.
+        let mut all_chunks = Vec::new();
+        for item in items {
+            all_chunks.extend(scanner.parse(item).unwrap());
+        }
+        assert!(!all_chunks.is_empty());
+        assert!(all_chunks.iter().all(|c| c.source == Source::OstkSpec));
+    }
+
+    #[test]
+    fn discover_paths_routes_mixed_sub_areas() {
+        let tmp = TempDir::new().unwrap();
+        write_fixture(tmp.path());
+
+        let scanner = OstkProjectScanner::new();
+        let cfg = cfg_for(tmp.path(), Some("p"));
+        let paths = vec![
+            tmp.path().join(".ostk/decisions.jsonl"),
+            tmp.path().join(".ostk/needles/issues.jsonl"),
+            tmp.path().join("docs/spec/overview.md"),
+            tmp.path().join("src/main.rs"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 4);
+
+        // Each requested path produced exactly one routed item with a
+        // distinct sub-area marker.
+        let mut markers: Vec<_> = items
+            .iter()
+            .map(|i| i.source_id.split(':').nth(1).unwrap_or("").to_string())
+            .collect();
+        markers.sort();
+        assert_eq!(markers, vec!["code", "decisions", "needles", "spec"]);
+
+        // Parsing each item yields chunks only from the matching source.
+        for item in items {
+            let marker = item.source_id.split(':').nth(1).unwrap_or("").to_string();
+            let chunks = scanner.parse(item).unwrap();
+            let expected = match marker.as_str() {
+                "decisions" => Source::OstkDecision,
+                "needles" => Source::OstkNeedle,
+                "spec" => Source::OstkSpec,
+                "code" => Source::Code,
+                _ => panic!("unexpected marker: {marker}"),
+            };
+            assert!(!chunks.is_empty(), "marker {marker} produced no chunks");
+            assert!(
+                chunks.iter().all(|c| c.source == expected),
+                "marker {marker} leaked non-{expected:?} chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_paths_drops_path_outside_root() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_fixture(tmp.path());
+        std::fs::write(outside.path().join("stray.md"), "# x\n").unwrap();
+
+        let scanner = OstkProjectScanner::new();
+        let cfg = cfg_for(tmp.path(), Some("p"));
+        let paths = vec![
+            tmp.path().join("docs/spec/overview.md"),
+            outside.path().join("stray.md"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.starts_with("__route__:spec:"));
+    }
+
+    #[test]
+    fn discover_paths_drops_unclassified_path() {
+        let tmp = TempDir::new().unwrap();
+        write_fixture(tmp.path());
+        // A file at the project root, not under any sub-area.
+        std::fs::write(tmp.path().join("README.md"), "# r\n").unwrap();
+
+        let scanner = OstkProjectScanner::new();
+        let cfg = cfg_for(tmp.path(), Some("p"));
+        let paths = vec![tmp.path().join("README.md")];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert!(items.is_empty());
     }
 
     #[test]

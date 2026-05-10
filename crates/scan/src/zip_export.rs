@@ -78,6 +78,44 @@ impl Scanner for ZipExportScanner {
         Box::new(iter)
     }
 
+    /// Path-filtered override: each input path that matches one of the
+    /// configured zip globs yields a single `SourceItem` rooted at that
+    /// zip — i.e. "rescan that one zip" (whole-archive parse). Paths
+    /// that don't match any glob, or aren't files, are dropped silently.
+    fn discover_paths<'a>(
+        &'a self,
+        cfg: &'a SourceConfig,
+        paths: &'a [PathBuf],
+    ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
+        let plans: Vec<GlobPlan> = match plan_globs(&cfg.paths) {
+            Ok(v) => v,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
+        let project = cfg.project.clone();
+
+        let owned_paths: Vec<PathBuf> = paths.to_vec();
+        let iter = owned_paths.into_iter().filter_map(move |path| {
+            if !path.is_file() {
+                return None;
+            }
+            if !plans.iter().any(|p| p.matcher.is_match(&path)) {
+                return None;
+            }
+            let source_id = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some(Ok(SourceItem {
+                source_id,
+                path: Some(path),
+                project: project.clone(),
+                bytes: None,
+                ignore: Vec::new(),
+            }))
+        });
+        Box::new(iter)
+    }
+
     fn parse(&self, item: SourceItem) -> Result<Vec<Chunk>> {
         let path = item
             .path
@@ -297,6 +335,67 @@ mod tests {
         let scanner = ZipExportScanner;
         let cfg = cfg_glob(&pat);
         let items: Vec<_> = scanner.discover(&cfg).filter_map(Result::ok).collect();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn discover_paths_filters_to_input_set() {
+        let tmp = TempDir::new().unwrap();
+        let z1 = tmp.path().join("claude-data-export-2024.zip");
+        let z2 = tmp.path().join("claude-data-export-2025.zip");
+        let z3 = tmp.path().join("claude-data-export-2026.zip");
+        build_fixture_zip(&z1);
+        build_fixture_zip(&z2);
+        build_fixture_zip(&z3);
+        let pat = format!("{}/claude-data-export-*.zip", tmp.path().display());
+        let scanner = ZipExportScanner;
+        let cfg = cfg_glob(&pat);
+
+        let paths = vec![z1, z2, z3];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn discover_paths_drops_non_matching_glob() {
+        let tmp = TempDir::new().unwrap();
+        let zip_match = tmp.path().join("claude-data-export-2024.zip");
+        let zip_nope = tmp.path().join("other.zip");
+        build_fixture_zip(&zip_match);
+        build_fixture_zip(&zip_nope);
+        let pat = format!("{}/claude-data-export-*.zip", tmp.path().display());
+        let scanner = ZipExportScanner;
+        let cfg = cfg_glob(&pat);
+
+        let paths = vec![zip_match, zip_nope];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.contains("claude-data-export-2024"));
+    }
+
+    #[test]
+    fn discover_paths_drops_outside_glob_root() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let inside = tmp.path().join("claude-data-export-2024.zip");
+        let outside_zip = outside.path().join("claude-data-export-2025.zip");
+        build_fixture_zip(&inside);
+        build_fixture_zip(&outside_zip);
+        let pat = format!("{}/claude-data-export-*.zip", tmp.path().display());
+        let scanner = ZipExportScanner;
+        let cfg = cfg_glob(&pat);
+
+        let paths = vec![inside, outside_zip];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
         assert_eq!(items.len(), 1);
     }
 

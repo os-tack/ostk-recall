@@ -17,7 +17,7 @@
 //!
 //! See `split_markdown` for the pure helper; it has its own unit tests.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{
@@ -57,12 +57,7 @@ impl Scanner for MarkdownScanner {
             let project = project.clone();
             let root_for_rel = root.clone();
             walk_filtered(&root, &ignore_patterns)
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .is_some_and(|x| x.eq_ignore_ascii_case("md"))
-                })
+                .filter(|e| is_markdown(e.path()))
                 .map(move |entry| {
                     let path = entry.path().to_path_buf();
                     let source_id = relative_source_id(&root_for_rel, &path);
@@ -74,6 +69,42 @@ impl Scanner for MarkdownScanner {
                         ignore: Vec::new(),
                     })
                 })
+        });
+        Box::new(iter)
+    }
+
+    /// Path-filtered override: O(|paths|) instead of walking the tree.
+    /// Each input path is checked against expanded roots; on first match
+    /// it yields a `SourceItem` rooted there. Paths outside every root,
+    /// non-`.md` extensions, and missing files are dropped silently.
+    fn discover_paths<'a>(
+        &'a self,
+        cfg: &'a SourceConfig,
+        paths: &'a [PathBuf],
+    ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
+        let roots = match cfg.expanded_paths() {
+            Ok(v) => v,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
+        let project = cfg.project.clone();
+
+        let owned_paths: Vec<PathBuf> = paths.to_vec();
+        let iter = owned_paths.into_iter().filter_map(move |path| {
+            if !is_markdown(&path) {
+                return None;
+            }
+            if !path.is_file() {
+                return None;
+            }
+            let root = roots.iter().find(|r| path.starts_with(r))?;
+            let source_id = relative_source_id(root, &path);
+            Some(Ok(SourceItem {
+                source_id,
+                path: Some(path),
+                project: project.clone(),
+                bytes: None,
+                ignore: Vec::new(),
+            }))
         });
         Box::new(iter)
     }
@@ -123,6 +154,12 @@ impl Scanner for MarkdownScanner {
         }
         Ok(chunks)
     }
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| x.eq_ignore_ascii_case("md"))
 }
 
 /// Compute the `source_id` for a discovered file: path relative to the
@@ -411,6 +448,69 @@ Beta.
         let ids: Vec<&str> = items.iter().map(|i| i.source_id.as_str()).collect();
         assert!(ids.iter().any(|s| s.ends_with("one.md")));
         assert!(ids.iter().any(|s| s.ends_with("two.md")));
+    }
+
+    #[test]
+    fn discover_paths_filters_to_input_set() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        std::fs::write(tmp.path().join("a/one.md"), "# one\n").unwrap();
+        std::fs::write(tmp.path().join("a/two.md"), "# two\n").unwrap();
+        std::fs::write(tmp.path().join("a/three.md"), "# three\n").unwrap();
+
+        let scanner = MarkdownScanner;
+        let cfg = cfg_with(tmp.path(), "p");
+        let paths = vec![
+            tmp.path().join("a/one.md"),
+            tmp.path().join("a/two.md"),
+            tmp.path().join("a/three.md"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 3);
+        for item in &items {
+            assert!(item.path.is_some());
+        }
+    }
+
+    #[test]
+    fn discover_paths_drops_non_md() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.md"), "# n\n").unwrap();
+        std::fs::write(tmp.path().join("not-md.txt"), "skip").unwrap();
+
+        let scanner = MarkdownScanner;
+        let cfg = cfg_with(tmp.path(), "p");
+        let paths = vec![tmp.path().join("note.md"), tmp.path().join("not-md.txt")];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.ends_with("note.md"));
+    }
+
+    #[test]
+    fn discover_paths_drops_outside_root() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(root.path().join("inside.md"), "# i\n").unwrap();
+        std::fs::write(outside.path().join("outside.md"), "# o\n").unwrap();
+
+        let scanner = MarkdownScanner;
+        let cfg = cfg_with(root.path(), "p");
+        let paths = vec![
+            root.path().join("inside.md"),
+            outside.path().join("outside.md"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.ends_with("inside.md"));
     }
 
     #[test]

@@ -68,6 +68,39 @@ impl Scanner for FileGlobScanner {
         Box::new(iter)
     }
 
+    /// Path-filtered override: O(|paths| * |globs|) instead of walking
+    /// each glob's root. Each input path is tested against every
+    /// compiled `GlobSet`; on first match it yields a `SourceItem` with
+    /// `source_id` relative to that glob's walk root.
+    fn discover_paths<'a>(
+        &'a self,
+        cfg: &'a SourceConfig,
+        paths: &'a [PathBuf],
+    ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
+        let planned: Vec<GlobPlan> = match plan_globs(&cfg.paths) {
+            Ok(v) => v,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
+        let project = cfg.project.clone();
+
+        let owned_paths: Vec<PathBuf> = paths.to_vec();
+        let iter = owned_paths.into_iter().filter_map(move |path| {
+            if !path.is_file() {
+                return None;
+            }
+            let plan = planned.iter().find(|p| p.matcher.is_match(&path))?;
+            let source_id = relative_source_id(&plan.root, &path);
+            Some(Ok(SourceItem {
+                source_id,
+                path: Some(path),
+                project: project.clone(),
+                bytes: None,
+                ignore: Vec::new(),
+            }))
+        });
+        Box::new(iter)
+    }
+
     fn parse(&self, item: SourceItem) -> Result<Vec<Chunk>> {
         let path = item
             .path
@@ -331,6 +364,69 @@ mod tests {
                 .iter()
                 .all(|c| matches!(c.source, Source::FileGlob))
         );
+    }
+
+    #[test]
+    fn discover_paths_filters_to_input_set() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(tmp.path().join("docs/a.txt"), "alpha\n").unwrap();
+        std::fs::write(tmp.path().join("docs/b.txt"), "beta\n").unwrap();
+        std::fs::write(tmp.path().join("docs/c.txt"), "gamma\n").unwrap();
+        let pat = format!("{}/**/*.txt", tmp.path().display());
+        let scanner = FileGlobScanner;
+        let cfg = cfg_glob(&pat, "p");
+
+        let paths = vec![
+            tmp.path().join("docs/a.txt"),
+            tmp.path().join("docs/b.txt"),
+            tmp.path().join("docs/c.txt"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn discover_paths_drops_non_matching_glob() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(tmp.path().join("b.bin"), "skip\n").unwrap();
+        let pat = format!("{}/**/*.txt", tmp.path().display());
+        let scanner = FileGlobScanner;
+        let cfg = cfg_glob(&pat, "p");
+
+        let paths = vec![tmp.path().join("a.txt"), tmp.path().join("b.bin")];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.ends_with("a.txt"));
+    }
+
+    #[test]
+    fn discover_paths_drops_outside_glob_root() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("inside.txt"), "a\n").unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "b\n").unwrap();
+        let pat = format!("{}/**/*.txt", tmp.path().display());
+        let scanner = FileGlobScanner;
+        let cfg = cfg_glob(&pat, "p");
+
+        let paths = vec![
+            tmp.path().join("inside.txt"),
+            outside.path().join("outside.txt"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.ends_with("inside.txt"));
     }
 
     #[test]

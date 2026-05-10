@@ -21,7 +21,7 @@
 //! without a semantic adapter, plus standalone `.rs` files outside any
 //! Cargo workspace.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{
@@ -92,6 +92,47 @@ impl Scanner for CodeScanner {
                         ignore: Vec::new(),
                     })
                 })
+        });
+        Box::new(iter)
+    }
+
+    /// Path-filtered override: O(|paths|) instead of walking the tree.
+    /// Each input path must (a) live under one configured root and
+    /// (b) carry an extension in `cfg.extensions`. Mismatches and
+    /// non-files are dropped silently.
+    fn discover_paths<'a>(
+        &'a self,
+        cfg: &'a SourceConfig,
+        paths: &'a [PathBuf],
+    ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
+        let roots = match cfg.expanded_paths() {
+            Ok(v) => v,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
+        let extensions: Vec<String> = cfg
+            .extensions
+            .iter()
+            .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+        let project = cfg.project.clone();
+
+        let owned_paths: Vec<PathBuf> = paths.to_vec();
+        let iter = owned_paths.into_iter().filter_map(move |path| {
+            if !extension_matches(&path, &extensions) {
+                return None;
+            }
+            if !path.is_file() {
+                return None;
+            }
+            let root = roots.iter().find(|r| path.starts_with(r))?;
+            let source_id = relative_source_id(root, &path);
+            Some(Ok(SourceItem {
+                source_id,
+                path: Some(path),
+                project: project.clone(),
+                bytes: None,
+                ignore: Vec::new(),
+            }))
         });
         Box::new(iter)
     }
@@ -310,6 +351,67 @@ mod tests {
         let cfg = cfg_with(tmp.path(), &["rs"]);
         let items: Vec<_> = scanner.discover(&cfg).filter_map(Result::ok).collect();
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn discover_paths_filters_to_input_set() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/c.rs"), "fn c() {}\n").unwrap();
+
+        let scanner = CodeScanner;
+        let cfg = cfg_with(tmp.path(), &["rs"]);
+        let paths = vec![
+            tmp.path().join("src/a.rs"),
+            tmp.path().join("src/b.rs"),
+            tmp.path().join("src/c.rs"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn discover_paths_drops_extension_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/b.txt"), "skip\n").unwrap();
+
+        let scanner = CodeScanner;
+        let cfg = cfg_with(tmp.path(), &["rs"]);
+        let paths = vec![tmp.path().join("src/a.rs"), tmp.path().join("src/b.txt")];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.ends_with("a.rs"));
+    }
+
+    #[test]
+    fn discover_paths_drops_outside_root() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(root.path().join("inside.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(outside.path().join("outside.rs"), "fn y() {}\n").unwrap();
+
+        let scanner = CodeScanner;
+        let cfg = cfg_with(root.path(), &["rs"]);
+        let paths = vec![
+            root.path().join("inside.rs"),
+            outside.path().join("outside.rs"),
+        ];
+        let items: Vec<_> = scanner
+            .discover_paths(&cfg, &paths)
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].source_id.ends_with("inside.rs"));
     }
 
     #[test]
