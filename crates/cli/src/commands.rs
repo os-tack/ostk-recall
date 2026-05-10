@@ -592,9 +592,7 @@ async fn run_socket_listener(
 pub async fn watch(config_path: &Path) -> Result<()> {
     use std::time::Duration;
 
-    use notify_debouncer_full::{
-        DebounceEventResult, new_debouncer, notify::RecursiveMode,
-    };
+    use notify_debouncer_full::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;

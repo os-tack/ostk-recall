@@ -30,9 +30,9 @@ pub use ostk_recall_core::{
 };
 pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
-pub use rerank::{RerankerError, RerankerLike};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
+pub use rerank::{RerankerError, RerankerLike};
 pub use synthesis::Synthesizer;
 
 /// Orchestrator that owns the resources needed to answer recall queries.

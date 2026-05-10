@@ -487,7 +487,10 @@ enabled = true
 mystery = 7
 "#;
         let err = toml::from_str::<Config>(body).unwrap_err().to_string();
-        assert!(err.contains("mystery") || err.contains("unknown field"), "got: {err}");
+        assert!(
+            err.contains("mystery") || err.contains("unknown field"),
+            "got: {err}"
+        );
     }
 
     #[test]

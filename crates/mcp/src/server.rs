@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ostk_recall_query::{QueryEngine, QueryError, RecallParams, Synthesizer, SynthesizedPage};
+use ostk_recall_query::{QueryEngine, QueryError, RecallParams, SynthesizedPage, Synthesizer};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};

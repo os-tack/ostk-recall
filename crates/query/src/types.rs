@@ -10,6 +10,5 @@
 //! ostk-recall-query dep entirely.
 
 pub use ostk_recall_core::{
-    AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats,
-    SourceCount,
+    AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats, SourceCount,
 };
