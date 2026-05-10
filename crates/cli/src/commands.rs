@@ -275,6 +275,92 @@ pub async fn scan(
     })
 }
 
+/// Path-aware sibling of [`scan`]. Loads the same config + scanners,
+/// then dispatches each input path to the matching `[[sources]]` via
+/// [`Pipeline::scan_paths`]. Sources whose roots don't parent any input
+/// are silent (no entry in the returned per-source vector).
+///
+/// Skips delete handling — gh#7 covers tombstone semantics for paths
+/// that yield no `SourceItem` (file removed, gitignore'd, etc.).
+pub async fn scan_paths(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    paths: &[PathBuf],
+    dry_run: bool,
+) -> Result<ScanOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    std::fs::create_dir_all(&root)?;
+
+    let store = Arc::new(
+        CorpusStore::open_or_create(&root, embedder.dim())
+            .await
+            .map_err(|e| anyhow!("open corpus store: {e}"))?,
+    );
+    let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
+    let pipeline = Pipeline::new(store, ingest, Arc::clone(&embedder)).with_dry_run(dry_run);
+
+    let markdown = MarkdownScanner;
+    let code = CodeScanner;
+    let claude_code = ClaudeCodeScanner;
+    let file_glob = FileGlobScanner;
+    let zip_export = ZipExportScanner;
+    let gemini = GeminiScanner;
+
+    let events_db: Option<Arc<EventsDb>> = if cfg
+        .sources
+        .iter()
+        .any(|s| matches!(s.kind, SourceKind::OstkProject))
+    {
+        Some(Arc::new(
+            EventsDb::open(&root).map_err(|e| anyhow!("open events db: {e}"))?,
+        ))
+    } else {
+        None
+    };
+    let ostk_project = events_db
+        .as_ref()
+        .map_or_else(OstkProjectScanner::new, |db| {
+            OstkProjectScanner::new().with_events_db(Arc::clone(db))
+        });
+
+    let pairs: Vec<(&dyn Scanner, &SourceConfig)> = cfg
+        .sources
+        .iter()
+        .map(|source_cfg| {
+            let scanner: &dyn Scanner = match source_cfg.kind {
+                SourceKind::Markdown => &markdown,
+                SourceKind::Code => &code,
+                SourceKind::ClaudeCode => &claude_code,
+                SourceKind::FileGlob => &file_glob,
+                SourceKind::ZipExport => &zip_export,
+                SourceKind::OstkProject => &ostk_project,
+                SourceKind::Gemini => &gemini,
+            };
+            (scanner, source_cfg)
+        })
+        .collect();
+
+    let per_source = pipeline
+        .scan_paths(&pairs, paths)
+        .await
+        .map_err(|e| anyhow!("scan_paths: {e}"))?;
+
+    let mut totals = PipelineStats::default();
+    for (_, s) in &per_source {
+        totals = totals.merge(*s);
+    }
+
+    ostk_recall_scan::fcp_rust::drain_session_cache();
+
+    Ok(ScanOutcome {
+        per_source,
+        totals,
+        dry_run,
+    })
+}
+
 pub async fn scan_reingest(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,

@@ -4,6 +4,7 @@
 //! [`CorpusStore`], an [`IngestDb`], and something that can embed text
 //! (the [`ChunkEmbedder`] trait) — and wires a [`Scanner`] up to them.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -269,6 +270,165 @@ impl Pipeline {
         stats
     }
 
+    /// Path-aware ingest: group `paths` by source root, then per-source
+    /// dispatch through `scanner.discover_paths` → parse → chunk → embed →
+    /// upsert (same flow as [`Pipeline::ingest_source`] minus the orphan
+    /// sweep — delete handling is gh#7).
+    ///
+    /// `sources` carries the same `(&dyn Scanner, &SourceConfig)` pairs the
+    /// caller would pass to `ingest_source` for a full scan; the pipeline
+    /// fans out only to the sources whose expanded `paths` parent at least
+    /// one input. A single input path can match multiple sources (e.g.
+    /// `code` + `markdown` both rooted at `~/projects/foo`); both fire.
+    /// Per-source `extensions` filter still applies.
+    ///
+    /// Returns one `(label, PipelineStats)` per source that received work
+    /// (skipped sources are absent from the returned vector). Label format
+    /// matches CLI [`commands::scan`]: `project` if set, else
+    /// `<kind>[<index>]`.
+    pub async fn scan_paths(
+        &self,
+        sources: &[(&dyn Scanner, &SourceConfig)],
+        paths: &[PathBuf],
+    ) -> Result<Vec<(String, PipelineStats)>, PipelineError> {
+        let mut out = Vec::new();
+        for (i, (scanner, cfg)) in sources.iter().enumerate() {
+            let label = cfg
+                .project
+                .clone()
+                .unwrap_or_else(|| format!("{}[{i}]", cfg.kind.as_str()));
+
+            let matched = paths_under_source(cfg, paths);
+            if matched.is_empty() {
+                continue;
+            }
+            let stats = self
+                .ingest_paths_for_source(*scanner, cfg, &matched)
+                .await;
+            out.push((label, stats));
+        }
+        Ok(out)
+    }
+
+    /// Per-source path-filtered ingest. Mirrors [`Pipeline::ingest_source`]
+    /// but drives discovery via [`Scanner::discover_paths`] and skips the
+    /// orphan sweep (delete pass tracked separately as gh#7).
+    async fn ingest_paths_for_source(
+        &self,
+        scanner: &dyn Scanner,
+        cfg: &SourceConfig,
+        paths: &[PathBuf],
+    ) -> PipelineStats {
+        let mut stats = PipelineStats::default();
+        let mut to_embed: Vec<Chunk> = Vec::new();
+        let source_kind_str = scanner.kind().as_str();
+        let project = cfg.project.as_deref().unwrap_or("default");
+
+        for item_res in scanner.discover_paths(cfg, paths) {
+            let item = match item_res {
+                Ok(it) => it,
+                Err(e) => {
+                    tracing::warn!(error = %e, "discover_paths failed");
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+            stats.items_seen += 1;
+
+            // Tier 1: file-level metadata short-circuit (same as ingest_source).
+            if let Some(path) = &item.path {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    let size = meta.len() as i64;
+
+                    if let Ok(Some((old_mtime, old_size))) =
+                        self.ingest
+                            .get_source_metadata(source_kind_str, project, &item.source_id)
+                    {
+                        if old_mtime == mtime && old_size == size {
+                            if self
+                                .ingest
+                                .touch_source_chunks(
+                                    source_kind_str,
+                                    project,
+                                    &item.source_id,
+                                    &self.run_id,
+                                )
+                                .is_ok()
+                            {
+                                stats.items_skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let _ = self.ingest.update_source_metadata(
+                        source_kind_str,
+                        project,
+                        &item.source_id,
+                        mtime,
+                        size,
+                        &self.run_id,
+                    );
+                }
+            }
+
+            let chunks = match scanner.parse(item) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "parse failed");
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+            stats.chunks_emitted += chunks.len();
+
+            for chunk in chunks {
+                match self
+                    .ingest
+                    .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
+                {
+                    Ok(true) => {
+                        stats.chunks_skipped_dup += 1;
+                        let row = IngestChunkRow {
+                            chunk_id: chunk.chunk_id.clone(),
+                            source: chunk.source.as_str().to_string(),
+                            project: project.to_string(),
+                            source_id: chunk.source_id.clone(),
+                            chunk_index: chunk.chunk_index,
+                            content_sha256: chunk.sha256.clone(),
+                        };
+                        let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
+                    }
+                    Ok(false) => to_embed.push(chunk),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ingest dedupe check failed");
+                        stats.errors += 1;
+                    }
+                }
+            }
+        }
+
+        if !to_embed.is_empty() && !self.dry_run {
+            for batch in to_embed.chunks(EMBED_BATCH) {
+                match self.embed_and_persist(batch, project).await {
+                    Ok(n) => stats.chunks_upserted += n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "embed/persist batch failed");
+                        stats.errors += 1;
+                    }
+                }
+            }
+        }
+
+        stats
+    }
+
     async fn embed_and_persist(
         &self,
         batch: &[Chunk],
@@ -331,6 +491,38 @@ impl VerifyReport {
     pub const fn is_consistent(&self) -> bool {
         self.corpus_total == self.ingest_total
     }
+}
+
+/// Filter `paths` down to those that fall under one of `cfg`'s expanded
+/// roots AND match its per-source `extensions` (if any). Used by
+/// [`Pipeline::scan_paths`] to compute the per-source path subset before
+/// dispatching to `discover_paths`.
+fn paths_under_source(cfg: &SourceConfig, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let roots = match cfg.expanded_paths() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    paths
+        .iter()
+        .filter(|p| roots.iter().any(|root| path_under_root(p, root)))
+        .filter(|p| matches_extensions(p, &cfg.extensions))
+        .cloned()
+        .collect()
+}
+
+fn path_under_root(path: &Path, root: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    path.starts_with(&root)
+}
+
+fn matches_extensions(path: &Path, extensions: &[String]) -> bool {
+    if extensions.is_empty() {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| extensions.iter().any(|x| x == ext))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -509,6 +701,145 @@ mod tests {
 
         let count_after = pipeline.store().row_count().await.unwrap();
         assert_eq!(count_after, 0, "code chunks must be physically deleted");
+    }
+
+    #[tokio::test]
+    async fn scan_paths_direct_paths_upserts_only_those_files() {
+        use ostk_recall_scan::markdown::MarkdownScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+        // Add a third file we will NOT pass to scan_paths.
+        std::fs::write(
+            fixtures.path().join("ignored.md"),
+            "# Ignored\n\nshould not be ingested\n",
+        )
+        .unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = MarkdownScanner;
+        let cfg = cfg_for(fixtures.path());
+
+        let before = pipeline.store().row_count().await.unwrap();
+
+        let paths = vec![
+            fixtures.path().join("a.md"),
+            fixtures.path().join("sub/b.md"),
+        ];
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &paths)
+            .await
+            .unwrap();
+        assert_eq!(per.len(), 1, "one source matched");
+        let stats = per[0].1;
+        assert_eq!(stats.items_seen, 2, "exactly the 2 input files");
+        assert!(stats.chunks_emitted >= 3);
+        assert_eq!(stats.chunks_upserted, stats.chunks_emitted);
+        assert_eq!(stats.errors, 0);
+
+        let after = pipeline.store().row_count().await.unwrap();
+        assert_eq!(after - before, stats.chunks_upserted);
+    }
+
+    #[tokio::test]
+    async fn scan_paths_multi_source_path_fires_each_source() {
+        use ostk_recall_scan::code::CodeScanner;
+        use ostk_recall_scan::markdown::MarkdownScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        // One markdown file and one rust file under the same root.
+        std::fs::write(
+            fixtures.path().join("notes.md"),
+            "# Notes\n\nIntro.\n\n## Section\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixtures.path().join("main.rs"),
+            "fn main() { println!(\"hi\"); }\n",
+        )
+        .unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let md_scanner = MarkdownScanner;
+        let code_scanner = CodeScanner;
+        let md_cfg = SourceConfig {
+            kind: SourceKind::Markdown,
+            project: Some("md-proj".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec![],
+        };
+        let code_cfg = SourceConfig {
+            kind: SourceKind::Code,
+            project: Some("code-proj".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec!["rs".into()],
+        };
+
+        let paths = vec![
+            fixtures.path().join("notes.md"),
+            fixtures.path().join("main.rs"),
+        ];
+        let per = pipeline
+            .scan_paths(
+                &[
+                    (&md_scanner, &md_cfg),
+                    (&code_scanner, &code_cfg),
+                ],
+                &paths,
+            )
+            .await
+            .unwrap();
+        assert_eq!(per.len(), 2, "both sources fired");
+
+        let md_stats = per
+            .iter()
+            .find(|(l, _)| l == "md-proj")
+            .map(|(_, s)| *s)
+            .expect("md source stats");
+        let code_stats = per
+            .iter()
+            .find(|(l, _)| l == "code-proj")
+            .map(|(_, s)| *s)
+            .expect("code source stats");
+
+        // Markdown's `extensions` is empty so it sees both inputs but only
+        // ingests the .md (the rust file falls through `is_markdown`); code's
+        // ext filter narrows to the .rs.
+        assert!(md_stats.chunks_upserted >= 1);
+        assert_eq!(code_stats.items_seen, 1);
+        assert_eq!(code_stats.chunks_upserted, 1);
+        assert_eq!(md_stats.errors, 0);
+        assert_eq!(code_stats.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn scan_paths_path_outside_every_source_returns_empty() {
+        use ostk_recall_scan::markdown::MarkdownScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+        std::fs::write(outside.path().join("stray.md"), "# Stray\n\nbody\n").unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = MarkdownScanner;
+        let cfg = cfg_for(fixtures.path());
+
+        let before = pipeline.store().row_count().await.unwrap();
+        let paths = vec![outside.path().join("stray.md")];
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &paths)
+            .await
+            .unwrap();
+        assert!(per.is_empty(), "no source matched, no per-source entry");
+
+        let after = pipeline.store().row_count().await.unwrap();
+        assert_eq!(after, before, "no upserts when path lies outside every source");
     }
 
     #[tokio::test]
