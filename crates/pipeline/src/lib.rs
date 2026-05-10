@@ -4,6 +4,7 @@
 //! [`CorpusStore`], an [`IngestDb`], and something that can embed text
 //! (the [`ChunkEmbedder`] trait) — and wires a [`Scanner`] up to them.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -302,7 +303,10 @@ impl Pipeline {
             if matched.is_empty() {
                 continue;
             }
-            let stats = self.ingest_paths_for_source(*scanner, cfg, &matched).await;
+            let (mut stats, yielded) = self.ingest_paths_for_source(*scanner, cfg, &matched).await;
+            stats = self
+                .purge_missing_paths(cfg, &matched, &yielded, stats)
+                .await;
             out.push((label, stats));
         }
         Ok(out)
@@ -310,15 +314,22 @@ impl Pipeline {
 
     /// Per-source path-filtered ingest. Mirrors [`Pipeline::ingest_source`]
     /// but drives discovery via [`Scanner::discover_paths`] and skips the
-    /// orphan sweep (delete pass tracked separately as gh#7).
+    /// orphan sweep — missing-on-disk paths are handled separately by
+    /// [`Pipeline::purge_missing_paths`] (gh#7).
+    ///
+    /// Returns the per-source [`PipelineStats`] and the set of input
+    /// paths that `discover_paths` actually yielded a [`SourceItem`] for.
+    /// The caller diffs that set against `paths` to find missing-on-disk
+    /// candidates for the delete pass.
     async fn ingest_paths_for_source(
         &self,
         scanner: &dyn Scanner,
         cfg: &SourceConfig,
         paths: &[PathBuf],
-    ) -> PipelineStats {
+    ) -> (PipelineStats, HashSet<PathBuf>) {
         let mut stats = PipelineStats::default();
         let mut to_embed: Vec<Chunk> = Vec::new();
+        let mut yielded: HashSet<PathBuf> = HashSet::new();
         let source_kind_str = scanner.kind().as_str();
         let project = cfg.project.as_deref().unwrap_or("default");
 
@@ -331,6 +342,9 @@ impl Pipeline {
                     continue;
                 }
             };
+            if let Some(p) = &item.path {
+                yielded.insert(p.clone());
+            }
             stats.items_seen += 1;
 
             // Tier 1: file-level metadata short-circuit (same as ingest_source).
@@ -424,6 +438,98 @@ impl Pipeline {
             }
         }
 
+        (stats, yielded)
+    }
+
+    /// Delete-event branch of [`Pipeline::scan_paths`] (gh#7).
+    ///
+    /// For each input path under this source's roots that
+    /// `discover_paths` did NOT yield (file deleted, gitignored, or
+    /// extension-filtered out), purge the chunk family from the ledger
+    /// and apply the source's [`RetentionPolicy`] against the corpus
+    /// (delete or mark-stale). Paths that were never ingested fall
+    /// through as no-ops.
+    ///
+    /// Atomicity ordering mirrors [`Pipeline::ingest_source`]'s orphan
+    /// sweep: ledger tombstone first, then corpus mutation. A crash
+    /// between the two leaves the same shape of drift the existing
+    /// `verify` already detects (corpus row stranded with no active
+    /// ledger entry — recoverable via `--reingest`).
+    ///
+    /// `RetentionPolicy::Keep` sources skip the corpus side per the
+    /// orphan-sweep policy table; we still tombstone their ledger so a
+    /// later full scan won't see stale rows.
+    async fn purge_missing_paths(
+        &self,
+        cfg: &SourceConfig,
+        matched: &[PathBuf],
+        yielded: &HashSet<PathBuf>,
+        mut stats: PipelineStats,
+    ) -> PipelineStats {
+        if self.dry_run {
+            return stats;
+        }
+        let project = cfg.project.as_deref().unwrap_or("default");
+        let roots = match cfg.expanded_paths() {
+            Ok(r) => r,
+            Err(_) => return stats,
+        };
+        // Canonicalize roots once. relative_source_id below also
+        // canonicalizes the input path so the strip_prefix succeeds
+        // even on macOS where /var/folders symlinks to /private/var.
+        let canon_roots: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
+            .collect();
+        let retention = cfg.kind.retention_policy();
+
+        for path in matched {
+            if yielded.contains(path) {
+                continue;
+            }
+            let canon_path = canonicalize_lossy(path);
+            let source_id = relative_source_id(&canon_roots, &canon_path);
+            // Each (source, project, source_id) ledger row keys a chunk
+            // family. SourceKind expands to multiple Source variants
+            // (notably ostk_project), so iterate the kind's sources to
+            // catch all of them; mismatched variants tombstone nothing.
+            for src in cfg.kind.sources() {
+                let chunk_ids = match self.ingest.tombstone_chunks_by_path(
+                    src.as_str(),
+                    project,
+                    &source_id,
+                ) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!(error = %e, source = %src.as_str(), path = %path.display(), "tombstone failed");
+                        stats.errors += 1;
+                        continue;
+                    }
+                };
+                if chunk_ids.is_empty() {
+                    continue;
+                }
+                match retention {
+                    RetentionPolicy::Delete => match self.store.delete_chunks(&chunk_ids).await {
+                        Ok(_) => stats.chunks_purged += chunk_ids.len(),
+                        Err(e) => {
+                            tracing::warn!(error = %e, source = %src.as_str(), "corpus delete failed for missing path");
+                            stats.errors += 1;
+                        }
+                    },
+                    RetentionPolicy::Stale => {
+                        if let Err(e) = self.store.mark_chunks_stale(&chunk_ids).await {
+                            tracing::warn!(error = %e, source = %src.as_str(), "corpus stale-mark failed for missing path");
+                            stats.errors += 1;
+                        }
+                        stats.chunks_staled += chunk_ids.len();
+                    }
+                    RetentionPolicy::Keep => {
+                        // Ledger tombstoned above; corpus rows preserved.
+                    }
+                }
+            }
+        }
         stats
     }
 
@@ -509,9 +615,52 @@ fn paths_under_source(cfg: &SourceConfig, paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn path_under_root(path: &Path, root: &Path) -> bool {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = canonicalize_lossy(path);
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     path.starts_with(&root)
+}
+
+/// Canonicalize a path even if it doesn't exist on disk (delete-event
+/// case in [`Pipeline::purge_missing_paths`]). Falls back to
+/// `parent.canonicalize() + file_name` so the leading symlinks resolve
+/// the same way they do for paths whose target still exists. Without
+/// this, on macOS a deleted `/var/folders/...` path stays uncanonical
+/// while its still-existing root canonicalizes to `/private/var/...`,
+/// and `starts_with` falsely rejects it.
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return p;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(p) = std::fs::canonicalize(parent) {
+            return p.join(name);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Compute a `source_id` from an absolute path the same way the
+/// path-rooted scanners (markdown, code, file_glob) do — relative to the
+/// first matching configured root, joined with `/`. Used by
+/// [`Pipeline::purge_missing_paths`] (gh#7) to look up a chunk family in
+/// the ledger by `(source, project, source_id)` for delete-event
+/// handling. Sources whose `source_id` scheme is NOT path-relative
+/// (ostk_project route markers, zip_export archive keys) won't match the
+/// ledger and the tombstone collapses to a no-op — desired for the
+/// first-cut scope (append-only sources are deferred per EPIC gh#8).
+fn relative_source_id(roots: &[PathBuf], path: &Path) -> String {
+    for root in roots {
+        if let Ok(rel) = path.strip_prefix(root) {
+            return rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+        }
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn matches_extensions(path: &Path, extensions: &[String]) -> bool {
@@ -892,5 +1041,208 @@ mod tests {
             }
         }
         assert!(found_stale, "at least one chunk should be marked stale");
+    }
+
+    // gh#7 — delete-event handling in `Pipeline::scan_paths`
+    //
+    // Watch fires on a delete event → the path lands in the trigger
+    // payload → `scan_paths` should purge the corpus rows for that path.
+    // `code` retention is `Delete`, so we use it to assert physical
+    // corpus row count goes down.
+    #[tokio::test]
+    async fn scan_paths_delete_event_purges_corpus_for_code_source() {
+        use ostk_recall_scan::code::CodeScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        let code_path = fixtures.path().join("main.rs");
+        std::fs::write(&code_path, "fn main() { println!(\"hi\"); }").unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = CodeScanner;
+        let cfg = SourceConfig {
+            kind: SourceKind::Code,
+            project: Some("code-test".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec!["rs".into()],
+        };
+
+        // Initial ingest via scan_paths (single-path).
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[code_path.clone()])
+            .await
+            .unwrap();
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0].1.chunks_upserted, 1);
+        assert_eq!(pipeline.store().row_count().await.unwrap(), 1);
+
+        // Delete the file on disk; trigger payload still names it.
+        std::fs::remove_file(&code_path).unwrap();
+
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[code_path.clone()])
+            .await
+            .unwrap();
+        assert_eq!(per.len(), 1, "source still matched on input path");
+        let stats = per[0].1;
+        assert_eq!(stats.items_seen, 0, "discover_paths yielded nothing");
+        assert_eq!(
+            stats.chunks_purged, 1,
+            "missing-on-disk path purged 1 chunk"
+        );
+        assert_eq!(stats.errors, 0);
+        assert_eq!(
+            pipeline.store().row_count().await.unwrap(),
+            0,
+            "corpus row physically deleted under RetentionPolicy::Delete"
+        );
+
+        // verify_counts must not widen: corpus_total == ingest_total.
+        let report = pipeline.verify_counts().await.unwrap();
+        assert!(
+            report.is_consistent(),
+            "verify must not show drift after delete"
+        );
+        assert_eq!(report.corpus_total, 0);
+        assert_eq!(report.ingest_total, 0);
+    }
+
+    // gh#7 acceptance #3 — rename arrives as (old: Remove) + (new: Create)
+    // in the same trigger payload. First-cut behavior is delete-old +
+    // ingest-new.
+    #[tokio::test]
+    async fn scan_paths_rename_event_purges_old_and_ingests_new() {
+        use ostk_recall_scan::code::CodeScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        let old_path = fixtures.path().join("old.rs");
+        let new_path = fixtures.path().join("new.rs");
+        std::fs::write(&old_path, "fn old() { println!(\"old\"); }").unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = CodeScanner;
+        let cfg = SourceConfig {
+            kind: SourceKind::Code,
+            project: Some("rename-test".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec!["rs".into()],
+        };
+
+        pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[old_path.clone()])
+            .await
+            .unwrap();
+        assert_eq!(pipeline.store().row_count().await.unwrap(), 1);
+
+        // Simulate rename: old is gone, new exists, both in payload.
+        std::fs::rename(&old_path, &new_path).unwrap();
+        let payload = vec![old_path.clone(), new_path.clone()];
+
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &payload)
+            .await
+            .unwrap();
+        assert_eq!(per.len(), 1);
+        let stats = per[0].1;
+        assert_eq!(stats.items_seen, 1, "only new path yields");
+        assert_eq!(stats.chunks_upserted, 1, "new path ingested");
+        assert_eq!(stats.chunks_purged, 1, "old path purged");
+        assert_eq!(stats.errors, 0);
+
+        // Net delta zero — same number of chunks under a different id.
+        assert_eq!(pipeline.store().row_count().await.unwrap(), 1);
+        let report = pipeline.verify_counts().await.unwrap();
+        assert!(report.is_consistent());
+    }
+
+    // gh#7 acceptance #4 — path that was never ingested: no-op, no
+    // errors, counter stays at 0.
+    #[tokio::test]
+    async fn scan_paths_delete_for_never_ingested_path_is_noop() {
+        use ostk_recall_scan::code::CodeScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+
+        // Write one file, ingest it, then ask scan_paths to "delete" a
+        // sibling that was never seen.
+        let known = fixtures.path().join("known.rs");
+        std::fs::write(&known, "fn known() {}").unwrap();
+        let unknown = fixtures.path().join("unknown.rs");
+        // unknown is NOT created on disk and was never ingested.
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = CodeScanner;
+        let cfg = SourceConfig {
+            kind: SourceKind::Code,
+            project: Some("noop-test".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec!["rs".into()],
+        };
+
+        pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[known.clone()])
+            .await
+            .unwrap();
+        let baseline = pipeline.store().row_count().await.unwrap();
+        assert_eq!(baseline, 1);
+
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[unknown])
+            .await
+            .unwrap();
+        assert_eq!(per.len(), 1, "source still matched on input path");
+        let stats = per[0].1;
+        assert_eq!(stats.items_seen, 0);
+        assert_eq!(stats.chunks_purged, 0, "never-ingested path => no-op");
+        assert_eq!(stats.chunks_staled, 0);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(
+            pipeline.store().row_count().await.unwrap(),
+            baseline,
+            "corpus untouched"
+        );
+    }
+
+    // gh#7 — markdown retention is Stale, so a missing-on-disk path
+    // marks chunks stale (not deletes them). Asserts the policy fan-out
+    // in `purge_missing_paths` matches the orphan-sweep contract.
+    #[tokio::test]
+    async fn scan_paths_delete_event_stales_markdown_corpus() {
+        use ostk_recall_scan::markdown::MarkdownScanner;
+
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        let md_path = fixtures.path().join("doomed.md");
+        std::fs::write(&md_path, "# Doomed\n\nbody\n").unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let scanner = MarkdownScanner;
+        let cfg = cfg_for(fixtures.path());
+
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[md_path.clone()])
+            .await
+            .unwrap();
+        let baseline = per[0].1.chunks_upserted;
+        assert!(baseline > 0);
+
+        std::fs::remove_file(&md_path).unwrap();
+        let per = pipeline
+            .scan_paths(&[(&scanner, &cfg)], &[md_path.clone()])
+            .await
+            .unwrap();
+        let stats = per[0].1;
+        assert_eq!(stats.chunks_staled, baseline);
+        assert_eq!(stats.chunks_purged, 0);
+        assert_eq!(stats.errors, 0);
+
+        // Markdown retention keeps the row in corpus (stale=true), so
+        // verify_counts shows: ingest decremented, corpus unchanged —
+        // matches existing Stale semantics for the markdown source.
     }
 }

@@ -275,6 +275,50 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         Ok(n as u64)
     }
 
+    /// Tombstone every chunk + source ledger row keyed by
+    /// `(source, project, source_id)`. Returns the chunk_ids that were
+    /// removed so the caller can issue the corresponding corpus delete or
+    /// stale-mark.
+    ///
+    /// Used by [`Pipeline::scan_paths`] (gh#7) for delete-event handling:
+    /// when a watcher trigger names a path that the per-source
+    /// `discover_paths` no longer yields (file deleted, gitignored, or
+    /// extension-filtered out), the chunk family for that path is purged
+    /// from the ledger and the returned ids drive the corpus-side delete.
+    /// No-op (returns empty Vec) when nothing was registered for the
+    /// triple — matches the "path that was never ingested" semantics.
+    pub fn tombstone_chunks_by_path(
+        &self,
+        source: &str,
+        project: &str,
+        source_id: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut ids = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT chunk_id FROM ingest_chunks WHERE source = ? AND project = ? AND source_id = ?"
+            )?;
+            let mut rows = stmt.query(params![source, project, source_id])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                ids.push(id);
+            }
+        }
+
+        conn.execute(
+            "DELETE FROM ingest_chunks WHERE source = ? AND project = ? AND source_id = ?",
+            params![source, project, source_id],
+        )?;
+
+        conn.execute(
+            "DELETE FROM ingest_sources WHERE source = ? AND project = ? AND source_id = ?",
+            params![source, project, source_id],
+        )?;
+
+        Ok(ids)
+    }
+
     pub fn delete_by_chunk_ids(&self, chunk_ids: &[String]) -> Result<u64> {
         if chunk_ids.is_empty() {
             return Ok(0);
@@ -328,5 +372,78 @@ mod tests {
         assert!(db.content_already_ingested("abc", "deadbeef").unwrap());
         assert!(!db.content_already_ingested("abc", "other").unwrap());
         assert_eq!(db.count_by_source().unwrap(), vec![("markdown".into(), 1)]);
+    }
+
+    #[test]
+    fn tombstone_chunks_by_path_returns_ids_and_clears_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db = IngestDb::open(tmp.path()).unwrap();
+
+        for i in 0..3 {
+            db.record_chunk(
+                &IngestChunkRow {
+                    chunk_id: format!("doomed-{i}"),
+                    source: "markdown".into(),
+                    project: "p1".into(),
+                    source_id: "doomed.md".into(),
+                    chunk_index: i,
+                    content_sha256: format!("sha-{i}"),
+                },
+                Some("run-1"),
+            )
+            .unwrap();
+        }
+        // Sibling chunk under a different source_id must NOT be touched.
+        db.record_chunk(
+            &IngestChunkRow {
+                chunk_id: "keep".into(),
+                source: "markdown".into(),
+                project: "p1".into(),
+                source_id: "keep.md".into(),
+                chunk_index: 0,
+                content_sha256: "sha-keep".into(),
+            },
+            Some("run-1"),
+        )
+        .unwrap();
+        db.update_source_metadata("markdown", "p1", "doomed.md", 0, 0, "run-1")
+            .unwrap();
+        db.update_source_metadata("markdown", "p1", "keep.md", 0, 0, "run-1")
+            .unwrap();
+
+        let purged = db
+            .tombstone_chunks_by_path("markdown", "p1", "doomed.md")
+            .unwrap();
+        assert_eq!(purged.len(), 3);
+        assert!(purged.iter().all(|id| id.starts_with("doomed-")));
+
+        // Re-tombstone is a no-op (the row is already gone).
+        let again = db
+            .tombstone_chunks_by_path("markdown", "p1", "doomed.md")
+            .unwrap();
+        assert!(again.is_empty(), "second tombstone returns nothing");
+
+        // Sibling row survived.
+        assert_eq!(
+            db.count_by_source().unwrap(),
+            vec![("markdown".into(), 1)],
+            "only the keep.md chunk remains"
+        );
+        // Source metadata for doomed.md is also gone.
+        assert!(
+            db.get_source_metadata("markdown", "p1", "doomed.md")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tombstone_chunks_by_path_for_unknown_path_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let db = IngestDb::open(tmp.path()).unwrap();
+        let purged = db
+            .tombstone_chunks_by_path("markdown", "p1", "never-existed.md")
+            .unwrap();
+        assert!(purged.is_empty());
     }
 }
