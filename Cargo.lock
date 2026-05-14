@@ -4365,6 +4365,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "fs4",
  "notify-debouncer-full",
  "ostk-recall-core",
  "ostk-recall-embed",

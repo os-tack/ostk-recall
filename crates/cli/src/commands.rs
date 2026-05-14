@@ -20,6 +20,8 @@ use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
 use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 
+use fs4::FileExt;
+
 /// Starter config written when the user runs `init` and no config exists.
 pub const STARTER_CONFIG: &str = r#"# ostk-recall configuration.
 # Edit this file, then re-run `ostk-recall init` and `ostk-recall scan`.
@@ -533,6 +535,62 @@ pub async fn serve(
             "only stdio transport is currently supported; pass --stdio"
         ));
     }
+
+    // Singleton guard: only one `serve` per corpus root.
+    //
+    // Multiple `serve` instances destroy each other's `recall.sock`
+    // (run_socket_listener does `remove_file` + `bind`) and race on
+    // the shared lance and SQLite state, which surfaces as
+    // deterministic SIGABRT crashes. Hold an advisory exclusive flock
+    // on `<corpus_root>/.serve.lock` for the lifetime of the process.
+    // Second-and-later serves exit cleanly so the MCP client sees EOF
+    // instead of a corrupted shared corpus.
+    use std::io::Write as _;
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
+    let corpus_root = cfg.expanded_root().context("resolving corpus.root")?;
+    std::fs::create_dir_all(&corpus_root)
+        .with_context(|| format!("creating corpus root {}", corpus_root.display()))?;
+    let lock_path = corpus_root.join(".serve.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening serve lock {}", lock_path.display()))?;
+    match FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => {
+            let _ = lock_file.set_len(0);
+            let _ = writeln!(&lock_file, "{}", std::process::id());
+            tracing::info!(
+                lock = %lock_path.display(),
+                pid = std::process::id(),
+                "serve lock acquired"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            let holder = std::fs::read_to_string(&lock_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            tracing::warn!(
+                lock = %lock_path.display(),
+                holder_pid = %holder,
+                "another ostk-recall serve is already running for this corpus; exiting cleanly"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "acquiring serve lock at {}: {e}",
+                lock_path.display()
+            ));
+        }
+    }
+    // `lock_file` is held to end-of-function so the OS releases the
+    // flock on process exit.
+
     let engine = build_query_engine_read_only(config_path, Arc::clone(&embedder)).await?;
     let root = engine.store().root().to_path_buf();
     let sock_path = root.join("recall.sock");
