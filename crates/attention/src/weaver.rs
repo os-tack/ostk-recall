@@ -145,7 +145,7 @@ impl AutoWeaver {
         let mut rx = pipeline.subscribe_ingest();
         loop {
             tokio::select! {
-                () = cancel.cancelled() => return Ok(()),
+                biased;
                 res = rx.recv() => {
                     match res {
                         Ok(event) => {
@@ -158,6 +158,16 @@ impl AutoWeaver {
                             tracing::warn!(skipped = n, "auto-weaver: ingest channel lagged");
                         }
                     }
+                }
+                () = cancel.cancelled() => {
+                    // Drain anything already queued before exiting so the
+                    // shutdown handshake doesn't race the broadcast.
+                    while let Ok(event) = rx.try_recv() {
+                        if let Err(err) = self.process_event(event).await {
+                            tracing::warn!(error = %err, "auto-weaver: process_event failed during drain");
+                        }
+                    }
+                    return Ok(());
                 }
             }
         }

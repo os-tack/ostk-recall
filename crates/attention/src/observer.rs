@@ -235,7 +235,7 @@ impl TurnObserver {
         let mut rx = self.pipeline.subscribe_ingest();
         loop {
             tokio::select! {
-                () = cancel.cancelled() => return Ok(()),
+                biased;
                 res = rx.recv() => {
                     match res {
                         Ok(event) => {
@@ -284,6 +284,35 @@ impl TurnObserver {
                             tracing::warn!(skipped = n, "turn-observer: ingest channel lagged");
                         }
                     }
+                }
+                () = cancel.cancelled() => {
+                    // Drain queued events before exiting so the shutdown
+                    // handshake doesn't race the broadcast. Best-effort
+                    // observe; per-event errors stay non-fatal.
+                    while let Ok(event) = rx.try_recv() {
+                        let scope = AttentionScope {
+                            project: event
+                                .project
+                                .clone()
+                                .or_else(|| scope_default.project.clone()),
+                            session_id: scope_default.session_id.clone(),
+                            agent: scope_default.agent.clone(),
+                            privacy_tier: scope_default.privacy_tier,
+                        };
+                        if self.refresh_known_handles().await.is_err() {
+                            break;
+                        }
+                        let Ok(texts) = corpus.fetch_texts(&event.chunk_ids_upserted).await
+                        else {
+                            continue;
+                        };
+                        for (chunk_id, text) in texts {
+                            let s = seq.fetch_add(1, Ordering::Relaxed);
+                            let session = format!("ambient:{chunk_id}");
+                            let _ = self.observe(&scope, &text, s, &session).await;
+                        }
+                    }
+                    return Ok(());
                 }
             }
         }
