@@ -28,3 +28,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 arrow-array = { workspace = true }
 lancedb = { workspace = true }
+serde_json = { workspace = true }
