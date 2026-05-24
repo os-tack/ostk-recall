@@ -163,11 +163,11 @@ impl<'de> Deserialize<'de> for ThreadHandle {
 pub enum ThreadHandleError {
     #[error("thread handle must not be empty")]
     Empty,
-    #[error("thread handle exceeds 64 chars (got {0})")]
+    #[error("thread handle exceeds {max} chars (got {0})", max = ThreadHandle::MAX_LEN)]
     TooLong(usize),
     #[error("thread handle must not start or end with '-'")]
     EdgeHyphen,
-    #[error("thread handle has {0} hyphens (max 4)")]
+    #[error("thread handle has {0} hyphens (max {max})", max = ThreadHandle::MAX_HYPHENS)]
     TooManyHyphens(usize),
     #[error("thread handle contains invalid char {0:?} (kebab-case lowercase ASCII only)")]
     InvalidChar(char),
