@@ -20,7 +20,7 @@ pub mod observer;
 pub mod weaver;
 
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
-pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver};
+pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default};
 pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};
 
 use std::collections::HashMap;

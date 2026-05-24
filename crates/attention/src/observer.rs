@@ -21,16 +21,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
-use ostk_recall_core::attention::{AttentionScope, ThreadHandle, ThreadHandleError};
+use ostk_recall_core::attention::{AttentionScope, PrivacyTier, ThreadHandle, ThreadHandleError};
 use ostk_recall_core::{Chunk, Links, Source};
 use ostk_recall_pipeline::{Pipeline, PipelineError, SyntheticSourceMeta};
+use ostk_recall_store::corpus::{CorpusStore, StoreError};
 use ostk_recall_store::ThreadsDb;
-use ostk_recall_store::corpus::StoreError;
 use regex::Regex;
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 // --- public types -----------------------------------------------------
 
@@ -209,6 +211,97 @@ impl TurnObserver {
             familiarity_increments: mentioned,
             proposed_stubs,
         })
+    }
+
+    /// Subscribe to the pipeline's post-ingest broadcast and observe every
+    /// chunk that lands in the corpus. The chunk text is fetched from
+    /// `corpus` by id (the broadcast carries ids only). Each chunk is
+    /// treated as one observation — handle mentions advance familiarity,
+    /// unknown handle candidates surface as proposed stubs.
+    ///
+    /// `scope_default` is the scope used when the event has no project
+    /// (corpus-wide ingest); event-provided projects override it.
+    ///
+    /// Runs until `cancel` fires or the pipeline channel closes. Per-event
+    /// errors are logged at `warn` and the loop continues — daemon survival
+    /// is more valuable than per-event strict failure.
+    pub async fn run_subscribed(
+        &self,
+        corpus: Arc<CorpusStore>,
+        scope_default: AttentionScope,
+        cancel: CancellationToken,
+    ) -> Result<(), ObserverError> {
+        let seq = AtomicU64::new(0);
+        let mut rx = self.pipeline.subscribe_ingest();
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return Ok(()),
+                res = rx.recv() => {
+                    match res {
+                        Ok(event) => {
+                            let scope = AttentionScope {
+                                project: event
+                                    .project
+                                    .clone()
+                                    .or_else(|| scope_default.project.clone()),
+                                session_id: scope_default.session_id.clone(),
+                                agent: scope_default.agent.clone(),
+                                privacy_tier: scope_default.privacy_tier,
+                            };
+                            // Refresh in case threads have been added since
+                            // the daemon started. Cheap (read all rows; bounded).
+                            if let Err(err) = self.refresh_known_handles().await {
+                                tracing::warn!(error = %err, "turn-observer: refresh failed");
+                                continue;
+                            }
+                            let texts = match corpus
+                                .fetch_texts(&event.chunk_ids_upserted)
+                                .await
+                            {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "turn-observer: fetch_texts failed");
+                                    continue;
+                                }
+                            };
+                            for (chunk_id, text) in texts {
+                                let s = seq.fetch_add(1, Ordering::Relaxed);
+                                let session = format!("ambient:{chunk_id}");
+                                if let Err(err) = self
+                                    .observe(&scope, &text, s, &session)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error = %err,
+                                        chunk = %chunk_id,
+                                        "turn-observer: observe failed",
+                                    );
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "turn-observer: ingest channel lagged");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build a default `AttentionScope` for ambient observation.
+///
+/// Used by `TurnObserver::run_subscribed` when callers don't supply
+/// project-specific scopes. Privacy tier defaults to `T1Project` —
+/// ambient pickup does not write to `T0Private` scopes.
+#[must_use]
+pub fn ambient_scope_default() -> AttentionScope {
+    AttentionScope {
+        project: None,
+        session_id: Some("ambient".into()),
+        agent: Some("substrate".into()),
+        privacy_tier: PrivacyTier::T1Project,
     }
 }
 

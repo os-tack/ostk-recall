@@ -314,6 +314,74 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Fetch the `text` column for a batch of chunks by their `chunk_id`.
+    /// Mirrors `fetch_embeddings` — used by ambient consumers (e.g.
+    /// `TurnObserver`) that subscribe to `IngestEvent` and need the
+    /// original chunk text to observe.
+    pub async fn fetch_texts(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        use std::collections::HashMap;
+
+        use arrow_array::Array;
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+
+        let ids_joined = ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({ids_joined})");
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "text".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        for batch in &batches {
+            let id_col = batch.column_by_name("chunk_id").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "chunk_id column missing in projection".into(),
+                ))
+            })?;
+            let ids_arr = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "chunk_id expected to be Utf8".into(),
+                    ))
+                })?;
+            let text_col = batch.column_by_name("text").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "text column missing in projection".into(),
+                ))
+            })?;
+            let text_arr = text_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "text expected to be Utf8".into(),
+                    ))
+                })?;
+            for i in 0..batch.num_rows() {
+                if text_arr.is_null(i) {
+                    continue;
+                }
+                out.insert(ids_arr.value(i).to_string(), text_arr.value(i).to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// Mark a batch of chunks as stale by their unique `chunk_id`.
     pub async fn mark_chunks_stale(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {

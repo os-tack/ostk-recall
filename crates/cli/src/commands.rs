@@ -9,6 +9,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode};
 use ostk_recall_mcp::Server;
+use ostk_recall_attention::{
+    AutoWeaver, TurnObserver, WeaverThresholds, ambient_scope_default,
+};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
@@ -19,7 +22,8 @@ use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
-use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
+use ostk_recall_store::{CorpusStore, EventsDb, IngestDb, ThreadsDb};
+use tokio_util::sync::CancellationToken;
 
 use fs4::FileExt;
 
@@ -197,6 +201,87 @@ fn force_wipe_corpus(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Spawn the ambient-pickup daemons (`TurnObserver`, `AutoWeaver`) for the
+/// lifetime of a scan. Returns a `CancellationToken` to fire when the scan
+/// completes plus the two `JoinHandle`s to await on cleanup.
+///
+/// `pipeline` must be the same `Arc<Pipeline>` the scan uses for ingest —
+/// both daemons subscribe to its broadcast channel for `IngestEvent`s.
+/// `corpus` provides text lookup for the observer's `fetch_texts` call.
+///
+/// Failures during construction (e.g. `ThreadsDb::open`) are logged at warn
+/// and return `None`; the scan continues without ambient pickup rather than
+/// failing the whole trigger.
+fn spawn_ambient_daemons(
+    pipeline: &Arc<Pipeline>,
+    corpus: &Arc<CorpusStore>,
+    root: &Path,
+) -> Option<(
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let threads = match ThreadsDb::open(root) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            tracing::warn!(error = %e, "ambient daemons: ThreadsDb::open failed; skipping ambient pickup");
+            return None;
+        }
+    };
+
+    let observer = Arc::new(TurnObserver::new(Arc::clone(pipeline), Arc::clone(&threads)));
+    let weaver = Arc::new(AutoWeaver::new(
+        Arc::clone(&threads),
+        Arc::clone(corpus),
+        WeaverThresholds::default(),
+    ));
+    let cancel = CancellationToken::new();
+
+    let observer_handle = {
+        let observer = Arc::clone(&observer);
+        let corpus = Arc::clone(corpus);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(err) = observer
+                .run_subscribed(corpus, ambient_scope_default(), cancel)
+                .await
+            {
+                tracing::warn!(error = %err, "turn-observer task exited with error");
+            }
+        })
+    };
+
+    let weaver_handle = {
+        let weaver = Arc::clone(&weaver);
+        let pipeline = Arc::clone(pipeline);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(err) = weaver.run(&pipeline, cancel).await {
+                tracing::warn!(error = %err, "auto-weaver task exited with error");
+            }
+        })
+    };
+
+    tracing::info!("ambient daemons spawned (turn-observer + auto-weaver)");
+    Some((cancel, observer_handle, weaver_handle))
+}
+
+/// Cancel the ambient daemons and await their join handles.
+async fn shutdown_ambient_daemons(
+    handles: Option<(
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )>,
+) {
+    let Some((cancel, observer_handle, weaver_handle)) = handles else {
+        return;
+    };
+    cancel.cancel();
+    let _ = observer_handle.await;
+    let _ = weaver_handle.await;
+}
+
 pub async fn scan(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -214,7 +299,11 @@ pub async fn scan(
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
-    let pipeline = Pipeline::new(store, ingest, Arc::clone(&embedder)).with_dry_run(dry_run);
+    let pipeline = Arc::new(
+        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
+    );
+
+    let ambient = spawn_ambient_daemons(&pipeline, &store, &root);
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -277,6 +366,8 @@ pub async fn scan(
 
     ostk_recall_scan::fcp_rust::drain_session_cache();
 
+    shutdown_ambient_daemons(ambient).await;
+
     Ok(ScanOutcome {
         per_source,
         totals,
@@ -310,7 +401,11 @@ pub async fn scan_paths(
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
-    let pipeline = Pipeline::new(store, ingest, Arc::clone(&embedder)).with_dry_run(dry_run);
+    let pipeline = Arc::new(
+        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
+    );
+
+    let ambient = spawn_ambient_daemons(&pipeline, &store, &root);
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -371,6 +466,8 @@ pub async fn scan_paths(
     }
 
     ostk_recall_scan::fcp_rust::drain_session_cache();
+
+    shutdown_ambient_daemons(ambient).await;
 
     Ok(ScanOutcome {
         per_source,
