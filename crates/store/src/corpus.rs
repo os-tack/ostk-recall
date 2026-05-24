@@ -53,8 +53,7 @@ impl From<rusqlite::Error> for StoreError {
                 let table = constraint
                     .split('.')
                     .next()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "unknown".into());
+                    .map_or_else(|| "unknown".into(), str::to_string);
                 return Self::UniqueViolation { table, constraint };
             }
         }
