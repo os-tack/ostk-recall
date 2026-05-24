@@ -336,120 +336,18 @@ mod tests {
         }
     }
 
-    // Direct constructor that bypasses Pipeline — for tests that call
-    // process_event without spinning up the full broadcast machinery.
-    struct WeaverTestHandle {
-        threads: Arc<ThreadsDb>,
-        corpus: Arc<CorpusStore>,
-        thresholds: WeaverThresholds,
-    }
-
-    impl WeaverTestHandle {
-        const fn new(
-            threads: Arc<ThreadsDb>,
-            corpus: Arc<CorpusStore>,
-            thresholds: WeaverThresholds,
-        ) -> Self {
-            Self {
-                threads,
-                corpus,
-                thresholds,
-            }
-        }
-
-        async fn process_event(&self, event: IngestEvent) -> Result<WeaverOutcome, WeaverError> {
-            // Reimplements AutoWeaver::process_event verbatim, sharing
-            // the same fields. Keeps tests off the Pipeline constructor
-            // (which would require a real embedder + ingest DB).
-            if event.chunk_ids_upserted.is_empty() {
-                return Ok(WeaverOutcome {
-                    event_seen: event,
-                    evidence_links_written: 0,
-                    proposed_weaves: vec![],
-                });
-            }
-            let new_embeds = self
-                .corpus
-                .fetch_embeddings(&event.chunk_ids_upserted)
-                .await?;
-            let threads = self.threads.list_threads(None)?;
-            let anchor_ids: Vec<String> = threads
-                .iter()
-                .filter_map(|t| t.anchor_chunk_id.clone())
-                .collect();
-            if anchor_ids.is_empty() {
-                return Ok(WeaverOutcome {
-                    event_seen: event,
-                    evidence_links_written: 0,
-                    proposed_weaves: vec![],
-                });
-            }
-            let anchor_embeds = self.corpus.fetch_embeddings(&anchor_ids).await?;
-            let threshold = self.thresholds.for_source(event.source);
-            let category = source_kind_to_category(event.source);
-            let mut links_written = 0usize;
-            let mut chunk_to_anchors: HashMap<String, Vec<ThreadHandle>> = HashMap::new();
-            for (chunk_id, chunk_vec) in &new_embeds {
-                for t in &threads {
-                    let Some(anchor_id) = &t.anchor_chunk_id else {
-                        continue;
-                    };
-                    let Some(anchor_vec) = anchor_embeds.get(anchor_id) else {
-                        continue;
-                    };
-                    let sim = cosine_similarity(chunk_vec, anchor_vec);
-                    if sim < threshold {
-                        continue;
-                    }
-                    let now = Utc::now();
-                    let link = EvidenceLink {
-                        id: 0,
-                        thread_handle: t.handle.clone(),
-                        original_path: PathBuf::from(chunk_id),
-                        current_path: None,
-                        content_hash: None,
-                        last_resolved_chunk_id: Some(chunk_id.clone()),
-                        relation_state: RelationState::Active,
-                        association_type: AssociationType::Derived,
-                        category: category.to_string(),
-                        similarity: Some(sim),
-                        created_at: now,
-                        updated_at: now,
-                    };
-                    if self.threads.add_evidence_link(&link).is_ok() {
-                        links_written += 1;
-                        chunk_to_anchors
-                            .entry(chunk_id.clone())
-                            .or_default()
-                            .push(t.handle.clone());
-                    }
-                }
-            }
-            let proposed_weaves = chunk_to_anchors
-                .into_iter()
-                .filter(|(_, a)| a.len() >= 2)
-                .map(|(c, a)| ProposedWeave {
-                    anchors: a,
-                    shared_chunks: vec![c],
-                })
-                .collect();
-            Ok(WeaverOutcome {
-                event_seen: event,
-                evidence_links_written: links_written,
-                proposed_weaves,
-            })
-        }
+    fn weaver(fx: &Fixture) -> AutoWeaver {
+        AutoWeaver::new(
+            fx.threads.clone(),
+            fx.corpus.clone(),
+            WeaverThresholds::default(),
+        )
     }
 
     #[tokio::test]
     async fn empty_event_returns_early() {
         let fx = fixture().await;
-        let w = WeaverTestHandle::new(
-            fx.threads.clone(),
-            fx.corpus.clone(),
-            WeaverThresholds::default(),
-        );
-        let out = w
+        let out = weaver(&fx)
             .process_event(event(SourceKind::Markdown, &[]))
             .await
             .unwrap();
@@ -460,19 +358,12 @@ mod tests {
     #[tokio::test]
     async fn process_event_with_no_anchors_yields_zero_links() {
         let fx = fixture().await;
-        // Insert a thread with NO anchor.
         fx.threads.upsert_thread(&thread("orphan", None)).unwrap();
-        // Insert a corpus chunk.
         fx.corpus
             .upsert(&[chunk("c1")], &[vec![1.0, 0.0, 0.0, 0.0]])
             .await
             .unwrap();
-        let w = WeaverTestHandle::new(
-            fx.threads.clone(),
-            fx.corpus.clone(),
-            WeaverThresholds::default(),
-        );
-        let out = w
+        let out = weaver(&fx)
             .process_event(event(SourceKind::Markdown, &["c1"]))
             .await
             .unwrap();
@@ -484,7 +375,6 @@ mod tests {
     async fn process_event_writes_link_above_threshold() {
         let fx = fixture().await;
         let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
-        // Identical chunk + anchor → cosine = 1.0 → above any threshold.
         fx.corpus
             .upsert(
                 &[chunk("anchor-1"), chunk("new-1")],
@@ -495,12 +385,7 @@ mod tests {
         fx.threads
             .upsert_thread(&thread("t1", Some("anchor-1")))
             .unwrap();
-        let w = WeaverTestHandle::new(
-            fx.threads.clone(),
-            fx.corpus.clone(),
-            WeaverThresholds::default(),
-        );
-        let out = w
+        let out = weaver(&fx)
             .process_event(event(SourceKind::Markdown, &["new-1"]))
             .await
             .unwrap();
@@ -518,7 +403,6 @@ mod tests {
     async fn process_event_skips_below_threshold() {
         let fx = fixture().await;
         let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
-        // Orthogonal vector → cosine = 0.0 → below every threshold.
         let orth_vec = vec![0.0_f32, 1.0, 0.0, 0.0];
         fx.corpus
             .upsert(
@@ -530,12 +414,7 @@ mod tests {
         fx.threads
             .upsert_thread(&thread("t1", Some("anchor-1")))
             .unwrap();
-        let w = WeaverTestHandle::new(
-            fx.threads.clone(),
-            fx.corpus.clone(),
-            WeaverThresholds::default(),
-        );
-        let out = w
+        let out = weaver(&fx)
             .process_event(event(SourceKind::Markdown, &["new-1"]))
             .await
             .unwrap();
@@ -547,14 +426,9 @@ mod tests {
         // Build a (chunk, anchor) pair whose cosine sim is exactly 0.79.
         // Code threshold is 0.78 → above → write.
         // Transcript threshold is 0.85 → below → skip.
-        // We pick vectors directly to hit ~0.79.
-        let fx = fixture().await;
-        // Two vectors with known dot/norms in 4-D yielding cos≈0.79.
-        // a = (1, 0, 0, 0); b = (0.79, sqrt(1 - 0.79^2), 0, 0)
         let cos = 0.79_f32;
         let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
         let other_vec = vec![cos, cos.mul_add(-cos, 1.0).sqrt(), 0.0, 0.0];
-        // sanity: cosine_similarity(anchor, other) should be ~0.79
         let actual = cosine_similarity(&anchor_vec, &other_vec);
         assert!((actual - 0.79).abs() < 1e-5, "got cos = {actual}");
 
@@ -569,12 +443,7 @@ mod tests {
                 .await
                 .unwrap();
             fx.threads.upsert_thread(&thread("tc", Some("a"))).unwrap();
-            let w = WeaverTestHandle::new(
-                fx.threads.clone(),
-                fx.corpus.clone(),
-                WeaverThresholds::default(),
-            );
-            let out = w
+            let out = weaver(&fx)
                 .process_event(event(SourceKind::Code, &["b"]))
                 .await
                 .unwrap();
@@ -586,17 +455,13 @@ mod tests {
 
         // Transcript event (ClaudeCode) → below 0.85 threshold → skip.
         {
+            let fx = fixture().await;
             fx.corpus
                 .upsert(&[chunk("a"), chunk("b")], &[anchor_vec, other_vec])
                 .await
                 .unwrap();
             fx.threads.upsert_thread(&thread("tt", Some("a"))).unwrap();
-            let w = WeaverTestHandle::new(
-                fx.threads.clone(),
-                fx.corpus.clone(),
-                WeaverThresholds::default(),
-            );
-            let out = w
+            let out = weaver(&fx)
                 .process_event(event(SourceKind::ClaudeCode, &["b"]))
                 .await
                 .unwrap();
@@ -620,12 +485,7 @@ mod tests {
             .unwrap();
         fx.threads.upsert_thread(&thread("t1", Some("a1"))).unwrap();
         fx.threads.upsert_thread(&thread("t2", Some("a2"))).unwrap();
-        let w = WeaverTestHandle::new(
-            fx.threads.clone(),
-            fx.corpus.clone(),
-            WeaverThresholds::default(),
-        );
-        let out = w
+        let out = weaver(&fx)
             .process_event(event(SourceKind::Markdown, &["new"]))
             .await
             .unwrap();

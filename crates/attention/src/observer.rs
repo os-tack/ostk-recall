@@ -525,7 +525,7 @@ mod tests {
     use super::*;
     use ostk_recall_core::attention::PrivacyTier;
     use ostk_recall_pipeline::ChunkEmbedder;
-    use ostk_recall_store::{CorpusStore, IngestDb};
+    use ostk_recall_store::{ChainEvent, ChainSink, CorpusStore, IngestDb};
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
