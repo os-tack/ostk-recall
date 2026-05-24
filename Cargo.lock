@@ -4516,6 +4516,7 @@ dependencies = [
 name = "ostk-recall-embed"
 version = "0.1.8"
 dependencies = [
+ "fastembed",
  "model2vec-rs",
  "ostk-recall-core",
  "tempfile",

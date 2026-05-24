@@ -16,3 +16,4 @@ Cargo.lock.user
 .idea/
 .vscode/
 *.swp
+.fastembed_cache/
