@@ -4530,6 +4530,7 @@ dependencies = [
 name = "ostk-recall-mcp"
 version = "0.1.8"
 dependencies = [
+ "ostk-recall-attention",
  "ostk-recall-attention-mcp",
  "ostk-recall-core",
  "ostk-recall-pipeline",
