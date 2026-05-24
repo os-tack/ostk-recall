@@ -184,12 +184,20 @@ impl TurnObserver {
         // familiarity-based fold-depth defaults inert.
         let mentioned = handles_mentioned(turn_text, &known_snapshot);
         if !mentioned.is_empty() {
+            // Skip handles that are in the in-memory cache but not in the
+            // ledger (cache can drift briefly ahead of the ledger,
+            // especially under seed_known_handles in tests). Increment
+            // returns Err for those; we drop them silently rather than
+            // failing the whole observation.
             let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(mentioned.len());
             for handle in &mentioned {
-                let new_familiarity = self.store.increment_familiarity(handle)?;
-                entries.push((handle.clone(), new_familiarity));
+                if let Ok(new_familiarity) = self.store.increment_familiarity(handle) {
+                    entries.push((handle.clone(), new_familiarity));
+                }
             }
-            self.store.record_familiarity_batch(entries, turn_seq)?;
+            if !entries.is_empty() {
+                self.store.record_familiarity_batch(entries, turn_seq)?;
+            }
         }
 
         // (c) proposed thread stubs — kebab-case phrases recurring in
