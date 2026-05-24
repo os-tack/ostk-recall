@@ -120,10 +120,10 @@ impl AssociationType {
 }
 
 fn bad_enum(field: &str, value: &str) -> StoreError {
-    StoreError::Lance(lancedb::Error::Other {
-        message: format!("threads ledger: invalid {field} value {value:?}"),
-        source: None,
-    })
+    StoreError::InvalidEnumValue {
+        field: field.to_string(),
+        value: value.to_string(),
+    }
 }
 
 /// A row in the `threads` table.

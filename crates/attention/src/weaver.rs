@@ -33,9 +33,14 @@ use crate::{AttentionError, cosine_similarity};
 /// fall in between.
 #[derive(Debug, Clone, Copy)]
 pub struct WeaverThresholds {
+    /// Cosine cut-off for `SourceKind::Markdown` chunks.
     pub prose: f32,
+    /// Cosine cut-off for `SourceKind::Code` chunks (lower → permissive).
     pub code: f32,
+    /// Cosine cut-off for transcript-shaped sources
+    /// (`ClaudeCode`, `Gemini`, `ZipExport`) — set high to filter chatter.
     pub transcript: f32,
+    /// Cosine cut-off for source kinds not listed above.
     pub default: f32,
 }
 
@@ -70,15 +75,25 @@ impl WeaverThresholds {
 /// substrate writer).
 #[derive(Debug, Clone)]
 pub struct ProposedWeave {
+    /// Thread handles whose anchors all resonated with the same chunk.
     pub anchors: Vec<ThreadHandle>,
+    /// Chunk ids shared by the resonating anchors (typically one per
+    /// `ProposedWeave`; the field is a `Vec` so future grouping passes
+    /// can collapse co-resonant chunks into a single weave).
     pub shared_chunks: Vec<String>,
 }
 
 /// Result of processing a single ingest event.
 #[derive(Debug)]
 pub struct WeaverOutcome {
+    /// The ingest event the weaver consumed.
     pub event_seen: IngestEvent,
+    /// Count of `evidence_links` rows the weaver inserted for this
+    /// event. Idempotent collisions (already-written edges) do not
+    /// count.
     pub evidence_links_written: usize,
+    /// Per-chunk groupings the weaver detected but did not write —
+    /// the caller decides whether to surface them as candidate threads.
     pub proposed_weaves: Vec<ProposedWeave>,
 }
 
@@ -222,16 +237,18 @@ impl AutoWeaver {
                             .or_default()
                             .push(thread.handle.clone());
                     }
-                    Err(err) => {
-                        // Idempotent path: a UNIQUE (thread, path,
-                        // category) collision means this edge was
-                        // already written in a prior batch — treat as
-                        // a no-op for this round and keep processing
-                        // the remaining (chunk, anchor) pairs. Logged
-                        // at debug so the trail exists if a real
-                        // store error masquerades as this.
-                        tracing::debug!(error = %err, thread = %thread.handle, chunk = %chunk_id, "auto-weaver: evidence link insert skipped (likely UNIQUE collision)");
+                    Err(StoreError::UniqueViolation { .. }) => {
+                        // The (thread, path, category) edge was written
+                        // in a prior batch. Idempotent no-op; skip and
+                        // keep processing the remaining (chunk, anchor)
+                        // pairs.
+                        tracing::trace!(
+                            thread = %thread.handle,
+                            chunk = %chunk_id,
+                            "auto-weaver: evidence link already exists",
+                        );
                     }
+                    Err(err) => return Err(WeaverError::from(err)),
                 }
             }
         }
