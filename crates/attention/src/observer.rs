@@ -173,10 +173,22 @@ impl TurnObserver {
         // (b) familiarity increments — one tick per distinct known
         // handle that shows up in the turn (case-sensitive, kebab-case
         // word-boundary match).
+        //
+        // Two-step per the chain-as-cognition-history policy:
+        //   1. increment_familiarity per distinct handle → bumps counter,
+        //      returns new value, NO chain row.
+        //   2. record_familiarity_batch with (handle, familiarity_after)
+        //      tuples → emits ONE chained event for the whole turn.
+        // Calling record_familiarity_batch alone (the original Phase 6 shape)
+        // chained the event but never advanced the counter, leaving
+        // familiarity-based fold-depth defaults inert.
         let mentioned = handles_mentioned(turn_text, &known_snapshot);
         if !mentioned.is_empty() {
-            let entries: Vec<(ThreadHandle, u32)> =
-                mentioned.iter().map(|h| (h.clone(), 1u32)).collect();
+            let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(mentioned.len());
+            for handle in &mentioned {
+                let new_familiarity = self.store.increment_familiarity(handle)?;
+                entries.push((handle.clone(), new_familiarity));
+            }
             self.store.record_familiarity_batch(entries, turn_seq)?;
         }
 
