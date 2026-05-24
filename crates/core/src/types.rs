@@ -108,7 +108,7 @@ pub struct AuditResult {
 /// via deserialization from cached pages and the recall driver socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthesizedPage {
-    /// e.g., "Symbol: alloc_page" or "Page: src/main.rs"
+    /// e.g., "Symbol: `alloc_page`" or "Page: src/main.rs"
     pub title: String,
     /// The Primary hit
     pub head: RecallHit,

@@ -277,10 +277,12 @@ pub async fn scan(
     })
 }
 
-/// Path-aware sibling of [`scan`]. Loads the same config + scanners,
-/// then dispatches each input path to the matching `[[sources]]` via
-/// [`Pipeline::scan_paths`]. Sources whose roots don't parent any input
-/// are silent (no entry in the returned per-source vector).
+/// Path-aware sibling of [`scan`].
+///
+/// Loads the same config + scanners, then dispatches each input path to the
+/// matching `[[sources]]` via [`Pipeline::scan_paths`]. Sources whose roots
+/// don't parent any input are silent (no entry in the returned per-source
+/// vector).
 ///
 /// Skips delete handling — gh#7 covers tombstone semantics for paths
 /// that yield no `SourceItem` (file removed, gitignore'd, etc.).
@@ -530,6 +532,8 @@ pub async fn serve(
     embedder: Arc<dyn ChunkEmbedder>,
     stdio: bool,
 ) -> Result<()> {
+    use std::io::Write as _;
+
     if !stdio {
         return Err(anyhow!(
             "only stdio transport is currently supported; pass --stdio"
@@ -545,7 +549,6 @@ pub async fn serve(
     // on `<corpus_root>/.serve.lock` for the lifetime of the process.
     // Second-and-later serves exit cleanly so the MCP client sees EOF
     // instead of a corrupted shared corpus.
-    use std::io::Write as _;
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config {}", config_path.display()))?;
     let corpus_root = cfg.expanded_root().context("resolving corpus.root")?;
@@ -803,12 +806,13 @@ where
         .collect()
 }
 
-/// `ostk-recall watch` — run a file-watcher that pokes the scan-trigger
-/// socket whenever a debounced batch of events touches a configured
-/// source path. Reuses each `[[sources]].paths` (and `extensions`) — the
-/// watcher does not declare its own paths. The scan does the real
-/// filtering; the watcher's job is just "did anything we care about
-/// change recently?".
+/// `ostk-recall watch` — run a file-watcher.
+///
+/// Pokes the scan-trigger socket whenever a debounced batch of events
+/// touches a configured source path. Reuses each `[[sources]].paths` (and
+/// `extensions`) — the watcher does not declare its own paths. The scan
+/// does the real filtering; the watcher's job is just "did anything we care
+/// about change recently?".
 ///
 /// Behavior:
 /// - Loads `[watch]` from config; bails if absent or `enabled = false`.
@@ -827,6 +831,7 @@ where
 /// fatal — the watcher keeps running so the next save after `serve`
 /// starts will fire. Errors from the underlying notify backend are
 /// surfaced through `tracing::warn`.
+#[allow(clippy::too_many_lines)]
 pub async fn watch(config_path: &Path) -> Result<()> {
     use std::time::Duration;
 
@@ -1001,12 +1006,9 @@ async fn kick_trigger_socket(socket: &Path, paths: &[PathBuf]) -> Result<()> {
     let mut batch: Vec<&PathBuf> = Vec::new();
     let mut batch_bytes: usize = 0;
     for p in paths {
-        let s = match p.to_str() {
-            Some(s) => s,
-            None => {
-                tracing::warn!(path = %p.display(), "skipping non-UTF-8 path in trigger frame");
-                continue;
-            }
+        let Some(s) = p.to_str() else {
+            tracing::warn!(path = %p.display(), "skipping non-UTF-8 path in trigger frame");
+            continue;
         };
         if s.contains('\n') {
             tracing::warn!(

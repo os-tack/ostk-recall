@@ -31,6 +31,10 @@ pub struct IngestChunkRow {
     pub content_sha256: String,
 }
 
+// Connection is the lock: every method must hold the guard across `prepare`
+// + statement execution, so tightening `conn`'s scope is wrong here.
+// `i64 -> u64` casts come from `SELECT COUNT(*)`, which is always non-negative.
+#[allow(clippy::significant_drop_tightening, clippy::cast_sign_loss)]
 impl IngestDb {
     pub fn open(root: &Path) -> Result<Self> {
         let path = root.join("ingest.sqlite");
@@ -276,7 +280,7 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
     }
 
     /// Tombstone every chunk + source ledger row keyed by
-    /// `(source, project, source_id)`. Returns the chunk_ids that were
+    /// `(source, project, source_id)`. Returns the `chunk_ids` that were
     /// removed so the caller can issue the corresponding corpus delete or
     /// stale-mark.
     ///
@@ -326,14 +330,10 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_project
         let conn = self.lock();
         let mut total: u64 = 0;
         for batch in chunk_ids.chunks(999) {
-            let placeholders = std::iter::repeat("?")
-                .take(batch.len())
+            let placeholders = std::iter::repeat_n("?", batch.len())
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!(
-                "DELETE FROM ingest_chunks WHERE chunk_id IN ({})",
-                placeholders
-            );
+            let sql = format!("DELETE FROM ingest_chunks WHERE chunk_id IN ({placeholders})");
             let mut stmt = conn.prepare(&sql)?;
             let n = stmt.execute(rusqlite::params_from_iter(batch))?;
             total += n as u64;
