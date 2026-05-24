@@ -95,6 +95,10 @@ pub struct WeaverOutcome {
     /// Per-chunk groupings the weaver detected but did not write —
     /// the caller decides whether to surface them as candidate threads.
     pub proposed_weaves: Vec<ProposedWeave>,
+    /// Count of `threads_proposed` rows the weaver inserted for this
+    /// event (one per emergent cluster found in the unmatched
+    /// chunks).
+    pub proposed_threads_written: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -172,6 +176,7 @@ impl AutoWeaver {
                 event_seen: event,
                 evidence_links_written: 0,
                 proposed_weaves: vec![],
+                proposed_threads_written: 0,
             });
         }
 
@@ -184,22 +189,74 @@ impl AutoWeaver {
             .iter()
             .filter_map(|t| t.anchor_chunk_id.clone())
             .collect();
-        if anchor_ids.is_empty() {
-            return Ok(WeaverOutcome {
-                event_seen: event,
-                evidence_links_written: 0,
-                proposed_weaves: vec![],
-            });
-        }
-        let anchor_embeds = self.corpus.fetch_embeddings(&anchor_ids).await?;
+        let anchor_embeds = if anchor_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.corpus.fetch_embeddings(&anchor_ids).await?
+        };
         let threshold = self.thresholds.for_source(event.source);
         let category = source_kind_to_category(event.source);
 
-        let mut links_written = 0usize;
-        let mut chunk_to_anchors: HashMap<String, Vec<ThreadHandle>> = HashMap::new();
+        let MatchPassOutcome {
+            links_written,
+            chunk_to_anchors,
+            matched_chunks,
+        } = self.match_against_anchors(
+            &new_embeds,
+            &threads,
+            &anchor_embeds,
+            threshold,
+            category,
+        )?;
 
-        for (chunk_id, chunk_vec) in &new_embeds {
-            for thread in &threads {
+        let proposed_weaves: Vec<ProposedWeave> = chunk_to_anchors
+            .into_iter()
+            .filter(|(_, anchors)| anchors.len() >= 2)
+            .map(|(chunk_id, anchors)| ProposedWeave {
+                anchors,
+                shared_chunks: vec![chunk_id],
+            })
+            .collect();
+
+        // Emergent-cluster pass: chunks that didn't resonate with any
+        // existing anchor are candidates for proposing brand-new
+        // threads. Density clustering is deterministic and cheap at
+        // batch sizes <= ~50 (per-scan). Failure to write a proposal
+        // never blocks the matched-path work above.
+        let unmatched: Vec<(String, Vec<f32>)> = new_embeds
+            .iter()
+            .filter(|(id, _)| !matched_chunks.contains(*id))
+            .map(|(id, v)| (id.clone(), v.clone()))
+            .collect();
+        let proposed_threads_written =
+            self.write_emergent_proposals(&unmatched).unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "auto-weaver: emergent-cluster write failed");
+                0
+            });
+
+        Ok(WeaverOutcome {
+            event_seen: event,
+            evidence_links_written: links_written,
+            proposed_weaves,
+            proposed_threads_written,
+        })
+    }
+
+    /// Match every (chunk, anchor) pair and persist the resulting
+    /// `Derived` evidence links. Extracted from `process_event` so the
+    /// outer function stays under the line budget; the body and error
+    /// shape are identical to the inlined version.
+    fn match_against_anchors(
+        &self,
+        new_embeds: &HashMap<String, Vec<f32>>,
+        threads: &[ostk_recall_store::ThreadRecord],
+        anchor_embeds: &HashMap<String, Vec<f32>>,
+        threshold: f32,
+        category: &str,
+    ) -> Result<MatchPassOutcome, WeaverError> {
+        let mut out = MatchPassOutcome::default();
+        for (chunk_id, chunk_vec) in new_embeds {
+            for thread in threads {
                 let Some(anchor_id) = &thread.anchor_chunk_id else {
                     continue;
                 };
@@ -210,14 +267,14 @@ impl AutoWeaver {
                 if sim < threshold {
                     continue;
                 }
+                out.matched_chunks.insert(chunk_id.clone());
                 let now = Utc::now();
                 let link = EvidenceLink {
                     id: 0,
                     thread_handle: thread.handle.clone(),
                     // The corpus chunk-id is the only durable handle we
                     // have on the resonating content; the threads
-                    // scanner is what knows about source paths. Future
-                    // work: a corpus → source path lookup.
+                    // scanner is what knows about source paths.
                     original_path: PathBuf::from(chunk_id),
                     current_path: None,
                     content_hash: None,
@@ -231,17 +288,15 @@ impl AutoWeaver {
                 };
                 match self.threads.add_evidence_link(&link) {
                     Ok(_) => {
-                        links_written += 1;
-                        chunk_to_anchors
+                        out.links_written += 1;
+                        out.chunk_to_anchors
                             .entry(chunk_id.clone())
                             .or_default()
                             .push(thread.handle.clone());
                     }
                     Err(StoreError::UniqueViolation { .. }) => {
                         // The (thread, path, category) edge was written
-                        // in a prior batch. Idempotent no-op; skip and
-                        // keep processing the remaining (chunk, anchor)
-                        // pairs.
+                        // in a prior batch. Idempotent no-op.
                         tracing::trace!(
                             thread = %thread.handle,
                             chunk = %chunk_id,
@@ -252,22 +307,78 @@ impl AutoWeaver {
                 }
             }
         }
-
-        let proposed_weaves: Vec<ProposedWeave> = chunk_to_anchors
-            .into_iter()
-            .filter(|(_, anchors)| anchors.len() >= 2)
-            .map(|(chunk_id, anchors)| ProposedWeave {
-                anchors,
-                shared_chunks: vec![chunk_id],
-            })
-            .collect();
-
-        Ok(WeaverOutcome {
-            event_seen: event,
-            evidence_links_written: links_written,
-            proposed_weaves,
-        })
+        Ok(out)
     }
+
+    /// Cluster unmatched chunks and write one `threads_proposed` row
+    /// per emergent cluster. Returns the number of proposals written.
+    fn write_emergent_proposals(
+        &self,
+        unmatched: &[(String, Vec<f32>)],
+    ) -> Result<usize, WeaverError> {
+        let clusters = crate::cluster::find_clusters(unmatched, crate::cluster::EMERGENT_THRESHOLD);
+        if clusters.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now();
+        let mut written = 0usize;
+        for cluster in clusters {
+            let handle = generate_proposed_handle(&cluster.chunk_ids, now);
+            let rec = ostk_recall_store::ProposedThreadRecord {
+                id: 0,
+                proposed_handle: handle,
+                chunk_ids: cluster.chunk_ids,
+                centroid_vec: cluster.centroid,
+                cohesion: cluster.cohesion,
+                created_at: now,
+                promoted_to: None,
+            };
+            match self.threads.insert_proposed_thread(&rec) {
+                Ok(_) => written += 1,
+                Err(StoreError::UniqueViolation { .. }) => {
+                    // A proposal with this handle already exists —
+                    // possible if two scans nominate near-identical
+                    // clusters in the same second. Skip; the existing
+                    // row is still valid.
+                    tracing::trace!(
+                        handle = %rec.proposed_handle,
+                        "auto-weaver: proposed thread already exists",
+                    );
+                }
+                Err(err) => return Err(WeaverError::from(err)),
+            }
+        }
+        Ok(written)
+    }
+}
+
+/// Intermediate result from the matched-anchor pass.
+#[derive(Debug, Default)]
+struct MatchPassOutcome {
+    links_written: usize,
+    chunk_to_anchors: HashMap<String, Vec<ThreadHandle>>,
+    matched_chunks: std::collections::HashSet<String>,
+}
+
+/// Build a kebab-case proposed-thread handle from a cluster's member
+/// chunks. Format: `proposed-<8 hex chars>` — deterministic enough that
+/// repeated scans of the same cluster collapse to one row (the unique
+/// constraint absorbs the duplicate), short enough to fit
+/// `ThreadHandle`'s 64-char / 4-hyphen budget.
+fn generate_proposed_handle(chunk_ids: &[String], ts: chrono::DateTime<Utc>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for id in chunk_ids {
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    // Include the date (not the full ts) so the same cluster surfaced
+    // in two scans on the same day collides; a different day yields a
+    // new proposal (which the operator can still merge).
+    hasher.update(ts.format("%Y%m%d").to_string().as_bytes());
+    let digest = hasher.finalize();
+    let short = hex::encode(&digest[..4]);
+    format!("proposed-{short}")
 }
 
 const fn source_kind_to_category(source: SourceKind) -> &'static str {
@@ -511,6 +622,39 @@ mod tests {
         let weave = &out.proposed_weaves[0];
         assert_eq!(weave.shared_chunks, vec!["new".to_string()]);
         assert_eq!(weave.anchors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unmatched_chunks_become_proposed_thread_when_dense() {
+        // Three chunks share an anchor vector; no anchors exist yet,
+        // so the weaver routes them through the emergent-cluster path
+        // and writes a `threads_proposed` row.
+        let fx = fixture().await;
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        // Tiny jitter so the cluster vectors are not bit-identical but
+        // still resonate above the EMERGENT_THRESHOLD (0.82).
+        let v2 = vec![1.0_f32, 0.01, 0.0, 0.0];
+        let v3 = vec![1.0_f32, 0.0, 0.01, 0.0];
+        fx.corpus
+            .upsert(
+                &[chunk("u1"), chunk("u2"), chunk("u3")],
+                &[v, v2, v3],
+            )
+            .await
+            .unwrap();
+        let out = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["u1", "u2", "u3"]))
+            .await
+            .unwrap();
+        assert_eq!(out.evidence_links_written, 0, "no anchors → no links");
+        assert_eq!(out.proposed_threads_written, 1, "one emergent cluster");
+        let proposals = fx.threads.list_proposed_threads().unwrap();
+        assert_eq!(proposals.len(), 1);
+        let p = &proposals[0];
+        assert_eq!(p.chunk_ids.len(), 3);
+        assert!(p.proposed_handle.starts_with("proposed-"));
+        assert!(p.cohesion > 0.99);
+        assert!(p.promoted_to.is_none());
     }
 
     #[test]

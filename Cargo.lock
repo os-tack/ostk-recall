@@ -4465,6 +4465,7 @@ version = "0.1.8"
 dependencies = [
  "async-trait",
  "chrono",
+ "hex",
  "ostk-recall-attention-mcp",
  "ostk-recall-core",
  "ostk-recall-pipeline",
