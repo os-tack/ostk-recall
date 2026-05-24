@@ -19,10 +19,12 @@ use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 /// Batch size used when calling the embedder.
 pub const EMBED_BATCH: usize = 64;
 
-/// Capacity of the post-ingest broadcast channel. Each `IngestEvent`
-/// occupies one slot until every live subscriber has consumed it; once
-/// the channel is full, slow subscribers see [`broadcast::error::RecvError::Lagged`]
-/// on their next `recv()` and recover from the next live slot.
+/// Capacity of the post-ingest broadcast channel.
+///
+/// Each `IngestEvent` occupies one slot until every live subscriber has
+/// consumed it; once the channel is full, slow subscribers see
+/// [`broadcast::error::RecvError::Lagged`] on their next `recv()` and
+/// recover from the next live slot.
 pub const INGEST_BROADCAST_CAPACITY: usize = 256;
 
 // NOTE(phase4): `IngestEvent` + `SyntheticSourceMeta` are defined here
@@ -31,10 +33,11 @@ pub const INGEST_BROADCAST_CAPACITY: usize = 256;
 // the local copies. The shape here mirrors the team-lead spec exactly;
 // phase 1 may widen it (e.g. adding `stats: PipelineStats`).
 
-/// Post-ingest event broadcast by [`Pipeline`] after `merge_insert`
-/// completes. Subscribers (auto-weaver, converger, turn observer
-/// feedback loops) receive one event per ingest call — both
-/// scanner-driven [`Pipeline::ingest_source`] and in-process
+/// Post-ingest event broadcast by [`Pipeline`] after `merge_insert` completes.
+///
+/// Subscribers (auto-weaver, converger, turn observer feedback loops)
+/// receive one event per ingest call — both scanner-driven
+/// [`Pipeline::ingest_source`] and in-process
 /// [`Pipeline::ingest_synthetic`].
 #[derive(Debug, Clone)]
 pub struct IngestEvent {
@@ -48,6 +51,7 @@ pub struct IngestEvent {
 }
 
 /// Caller-provided metadata accompanying a batch of synthetic chunks.
+///
 /// The pipeline already knows `source_ids` and `chunk_ids` (read from
 /// the chunks themselves), so the caller only supplies the routing
 /// pair `(source_kind, project)`.
@@ -361,11 +365,11 @@ impl Pipeline {
     /// surfacer feedback loops) that have already constructed chunks
     /// and just need them embedded + merged into the corpus.
     ///
-    /// Reuses the existing embed → merge_insert path
+    /// Reuses the existing embed → `merge_insert` path
     /// ([`Pipeline::embed_and_persist`]) and runs the same Tier 2
     /// content-hash dedupe check so re-ingesting an identical chunk is
     /// idempotent. Emits one [`IngestEvent`] on the broadcast channel
-    /// after merge_insert completes, exactly like a scanner-driven
+    /// after `merge_insert` completes, exactly like a scanner-driven
     /// [`Pipeline::ingest_source`] call. Honors `dry_run` (skips
     /// embed + emit if set).
     pub async fn ingest_synthetic(
@@ -373,9 +377,11 @@ impl Pipeline {
         chunks: Vec<Chunk>,
         source_meta: SyntheticSourceMeta,
     ) -> Result<PipelineStats, PipelineError> {
-        let mut stats = PipelineStats::default();
-        stats.items_seen = 1;
-        stats.chunks_emitted = chunks.len();
+        let mut stats = PipelineStats {
+            items_seen: 1,
+            chunks_emitted: chunks.len(),
+            ..PipelineStats::default()
+        };
 
         let project = source_meta.project.as_deref().unwrap_or("default");
         let mut to_embed: Vec<Chunk> = Vec::with_capacity(chunks.len());
@@ -1632,7 +1638,7 @@ mod tests {
         assert_eq!(event.project.as_deref(), Some("phase4-test"));
         assert_eq!(event.chunks_upserted, 2);
         assert_eq!(event.chunks_stale, 0);
-        let mut got = event.chunk_ids_upserted.clone();
+        let mut got = event.chunk_ids_upserted;
         let mut want = expected.clone();
         got.sort();
         want.sort();

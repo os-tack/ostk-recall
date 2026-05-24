@@ -1,4 +1,4 @@
-//! Storage layer: `LanceDB` table (vector + Tantivy FTS) + SQLite files
+//! Storage layer: `LanceDB` table (vector + Tantivy FTS) + `SQLite` files
 //! (`events.sqlite` for audit firehose, `ingest.sqlite` for idempotency,
 //! `threads.sqlite` for the attention-substrate threads/evidence ledger).
 
