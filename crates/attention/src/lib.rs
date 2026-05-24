@@ -15,6 +15,9 @@
 //! future workpiece. Keeping the runtime abstract makes the math and
 //! scope-isolation invariants testable on their own.
 
+pub mod observer;
+pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

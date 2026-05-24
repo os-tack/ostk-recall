@@ -264,6 +264,10 @@ pub async fn scan(
             SourceKind::OstkProject => &ostk_project,
             SourceKind::Gemini => &gemini,
             SourceKind::Thread => &thread,
+            // Membrane sources are in-process synthetic ingest only
+            // (turn observer → Pipeline::ingest_synthetic); they have
+            // no on-disk scanner, so the config-driven scan skips them.
+            SourceKind::Membrane => continue,
         };
 
         let stats = pipeline.ingest_source(scanner, source_cfg).await;
@@ -338,7 +342,12 @@ pub async fn scan_paths(
         .iter()
         .map(|source_cfg| {
             let scanner: &dyn Scanner = match source_cfg.kind {
-                SourceKind::Markdown => &markdown,
+                // Membrane sources are in-process synthetic ingest only
+                // (turn observer → Pipeline::ingest_synthetic); they have
+                // no on-disk scanner, so for scan_paths fan-out we treat
+                // them as markdown — the path-filter step will exclude
+                // any actual work since membrane sources name no roots.
+                SourceKind::Markdown | SourceKind::Membrane => &markdown,
                 SourceKind::Code => &code,
                 SourceKind::ClaudeCode => &claude_code,
                 SourceKind::FileGlob => &file_glob,

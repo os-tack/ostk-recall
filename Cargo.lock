@@ -4389,9 +4389,13 @@ dependencies = [
  "async-trait",
  "chrono",
  "ostk-recall-core",
+ "ostk-recall-pipeline",
+ "ostk-recall-store",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
