@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -27,28 +27,16 @@ pub const EMBED_BATCH: usize = 64;
 /// recover from the next live slot.
 pub const INGEST_BROADCAST_CAPACITY: usize = 256;
 
-// NOTE(phase4): `IngestEvent` + `SyntheticSourceMeta` are defined here
-// locally until phase 1 (`ostk-recall-core::attention`) lands. Once that
-// merges, swap these for re-exports from `ostk_recall_core` and remove
-// the local copies. The shape here mirrors the team-lead spec exactly;
-// phase 1 may widen it (e.g. adding `stats: PipelineStats`).
-
 /// Post-ingest event broadcast by [`Pipeline`] after `merge_insert` completes.
 ///
 /// Subscribers (auto-weaver, converger, turn observer feedback loops)
 /// receive one event per ingest call — both scanner-driven
 /// [`Pipeline::ingest_source`] and in-process
 /// [`Pipeline::ingest_synthetic`].
-#[derive(Debug, Clone)]
-pub struct IngestEvent {
-    pub project: Option<String>,
-    pub source: SourceKind,
-    pub source_ids: Vec<String>,
-    pub chunk_ids_upserted: Vec<String>,
-    pub chunks_upserted: usize,
-    pub chunks_stale: usize,
-    pub ts: DateTime<Utc>,
-}
+///
+/// Defined canonically in `ostk-recall-core`; re-exported here so existing
+/// consumers can keep importing `ostk_recall_pipeline::IngestEvent`.
+pub use ostk_recall_core::IngestEvent;
 
 /// Caller-provided metadata accompanying a batch of synthetic chunks.
 ///
