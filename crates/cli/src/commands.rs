@@ -17,6 +17,7 @@ use ostk_recall_scan::file_glob::FileGlobScanner;
 use ostk_recall_scan::gemini::GeminiScanner;
 use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
+use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
 use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 
@@ -221,6 +222,7 @@ pub async fn scan(
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
     let gemini = GeminiScanner;
+    let thread = ThreadScanner;
 
     let events_db: Option<Arc<EventsDb>> = if cfg
         .sources
@@ -261,6 +263,7 @@ pub async fn scan(
             SourceKind::ZipExport => &zip_export,
             SourceKind::OstkProject => &ostk_project,
             SourceKind::Gemini => &gemini,
+            SourceKind::Thread => &thread,
         };
 
         let stats = pipeline.ingest_source(scanner, source_cfg).await;
@@ -311,6 +314,7 @@ pub async fn scan_paths(
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
     let gemini = GeminiScanner;
+    let thread = ThreadScanner;
 
     let events_db: Option<Arc<EventsDb>> = if cfg
         .sources
@@ -341,6 +345,7 @@ pub async fn scan_paths(
                 SourceKind::ZipExport => &zip_export,
                 SourceKind::OstkProject => &ostk_project,
                 SourceKind::Gemini => &gemini,
+                SourceKind::Thread => &thread,
             };
             (scanner, source_cfg)
         })

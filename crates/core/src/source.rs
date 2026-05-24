@@ -22,6 +22,7 @@ pub enum SourceKind {
     FileGlob,
     ZipExport,
     Gemini,
+    Thread,
 }
 
 impl SourceKind {
@@ -34,6 +35,7 @@ impl SourceKind {
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
+            Self::Thread => "thread",
         }
     }
 
@@ -56,6 +58,7 @@ impl SourceKind {
             Self::FileGlob => vec![Source::FileGlob],
             Self::ZipExport => vec![Source::ZipExport],
             Self::Gemini => vec![Source::Gemini],
+            Self::Thread => vec![Source::Thread],
         }
     }
 
@@ -64,7 +67,10 @@ impl SourceKind {
         match self {
             Self::Code => RetentionPolicy::Delete,
             Self::Markdown | Self::FileGlob => RetentionPolicy::Stale,
-            _ => RetentionPolicy::Keep, // Gemini, ClaudeCode, ZipExport, OstkProject
+            // Threads carry attention-substrate identity (handle, evidence,
+            // familiarity) that outlives the filesystem write — fade is a
+            // first-class state, not a delete.
+            _ => RetentionPolicy::Keep,
         }
     }
 }
@@ -88,6 +94,7 @@ pub enum Source {
     FileGlob,
     ZipExport,
     Gemini,
+    Thread,
 }
 
 impl Source {
@@ -106,6 +113,7 @@ impl Source {
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
+            Self::Thread => "thread",
         }
     }
 }
@@ -130,6 +138,7 @@ mod tests {
             SourceKind::FileGlob,
             SourceKind::ZipExport,
             SourceKind::Gemini,
+            SourceKind::Thread,
         ] {
             let w = Wrap { kind };
             let s = toml::to_string(&w).unwrap();
