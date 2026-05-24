@@ -23,6 +23,9 @@ pub enum SourceKind {
     ZipExport,
     Gemini,
     Thread,
+    /// In-process "recognition moments" emitted by the turn observer.
+    /// No scanner; chunks land via `Pipeline::ingest_synthetic`.
+    Membrane,
 }
 
 impl SourceKind {
@@ -36,6 +39,7 @@ impl SourceKind {
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
             Self::Thread => "thread",
+            Self::Membrane => "membrane",
         }
     }
 
@@ -59,6 +63,7 @@ impl SourceKind {
             Self::ZipExport => vec![Source::ZipExport],
             Self::Gemini => vec![Source::Gemini],
             Self::Thread => vec![Source::Thread],
+            Self::Membrane => vec![Source::Membrane],
         }
     }
 
@@ -95,6 +100,8 @@ pub enum Source {
     ZipExport,
     Gemini,
     Thread,
+    /// In-process "recognition moments" emitted by the turn observer.
+    Membrane,
 }
 
 impl Source {
@@ -114,6 +121,7 @@ impl Source {
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
             Self::Thread => "thread",
+            Self::Membrane => "membrane",
         }
     }
 }
@@ -139,6 +147,7 @@ mod tests {
             SourceKind::ZipExport,
             SourceKind::Gemini,
             SourceKind::Thread,
+            SourceKind::Membrane,
         ] {
             let w = Wrap { kind };
             let s = toml::to_string(&w).unwrap();
