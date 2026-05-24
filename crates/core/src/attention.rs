@@ -105,11 +105,13 @@ impl ThreadHandle {
     }
 
     /// Borrow the underlying string slice.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Consume the wrapper and return the owned string.
+    #[must_use]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -159,39 +161,19 @@ impl<'de> Deserialize<'de> for ThreadHandle {
 }
 
 /// Validation failure shapes for `ThreadHandle::new`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ThreadHandleError {
+    #[error("thread handle must not be empty")]
     Empty,
+    #[error("thread handle exceeds {max} chars (got {0})", max = ThreadHandle::MAX_LEN)]
     TooLong(usize),
+    #[error("thread handle must not start or end with '-'")]
     EdgeHyphen,
+    #[error("thread handle has {0} hyphens (max {max})", max = ThreadHandle::MAX_HYPHENS)]
     TooManyHyphens(usize),
+    #[error("thread handle contains invalid char {0:?} (kebab-case lowercase ASCII only)")]
     InvalidChar(char),
 }
-
-impl fmt::Display for ThreadHandleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("thread handle must not be empty"),
-            Self::TooLong(n) => write!(
-                f,
-                "thread handle exceeds {} chars (got {n})",
-                ThreadHandle::MAX_LEN
-            ),
-            Self::EdgeHyphen => f.write_str("thread handle must not start or end with '-'"),
-            Self::TooManyHyphens(n) => write!(
-                f,
-                "thread handle has {n} hyphens (max {})",
-                ThreadHandle::MAX_HYPHENS
-            ),
-            Self::InvalidChar(c) => write!(
-                f,
-                "thread handle contains invalid char {c:?} (kebab-case lowercase ASCII only)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ThreadHandleError {}
 
 /// Mandatory scope on every attention surface.
 ///
