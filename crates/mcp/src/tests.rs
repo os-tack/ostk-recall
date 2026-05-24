@@ -199,3 +199,92 @@ async fn tools_call_recall_link_missing_arg() {
     assert!(resp.error.is_some());
     assert_eq!(resp.error.unwrap().code, -32602);
 }
+
+// ---------------------------------------------------------------------
+// Attention substrate wiring smoke tests
+// ---------------------------------------------------------------------
+//
+// These tests prove that `Server::with_attention` exposes the attention
+// dispatch surface end-to-end: tools/list includes the new tools, and
+// tools/call routes through the dispatch correctly.
+
+async fn build_server_with_attention() -> (TempDir, Server) {
+    use ostk_recall_attention::{AttentionForwardStore, InMemoryAttention};
+    use ostk_recall_attention_mcp::AttentionDispatch;
+    use ostk_recall_store::ThreadsDb;
+
+    let (tmp, server) = build_server().await;
+    let threads = Arc::new(ThreadsDb::open(tmp.path()).unwrap());
+    let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+    let dispatch = Arc::new(AttentionDispatch::new(attention, threads));
+    (tmp, server.with_attention(dispatch))
+}
+
+#[tokio::test]
+async fn tools_list_includes_attention_when_wired() {
+    let (_tmp, server) = build_server_with_attention().await;
+    let req = json!({"jsonrpc":"2.0","id":100,"method":"tools/list"});
+    let resp = server.handle_request(req).await.unwrap();
+    let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"attention_attend"));
+    assert!(names.contains(&"attention_surface"));
+    assert!(names.contains(&"attention_fold"));
+    assert!(names.contains(&"thread_create"));
+    assert!(names.contains(&"thread_list"));
+}
+
+#[tokio::test]
+async fn tools_call_thread_create_then_list_round_trip() {
+    let (_tmp, server) = build_server_with_attention().await;
+
+    let create_req = json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "tools/call",
+        "params": {
+            "name": "thread_create",
+            "arguments": { "handle": "smoke-thread", "tension": "active" }
+        }
+    });
+    let create_resp = server.handle_request(create_req).await.unwrap();
+    assert!(create_resp.error.is_none(), "{:?}", create_resp.error);
+
+    let list_req = json!({
+        "jsonrpc": "2.0",
+        "id": 102,
+        "method": "tools/call",
+        "params": { "name": "thread_list", "arguments": {} }
+    });
+    let list_resp = server.handle_request(list_req).await.unwrap();
+    assert!(list_resp.error.is_none(), "{:?}", list_resp.error);
+    let text = list_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inner: Value = serde_json::from_str(&text).unwrap();
+    let handles: Vec<&str> = inner["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["handle"].as_str().unwrap())
+        .collect();
+    assert!(
+        handles.contains(&"smoke-thread"),
+        "thread_create result should be visible via thread_list: {handles:?}"
+    );
+}
+
+#[tokio::test]
+async fn attention_tools_unavailable_without_dispatch() {
+    let (_tmp, server) = build_server().await;
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 103,
+        "method": "tools/call",
+        "params": { "name": "thread_create", "arguments": { "handle": "x" } }
+    });
+    let resp = server.handle_request(req).await.unwrap();
+    assert!(resp.error.is_some(), "expected method-not-found");
+    assert_eq!(resp.error.unwrap().code, -32601);
+}

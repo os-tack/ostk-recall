@@ -224,6 +224,288 @@ impl ChainSink for NoopChainSink {
     }
 }
 
+impl ChainEvent {
+    /// Stable wire `kind` discriminator used by the `chain_log` table.
+    pub const fn kind_str(&self) -> &'static str {
+        match self {
+            Self::ThreadCreate { .. } => "thread_create",
+            Self::ThreadRename { .. } => "thread_rename",
+            Self::ThreadDelete { .. } => "thread_delete",
+            Self::EvidenceAdd { .. } => "evidence_add",
+            Self::EvidenceRemove { .. } => "evidence_remove",
+            Self::EvidenceStateChange { .. } => "evidence_state_change",
+            Self::FamiliarityBatch { .. } => "familiarity_batch",
+            Self::TensionTransition { .. } => "tension_transition",
+        }
+    }
+
+    /// Timestamp on the row (every variant carries one).
+    pub const fn ts(&self) -> &DateTime<Utc> {
+        match self {
+            Self::ThreadCreate { ts, .. }
+            | Self::ThreadRename { ts, .. }
+            | Self::ThreadDelete { ts, .. }
+            | Self::EvidenceAdd { ts, .. }
+            | Self::EvidenceRemove { ts, .. }
+            | Self::EvidenceStateChange { ts, .. }
+            | Self::FamiliarityBatch { ts, .. }
+            | Self::TensionTransition { ts, .. } => ts,
+        }
+    }
+
+    /// Serialize the body to a JSON string for the `chain_log.payload`
+    /// column. Together with [`Self::kind_str`] this is the durable wire
+    /// form; [`Self::from_row`] is the inverse.
+    pub fn to_payload(&self) -> std::result::Result<String, serde_json::Error> {
+        let v = match self {
+            Self::ThreadCreate { handle, .. } | Self::ThreadDelete { handle, .. } => {
+                serde_json::json!({ "handle": handle.as_str() })
+            }
+            Self::ThreadRename { old, new, .. } => serde_json::json!({
+                "old": old.as_str(),
+                "new": new.as_str(),
+            }),
+            Self::EvidenceAdd {
+                thread,
+                path,
+                association,
+                ..
+            } => serde_json::json!({
+                "thread": thread.as_str(),
+                "path": path.to_string_lossy(),
+                "association": association.as_str(),
+            }),
+            Self::EvidenceRemove {
+                thread,
+                evidence_id,
+                ..
+            } => serde_json::json!({
+                "thread": thread.as_str(),
+                "evidence_id": evidence_id,
+            }),
+            Self::EvidenceStateChange {
+                evidence_id,
+                from,
+                to,
+                ..
+            } => serde_json::json!({
+                "evidence_id": evidence_id,
+                "from": from.as_str(),
+                "to": to.as_str(),
+            }),
+            Self::FamiliarityBatch {
+                entries, turn_seq, ..
+            } => {
+                let pairs: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(h, fam)| serde_json::json!([h.as_str(), fam]))
+                    .collect();
+                serde_json::json!({
+                    "entries": pairs,
+                    "turn_seq": turn_seq,
+                })
+            }
+            Self::TensionTransition {
+                handle, from, to, ..
+            } => serde_json::json!({
+                "handle": handle.as_str(),
+                "from": from.as_str(),
+                "to": to.as_str(),
+            }),
+        };
+        serde_json::to_string(&v)
+    }
+
+    /// Decode a `(kind, payload)` pair from the `chain_log` table.
+    #[allow(clippy::too_many_lines)]
+    pub fn from_row(kind: &str, payload: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
+            StoreError::Lance(lancedb::Error::Other {
+                message: format!("chain_log payload not JSON: {e}"),
+                source: None,
+            })
+        })?;
+        // The chain row's authoritative timestamp lives on the row, but
+        // we synthesize Utc::now() on the decode boundary since callers
+        // that need the original ts read it from the column directly via
+        // a future read variant. For replay use, the in-memory runtime
+        // re-derives `last_touched_at` on familiarize anyway.
+        let ts = Utc::now();
+        let s_field = |k: &str| -> Result<String> {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                    message: format!("chain payload missing `{k}` for kind={kind}"),
+                    source: None,
+                }))
+        };
+        let handle_field = |k: &str| -> Result<ThreadHandle> {
+            let s = s_field(k)?;
+            ThreadHandle::new(s).map_err(|e| StoreError::Lance(lancedb::Error::Other {
+                message: format!("chain payload bad handle: {e}"),
+                source: None,
+            }))
+        };
+        let ev = match kind {
+            "thread_create" => Self::ThreadCreate {
+                handle: handle_field("handle")?,
+                ts,
+            },
+            "thread_rename" => Self::ThreadRename {
+                old: handle_field("old")?,
+                new: handle_field("new")?,
+                ts,
+            },
+            "thread_delete" => Self::ThreadDelete {
+                handle: handle_field("handle")?,
+                ts,
+            },
+            "evidence_add" => Self::EvidenceAdd {
+                thread: handle_field("thread")?,
+                path: PathBuf::from(s_field("path")?),
+                association: AssociationType::parse(&s_field("association")?)?,
+                ts,
+            },
+            "evidence_remove" => {
+                let eid = v
+                    .get("evidence_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                        message: "chain payload missing evidence_id".into(),
+                        source: None,
+                    }))?;
+                Self::EvidenceRemove {
+                    thread: handle_field("thread")?,
+                    evidence_id: eid,
+                    ts,
+                }
+            }
+            "evidence_state_change" => {
+                let eid = v
+                    .get("evidence_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                        message: "chain payload missing evidence_id".into(),
+                        source: None,
+                    }))?;
+                Self::EvidenceStateChange {
+                    evidence_id: eid,
+                    from: RelationState::parse(&s_field("from")?)?,
+                    to: RelationState::parse(&s_field("to")?)?,
+                    ts,
+                }
+            }
+            "familiarity_batch" => {
+                let entries_raw = v
+                    .get("entries")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                        message: "chain payload missing entries".into(),
+                        source: None,
+                    }))?;
+                let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(entries_raw.len());
+                for row in entries_raw {
+                    let pair = row.as_array().ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                        message: "familiarity entry not array".into(),
+                        source: None,
+                    }))?;
+                    let h_s = pair
+                        .first()
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                            message: "familiarity entry missing handle".into(),
+                            source: None,
+                        }))?;
+                    let fam = pair
+                        .get(1)
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                            message: "familiarity entry missing count".into(),
+                            source: None,
+                        }))?;
+                    let h = ThreadHandle::new(h_s).map_err(|e| StoreError::Lance(lancedb::Error::Other {
+                        message: format!("familiarity entry bad handle: {e}"),
+                        source: None,
+                    }))?;
+                    let fam_u32 = u32::try_from(fam).map_err(|_| StoreError::Lance(lancedb::Error::Other {
+                        message: format!("familiarity count overflow: {fam}"),
+                        source: None,
+                    }))?;
+                    entries.push((h, fam_u32));
+                }
+                let turn_seq = v
+                    .get("turn_seq")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                Self::FamiliarityBatch {
+                    entries,
+                    turn_seq,
+                    ts,
+                }
+            }
+            "tension_transition" => Self::TensionTransition {
+                handle: handle_field("handle")?,
+                from: TensionState::parse(&s_field("from")?)?,
+                to: TensionState::parse(&s_field("to")?)?,
+                ts,
+            },
+            other => {
+                return Err(StoreError::Lance(lancedb::Error::Other {
+                    message: format!("unknown chain kind: {other}"),
+                    source: None,
+                }));
+            }
+        };
+        Ok(ev)
+    }
+}
+
+/// Durable chain sink for `threads.sqlite`.
+///
+/// Writes each `ChainEvent` into the `chain_log` table of the same
+/// `threads.sqlite` database. Used by `serve()` so the in-memory score
+/// tier can be rebuilt from durable state on every boot.
+pub struct SqliteChainSink {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteChainSink {
+    /// Open a fresh `Connection` to `<root>/threads.sqlite` for chain
+    /// writes. Held independently of the `ThreadsDb` connection so chain
+    /// appends never block on the same `MutexGuard` the mutation holds.
+    ///
+    /// Runs `ThreadsDb::migrate` defensively so the sink can be
+    /// constructed before the matching `ThreadsDb::open`.
+    pub fn open(root: &Path) -> Result<Self> {
+        let path = root.join("threads.sqlite");
+        let conn = Connection::open(path)?;
+        ThreadsDb::setup_connection(&conn)?;
+        ThreadsDb::migrate(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+}
+
+impl ChainSink for SqliteChainSink {
+    fn append(&self, event: &ChainEvent) -> Result<()> {
+        let payload = event.to_payload().map_err(|e| StoreError::Lance(lancedb::Error::Other {
+            message: format!("chain serialize: {e}"),
+            source: None,
+        }))?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        conn.execute(
+            "INSERT INTO chain_log (ts, kind, payload) VALUES (?, ?, ?)",
+            params![event.ts().to_rfc3339(), event.kind_str(), payload],
+        )?;
+        Ok(())
+    }
+}
+
 /// Threads-ledger handle (one per `<root>/threads.sqlite`).
 pub struct ThreadsDb {
     conn: Mutex<Connection>,
@@ -266,7 +548,7 @@ impl ThreadsDb {
         std::mem::replace(&mut self.sink, sink)
     }
 
-    fn setup_connection(conn: &Connection) -> Result<()> {
+    pub(crate) fn setup_connection(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
@@ -282,7 +564,7 @@ impl ThreadsDb {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn migrate(conn: &Connection) -> Result<()> {
+    pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             r"
 CREATE TABLE IF NOT EXISTS threads (
@@ -319,9 +601,44 @@ CREATE TABLE IF NOT EXISTS evidence_links (
 CREATE INDEX IF NOT EXISTS idx_evidence_thread ON evidence_links(thread_handle);
 CREATE INDEX IF NOT EXISTS idx_evidence_state ON evidence_links(relation_state);
 CREATE INDEX IF NOT EXISTS idx_evidence_current_path ON evidence_links(current_path);
+
+CREATE TABLE IF NOT EXISTS chain_log (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_kind ON chain_log(kind);
 ",
         )?;
         Ok(())
+    }
+
+    /// Iterate the durable chain log in insertion order. Used by `serve()`
+    /// to rebuild the in-memory score tier on boot — the chain is the
+    /// source of truth, the in-memory state is a derived view.
+    ///
+    /// Rows whose payload fails to deserialize are skipped with a warn-log
+    /// rather than aborting the whole replay: a single corrupted row
+    /// should not wedge boot.
+    pub fn iter_chain(&self) -> Result<Vec<ChainEvent>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT kind, payload FROM chain_log ORDER BY seq ASC")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut events: Vec<ChainEvent> = Vec::with_capacity(rows.len());
+        for (kind, payload) in rows {
+            match ChainEvent::from_row(&kind, &payload) {
+                Ok(ev) => events.push(ev),
+                Err(e) => {
+                    tracing::warn!(kind = %kind, error = %e, "chain row decode failed; skipping");
+                }
+            }
+        }
+        Ok(events)
     }
 
     // ---------- threads ----------
@@ -1162,6 +1479,48 @@ mod tests {
                 assert_eq!(entries[0].1, 3);
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sqlite_chain_sink_persists_and_iter_chain_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+
+        // Three mutations chained: thread create + familiarity batch + tension transition.
+        db.upsert_thread(&sample_thread("scribe")).unwrap();
+        db.record_familiarity_batch(vec![(handle("scribe"), 7)], 42)
+            .unwrap();
+        db.set_tension(&handle("scribe"), TensionState::Slack)
+            .unwrap();
+
+        // Drop the live handles and reopen to prove the chain survives
+        // across process boundaries.
+        drop(db);
+        drop(sink);
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+
+        let events = db.iter_chain().unwrap();
+        assert_eq!(events.len(), 3, "expected three chain rows, got {events:?}");
+        assert!(matches!(events[0], ChainEvent::ThreadCreate { .. }));
+        match &events[1] {
+            ChainEvent::FamiliarityBatch {
+                entries, turn_seq, ..
+            } => {
+                assert_eq!(*turn_seq, 42);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].0.as_str(), "scribe");
+                assert_eq!(entries[0].1, 7);
+            }
+            other => panic!("expected FamiliarityBatch, got {other:?}"),
+        }
+        match &events[2] {
+            ChainEvent::TensionTransition { handle: h, to, .. } => {
+                assert_eq!(h.as_str(), "scribe");
+                assert_eq!(*to, TensionState::Slack);
+            }
+            other => panic!("expected TensionTransition, got {other:?}"),
         }
     }
 }

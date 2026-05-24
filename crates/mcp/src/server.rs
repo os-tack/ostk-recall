@@ -2,6 +2,10 @@
 
 use std::sync::Arc;
 
+use ostk_recall_attention_mcp::{
+    AttentionDispatch, AttentionHandlersError, DefaultAttentionHandlers, attention_tools,
+    thread_tools,
+};
 use ostk_recall_query::{QueryEngine, QueryError, RecallParams, SynthesizedPage, Synthesizer};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,8 +18,14 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// MCP stdio server. Holds an `Arc<QueryEngine>` so it can be cloned cheaply
 /// across tasks if the caller ever wants to run multiple transports.
+///
+/// The optional `attention` dispatch unlocks the
+/// `attention_*` / `thread_*` tool families when the caller (typically
+/// `cli::commands::serve`) constructs a long-lived `AttentionDispatch`
+/// and threads it through.
 pub struct Server {
     engine: Arc<QueryEngine>,
+    attention: Option<Arc<AttentionDispatch>>,
 }
 
 impl Server {
@@ -23,12 +33,25 @@ impl Server {
     pub fn new(engine: QueryEngine) -> Self {
         Self {
             engine: Arc::new(engine),
+            attention: None,
         }
     }
 
     #[must_use]
     pub const fn from_arc(engine: Arc<QueryEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            attention: None,
+        }
+    }
+
+    /// Attach an `AttentionDispatch` so the attention/thread MCP tools
+    /// become callable. Without one, those tools are not advertised in
+    /// `tools/list` and `tools/call` returns method-not-found.
+    #[must_use]
+    pub fn with_attention(mut self, dispatch: Arc<AttentionDispatch>) -> Self {
+        self.attention = Some(dispatch);
+        self
     }
 
     pub const fn engine(&self) -> &Arc<QueryEngine> {
@@ -124,7 +147,12 @@ impl Server {
     }
 
     fn handle_tools_list(&self) -> Value {
-        json!({ "tools": tool_list(self.engine.has_audit()) })
+        let mut tools = tool_list(self.engine.has_audit());
+        if self.attention.is_some() {
+            tools.extend(attention_tools());
+            tools.extend(thread_tools());
+        }
+        json!({ "tools": tools })
     }
 
     async fn handle_tools_call(&self, params: Value) -> std::result::Result<Value, JsonRpcError> {
@@ -193,6 +221,21 @@ impl Server {
                 json!({ "pages": named })
             }
             other => {
+                if let Some(d) = self.attention.as_ref() {
+                    if is_attention_tool(other) {
+                        let out = d
+                            .dispatch(other, args)
+                            .await
+                            .map_err(attention_error_to_rpc)?;
+                        let text = serde_json::to_string(&out).map_err(|e| {
+                            JsonRpcError::internal(format!("serialize: {e}"))
+                        })?;
+                        return Ok(json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": false,
+                        }));
+                    }
+                }
                 return Err(JsonRpcError::method_not_found(&format!(
                     "tools/call/{other}"
                 )));
@@ -208,6 +251,23 @@ impl Server {
             ],
             "isError": false
         }))
+    }
+}
+
+fn is_attention_tool(name: &str) -> bool {
+    name.starts_with("attention_") || name.starts_with("thread_")
+}
+
+fn attention_error_to_rpc(err: AttentionHandlersError) -> JsonRpcError {
+    match err {
+        AttentionHandlersError::InvalidParams(m) => JsonRpcError::invalid_params(m),
+        AttentionHandlersError::InvalidHandle(e) => {
+            JsonRpcError::invalid_params(format!("invalid handle: {e}"))
+        }
+        AttentionHandlersError::PrivacyForbidden(tier) => {
+            JsonRpcError::invalid_params(format!("privacy tier {tier:?} not permitted"))
+        }
+        other => JsonRpcError::internal(other.to_string()),
     }
 }
 
