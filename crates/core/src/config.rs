@@ -83,11 +83,13 @@ impl RerankerConfig {
     }
 }
 
-/// File-watcher tuning. The watcher reuses each `[[sources]].paths`
-/// (and `extensions`) — it does not declare its own paths. When a debounced
-/// batch contains any event under a watched source path, the watcher pokes
-/// the scan-trigger socket once. The scan does the real filtering; the
-/// watcher's only job is "did anything we care about change recently?".
+/// File-watcher tuning.
+///
+/// The watcher reuses each `[[sources]].paths` (and `extensions`) — it does
+/// not declare its own paths. When a debounced batch contains any event
+/// under a watched source path, the watcher pokes the scan-trigger socket
+/// once. The scan does the real filtering; the watcher's only job is "did
+/// anything we care about change recently?".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchConfig {
@@ -144,11 +146,11 @@ pub enum WatchMode {
 ///   Debounce is doing real coalescing; 800 ms catches IntelliJ-style
 ///   "save the world" bursts without making interactive workflows feel
 ///   sluggish.
-/// - **macOS (FSEvents)** — the kernel already coalesces at ~30 ms;
+/// - **macOS (`FSEvents`)** — the kernel already coalesces at ~30 ms;
 ///   notify-debouncer-full receives mostly-batched events. Lower windows
-///   have no upside (FSEvents floor dominates) and risk split bursts on
+///   have no upside (`FSEvents` floor dominates) and risk split bursts on
 ///   slow disks. 1500 ms is the safe middle.
-/// - **Windows (ReadDirectoryChangesW)** — per-event with IOCP batching
+/// - **Windows (`ReadDirectoryChangesW`)** — per-event with IOCP batching
 ///   at the OS layer; AV filter drivers (Defender et al.) can stretch
 ///   delivery another 100–200 ms. 1200 ms absorbs that without going
 ///   macOS-conservative.
@@ -183,7 +185,7 @@ impl WatchConfig {
     /// watcher subcommand entry point to bail early on misconfiguration
     /// rather than silently doing nothing.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.enabled
     }
 
@@ -191,10 +193,9 @@ impl WatchConfig {
     /// `corpus_root/recall.sock` (the same default `serve` binds to)
     /// when no override is set.
     pub fn resolve_socket(&self, corpus_root: &Path) -> Result<PathBuf> {
-        match &self.socket {
-            Some(s) => expand_path(s),
-            None => Ok(corpus_root.join("recall.sock")),
-        }
+        self.socket
+            .as_ref()
+            .map_or_else(|| Ok(corpus_root.join("recall.sock")), |s| expand_path(s))
     }
 
     /// True when this source's `project` should be watched given the
@@ -204,10 +205,7 @@ impl WatchConfig {
         if self.projects.is_empty() {
             return true;
         }
-        match project {
-            Some(p) => self.projects.iter().any(|s| s == p),
-            None => false,
-        }
+        project.is_some_and(|p| self.projects.iter().any(|s| s == p))
     }
 }
 

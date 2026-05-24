@@ -64,9 +64,9 @@ impl Synthesizer {
             if let Some(h) = head {
                 let is_symbol = h.extra.get("symbol_name").is_some();
                 let title = if is_symbol {
-                    format!("Symbol: {}", group_key)
+                    format!("Symbol: {group_key}")
                 } else {
-                    format!("Page: {}", group_key)
+                    format!("Page: {group_key}")
                 };
 
                 let total_lineage = lineage.len();
@@ -82,8 +82,7 @@ impl Synthesizer {
                 }
 
                 let summary = format!(
-                    "Synthesized memory for {} with {} evolution and {} evidence points.",
-                    group_key, total_lineage, total_evidence
+                    "Synthesized memory for {group_key} with {total_lineage} evolution and {total_evidence} evidence points."
                 );
 
                 pages.push(SynthesizedPage {
@@ -198,7 +197,7 @@ mod tests {
     fn collapse_truncates_for_lazy_loading() {
         let mut hits = vec![fake_hit("p", "S", 1.0, "code", false)];
         for i in 0..10 {
-            hits.push(fake_hit(&format!("l{}", i), "S", 0.5, "code", true));
+            hits.push(fake_hit(&format!("l{i}"), "S", 0.5, "code", true));
         }
 
         let pages = Synthesizer::collapse(hits);

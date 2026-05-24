@@ -49,13 +49,11 @@ pub trait Scanner: Send + Sync {
         paths: &'a [PathBuf],
     ) -> Box<dyn Iterator<Item = Result<SourceItem>> + 'a> {
         Box::new(self.discover(cfg).filter(move |item| {
-            match item {
-                Ok(it) => it
-                    .path
+            item.as_ref().map_or(true, |it| {
+                it.path
                     .as_deref()
-                    .is_some_and(|p| paths.iter().any(|q| q == p || q.starts_with(p))),
-                Err(_) => true, // propagate errors so caller sees them
-            }
+                    .is_some_and(|p| paths.iter().any(|q| q == p || q.starts_with(p)))
+            })
         }))
     }
 }

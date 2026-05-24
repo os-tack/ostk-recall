@@ -7,14 +7,47 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use chrono::Utc;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use ostk_recall_core::{Chunk, RetentionPolicy, Scanner, SourceConfig};
+use ostk_recall_core::{Chunk, RetentionPolicy, Scanner, SourceConfig, SourceKind};
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 
 /// Batch size used when calling the embedder.
 pub const EMBED_BATCH: usize = 64;
+
+/// Capacity of the post-ingest broadcast channel.
+///
+/// Each `IngestEvent` occupies one slot until every live subscriber has
+/// consumed it; once the channel is full, slow subscribers see
+/// [`broadcast::error::RecvError::Lagged`] on their next `recv()` and
+/// recover from the next live slot.
+pub const INGEST_BROADCAST_CAPACITY: usize = 256;
+
+/// Post-ingest event broadcast by [`Pipeline`] after `merge_insert` completes.
+///
+/// Subscribers (auto-weaver, converger, turn observer feedback loops)
+/// receive one event per ingest call — both scanner-driven
+/// [`Pipeline::ingest_source`] and in-process
+/// [`Pipeline::ingest_synthetic`].
+///
+/// Defined canonically in `ostk-recall-core`; re-exported here so existing
+/// consumers can keep importing `ostk_recall_pipeline::IngestEvent`.
+pub use ostk_recall_core::IngestEvent;
+
+/// Caller-provided metadata accompanying a batch of synthetic chunks.
+///
+/// The pipeline already knows `source_ids` and `chunk_ids` (read from
+/// the chunks themselves), so the caller only supplies the routing
+/// pair `(source_kind, project)`.
+#[derive(Debug, Clone)]
+pub struct SyntheticSourceMeta {
+    pub source: SourceKind,
+    pub project: Option<String>,
+}
 
 pub trait ChunkEmbedder: Send + Sync {
     fn dim(&self) -> usize;
@@ -63,6 +96,7 @@ pub struct Pipeline {
     embedder: Arc<dyn ChunkEmbedder>,
     dry_run: bool,
     run_id: String,
+    events: broadcast::Sender<IngestEvent>,
 }
 
 impl Pipeline {
@@ -71,12 +105,14 @@ impl Pipeline {
         ingest: Arc<IngestDb>,
         embedder: Arc<dyn ChunkEmbedder>,
     ) -> Self {
+        let (events, _) = broadcast::channel(INGEST_BROADCAST_CAPACITY);
         Self {
             store,
             ingest,
             embedder,
             dry_run: false,
             run_id: Uuid::now_v7().to_string(),
+            events,
         }
     }
 
@@ -94,9 +130,32 @@ impl Pipeline {
         &self.ingest
     }
 
+    /// Subscribe to post-`merge_insert` events. Multiple subscribers are
+    /// supported via [`tokio::sync::broadcast`]; lagged receivers see an
+    /// explicit `RecvError::Lagged(n)` on their next `recv()` and
+    /// recover from the next live slot. The publisher never blocks on
+    /// backpressure (slow subscribers lose history, not liveness).
+    ///
+    /// Events fire from BOTH [`Pipeline::ingest_source`] (after the
+    /// orphan sweep completes successfully) and
+    /// [`Pipeline::ingest_synthetic`].
+    pub fn subscribe_ingest(&self) -> broadcast::Receiver<IngestEvent> {
+        self.events.subscribe()
+    }
+
+    // Casts: `d.as_micros() as i64` and `meta.len() as i64` are intentional —
+    // micros within i64 range until year 294247; file lengths under 8 EiB.
+    // Length and nested-if shape track the parallel `ingest_paths_for_source`.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::collapsible_if
+    )]
     pub async fn ingest_source(&self, scanner: &dyn Scanner, cfg: &SourceConfig) -> PipelineStats {
         let mut stats = PipelineStats::default();
         let mut to_embed: Vec<Chunk> = Vec::new();
+        let mut event_source_ids: HashSet<String> = HashSet::new();
         let source_kind_str = scanner.kind().as_str();
         let project = cfg.project.as_deref().unwrap_or("default");
 
@@ -118,8 +177,7 @@ impl Pipeline {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_micros() as i64);
                     let size = meta.len() as i64;
 
                     if let Ok(Some((old_mtime, old_size))) =
@@ -191,10 +249,17 @@ impl Pipeline {
             }
         }
 
+        let mut upserted_chunk_ids: Vec<String> = Vec::new();
         if !to_embed.is_empty() && !self.dry_run {
             for batch in to_embed.chunks(EMBED_BATCH) {
                 match self.embed_and_persist(batch, project).await {
-                    Ok(n) => stats.chunks_upserted += n,
+                    Ok(n) => {
+                        stats.chunks_upserted += n;
+                        upserted_chunk_ids.extend(batch.iter().map(|c| c.chunk_id.clone()));
+                        for c in batch {
+                            event_source_ids.insert(c.source_id.clone());
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "embed/persist batch failed");
                         stats.errors += 1;
@@ -239,7 +304,7 @@ impl Pipeline {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed")
+                                tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed");
                             }
                         }
                     }
@@ -259,7 +324,7 @@ impl Pipeline {
                                 stats.chunks_staled += orphans.len();
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed")
+                                tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed");
                             }
                         }
                     }
@@ -268,7 +333,96 @@ impl Pipeline {
             }
         }
 
+        if !self.dry_run && self.events.receiver_count() > 0 {
+            let _ = self.events.send(IngestEvent {
+                project: cfg.project.clone(),
+                source: cfg.kind,
+                source_ids: event_source_ids.into_iter().collect(),
+                chunk_ids_upserted: upserted_chunk_ids,
+                chunks_upserted: stats.chunks_upserted,
+                chunks_stale: stats.chunks_staled,
+                ts: Utc::now(),
+            });
+        }
+
         stats
+    }
+
+    /// Ingest a batch of pre-formed chunks bypassing the scanner +
+    /// discover phase. Used by in-process producers (turn observer,
+    /// surfacer feedback loops) that have already constructed chunks
+    /// and just need them embedded + merged into the corpus.
+    ///
+    /// Reuses the existing embed → `merge_insert` path
+    /// ([`Pipeline::embed_and_persist`]) and runs the same Tier 2
+    /// content-hash dedupe check so re-ingesting an identical chunk is
+    /// idempotent. Emits one [`IngestEvent`] on the broadcast channel
+    /// after `merge_insert` completes, exactly like a scanner-driven
+    /// [`Pipeline::ingest_source`] call. Honors `dry_run` (skips
+    /// embed + emit if set).
+    pub async fn ingest_synthetic(
+        &self,
+        chunks: Vec<Chunk>,
+        source_meta: SyntheticSourceMeta,
+    ) -> Result<PipelineStats, PipelineError> {
+        let mut stats = PipelineStats {
+            items_seen: 1,
+            chunks_emitted: chunks.len(),
+            ..PipelineStats::default()
+        };
+
+        let project = source_meta.project.as_deref().unwrap_or("default");
+        let mut to_embed: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        let mut event_source_ids: HashSet<String> = HashSet::new();
+
+        for chunk in chunks {
+            event_source_ids.insert(chunk.source_id.clone());
+            match self
+                .ingest
+                .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
+            {
+                Ok(true) => {
+                    stats.chunks_skipped_dup += 1;
+                    let row = IngestChunkRow {
+                        chunk_id: chunk.chunk_id.clone(),
+                        source: chunk.source.as_str().to_string(),
+                        project: project.to_string(),
+                        source_id: chunk.source_id.clone(),
+                        chunk_index: chunk.chunk_index,
+                        content_sha256: chunk.sha256.clone(),
+                    };
+                    let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
+                }
+                Ok(false) => to_embed.push(chunk),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ingest dedupe check failed");
+                    stats.errors += 1;
+                }
+            }
+        }
+
+        let mut upserted_chunk_ids: Vec<String> = Vec::new();
+        if !to_embed.is_empty() && !self.dry_run {
+            for batch in to_embed.chunks(EMBED_BATCH) {
+                let n = self.embed_and_persist(batch, project).await?;
+                stats.chunks_upserted += n;
+                upserted_chunk_ids.extend(batch.iter().map(|c| c.chunk_id.clone()));
+            }
+        }
+
+        if !self.dry_run && self.events.receiver_count() > 0 {
+            let _ = self.events.send(IngestEvent {
+                project: source_meta.project.clone(),
+                source: source_meta.source,
+                source_ids: event_source_ids.into_iter().collect(),
+                chunk_ids_upserted: upserted_chunk_ids,
+                chunks_upserted: stats.chunks_upserted,
+                chunks_stale: 0,
+                ts: Utc::now(),
+            });
+        }
+
+        Ok(stats)
     }
 
     /// Path-aware ingest: group `paths` by source root, then per-source
@@ -321,6 +475,13 @@ impl Pipeline {
     /// paths that `discover_paths` actually yielded a [`SourceItem`] for.
     /// The caller diffs that set against `paths` to find missing-on-disk
     /// candidates for the delete pass.
+    // Mirrors `ingest_source`; same cast + nested-if intentional patterns.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::collapsible_if
+    )]
     async fn ingest_paths_for_source(
         &self,
         scanner: &dyn Scanner,
@@ -354,8 +515,7 @@ impl Pipeline {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_micros() as i64);
                     let size = meta.len() as i64;
 
                     if let Ok(Some((old_mtime, old_size))) =
@@ -470,9 +630,8 @@ impl Pipeline {
             return stats;
         }
         let project = cfg.project.as_deref().unwrap_or("default");
-        let roots = match cfg.expanded_paths() {
-            Ok(r) => r,
-            Err(_) => return stats,
+        let Ok(roots) = cfg.expanded_paths() else {
+            return stats;
         };
         // Canonicalize roots once. relative_source_id below also
         // canonicalizes the input path so the strip_prefix succeeds
@@ -576,9 +735,12 @@ impl Pipeline {
             .count_active_by_source()
             .map_err(|e| PipelineError::Store(e.to_string()))?;
         let ingest_total: u64 = ingest_by_source.iter().map(|(_, n)| *n).sum();
+        // u64 -> usize: chunk counts won't exceed usize::MAX on 64-bit targets.
+        #[allow(clippy::cast_possible_truncation)]
+        let ingest_total_usize = ingest_total as usize;
         Ok(VerifyReport {
             corpus_total,
-            ingest_total: ingest_total as usize,
+            ingest_total: ingest_total_usize,
             by_source: ingest_by_source,
         })
     }
@@ -602,9 +764,8 @@ impl VerifyReport {
 /// [`Pipeline::scan_paths`] to compute the per-source path subset before
 /// dispatching to `discover_paths`.
 fn paths_under_source(cfg: &SourceConfig, paths: &[PathBuf]) -> Vec<PathBuf> {
-    let roots = match cfg.expanded_paths() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+    let Ok(roots) = cfg.expanded_paths() else {
+        return Vec::new();
     };
     paths
         .iter()
@@ -640,12 +801,12 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
 }
 
 /// Compute a `source_id` from an absolute path the same way the
-/// path-rooted scanners (markdown, code, file_glob) do — relative to the
+/// path-rooted scanners (markdown, code, `file_glob`) do — relative to the
 /// first matching configured root, joined with `/`. Used by
 /// [`Pipeline::purge_missing_paths`] (gh#7) to look up a chunk family in
 /// the ledger by `(source, project, source_id)` for delete-event
 /// handling. Sources whose `source_id` scheme is NOT path-relative
-/// (ostk_project route markers, zip_export archive keys) won't match the
+/// (`ostk_project` route markers, `zip_export` archive keys) won't match the
 /// ledger and the tombstone collapses to a no-op — desired for the
 /// first-cut scope (append-only sources are deferred per EPIC gh#8).
 fn relative_source_id(roots: &[PathBuf], path: &Path) -> String {
@@ -696,6 +857,7 @@ mod tests {
         fn dim(&self) -> usize {
             self.dim
         }
+        #[allow(clippy::cast_precision_loss)]
         fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
             texts
                 .iter()
@@ -1070,7 +1232,7 @@ mod tests {
 
         // Initial ingest via scan_paths (single-path).
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[code_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&code_path))
             .await
             .unwrap();
         assert_eq!(per.len(), 1);
@@ -1081,7 +1243,7 @@ mod tests {
         std::fs::remove_file(&code_path).unwrap();
 
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[code_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&code_path))
             .await
             .unwrap();
         assert_eq!(per.len(), 1, "source still matched on input path");
@@ -1132,7 +1294,7 @@ mod tests {
         };
 
         pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[old_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&old_path))
             .await
             .unwrap();
         assert_eq!(pipeline.store().row_count().await.unwrap(), 1);
@@ -1185,7 +1347,7 @@ mod tests {
         };
 
         pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[known.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&known))
             .await
             .unwrap();
         let baseline = pipeline.store().row_count().await.unwrap();
@@ -1225,7 +1387,7 @@ mod tests {
         let cfg = cfg_for(fixtures.path());
 
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[md_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&md_path))
             .await
             .unwrap();
         let baseline = per[0].1.chunks_upserted;
@@ -1233,7 +1395,7 @@ mod tests {
 
         std::fs::remove_file(&md_path).unwrap();
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[md_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&md_path))
             .await
             .unwrap();
         let stats = per[0].1;
@@ -1244,5 +1406,230 @@ mod tests {
         // Markdown retention keeps the row in corpus (stale=true), so
         // verify_counts shows: ingest decremented, corpus unchanged —
         // matches existing Stale semantics for the markdown source.
+    }
+
+    // ===== phase 4: ingest_synthetic + subscribe_ingest =====
+
+    use ostk_recall_core::{Chunk, Links, Source};
+
+    fn make_synthetic_chunk(source_id: &str, idx: u32, text: &str) -> Chunk {
+        let chunk_id = Chunk::make_id(Source::Gemini, source_id, idx);
+        let sha = Chunk::content_hash(text);
+        Chunk {
+            chunk_id,
+            source: Source::Gemini,
+            project: Some("phase4-test".into()),
+            source_id: source_id.to_string(),
+            chunk_index: idx,
+            ts: None,
+            role: None,
+            text: text.to_string(),
+            sha256: sha,
+            links: Links::default(),
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_synthetic_round_trip() {
+        let corpus = TempDir::new().unwrap();
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let before = pipeline.store().row_count().await.unwrap();
+
+        let chunks = vec![
+            make_synthetic_chunk("turn:001", 0, "alpha body"),
+            make_synthetic_chunk("turn:001", 1, "beta body"),
+            make_synthetic_chunk("turn:002", 0, "gamma body"),
+        ];
+        let expected_ids: Vec<String> = chunks.iter().map(|c| c.chunk_id.clone()).collect();
+
+        let stats = pipeline
+            .ingest_synthetic(
+                chunks,
+                SyntheticSourceMeta {
+                    source: SourceKind::Gemini,
+                    project: Some("phase4-test".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stats.chunks_emitted, 3);
+        assert_eq!(stats.chunks_upserted, 3);
+        assert_eq!(stats.errors, 0);
+
+        let after = pipeline.store().row_count().await.unwrap();
+        assert_eq!(after - before, 3, "exactly 3 new corpus rows");
+
+        // Re-ingest the same chunks; Tier 2 content-hash dedupe should
+        // collapse them to chunks_skipped_dup with no new upserts.
+        let again = pipeline
+            .ingest_synthetic(
+                expected_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let (sid, idx, text) = match i {
+                            0 => ("turn:001", 0u32, "alpha body"),
+                            1 => ("turn:001", 1u32, "beta body"),
+                            _ => ("turn:002", 0u32, "gamma body"),
+                        };
+                        make_synthetic_chunk(sid, idx, text)
+                    })
+                    .collect(),
+                SyntheticSourceMeta {
+                    source: SourceKind::Gemini,
+                    project: Some("phase4-test".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.chunks_upserted, 0);
+        assert_eq!(again.chunks_skipped_dup, 3);
+        assert_eq!(
+            pipeline.store().row_count().await.unwrap(),
+            after,
+            "no new rows on dedupe re-ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_ingest_delivers_event() {
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let mut rx = pipeline.subscribe_ingest();
+
+        let scanner = MarkdownScanner;
+        let stats = pipeline
+            .ingest_source(&scanner, &cfg_for(fixtures.path()))
+            .await;
+        assert!(stats.chunks_upserted > 0);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event delivered within timeout")
+            .expect("recv ok");
+        assert!(
+            !event.chunk_ids_upserted.is_empty(),
+            "event carries upserted chunk_ids"
+        );
+        assert_eq!(event.chunks_upserted, stats.chunks_upserted);
+        assert_eq!(event.source, SourceKind::Markdown);
+        assert_eq!(event.project.as_deref(), Some("test"));
+        assert!(
+            !event.source_ids.is_empty(),
+            "event carries source_ids covering this batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_each_receive() {
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        write_sample_tree(fixtures.path());
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let mut rx1 = pipeline.subscribe_ingest();
+        let mut rx2 = pipeline.subscribe_ingest();
+
+        let scanner = MarkdownScanner;
+        pipeline
+            .ingest_source(&scanner, &cfg_for(fixtures.path()))
+            .await;
+
+        let ev1 = tokio::time::timeout(std::time::Duration::from_secs(1), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ev2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev1.chunk_ids_upserted, ev2.chunk_ids_upserted);
+        assert_eq!(ev1.chunks_upserted, ev2.chunks_upserted);
+    }
+
+    #[tokio::test]
+    async fn lagged_subscriber_recovers() {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let corpus = TempDir::new().unwrap();
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let mut slow = pipeline.subscribe_ingest();
+
+        // Send INGEST_BROADCAST_CAPACITY + 1 synthetic ingests without
+        // draining `slow`. The first event slot is evicted; the slow
+        // receiver's next recv() yields RecvError::Lagged(n) and then
+        // continues from the oldest still-live slot.
+        let overflow = INGEST_BROADCAST_CAPACITY + 1;
+        for i in 0..overflow {
+            let sid = format!("turn:{i:05}");
+            let chunk = make_synthetic_chunk(&sid, 0, &format!("body-{i}"));
+            pipeline
+                .ingest_synthetic(
+                    vec![chunk],
+                    SyntheticSourceMeta {
+                        source: SourceKind::Gemini,
+                        project: Some("phase4-test".into()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = slow.recv().await;
+        match first {
+            Err(RecvError::Lagged(n)) => {
+                assert!(n >= 1, "lag count reports >= 1 dropped event");
+            }
+            other => panic!("expected Lagged, got {other:?}"),
+        }
+
+        // After the Lagged report, the receiver recovers and delivers
+        // the next live event.
+        let next = slow.recv().await.expect("recover after lag");
+        assert!(!next.chunk_ids_upserted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn synthetic_ingest_emits_broadcast() {
+        let corpus = TempDir::new().unwrap();
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        let mut rx = pipeline.subscribe_ingest();
+
+        let chunks = vec![
+            make_synthetic_chunk("turn:syn", 0, "synthetic body one"),
+            make_synthetic_chunk("turn:syn", 1, "synthetic body two"),
+        ];
+        let expected: Vec<String> = chunks.iter().map(|c| c.chunk_id.clone()).collect();
+
+        let stats = pipeline
+            .ingest_synthetic(
+                chunks,
+                SyntheticSourceMeta {
+                    source: SourceKind::Gemini,
+                    project: Some("phase4-test".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.chunks_upserted, 2);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.source, SourceKind::Gemini);
+        assert_eq!(event.project.as_deref(), Some("phase4-test"));
+        assert_eq!(event.chunks_upserted, 2);
+        assert_eq!(event.chunks_stale, 0);
+        let mut got = event.chunk_ids_upserted;
+        let mut want = expected.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "event carries the synthetic chunk_ids");
     }
 }

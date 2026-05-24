@@ -17,6 +17,7 @@ use ostk_recall_scan::file_glob::FileGlobScanner;
 use ostk_recall_scan::gemini::GeminiScanner;
 use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
+use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
 use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 
@@ -221,6 +222,7 @@ pub async fn scan(
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
     let gemini = GeminiScanner;
+    let thread = ThreadScanner;
 
     let events_db: Option<Arc<EventsDb>> = if cfg
         .sources
@@ -261,6 +263,11 @@ pub async fn scan(
             SourceKind::ZipExport => &zip_export,
             SourceKind::OstkProject => &ostk_project,
             SourceKind::Gemini => &gemini,
+            SourceKind::Thread => &thread,
+            // Membrane sources are in-process synthetic ingest only
+            // (turn observer → Pipeline::ingest_synthetic); they have
+            // no on-disk scanner, so the config-driven scan skips them.
+            SourceKind::Membrane => continue,
         };
 
         let stats = pipeline.ingest_source(scanner, source_cfg).await;
@@ -277,10 +284,12 @@ pub async fn scan(
     })
 }
 
-/// Path-aware sibling of [`scan`]. Loads the same config + scanners,
-/// then dispatches each input path to the matching `[[sources]]` via
-/// [`Pipeline::scan_paths`]. Sources whose roots don't parent any input
-/// are silent (no entry in the returned per-source vector).
+/// Path-aware sibling of [`scan`].
+///
+/// Loads the same config + scanners, then dispatches each input path to the
+/// matching `[[sources]]` via [`Pipeline::scan_paths`]. Sources whose roots
+/// don't parent any input are silent (no entry in the returned per-source
+/// vector).
 ///
 /// Skips delete handling — gh#7 covers tombstone semantics for paths
 /// that yield no `SourceItem` (file removed, gitignore'd, etc.).
@@ -309,6 +318,7 @@ pub async fn scan_paths(
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
     let gemini = GeminiScanner;
+    let thread = ThreadScanner;
 
     let events_db: Option<Arc<EventsDb>> = if cfg
         .sources
@@ -332,13 +342,19 @@ pub async fn scan_paths(
         .iter()
         .map(|source_cfg| {
             let scanner: &dyn Scanner = match source_cfg.kind {
-                SourceKind::Markdown => &markdown,
+                // Membrane sources are in-process synthetic ingest only
+                // (turn observer → Pipeline::ingest_synthetic); they have
+                // no on-disk scanner, so for scan_paths fan-out we treat
+                // them as markdown — the path-filter step will exclude
+                // any actual work since membrane sources name no roots.
+                SourceKind::Markdown | SourceKind::Membrane => &markdown,
                 SourceKind::Code => &code,
                 SourceKind::ClaudeCode => &claude_code,
                 SourceKind::FileGlob => &file_glob,
                 SourceKind::ZipExport => &zip_export,
                 SourceKind::OstkProject => &ostk_project,
                 SourceKind::Gemini => &gemini,
+                SourceKind::Thread => &thread,
             };
             (scanner, source_cfg)
         })
@@ -530,6 +546,8 @@ pub async fn serve(
     embedder: Arc<dyn ChunkEmbedder>,
     stdio: bool,
 ) -> Result<()> {
+    use std::io::Write as _;
+
     if !stdio {
         return Err(anyhow!(
             "only stdio transport is currently supported; pass --stdio"
@@ -545,7 +563,6 @@ pub async fn serve(
     // on `<corpus_root>/.serve.lock` for the lifetime of the process.
     // Second-and-later serves exit cleanly so the MCP client sees EOF
     // instead of a corrupted shared corpus.
-    use std::io::Write as _;
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config {}", config_path.display()))?;
     let corpus_root = cfg.expanded_root().context("resolving corpus.root")?;
@@ -803,12 +820,13 @@ where
         .collect()
 }
 
-/// `ostk-recall watch` — run a file-watcher that pokes the scan-trigger
-/// socket whenever a debounced batch of events touches a configured
-/// source path. Reuses each `[[sources]].paths` (and `extensions`) — the
-/// watcher does not declare its own paths. The scan does the real
-/// filtering; the watcher's job is just "did anything we care about
-/// change recently?".
+/// `ostk-recall watch` — run a file-watcher.
+///
+/// Pokes the scan-trigger socket whenever a debounced batch of events
+/// touches a configured source path. Reuses each `[[sources]].paths` (and
+/// `extensions`) — the watcher does not declare its own paths. The scan
+/// does the real filtering; the watcher's job is just "did anything we care
+/// about change recently?".
 ///
 /// Behavior:
 /// - Loads `[watch]` from config; bails if absent or `enabled = false`.
@@ -827,6 +845,7 @@ where
 /// fatal — the watcher keeps running so the next save after `serve`
 /// starts will fire. Errors from the underlying notify backend are
 /// surfaced through `tracing::warn`.
+#[allow(clippy::too_many_lines)]
 pub async fn watch(config_path: &Path) -> Result<()> {
     use std::time::Duration;
 
@@ -1001,12 +1020,9 @@ async fn kick_trigger_socket(socket: &Path, paths: &[PathBuf]) -> Result<()> {
     let mut batch: Vec<&PathBuf> = Vec::new();
     let mut batch_bytes: usize = 0;
     for p in paths {
-        let s = match p.to_str() {
-            Some(s) => s,
-            None => {
-                tracing::warn!(path = %p.display(), "skipping non-UTF-8 path in trigger frame");
-                continue;
-            }
+        let Some(s) = p.to_str() else {
+            tracing::warn!(path = %p.display(), "skipping non-UTF-8 path in trigger frame");
+            continue;
         };
         if s.contains('\n') {
             tracing::warn!(

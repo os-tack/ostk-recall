@@ -54,7 +54,7 @@ const ROUTE_PREFIX: &str = "__route__:";
 
 /// Sub-areas of a `.ostk/` project that `discover_paths` can route to.
 /// Each variant maps to one of the eight chunker entry points already
-/// invoked by `parse()` for a project-root SourceItem.
+/// invoked by `parse()` for a project-root `SourceItem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubArea {
     Decisions,
@@ -145,8 +145,8 @@ fn has_code_extension(path: &Path) -> bool {
         .is_some_and(|ext| CODE_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)))
 }
 
-/// Build the `__route__:<sub_area>:<project_root>` source_id marker for
-/// a single-file sub-scan SourceItem.
+/// Build the `__route__:<sub_area>:<project_root>` `source_id` marker for
+/// a single-file sub-scan `SourceItem`.
 fn route_source_id(sub: SubArea, project_root: &Path) -> String {
     format!(
         "{ROUTE_PREFIX}{}:{}",
@@ -227,7 +227,7 @@ impl Scanner for OstkProjectScanner {
     /// Path-filtered override: classify each input path into one of the
     /// project's sub-areas (decisions / needles / audit / conversations
     /// / sessions / memory / spec / code) and yield a single-file
-    /// SourceItem tagged with a `__route__:<sub_area>:<root>` marker.
+    /// `SourceItem` tagged with a `__route__:<sub_area>:<root>` marker.
     /// `parse` reads the marker and runs only the matching sub-routine
     /// on that one file. Paths that don't classify under any sub-area
     /// are dropped silently.
@@ -313,7 +313,7 @@ impl Scanner for OstkProjectScanner {
 }
 
 impl OstkProjectScanner {
-    /// Single-sub-area dispatch for path-routed SourceItems. Only the
+    /// Single-sub-area dispatch for path-routed `SourceItems`. Only the
     /// chunker matching `sub` is invoked; sub-areas that already process
     /// whole files (decisions, needles, audit, memory) re-read the
     /// canonical project file (the input path is expected to point at

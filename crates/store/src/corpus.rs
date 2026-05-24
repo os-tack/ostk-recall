@@ -193,11 +193,98 @@ impl CorpusStore {
             .map(|id| format!("'{}'", escape_sql(id)))
             .collect::<Vec<_>>()
             .join(", ");
-        let filter = format!("chunk_id IN ({})", ids_joined);
+        let filter = format!("chunk_id IN ({ids_joined})");
 
         table.delete(&filter).await?;
         let after = table.count_rows(None).await?;
         Ok(u64::try_from(before.saturating_sub(after)).unwrap_or(0))
+    }
+
+    /// Fetch chunk embeddings by id. Returns a map keyed by `chunk_id`;
+    /// ids absent from the corpus are simply omitted (no error).
+    ///
+    /// Used by the auto-weaver (Phase 7) to compute resonance between
+    /// freshly-ingested chunks and the anchor vectors of existing
+    /// threads. The vector column is `FixedSizeList<Float32, dim>`; rows
+    /// are decoded one slice at a time.
+    pub async fn fetch_embeddings(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        use arrow_array::Array;
+        use std::collections::HashMap;
+
+        let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+
+        let ids_joined = ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({ids_joined})");
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "embedding".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        for batch in &batches {
+            let id_col = batch.column_by_name("chunk_id").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "chunk_id column missing in projection".into(),
+                ))
+            })?;
+            let ids_arr = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "chunk_id expected to be Utf8".into(),
+                    ))
+                })?;
+            let emb_col = batch.column_by_name("embedding").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "embedding column missing in projection".into(),
+                ))
+            })?;
+            let emb_arr = emb_col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding expected to be FixedSizeList".into(),
+                    ))
+                })?;
+            let f32_values = emb_arr
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding inner expected to be Float32".into(),
+                    ))
+                })?;
+            let dim = usize::try_from(emb_arr.value_length()).map_err(|_| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                    "embedding value_length not representable as usize: {}",
+                    emb_arr.value_length()
+                )))
+            })?;
+            for i in 0..batch.num_rows() {
+                if emb_arr.is_null(i) {
+                    continue;
+                }
+                let start = i * dim;
+                let slice = &f32_values.values()[start..start + dim];
+                out.insert(ids_arr.value(i).to_string(), slice.to_vec());
+            }
+        }
+        Ok(out)
     }
 
     /// Mark a batch of chunks as stale by their unique `chunk_id`.
@@ -212,7 +299,7 @@ impl CorpusStore {
             .map(|id| format!("'{}'", escape_sql(id)))
             .collect::<Vec<_>>()
             .join(", ");
-        let filter = format!("chunk_id IN ({})", ids_joined);
+        let filter = format!("chunk_id IN ({ids_joined})");
 
         table
             .update()
@@ -372,7 +459,7 @@ mod tests {
     async fn read_stale_for(store: &CorpusStore, chunk_id: &str) -> bool {
         use arrow_array::BooleanArray;
         let table = store.conn.open_table(CORPUS_TABLE).execute().await.unwrap();
-        let filter = format!("chunk_id = '{}'", chunk_id);
+        let filter = format!("chunk_id = '{chunk_id}'");
         let stream = table
             .query()
             .only_if(filter)
@@ -391,7 +478,39 @@ mod tests {
                 return arr.value(0);
             }
         }
-        panic!("no row found for chunk_id={}", chunk_id);
+        panic!("no row found for chunk_id={chunk_id}");
+    }
+
+    #[tokio::test]
+    async fn fetch_embeddings_returns_known_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let chunks = vec![
+            sample_chunk("a", "alpha"),
+            sample_chunk("b", "beta"),
+            sample_chunk("c", "gamma"),
+        ];
+        let embs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.5, 0.5, 0.5, 0.5],
+        ];
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        // Fetch a subset (and one missing id); only present rows come back.
+        let map = store
+            .fetch_embeddings(&["a".into(), "c".into(), "missing".into()])
+            .await
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a").unwrap(), &vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(map.get("c").unwrap(), &vec![0.5, 0.5, 0.5, 0.5]);
+        assert!(!map.contains_key("missing"));
+
+        // Empty input is a no-op.
+        let empty = store.fetch_embeddings(&[]).await.unwrap();
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]

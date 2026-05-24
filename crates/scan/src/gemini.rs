@@ -100,12 +100,14 @@ impl Scanner for GeminiScanner {
                     let gemini_text = extract_text(msg);
 
                     let combined_text =
-                        format!("### User\n{}\n\n### Gemini\n{}", user_text, gemini_text);
+                        format!("### User\n{user_text}\n\n### Gemini\n{gemini_text}");
                     let ts = DateTime::parse_from_rfc3339(&user.timestamp)
                         .or_else(|_| DateTime::parse_from_rfc3339(&msg.timestamp))
                         .ok()
                         .map(|dt| dt.with_timezone(&Utc));
 
+                    // Chunk index fits u32 — sessions have far fewer than 4B pairs.
+                    #[allow(clippy::cast_possible_truncation)]
                     let chunk_index = chunks.len() as u32;
                     let chunk_id = Chunk::make_id(Source::Gemini, &item.source_id, chunk_index);
 

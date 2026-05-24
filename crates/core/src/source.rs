@@ -22,9 +22,14 @@ pub enum SourceKind {
     FileGlob,
     ZipExport,
     Gemini,
+    Thread,
+    /// In-process "recognition moments" emitted by the turn observer.
+    /// No scanner; chunks land via `Pipeline::ingest_synthetic`.
+    Membrane,
 }
 
 impl SourceKind {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Markdown => "markdown",
@@ -34,11 +39,14 @@ impl SourceKind {
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
+            Self::Thread => "thread",
+            Self::Membrane => "membrane",
         }
     }
 
     /// Returns the list of concrete [`Source`] variants this kind can produce.
     /// Used during orphan sweeps to ensure all related subtypes are cleaned.
+    #[must_use]
     pub fn sources(self) -> Vec<Source> {
         match self {
             Self::Markdown => vec![Source::Markdown],
@@ -56,15 +64,21 @@ impl SourceKind {
             Self::FileGlob => vec![Source::FileGlob],
             Self::ZipExport => vec![Source::ZipExport],
             Self::Gemini => vec![Source::Gemini],
+            Self::Thread => vec![Source::Thread],
+            Self::Membrane => vec![Source::Membrane],
         }
     }
 
     /// Returns the retention policy for this source kind.
+    #[must_use]
     pub const fn retention_policy(self) -> RetentionPolicy {
         match self {
             Self::Code => RetentionPolicy::Delete,
             Self::Markdown | Self::FileGlob => RetentionPolicy::Stale,
-            _ => RetentionPolicy::Keep, // Gemini, ClaudeCode, ZipExport, OstkProject
+            // Threads carry attention-substrate identity (handle, evidence,
+            // familiarity) that outlives the filesystem write — fade is a
+            // first-class state, not a delete.
+            _ => RetentionPolicy::Keep,
         }
     }
 }
@@ -88,9 +102,13 @@ pub enum Source {
     FileGlob,
     ZipExport,
     Gemini,
+    Thread,
+    /// In-process "recognition moments" emitted by the turn observer.
+    Membrane,
 }
 
 impl Source {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Markdown => "markdown",
@@ -106,6 +124,8 @@ impl Source {
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
+            Self::Thread => "thread",
+            Self::Membrane => "membrane",
         }
     }
 }
@@ -130,6 +150,8 @@ mod tests {
             SourceKind::FileGlob,
             SourceKind::ZipExport,
             SourceKind::Gemini,
+            SourceKind::Thread,
+            SourceKind::Membrane,
         ] {
             let w = Wrap { kind };
             let s = toml::to_string(&w).unwrap();

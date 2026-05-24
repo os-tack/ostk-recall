@@ -26,6 +26,8 @@ ostk-recall-pipeline = { workspace = true }
 ostk-recall-scan = { workspace = true }
 ostk-recall-query = { workspace = true }
 ostk-recall-mcp = { workspace = true }
+ostk-recall-attention = { workspace = true }
+ostk-recall-attention-mcp = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

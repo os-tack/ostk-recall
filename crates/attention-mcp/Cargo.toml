@@ -1,5 +1,5 @@
 [package]
-name = "ostk-recall-scan"
+name = "ostk-recall-attention-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,20 +12,17 @@ workspace = true
 
 [dependencies]
 ostk-recall-core = { workspace = true }
+ostk-recall-attention = { workspace = true }
 ostk-recall-store = { workspace = true }
-ignore = { workspace = true }
-walkdir = { workspace = true }
-chrono = { workspace = true }
+ostk-recall-mcp = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-tracing = { workspace = true }
-globset = { workspace = true }
-shellexpand = { workspace = true }
-zip = { workspace = true }
 thiserror = { workspace = true }
-which = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-zip = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

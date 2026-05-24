@@ -8,9 +8,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ostk_recall_attention::{AttentionForwardStore, InMemoryAttention};
+use ostk_recall_attention_mcp::{AttentionDispatch, cli as attn_cli};
 use ostk_recall_cli::commands::{self, InitOptions, InitOutcome};
 use ostk_recall_embed::Embedder;
 use ostk_recall_pipeline::ChunkEmbedder;
+use ostk_recall_store::ThreadsDb;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -74,6 +77,136 @@ enum Command {
     /// Requires `[watch].enabled = true` in config; reuses each
     /// `[[sources]].paths` and `extensions`.
     Watch,
+    /// Attention substrate verbs (forward-attention runtime).
+    Attention {
+        /// Emit JSON instead of the human-readable summary.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        verb: AttentionVerb,
+    },
+    /// Thread ledger verbs (durable thread + evidence ledger).
+    Thread {
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        verb: ThreadVerb,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AttentionVerb {
+    /// Ingest current context into the attention vector for `--scope-project`.
+    Attend {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        privacy_tier: Option<String>,
+        /// Inline context. Mutually exclusive with `--context-from-stdin`.
+        #[arg(long, conflicts_with = "context_from_stdin")]
+        context: Option<String>,
+        /// Read the context from stdin to EOF.
+        #[arg(long)]
+        context_from_stdin: bool,
+    },
+    /// Surface attention pages above the archive threshold.
+    Surface {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        privacy_tier: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Set fold depth for a thread handle within the scope.
+    Fold {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        privacy_tier: Option<String>,
+        #[arg(long)]
+        handle: String,
+        /// folded | half | full
+        #[arg(long)]
+        depth: String,
+    },
+    /// Increment familiarity for a handle within the scope.
+    Familiarize {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        privacy_tier: Option<String>,
+        #[arg(long)]
+        handle: String,
+    },
+    /// Apply a multiplicative fade factor to a handle's floor.
+    Decay {
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        factor: f64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadVerb {
+    /// Insert-or-replace a thread row.
+    Create {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        body_from_file: Option<PathBuf>,
+        #[arg(long)]
+        tension: Option<String>,
+    },
+    /// Add a curated evidence link.
+    Link {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        category: String,
+    },
+    /// Remove an evidence row by id.
+    Unlink {
+        #[arg(long)]
+        evidence_id: i64,
+    },
+    /// Promote a proposed thread to active or slack.
+    Promote {
+        #[arg(long = "from")]
+        handle_from_proposed: String,
+        #[arg(long = "to")]
+        target_tier: String,
+    },
+    /// List threads, optionally filtered by tension.
+    List {
+        #[arg(long)]
+        scope_project: Option<String>,
+        #[arg(long)]
+        tension: Option<String>,
+    },
 }
 
 fn load_embedder(model_id: &str) -> Result<Arc<dyn ChunkEmbedder>> {
@@ -132,6 +265,7 @@ fn resolve_embedder(config: Option<&PathBuf>) -> Result<Arc<dyn ChunkEmbedder>> 
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     // Stdout is reserved for tool output (and JSON-RPC frames in
     // `serve --stdio`); logs go to stderr unconditionally so MCP clients
@@ -233,7 +367,204 @@ async fn main() -> Result<()> {
         Command::Watch => {
             commands::watch(&config_path).await?;
         }
+        Command::Attention { json, verb } => {
+            let dispatch = build_attention_dispatch(&config_path)?;
+            let out = run_attention(&dispatch, verb).await?;
+            print_attention_output(json, &out);
+        }
+        Command::Thread { json, verb } => {
+            let dispatch = build_attention_dispatch(&config_path)?;
+            let out = run_thread(&dispatch, verb).await?;
+            print_attention_output(json, &out);
+        }
     }
 
     Ok(())
+}
+
+/// Build the attention dispatch from the resolved config.
+///
+/// The score tier is an `InMemoryAttention` (per Phase 2 — the chain
+/// rebuilds it on boot in the daemon; the CLI uses an empty store for
+/// one-shot verbs). The thread ledger is the durable
+/// `<root>/threads.sqlite`.
+fn build_attention_dispatch(config_path: &std::path::Path) -> Result<AttentionDispatch> {
+    let cfg = ostk_recall_core::Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating corpus root {}", root.display()))?;
+    let threads =
+        Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow::anyhow!("open threads ledger: {e}"))?);
+    let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+    Ok(AttentionDispatch::new(attention, threads))
+}
+
+async fn run_attention(d: &AttentionDispatch, verb: AttentionVerb) -> Result<serde_json::Value> {
+    let v = match verb {
+        AttentionVerb::Attend {
+            scope_project,
+            session_id,
+            agent,
+            privacy_tier,
+            context,
+            context_from_stdin,
+        } => {
+            let ctx = resolve_context(context, context_from_stdin)?;
+            attn_cli::run_attend(d, scope_project, session_id, agent, privacy_tier, ctx)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        }
+        AttentionVerb::Surface {
+            scope_project,
+            session_id,
+            agent,
+            privacy_tier,
+            limit,
+        } => attn_cli::run_surface(d, scope_project, session_id, agent, privacy_tier, limit)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        AttentionVerb::Fold {
+            scope_project,
+            session_id,
+            agent,
+            privacy_tier,
+            handle,
+            depth,
+        } => attn_cli::run_fold(
+            d,
+            scope_project,
+            session_id,
+            agent,
+            privacy_tier,
+            handle,
+            depth,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        AttentionVerb::Familiarize {
+            scope_project,
+            session_id,
+            agent,
+            privacy_tier,
+            handle,
+        } => attn_cli::run_familiarize(d, scope_project, session_id, agent, privacy_tier, handle)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        AttentionVerb::Decay { handle, factor } => attn_cli::run_decay(d, handle, factor)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    };
+    Ok(v)
+}
+
+async fn run_thread(d: &AttentionDispatch, verb: ThreadVerb) -> Result<serde_json::Value> {
+    let v = match verb {
+        ThreadVerb::Create {
+            scope_project,
+            handle,
+            body_from_file,
+            tension,
+        } => {
+            let body = body_from_file
+                .as_deref()
+                .map(std::fs::read_to_string)
+                .transpose()
+                .with_context(|| format!("reading body from {body_from_file:?}"))?;
+            attn_cli::run_thread_create(d, scope_project, handle, body, tension)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        }
+        ThreadVerb::Link {
+            scope_project,
+            handle,
+            target,
+            category,
+        } => attn_cli::run_thread_link(
+            d,
+            scope_project,
+            handle,
+            target.to_string_lossy().into_owned(),
+            category,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ThreadVerb::Unlink { evidence_id } => attn_cli::run_thread_unlink(d, evidence_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ThreadVerb::Promote {
+            handle_from_proposed,
+            target_tier,
+        } => attn_cli::run_thread_promote(d, handle_from_proposed, target_tier)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ThreadVerb::List {
+            scope_project,
+            tension,
+        } => attn_cli::run_thread_list(d, scope_project, tension)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    };
+    Ok(v)
+}
+
+fn resolve_context(inline: Option<String>, from_stdin: bool) -> Result<String> {
+    if let Some(s) = inline {
+        return Ok(s);
+    }
+    if from_stdin {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        return Ok(buf);
+    }
+    Err(anyhow::anyhow!(
+        "one of --context or --context-from-stdin is required"
+    ))
+}
+
+fn print_attention_output(json: bool, value: &serde_json::Value) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        );
+    } else {
+        // Human-readable rendering for the common cases; falls back
+        // to JSON for unknown shapes.
+        if let Some(pages) = value.get("pages").and_then(|v| v.as_array()) {
+            println!("pages ({}):", pages.len());
+            for p in pages {
+                println!(
+                    "  {}: score={:.3} depth={} resonance={:.3} familiarity={}",
+                    p["handle"].as_str().unwrap_or("?"),
+                    p["score"].as_f64().unwrap_or(0.0),
+                    p["depth"].as_str().unwrap_or("?"),
+                    p["why"]["resonance"].as_f64().unwrap_or(0.0),
+                    p["why"]["familiarity"].as_u64().unwrap_or(0),
+                );
+            }
+        } else if let Some(records) = value.get("records").and_then(|v| v.as_array()) {
+            println!("threads ({}):", records.len());
+            for r in records {
+                println!(
+                    "  {}: tension={} familiarity={} privacy_tier={}",
+                    r["handle"].as_str().unwrap_or("?"),
+                    r["tension"].as_str().unwrap_or("?"),
+                    r["familiarity"].as_u64().unwrap_or(0),
+                    r["privacy_tier"].as_str().unwrap_or("?"),
+                );
+            }
+        } else if let Some(rec) = value.get("record") {
+            println!(
+                "thread: {}",
+                serde_json::to_string_pretty(rec).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+            );
+        }
+    }
 }

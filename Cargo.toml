@@ -7,6 +7,8 @@ members = [
     "crates/scan",
     "crates/pipeline",
     "crates/query",
+    "crates/attention",
+    "crates/attention-mcp",
     "crates/mcp",
     "crates/cli",
 ]
@@ -48,6 +50,8 @@ ostk-recall-store = { path = "crates/store" }
 ostk-recall-scan = { path = "crates/scan" }
 ostk-recall-pipeline = { path = "crates/pipeline" }
 ostk-recall-query = { path = "crates/query" }
+ostk-recall-attention = { path = "crates/attention" }
+ostk-recall-attention-mcp = { path = "crates/attention-mcp" }
 ostk-recall-mcp = { path = "crates/mcp" }
 ostk-recall-cli = { path = "crates/cli" }
 
@@ -59,10 +63,12 @@ arrow-array = "57"
 arrow-schema = "57"
 rusqlite = { version = "0.33", features = ["bundled"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync", "net"] }
+tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 toml = "0.9"
 thiserror = "2"
 anyhow = "1"

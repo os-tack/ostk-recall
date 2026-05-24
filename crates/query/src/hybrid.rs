@@ -214,12 +214,12 @@ pub fn is_identifier_query(q: &str) -> bool {
 /// `candidates` unchanged.
 ///
 /// The substring check is case-insensitive and only applied to code-source
-/// candidates. It exists so that snake_case queries with no code match in
+/// candidates. It exists so that `snake_case` queries with no code match in
 /// the corpus (e.g. a markdown-only term that happens to look like an
 /// identifier) do not crowd out the genuine non-code matches with an
 /// undeserved +3.0. Code candidates that *do* contain the identifier still
 /// get the full boost. Pre-fix, an identifier query would lift every code
-/// candidate equally, which broke the markdown/file_glob branches of the
+/// candidate equally, which broke the `markdown/file_glob` branches of the
 /// verification panel.
 fn boost_code_for_identifier_queries(
     query: &str,
