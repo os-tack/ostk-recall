@@ -120,9 +120,11 @@ impl AutoWeaver {
     }
 
     /// Drive the weaver until `cancel` fires or the pipeline channel
-    /// closes. Errors processing a single event are logged and
-    /// swallowed — the weaver must not die because one event was
-    /// malformed.
+    /// closes. Per-event errors are logged at `warn` and the loop
+    /// continues — daemon survival is more valuable than per-event
+    /// strict failure, and the audit chain still records the event
+    /// that triggered it. Channel lag is logged at `warn` with the
+    /// skipped count so it's visible.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), WeaverError> {
         let mut rx = self.pipeline.subscribe_ingest();
         loop {
@@ -220,10 +222,14 @@ impl AutoWeaver {
                             .push(thread.handle.clone());
                     }
                     Err(err) => {
-                        // Most often: UNIQUE (thread, path, category)
-                        // already present from a prior batch. Logged
-                        // and moved on; do NOT abort the whole event.
-                        tracing::debug!(error = %err, thread = %thread.handle, chunk = %chunk_id, "auto-weaver: evidence link insert skipped");
+                        // Idempotent path: a UNIQUE (thread, path,
+                        // category) collision means this edge was
+                        // already written in a prior batch — treat as
+                        // a no-op for this round and keep processing
+                        // the remaining (chunk, anchor) pairs. Logged
+                        // at debug so the trail exists if a real
+                        // store error masquerades as this.
+                        tracing::debug!(error = %err, thread = %thread.handle, chunk = %chunk_id, "auto-weaver: evidence link insert skipped (likely UNIQUE collision)");
                     }
                 }
             }
