@@ -5,7 +5,7 @@
 //! `crates/attention/src/*.rs` cover the math; this file covers the
 //! wiring — ledger persistence across re-open, ledger row advancement
 //! through the observer, MCP JSON-shape strictness, full state-chain
-//! transitions through the curator, AutoWeaver merge semantics.
+//! transitions through the curator, `AutoWeaver` merge semantics.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ const EMBED_DIM: usize = 16;
 
 /// Deterministic embedder. Identical text yields identical vectors; the
 /// integration tests rely on this to engineer specific (anchor, chunk)
-/// cosine similarities for the AutoWeaver merge-vs-skip path.
+/// cosine similarities for the `AutoWeaver` merge-vs-skip path.
 struct FakeEmbedder {
     dim: usize,
 }
@@ -47,6 +47,7 @@ impl ChunkEmbedder for FakeEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
+    #[allow(clippy::cast_precision_loss)]
     fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
         texts
             .iter()
@@ -695,7 +696,7 @@ async fn mcp_surface_payload_carries_full_score_attribution() {
         );
     }
     assert!(why["familiarity"].is_number());
-    assert_eq!(why["familiarity"].as_u64().unwrap() >= 5, true);
+    assert!(why["familiarity"].as_u64().unwrap() >= 5);
     assert!(why["resonance"].is_number());
     assert!(why["tension"].is_number());
     assert!(why["off_diagonal_lift"].is_number());
@@ -719,6 +720,7 @@ async fn mcp_surface_payload_carries_full_score_attribution() {
 // exercised too.
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn autoweaver_links_resonant_ingest_and_skips_non_resonant() {
     let tmp = TempDir::new().unwrap();
     let (pipeline, corpus) = make_pipeline_with_corpus(&tmp).await;
@@ -760,7 +762,10 @@ async fn autoweaver_links_resonant_ingest_and_skips_non_resonant() {
         let corpus = corpus.clone();
         let chunk_id = chunk_id.to_string();
         async move {
-            let new = corpus.fetch_embeddings(&[chunk_id.clone()]).await.unwrap();
+            let new = corpus
+                .fetch_embeddings(std::slice::from_ref(&chunk_id))
+                .await
+                .unwrap();
             let rows = threads.list_threads(None).unwrap();
             let anchor_ids: Vec<String> = rows
                 .iter()
