@@ -12,13 +12,18 @@ workspace = true
 
 [dependencies]
 ostk-recall-core = { workspace = true }
+ostk-recall-pipeline = { workspace = true }
+ostk-recall-store = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

@@ -15,6 +15,9 @@
 //! future workpiece. Keeping the runtime abstract makes the math and
 //! scope-isolation invariants testable on their own.
 
+pub mod weaver;
+pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
