@@ -94,6 +94,15 @@ impl Pipeline {
         &self.ingest
     }
 
+    // Casts: `d.as_micros() as i64` and `meta.len() as i64` are intentional —
+    // micros within i64 range until year 294247; file lengths under 8 EiB.
+    // Length and nested-if shape track the parallel `ingest_paths_for_source`.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::collapsible_if
+    )]
     pub async fn ingest_source(&self, scanner: &dyn Scanner, cfg: &SourceConfig) -> PipelineStats {
         let mut stats = PipelineStats::default();
         let mut to_embed: Vec<Chunk> = Vec::new();
@@ -118,8 +127,7 @@ impl Pipeline {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_micros() as i64);
                     let size = meta.len() as i64;
 
                     if let Ok(Some((old_mtime, old_size))) =
@@ -239,7 +247,7 @@ impl Pipeline {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed")
+                                tracing::warn!(error = %e, source = %s.as_str(), "orphan sweep failed");
                             }
                         }
                     }
@@ -259,7 +267,7 @@ impl Pipeline {
                                 stats.chunks_staled += orphans.len();
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed")
+                                tracing::warn!(error = %e, source = %s.as_str(), "stale marking failed");
                             }
                         }
                     }
@@ -321,6 +329,13 @@ impl Pipeline {
     /// paths that `discover_paths` actually yielded a [`SourceItem`] for.
     /// The caller diffs that set against `paths` to find missing-on-disk
     /// candidates for the delete pass.
+    // Mirrors `ingest_source`; same cast + nested-if intentional patterns.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::collapsible_if
+    )]
     async fn ingest_paths_for_source(
         &self,
         scanner: &dyn Scanner,
@@ -354,8 +369,7 @@ impl Pipeline {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_micros() as i64);
                     let size = meta.len() as i64;
 
                     if let Ok(Some((old_mtime, old_size))) =
@@ -470,9 +484,8 @@ impl Pipeline {
             return stats;
         }
         let project = cfg.project.as_deref().unwrap_or("default");
-        let roots = match cfg.expanded_paths() {
-            Ok(r) => r,
-            Err(_) => return stats,
+        let Ok(roots) = cfg.expanded_paths() else {
+            return stats;
         };
         // Canonicalize roots once. relative_source_id below also
         // canonicalizes the input path so the strip_prefix succeeds
@@ -576,9 +589,12 @@ impl Pipeline {
             .count_active_by_source()
             .map_err(|e| PipelineError::Store(e.to_string()))?;
         let ingest_total: u64 = ingest_by_source.iter().map(|(_, n)| *n).sum();
+        // u64 -> usize: chunk counts won't exceed usize::MAX on 64-bit targets.
+        #[allow(clippy::cast_possible_truncation)]
+        let ingest_total_usize = ingest_total as usize;
         Ok(VerifyReport {
             corpus_total,
-            ingest_total: ingest_total as usize,
+            ingest_total: ingest_total_usize,
             by_source: ingest_by_source,
         })
     }
@@ -602,9 +618,8 @@ impl VerifyReport {
 /// [`Pipeline::scan_paths`] to compute the per-source path subset before
 /// dispatching to `discover_paths`.
 fn paths_under_source(cfg: &SourceConfig, paths: &[PathBuf]) -> Vec<PathBuf> {
-    let roots = match cfg.expanded_paths() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+    let Ok(roots) = cfg.expanded_paths() else {
+        return Vec::new();
     };
     paths
         .iter()
@@ -640,12 +655,12 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
 }
 
 /// Compute a `source_id` from an absolute path the same way the
-/// path-rooted scanners (markdown, code, file_glob) do — relative to the
+/// path-rooted scanners (markdown, code, `file_glob`) do — relative to the
 /// first matching configured root, joined with `/`. Used by
 /// [`Pipeline::purge_missing_paths`] (gh#7) to look up a chunk family in
 /// the ledger by `(source, project, source_id)` for delete-event
 /// handling. Sources whose `source_id` scheme is NOT path-relative
-/// (ostk_project route markers, zip_export archive keys) won't match the
+/// (`ostk_project` route markers, `zip_export` archive keys) won't match the
 /// ledger and the tombstone collapses to a no-op — desired for the
 /// first-cut scope (append-only sources are deferred per EPIC gh#8).
 fn relative_source_id(roots: &[PathBuf], path: &Path) -> String {
@@ -696,6 +711,7 @@ mod tests {
         fn dim(&self) -> usize {
             self.dim
         }
+        #[allow(clippy::cast_precision_loss)]
         fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
             texts
                 .iter()
@@ -1070,7 +1086,7 @@ mod tests {
 
         // Initial ingest via scan_paths (single-path).
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[code_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&code_path))
             .await
             .unwrap();
         assert_eq!(per.len(), 1);
@@ -1081,7 +1097,7 @@ mod tests {
         std::fs::remove_file(&code_path).unwrap();
 
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[code_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&code_path))
             .await
             .unwrap();
         assert_eq!(per.len(), 1, "source still matched on input path");
@@ -1132,7 +1148,7 @@ mod tests {
         };
 
         pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[old_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&old_path))
             .await
             .unwrap();
         assert_eq!(pipeline.store().row_count().await.unwrap(), 1);
@@ -1185,7 +1201,7 @@ mod tests {
         };
 
         pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[known.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&known))
             .await
             .unwrap();
         let baseline = pipeline.store().row_count().await.unwrap();
@@ -1225,7 +1241,7 @@ mod tests {
         let cfg = cfg_for(fixtures.path());
 
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[md_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&md_path))
             .await
             .unwrap();
         let baseline = per[0].1.chunks_upserted;
@@ -1233,7 +1249,7 @@ mod tests {
 
         std::fs::remove_file(&md_path).unwrap();
         let per = pipeline
-            .scan_paths(&[(&scanner, &cfg)], &[md_path.clone()])
+            .scan_paths(&[(&scanner, &cfg)], std::slice::from_ref(&md_path))
             .await
             .unwrap();
         let stats = per[0].1;

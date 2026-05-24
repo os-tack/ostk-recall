@@ -80,7 +80,7 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
             .as_ref()
             .map_or(0.0, |a| if a.is_null(i) { 0.0 } else { a.value(i) });
 
-        let is_stale = stale_col.map_or(false, |a| if a.is_null(i) { false } else { a.value(i) });
+        let is_stale = stale_col.is_some_and(|a| if a.is_null(i) { false } else { a.value(i) });
 
         out.push(RecallHit {
             chunk_id: chunk_id.value(i).to_string(),

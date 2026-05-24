@@ -193,7 +193,7 @@ impl CorpusStore {
             .map(|id| format!("'{}'", escape_sql(id)))
             .collect::<Vec<_>>()
             .join(", ");
-        let filter = format!("chunk_id IN ({})", ids_joined);
+        let filter = format!("chunk_id IN ({ids_joined})");
 
         table.delete(&filter).await?;
         let after = table.count_rows(None).await?;
@@ -212,7 +212,7 @@ impl CorpusStore {
             .map(|id| format!("'{}'", escape_sql(id)))
             .collect::<Vec<_>>()
             .join(", ");
-        let filter = format!("chunk_id IN ({})", ids_joined);
+        let filter = format!("chunk_id IN ({ids_joined})");
 
         table
             .update()
@@ -372,7 +372,7 @@ mod tests {
     async fn read_stale_for(store: &CorpusStore, chunk_id: &str) -> bool {
         use arrow_array::BooleanArray;
         let table = store.conn.open_table(CORPUS_TABLE).execute().await.unwrap();
-        let filter = format!("chunk_id = '{}'", chunk_id);
+        let filter = format!("chunk_id = '{chunk_id}'");
         let stream = table
             .query()
             .only_if(filter)
@@ -391,7 +391,7 @@ mod tests {
                 return arr.value(0);
             }
         }
-        panic!("no row found for chunk_id={}", chunk_id);
+        panic!("no row found for chunk_id={chunk_id}");
     }
 
     #[tokio::test]

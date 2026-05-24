@@ -242,8 +242,7 @@ fn named_page_value(page: &SynthesizedPage) -> std::result::Result<Value, serde_
     let slug = page
         .head
         .source_id
-        .replace('/', ":")
-        .replace('\\', ":")
+        .replace(['/', '\\'], ":")
         .replace(' ', "_");
     let name = format!("recall:{slug}");
     let content = serde_json::to_string(page)?;

@@ -11,7 +11,7 @@ pub struct EventsDb {
     conn: Mutex<Connection>,
 }
 
-/// One row as it lands in audit_events.
+/// One row as it lands in `audit_events`.
 #[derive(Debug, Clone)]
 pub struct AuditEventRow {
     pub row_key: String,
@@ -89,6 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         Ok(())
     }
 
+    // `conn` is held intentionally: `tx` borrows it for the whole batch.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn ingest_batch(&self, rows: &[AuditEventRow]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
@@ -110,7 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
                     row.event,
                     row.tool,
                     row.agent,
-                    row.success.map(|b| if b { 1i32 } else { 0i32 }),
+                    row.success.map(i32::from),
                     row.exit_code,
                     row.duration_ms,
                     row.raw,
@@ -122,6 +124,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         Ok(inserted)
     }
 
+    // `conn` is held intentionally: `stmt` borrows it for the query.
+    #[allow(clippy::significant_drop_tightening, clippy::cast_sign_loss)]
     pub fn row_count(&self) -> Result<u64> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM audit_events")?;
@@ -129,6 +133,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         Ok(n as u64)
     }
 
+    // `conn` is held intentionally: `stmt` borrows it for the query.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn execute_select(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
         let conn = self.lock();
         let mut stmt = conn.prepare(sql)?;
@@ -152,6 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
         Ok((columns, out))
     }
 
+    // `conn` is held intentionally: `stmt` borrows it for the query.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn get(&self, row_key: &str) -> Result<Option<AuditEventRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
