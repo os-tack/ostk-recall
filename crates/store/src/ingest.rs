@@ -5,16 +5,7 @@ use ostk_recall_core::Source;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use crate::corpus::{Result, StoreError};
-
-impl From<rusqlite::Error> for StoreError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Lance(lancedb::Error::Other {
-            message: format!("sqlite: {e}"),
-            source: Some(Box::new(e)),
-        })
-    }
-}
+use crate::corpus::Result;
 
 /// Idempotency + provenance metadata. Lives at <root>/ingest.sqlite.
 pub struct IngestDb {

@@ -24,6 +24,15 @@ pub enum StoreError {
     #[error("arrow: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
+    #[error("sqlite: {0}")]
+    Sqlite(rusqlite::Error),
+
+    #[error("UNIQUE constraint violated on {table}: {constraint}")]
+    UniqueViolation { table: String, constraint: String },
+
+    #[error("invalid {field} value {value:?}")]
+    InvalidEnumValue { field: String, value: String },
+
     #[error("schema mismatch: table dim {have}, embedder dim {want}")]
     DimMismatch { have: usize, want: usize },
 
@@ -32,6 +41,25 @@ pub enum StoreError {
 
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(code, ref msg) = e {
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+                && code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            {
+                let constraint = msg.clone().unwrap_or_else(|| "UNIQUE".into());
+                let table = constraint
+                    .split('.')
+                    .next()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "unknown".into());
+                return Self::UniqueViolation { table, constraint };
+            }
+        }
+        Self::Sqlite(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

@@ -222,16 +222,18 @@ impl AutoWeaver {
                             .or_default()
                             .push(thread.handle.clone());
                     }
-                    Err(err) => {
-                        // Idempotent path: a UNIQUE (thread, path,
-                        // category) collision means this edge was
-                        // already written in a prior batch — treat as
-                        // a no-op for this round and keep processing
-                        // the remaining (chunk, anchor) pairs. Logged
-                        // at debug so the trail exists if a real
-                        // store error masquerades as this.
-                        tracing::debug!(error = %err, thread = %thread.handle, chunk = %chunk_id, "auto-weaver: evidence link insert skipped (likely UNIQUE collision)");
+                    Err(StoreError::UniqueViolation { .. }) => {
+                        // The (thread, path, category) edge was written
+                        // in a prior batch. Idempotent no-op; skip and
+                        // keep processing the remaining (chunk, anchor)
+                        // pairs.
+                        tracing::trace!(
+                            thread = %thread.handle,
+                            chunk = %chunk_id,
+                            "auto-weaver: evidence link already exists",
+                        );
                     }
+                    Err(err) => return Err(WeaverError::from(err)),
                 }
             }
         }
