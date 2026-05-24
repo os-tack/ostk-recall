@@ -92,12 +92,11 @@ pub enum WeaverError {
 
 /// Resonance-driven evidence-link writer.
 ///
-/// One instance is meant to live for the life of the daemon: build it
-/// with `new`, then drive `run` on a long-lived task. `process_event`
-/// is public so unit tests (and operators) can drive single events
-/// without standing up a broadcast channel.
+/// Holds only the dependencies `process_event` needs (the ledger, the
+/// corpus, and per-source thresholds). `run` adds the broadcast wiring
+/// on top — separating the two lets unit tests drive `process_event`
+/// directly without standing up a `Pipeline`.
 pub struct AutoWeaver {
-    pipeline: Arc<Pipeline>,
     threads: Arc<ThreadsDb>,
     corpus: Arc<CorpusStore>,
     thresholds: WeaverThresholds,
@@ -106,27 +105,29 @@ pub struct AutoWeaver {
 impl AutoWeaver {
     #[must_use]
     pub const fn new(
-        pipeline: Arc<Pipeline>,
         threads: Arc<ThreadsDb>,
         corpus: Arc<CorpusStore>,
         thresholds: WeaverThresholds,
     ) -> Self {
         Self {
-            pipeline,
             threads,
             corpus,
             thresholds,
         }
     }
 
-    /// Drive the weaver until `cancel` fires or the pipeline channel
-    /// closes. Per-event errors are logged at `warn` and the loop
-    /// continues — daemon survival is more valuable than per-event
-    /// strict failure, and the audit chain still records the event
-    /// that triggered it. Channel lag is logged at `warn` with the
-    /// skipped count so it's visible.
-    pub async fn run(&self, cancel: CancellationToken) -> Result<(), WeaverError> {
-        let mut rx = self.pipeline.subscribe_ingest();
+    /// Subscribe to `pipeline` and drive the weaver until `cancel`
+    /// fires or the pipeline channel closes. Per-event errors are
+    /// logged at `warn` and the loop continues — daemon survival is
+    /// more valuable than per-event strict failure, and the audit
+    /// chain still records the event that triggered it. Channel lag
+    /// is logged at `warn` with the skipped count so it's visible.
+    pub async fn run(
+        &self,
+        pipeline: &Pipeline,
+        cancel: CancellationToken,
+    ) -> Result<(), WeaverError> {
+        let mut rx = pipeline.subscribe_ingest();
         loop {
             tokio::select! {
                 () = cancel.cancelled() => return Ok(()),

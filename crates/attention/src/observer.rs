@@ -27,7 +27,7 @@ use ostk_recall_core::attention::{AttentionScope, ThreadHandle, ThreadHandleErro
 use ostk_recall_core::{Chunk, Links, Source};
 use ostk_recall_pipeline::{Pipeline, PipelineError, SyntheticSourceMeta};
 use ostk_recall_store::corpus::StoreError;
-use ostk_recall_store::{ChainEvent, ChainSink, ThreadsDb};
+use ostk_recall_store::ThreadsDb;
 use regex::Regex;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -512,16 +512,6 @@ fn stub_confidence(occurrences: usize) -> f32 {
 // the score-tier counter (that runs through `AttentionForwardStore::
 // familiarize`). The observer's contract is per the spec: emit the
 // batch chain row. Score-tier wiring is the surfacer's job (Phase 10+).
-//
-// Convenience re-export so test/MCP code can attach a sink to the
-// observer's store without re-importing the trait. Kept inside this
-// module so the surface stays a single `observer::*` import.
-pub use ostk_recall_store::ChainSink as ObserverChainSink;
-pub use ostk_recall_store::NoopChainSink;
-// silences "unused import" diagnostics when downstream code only
-// touches one of the two; compile-time cost is zero.
-#[allow(dead_code)]
-fn _force_chain_use(_e: &ChainEvent, _s: &dyn ChainSink) {}
 
 // ===== tests =====
 
