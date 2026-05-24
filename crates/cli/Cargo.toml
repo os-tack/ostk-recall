@@ -37,6 +37,8 @@ dirs = { workspace = true }
 serde_json = { workspace = true }
 notify-debouncer-full = { workspace = true }
 fs4 = { workspace = true }
+ignore = { workspace = true }
+
 
 [dev-dependencies]
 ostk-recall-store = { workspace = true }

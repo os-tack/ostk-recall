@@ -917,11 +917,73 @@ pub async fn watch(config_path: &Path) -> Result<()> {
     )
     .context("creating filesystem debouncer")?;
 
-    for (root, _) in &watched_roots {
-        debouncer
-            .watch(root, RecursiveMode::Recursive)
-            .with_context(|| format!("registering watch on {}", root.display()))?;
-        tracing::info!(path = %root.display(), "watching");
+    for (root, source) in &watched_roots {
+        if root.is_file() {
+            debouncer
+                .watch(root, RecursiveMode::NonRecursive)
+                .with_context(|| format!("registering watch on file {}", root.display()))?;
+            tracing::info!(path = %root.display(), "watching file");
+        } else {
+            debouncer
+                .watch(root, RecursiveMode::NonRecursive)
+                .with_context(|| format!("registering base watch on {}", root.display()))?;
+            tracing::info!(path = %root.display(), "watching base directory");
+
+            let mut builder = ignore::WalkBuilder::new(root);
+            builder
+                .standard_filters(true)
+                .hidden(true)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .add_custom_ignore_filename(".ostk-recall-ignore")
+                .follow_links(false)
+                .max_depth(Some(1));
+
+            if !source.ignore.is_empty() {
+                let mut overrides = ignore::overrides::OverrideBuilder::new(root);
+                for pat in &source.ignore {
+                    let needs_bang = !pat.starts_with('!');
+                    let normalized = if needs_bang {
+                        format!("!{pat}")
+                    } else {
+                        pat.clone()
+                    };
+                    if let Err(e) = overrides.add(&normalized) {
+                        tracing::warn!(pattern = %pat, error = %e, "ignore: bad override pattern");
+                    }
+                }
+                match overrides.build() {
+                    Ok(o) => {
+                        builder.overrides(o);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ignore: failed to build overrides");
+                    }
+                }
+            }
+
+            for entry in builder.build().filter_map(std::result::Result::ok) {
+                let path = entry.path();
+                if path == root {
+                    continue;
+                }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if matches!(
+                        name,
+                        ".git" | "target" | "node_modules" | ".ostk" | ".worktrees" | ".next" | "dist" | "build"
+                    ) {
+                        continue;
+                    }
+                }
+                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    debouncer
+                        .watch(path, RecursiveMode::Recursive)
+                        .with_context(|| format!("registering recursive watch on {}", path.display()))?;
+                    tracing::info!(path = %path.display(), "watching recursively");
+                }
+            }
+        }
     }
     tracing::info!(
         socket = %socket_path.display(),

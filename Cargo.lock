@@ -4439,6 +4439,7 @@ dependencies = [
  "clap",
  "dirs",
  "fs4",
+ "ignore",
  "notify-debouncer-full",
  "ostk-recall-attention",
  "ostk-recall-attention-mcp",
