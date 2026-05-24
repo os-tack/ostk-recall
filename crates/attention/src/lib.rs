@@ -15,7 +15,10 @@
 //! future workpiece. Keeping the runtime abstract makes the math and
 //! scope-isolation invariants testable on their own.
 
+pub mod curator;
 pub mod observer;
+
+pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
 pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver};
 
 use std::collections::HashMap;
@@ -181,6 +184,21 @@ pub trait AttentionForwardStore: Send + Sync {
 
     /// Apply an explicit fade factor (multiplies the floor).
     async fn decay(&self, handle: &ThreadHandle, factor: f32) -> Result<(), AttentionError>;
+
+    /// Compute the current fade score for a thread, scope-agnostic.
+    ///
+    /// The idle curator calls this once per thread per tick and compares
+    /// the result against configured tension thresholds. Implementations
+    /// that maintain per-scope state (the in-memory runtime) return the
+    /// maximum score across all scopes containing the handle — a thread
+    /// that is "still warm somewhere" should not be archived.
+    ///
+    /// Default implementation returns 0.0 so callers without a real
+    /// scoring runtime fall through to the lowest tension bucket; the
+    /// in-memory runtime overrides this.
+    async fn score_thread(&self, _handle: &ThreadHandle) -> Result<f32, AttentionError> {
+        Ok(0.0)
+    }
 }
 
 // --- in-memory implementation -----------------------------------------
@@ -458,6 +476,36 @@ impl AttentionForwardStore for InMemoryAttention {
             return Err(AttentionError::ThreadNotFound(handle.to_string()));
         }
         Ok(())
+    }
+
+    // Curator-side scoring: walk every scope that contains the handle
+    // and return the max score. Same formula as `surface()`; "still
+    // warm somewhere" should keep a thread alive globally even if it
+    // has cooled in the scope that originated it.
+    #[allow(
+        clippy::similar_names,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    async fn score_thread(&self, handle: &ThreadHandle) -> Result<f32, AttentionError> {
+        let inner = self.inner.read().await;
+        let now = Utc::now();
+        let mut best: Option<f32> = None;
+        for scope_state in inner.scopes.values() {
+            let Some(state) = scope_state.threads.get(handle) else {
+                continue;
+            };
+            let resonance = cosine_similarity(&state.anchor, &scope_state.attention_vec);
+            let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
+            let dt_days = dt_secs as f32 / 86_400.0;
+            let floor = familiarity_floor(state.familiarity) * state.fade_multiplier;
+            let decay_term = floor * (-decay_rate(state.familiarity) * dt_days).exp();
+            let resonance_term = ALPHA * resonance;
+            let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
+            let score = decay_term + resonance_term + lift_term;
+            best = Some(best.map_or(score, |b| b.max(score)));
+        }
+        Ok(best.unwrap_or(0.0))
     }
 }
 
