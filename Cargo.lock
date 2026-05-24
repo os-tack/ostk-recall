@@ -4383,6 +4383,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostk-recall-attention"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ostk-recall-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ostk-recall-core"
 version = "0.1.8"
 dependencies = [
