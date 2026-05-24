@@ -4389,11 +4389,14 @@ dependencies = [
  "async-trait",
  "chrono",
  "ostk-recall-core",
+ "ostk-recall-store",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -6299,6 +6302,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
