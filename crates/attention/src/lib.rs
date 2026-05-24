@@ -17,9 +17,11 @@
 
 pub mod curator;
 pub mod observer;
+pub mod weaver;
 
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
 pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver};
+pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};
 
 use std::collections::HashMap;
 use std::sync::Arc;
