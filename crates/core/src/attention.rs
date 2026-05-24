@@ -105,11 +105,13 @@ impl ThreadHandle {
     }
 
     /// Borrow the underlying string slice.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Consume the wrapper and return the owned string.
+    #[must_use]
     pub fn into_inner(self) -> String {
         self.0
     }

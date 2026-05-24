@@ -40,6 +40,7 @@ impl Chunk {
     /// `chunk_id = sha256(source || ':' || source_id || ':' || chunk_index)`.
     /// Re-running a scanner with identical inputs produces identical ids, so
     /// upsert by `chunk_id` is idempotent.
+    #[must_use]
     pub fn make_id(source: Source, source_id: &str, chunk_index: u32) -> String {
         let mut h = Sha256::new();
         h.update(source.as_str().as_bytes());
@@ -52,6 +53,7 @@ impl Chunk {
 
     /// Content hash for the `text` field. Used by the pipeline's dedupe step:
     /// if `sha256(text)` already present in `ingest_chunks`, skip embedding.
+    #[must_use]
     pub fn content_hash(text: &str) -> String {
         hex::encode(Sha256::digest(text.as_bytes()))
     }

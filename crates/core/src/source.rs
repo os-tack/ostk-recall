@@ -29,6 +29,7 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Markdown => "markdown",
@@ -45,6 +46,7 @@ impl SourceKind {
 
     /// Returns the list of concrete [`Source`] variants this kind can produce.
     /// Used during orphan sweeps to ensure all related subtypes are cleaned.
+    #[must_use]
     pub fn sources(self) -> Vec<Source> {
         match self {
             Self::Markdown => vec![Source::Markdown],
@@ -68,6 +70,7 @@ impl SourceKind {
     }
 
     /// Returns the retention policy for this source kind.
+    #[must_use]
     pub const fn retention_policy(self) -> RetentionPolicy {
         match self {
             Self::Code => RetentionPolicy::Delete,
@@ -105,6 +108,7 @@ pub enum Source {
 }
 
 impl Source {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Markdown => "markdown",
