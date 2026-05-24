@@ -237,6 +237,41 @@ struct Inner {
 }
 
 /// In-memory attention runtime. Cloning is cheap (Arc-shared).
+/// Per-thread score breakdown shared by `surface` and `score_thread`.
+/// Centralises the formula so the two callers cannot drift.
+struct ScoreParts {
+    score: f32,
+    resonance: f32,
+    lift_term: f32,
+    dt_secs: u64,
+}
+
+#[allow(
+    clippy::similar_names,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn compute_score_parts(
+    state: &ThreadState,
+    attention_vec: &[f32],
+    now: DateTime<Utc>,
+) -> ScoreParts {
+    let resonance = cosine_similarity(&state.anchor, attention_vec);
+    let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
+    let dt_days = dt_secs as f32 / 86_400.0;
+    let floor = familiarity_floor(state.familiarity) * state.fade_multiplier;
+    let decay_term = floor * (-decay_rate(state.familiarity) * dt_days).exp();
+    let resonance_term = ALPHA * resonance;
+    let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
+    let score = decay_term + resonance_term + lift_term;
+    ScoreParts {
+        score,
+        resonance,
+        lift_term,
+        dt_secs,
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct InMemoryAttention {
     inner: Arc<RwLock<Inner>>,
@@ -339,16 +374,6 @@ impl AttentionForwardStore for InMemoryAttention {
         Ok(())
     }
 
-    // `*_term` triplet plus `scope`/`scope_state` triggers
-    // similar_names; the names are deliberate (each term mirrors an
-    // attribution axis) and renaming would obscure the score formula.
-    // Casts are bounded: dt_secs is clamped >=0 then expressed in days,
-    // well within f32 precision for any realistic uptime.
-    #[allow(
-        clippy::similar_names,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
     async fn surface(
         &self,
         scope: &AttentionScope,
@@ -366,30 +391,22 @@ impl AttentionForwardStore for InMemoryAttention {
             .iter()
             .filter(|(_, t)| should_surface_thread(t, &key))
             .filter_map(|(handle, state)| {
-                let resonance = cosine_similarity(&state.anchor, &scope_state.attention_vec);
-                let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
-                let dt_days = dt_secs as f32 / 86_400.0;
-                let floor = familiarity_floor(state.familiarity) * state.fade_multiplier;
-                let decay_term = floor * (-decay_rate(state.familiarity) * dt_days).exp();
-                let resonance_term = ALPHA * resonance;
-                let lift_gate = off_diagonal_lift_gate(state.tension, resonance);
-                let lift_term = BETA * lift_gate;
-                let score = decay_term + resonance_term + lift_term;
-                if score < ARCHIVE_THRESHOLD {
+                let parts = compute_score_parts(state, &scope_state.attention_vec, now);
+                if parts.score < ARCHIVE_THRESHOLD {
                     return None;
                 }
                 Some(AttentionPage {
                     handle: handle.to_string(),
                     depth: state.depth,
-                    score,
+                    score: parts.score,
                     why: ScoreAttribution {
                         tension: state.tension,
-                        resonance,
+                        resonance: parts.resonance,
                         familiarity: state.familiarity,
                         // Already-weighted contribution so attribution
                         // axes sum (within float tolerance) to `score`.
-                        off_diagonal_lift: lift_term,
-                        time_since_touch_secs: dt_secs,
+                        off_diagonal_lift: parts.lift_term,
+                        time_since_touch_secs: parts.dt_secs,
                     },
                 })
             })
@@ -484,11 +501,6 @@ impl AttentionForwardStore for InMemoryAttention {
     // and return the max score. Same formula as `surface()`; "still
     // warm somewhere" should keep a thread alive globally even if it
     // has cooled in the scope that originated it.
-    #[allow(
-        clippy::similar_names,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
     async fn score_thread(&self, handle: &ThreadHandle) -> Result<f32, AttentionError> {
         let inner = self.inner.read().await;
         let now = Utc::now();
@@ -497,14 +509,7 @@ impl AttentionForwardStore for InMemoryAttention {
             let Some(state) = scope_state.threads.get(handle) else {
                 continue;
             };
-            let resonance = cosine_similarity(&state.anchor, &scope_state.attention_vec);
-            let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
-            let dt_days = dt_secs as f32 / 86_400.0;
-            let floor = familiarity_floor(state.familiarity) * state.fade_multiplier;
-            let decay_term = floor * (-decay_rate(state.familiarity) * dt_days).exp();
-            let resonance_term = ALPHA * resonance;
-            let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
-            let score = decay_term + resonance_term + lift_term;
+            let score = compute_score_parts(state, &scope_state.attention_vec, now).score;
             best = Some(best.map_or(score, |b| b.max(score)));
         }
         Ok(best.unwrap_or(0.0))
