@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod attention;
 pub mod chunk;
 pub mod config;
 pub mod error;
@@ -12,6 +13,10 @@ pub mod scanner;
 pub mod source;
 pub mod types;
 
+pub use attention::{
+    AttentionPage, AttentionScope, FoldDepth, IngestEvent, PrivacyTier, ScoreAttribution,
+    ThreadHandle, ThreadHandleError,
+};
 pub use chunk::{Chunk, Links};
 pub use config::{
     Config, CorpusConfig, EmbedderConfig, RerankerConfig, SourceConfig, WatchConfig, WatchMode,
