@@ -8,6 +8,7 @@ members = [
     "crates/pipeline",
     "crates/query",
     "crates/attention",
+    "crates/attention-mcp",
     "crates/mcp",
     "crates/cli",
 ]
@@ -50,6 +51,7 @@ ostk-recall-scan = { path = "crates/scan" }
 ostk-recall-pipeline = { path = "crates/pipeline" }
 ostk-recall-query = { path = "crates/query" }
 ostk-recall-attention = { path = "crates/attention" }
+ostk-recall-attention-mcp = { path = "crates/attention-mcp" }
 ostk-recall-mcp = { path = "crates/mcp" }
 ostk-recall-cli = { path = "crates/cli" }
 

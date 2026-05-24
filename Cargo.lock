@@ -4440,6 +4440,8 @@ dependencies = [
  "dirs",
  "fs4",
  "notify-debouncer-full",
+ "ostk-recall-attention",
+ "ostk-recall-attention-mcp",
  "ostk-recall-core",
  "ostk-recall-embed",
  "ostk-recall-mcp",
@@ -4472,6 +4474,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "ostk-recall-attention-mcp"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ostk-recall-attention",
+ "ostk-recall-core",
+ "ostk-recall-mcp",
+ "ostk-recall-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
