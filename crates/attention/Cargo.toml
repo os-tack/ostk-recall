@@ -33,3 +33,8 @@ regex = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+# QA integration tests in crates/attention/tests/ drive the MCP
+# dispatch surface end-to-end (e.g. verify ScoreAttribution leaves the
+# JSON boundary intact) and need a deterministic embedder; both pull in
+# attention-mcp + a fake ChunkEmbedder.
+ostk-recall-attention-mcp = { workspace = true }
