@@ -10,7 +10,7 @@
 //! - `fade-is-concentration` — fade is the load-bearing primitive
 //! - `abi-as-sovereign-boundary` — every page carries `ScoreAttribution`
 //!
-//! Persistence (chain replay, SQLite ledger) is intentionally not in
+//! Persistence (chain replay, `SQLite` ledger) is intentionally not in
 //! this crate; the store-backed `AttentionForwardStore` impl is a
 //! future workpiece. Keeping the runtime abstract makes the math and
 //! scope-isolation invariants testable on their own.
@@ -50,15 +50,23 @@ pub const OFF_DIAGONAL_RESONANCE_MIN: f32 = 0.7;
 
 /// Linear interpolation between BASE and FAMILIAR over F in `[0, FAMILIARITY_SATURATION]`.
 #[must_use]
+// familiarity is small (saturates at 20); FAMILIARITY_SATURATION is a const.
+// Both are well within f32 mantissa range — precision loss is irrelevant here.
+#[allow(clippy::cast_precision_loss)]
 pub fn decay_rate(familiarity: u32) -> f32 {
     let f = (familiarity as f32 / FAMILIARITY_SATURATION as f32).min(1.0);
-    DECAY_RATE_BASE + (DECAY_RATE_FAMILIAR - DECAY_RATE_BASE) * f
+    (DECAY_RATE_FAMILIAR - DECAY_RATE_BASE).mul_add(f, DECAY_RATE_BASE)
 }
 
 /// Floor rises from 0.1 to 1.0 as familiarity climbs to `FAMILIARITY_SATURATION`.
 #[must_use]
+// Same bounded-range justification as `decay_rate`.
+#[allow(clippy::cast_precision_loss)]
 pub fn familiarity_floor(familiarity: u32) -> f32 {
-    0.1 + 0.9 * (familiarity as f32 / FAMILIARITY_SATURATION as f32).min(1.0)
+    0.9f32.mul_add(
+        (familiarity as f32 / FAMILIARITY_SATURATION as f32).min(1.0),
+        0.1,
+    )
 }
 
 /// Cosine similarity. Returns 0.0 if either vector is zero-norm or empty,
@@ -113,9 +121,11 @@ pub enum AttentionError {
 
 // --- scope key ---------------------------------------------------------
 
-/// Stable hash-able projection of `AttentionScope`. Two scopes with the
-/// same `(project, session_id, agent)` triple share state regardless of
-/// privacy tier — tier is enforced at surface time, not at attend time.
+/// Stable hash-able projection of `AttentionScope`.
+///
+/// Two scopes with the same `(project, session_id, agent)` triple share
+/// state regardless of privacy tier — tier is enforced at surface time,
+/// not at attend time.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ScopeKey {
     pub project: Option<String>,
@@ -185,7 +195,7 @@ struct ThreadState {
     /// at the moment of creation (a stand-in until the threads scanner
     /// supplies real anchors).
     anchor: Vec<f32>,
-    /// Scope that created this thread; T0Private threads only surface here.
+    /// Scope that created this thread; `T0Private` threads only surface here.
     origin: ScopeKey,
     /// Cached from `origin.privacy_tier` at creation time so cross-scope
     /// surface checks stay O(1) without re-reading scope metadata.
@@ -268,10 +278,11 @@ pub enum ReplayEvent {
 }
 
 /// Deterministic embedding stub: SHA-256 of context, expanded to a
-/// fixed-length f32 vector. Replaced by a real embedder via dependency
-/// injection in a later phase; the runtime never assumes anything about
-/// the embedding source beyond "cosine-comparable vectors of equal
-/// dimension".
+/// fixed-length f32 vector.
+///
+/// Replaced by a real embedder via dependency injection in a later
+/// phase; the runtime never assumes anything about the embedding source
+/// beyond "cosine-comparable vectors of equal dimension".
 #[must_use]
 pub fn stub_embed(context: &str) -> Vec<f32> {
     const DIM: usize = 32;
@@ -280,7 +291,7 @@ pub fn stub_embed(context: &str) -> Vec<f32> {
     for chunk in hash.chunks(2).take(DIM / 2) {
         // 16 bits -> [-1.0, 1.0]
         let v = u16::from_be_bytes([chunk[0], chunk[1]]);
-        let f = (f32::from(v) / f32::from(u16::MAX)) * 2.0 - 1.0;
+        let f = (f32::from(v) / f32::from(u16::MAX)).mul_add(2.0, -1.0);
         out.push(f);
     }
     while out.len() < DIM {
@@ -289,6 +300,12 @@ pub fn stub_embed(context: &str) -> Vec<f32> {
     out
 }
 
+// The `RwLock` guard pattern intentionally holds the lock across the
+// `entry()/get()` borrow plus the work that follows; clippy's "merge
+// the temporary into its single usage" rewrites either lose the
+// `&mut Inner` we need or split a read/write boundary that must stay
+// atomic. Same precedent as `crates/store/src/threads.rs`.
+#[allow(clippy::significant_drop_tightening)]
 #[async_trait]
 impl AttentionForwardStore for InMemoryAttention {
     async fn attend(&self, scope: &AttentionScope, context: &str) -> Result<(), AttentionError> {
@@ -299,6 +316,16 @@ impl AttentionForwardStore for InMemoryAttention {
         Ok(())
     }
 
+    // `*_term` triplet plus `scope`/`scope_state` triggers
+    // similar_names; the names are deliberate (each term mirrors an
+    // attribution axis) and renaming would obscure the score formula.
+    // Casts are bounded: dt_secs is clamped >=0 then expressed in days,
+    // well within f32 precision for any realistic uptime.
+    #[allow(
+        clippy::similar_names,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     async fn surface(
         &self,
         scope: &AttentionScope,
@@ -434,7 +461,7 @@ impl AttentionForwardStore for InMemoryAttention {
 /// Privacy and scope-isolation filter applied to every surfaced thread.
 ///
 /// A thread is dropped from `surface()` if its origin scope was
-/// T0Private and the querying scope key differs, regardless of the
+/// `T0Private` and the querying scope key differs, regardless of the
 /// querying scope's own tier.
 fn should_surface_thread(state: &ThreadState, key: &ScopeKey) -> bool {
     if state.origin_was_private && &state.origin != key {
@@ -450,6 +477,11 @@ impl InMemoryAttention {
     /// Tests use this to assemble specific score-shape scenarios
     /// without driving the full ingest path.
     #[doc(hidden)]
+    // Test-only helper; bundling the args into a struct would obscure
+    // the call sites that exist to set every axis independently.
+    // significant_drop_tightening: same `RwLock` guard pattern as the
+    // trait impl above — the guard must span the entry()/insert() pair.
+    #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
     pub async fn __install_thread_for_test(
         &self,
         scope: &AttentionScope,
@@ -482,6 +514,16 @@ impl InMemoryAttention {
 // --- tests -------------------------------------------------------------
 
 #[cfg(test)]
+// Tests assemble small bounded indices and exact 0.0 outputs from the
+// cosine_similarity contract ("Returns 0.0 if zero-norm or mismatched").
+// The cast/float_cmp suppressions are test-data ergonomics, not behavior.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
     use chrono::Duration;
@@ -678,7 +720,7 @@ mod tests {
             // We don't have the raw floor in the attribution, but we
             // can check: score - (ALPHA*resonance) - off_diagonal_lift
             // must be a non-negative number bounded by familiarity_floor(F).
-            let decay_term = p.score - ALPHA * p.why.resonance - p.why.off_diagonal_lift;
+            let decay_term = ALPHA.mul_add(-p.why.resonance, p.score) - p.why.off_diagonal_lift;
             assert!(
                 decay_term >= -1e-4,
                 "decay term went negative: {decay_term}"
@@ -691,7 +733,8 @@ mod tests {
             // Recompute the full score from attribution and compare.
             let dt_days = p.why.time_since_touch_secs as f32 / 86_400.0;
             let expected_decay = floor * (-decay_rate(p.why.familiarity) * dt_days).exp();
-            let expected_total = expected_decay + ALPHA * p.why.resonance + p.why.off_diagonal_lift;
+            let expected_total =
+                ALPHA.mul_add(p.why.resonance, expected_decay) + p.why.off_diagonal_lift;
             assert!(
                 approx_eq(expected_total, p.score, 1e-4),
                 "reconstructed {expected_total} != score {}",
