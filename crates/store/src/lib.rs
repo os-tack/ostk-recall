@@ -14,5 +14,5 @@ pub use ingest::{IngestChunkRow, IngestDb};
 pub use schema::{CORPUS_TABLE, corpus_schema};
 pub use threads::{
     AssociationType, ChainEvent, ChainSink, EvidenceLink, NoopChainSink, ProposedThreadRecord,
-    RelationState, TensionState, ThreadRecord, ThreadsDb,
+    RelationState, SqliteChainSink, TensionState, ThreadRecord, ThreadsDb,
 };

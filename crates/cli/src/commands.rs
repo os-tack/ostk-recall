@@ -7,11 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use ostk_recall_attention::{
+    AttentionForwardStore, AutoWeaver, CuratorConfig, IdleCurator, InMemoryAttention, ReplayEvent,
+    TurnObserver, WeaverThresholds, ambient_scope_default,
+};
+use ostk_recall_attention_mcp::AttentionDispatch;
+use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode};
 use ostk_recall_mcp::Server;
-use ostk_recall_attention::{
-    AutoWeaver, TurnObserver, WeaverThresholds, ambient_scope_default,
-};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
@@ -22,7 +25,7 @@ use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
-use ostk_recall_store::{CorpusStore, EventsDb, IngestDb, ThreadsDb};
+use ostk_recall_store::{ChainSink, CorpusStore, EventsDb, IngestDb, SqliteChainSink, ThreadsDb};
 use tokio_util::sync::CancellationToken;
 
 use fs4::FileExt;
@@ -201,37 +204,67 @@ fn force_wipe_corpus(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Spawn the ambient-pickup daemons (`TurnObserver`, `AutoWeaver`) for the
-/// lifetime of a scan. Returns a `CancellationToken` to fire when the scan
-/// completes plus the two `JoinHandle`s to await on cleanup.
+/// Shared mutable state owned by `serve()`.
 ///
-/// `pipeline` must be the same `Arc<Pipeline>` the scan uses for ingest —
-/// both daemons subscribe to its broadcast channel for `IngestEvent`s.
-/// `corpus` provides text lookup for the observer's `fetch_texts` call.
+/// Reused across every per-trigger scan. The serve binary constructs
+/// this once at boot; the scan-trigger handler reads from it instead of
+/// opening per-scan `ThreadsDb` instances so the long-lived
+/// `IdleCurator` and the per-scan ambient daemons agree on familiarity,
+/// tension, and proposed-thread state.
+#[derive(Clone)]
+pub struct ServeContext {
+    pub threads: Arc<ThreadsDb>,
+    pub attention: Arc<InMemoryAttention>,
+}
+
+/// Resolve the `Arc<ThreadsDb>` a scan should use.
 ///
-/// Failures during construction (e.g. `ThreadsDb::open`) are logged at warn
-/// and return `None`; the scan continues without ambient pickup rather than
-/// failing the whole trigger.
-fn spawn_ambient_daemons(
-    pipeline: &Arc<Pipeline>,
-    corpus: &Arc<CorpusStore>,
-    root: &Path,
-) -> Option<(
+/// When `ctx` is `Some` (i.e. the caller is the long-lived `serve()`
+/// daemon) the scan shares the long-lived ledger. Otherwise it opens a
+/// fresh per-scan handle. Open failures degrade to "ambient pickup
+/// disabled" rather than failing the whole scan.
+fn resolve_threads_db(ctx: Option<&ServeContext>, root: &Path) -> Option<Arc<ThreadsDb>> {
+    ctx.map_or_else(
+        || match ThreadsDb::open(root) {
+            Ok(db) => Some(Arc::new(db)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ambient daemons: ThreadsDb::open failed; skipping ambient pickup"
+                );
+                None
+            }
+        },
+        |c| Some(Arc::clone(&c.threads)),
+    )
+}
+
+/// Spawn the ambient-pickup daemons (`TurnObserver`, `AutoWeaver`).
+///
+/// Returns a `CancellationToken` to fire when the scan completes plus the
+/// two `JoinHandle`s to await on cleanup. `pipeline` must be the same
+/// `Arc<Pipeline>` the scan uses for ingest — both daemons subscribe to
+/// its broadcast channel for `IngestEvent`s. `corpus` provides text
+/// lookup for the observer's `fetch_texts` call. `threads` is shared
+/// with the long-lived `IdleCurator` in `serve()` so the per-scan
+/// daemons and the curator agree on familiarity and tension state.
+/// When `serve()` is not the caller (e.g. one-shot `scan` / `scan_paths`),
+/// callers may pass a freshly-opened `Arc<ThreadsDb>` — semantics are
+/// identical, just without curator sharing.
+type AmbientHandles = (
     CancellationToken,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
-)> {
-    let threads = match ThreadsDb::open(root) {
-        Ok(db) => Arc::new(db),
-        Err(e) => {
-            tracing::warn!(error = %e, "ambient daemons: ThreadsDb::open failed; skipping ambient pickup");
-            return None;
-        }
-    };
+);
 
-    let observer = Arc::new(TurnObserver::new(Arc::clone(pipeline), Arc::clone(&threads)));
+fn spawn_ambient_daemons(
+    pipeline: &Arc<Pipeline>,
+    corpus: &Arc<CorpusStore>,
+    threads: &Arc<ThreadsDb>,
+) -> AmbientHandles {
+    let observer = Arc::new(TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads)));
     let weaver = Arc::new(AutoWeaver::new(
-        Arc::clone(&threads),
+        Arc::clone(threads),
         Arc::clone(corpus),
         WeaverThresholds::default(),
     ));
@@ -263,17 +296,11 @@ fn spawn_ambient_daemons(
     };
 
     tracing::info!("ambient daemons spawned (turn-observer + auto-weaver)");
-    Some((cancel, observer_handle, weaver_handle))
+    (cancel, observer_handle, weaver_handle)
 }
 
 /// Cancel the ambient daemons and await their join handles.
-async fn shutdown_ambient_daemons(
-    handles: Option<(
-        CancellationToken,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-    )>,
-) {
+async fn shutdown_ambient_daemons(handles: Option<AmbientHandles>) {
     let Some((cancel, observer_handle, weaver_handle)) = handles else {
         return;
     };
@@ -287,6 +314,19 @@ pub async fn scan(
     embedder: Arc<dyn ChunkEmbedder>,
     source_filter: Option<&str>,
     dry_run: bool,
+) -> Result<ScanOutcome> {
+    scan_with_context(config_path, embedder, source_filter, dry_run, None).await
+}
+
+/// `scan` variant that reuses a caller-owned `ServeContext` instead of
+/// opening a fresh `ThreadsDb`. Used by `serve()` so per-trigger scans
+/// share state with the long-lived `IdleCurator`.
+pub async fn scan_with_context(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    source_filter: Option<&str>,
+    dry_run: bool,
+    ctx: Option<&ServeContext>,
 ) -> Result<ScanOutcome> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
@@ -303,7 +343,10 @@ pub async fn scan(
         Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
     );
 
-    let ambient = spawn_ambient_daemons(&pipeline, &store, &root);
+    let threads_db = resolve_threads_db(ctx, &root);
+    let ambient = threads_db
+        .as_ref()
+        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads));
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -390,6 +433,18 @@ pub async fn scan_paths(
     paths: &[PathBuf],
     dry_run: bool,
 ) -> Result<ScanOutcome> {
+    scan_paths_with_context(config_path, embedder, paths, dry_run, None).await
+}
+
+/// `scan_paths` variant that reuses a caller-owned `ServeContext` instead
+/// of opening a fresh `ThreadsDb`. See [`scan_with_context`].
+pub async fn scan_paths_with_context(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    paths: &[PathBuf],
+    dry_run: bool,
+    ctx: Option<&ServeContext>,
+) -> Result<ScanOutcome> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let root = cfg.expanded_root()?;
@@ -405,7 +460,10 @@ pub async fn scan_paths(
         Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
     );
 
-    let ambient = spawn_ambient_daemons(&pipeline, &store, &root);
+    let threads_db = resolve_threads_db(ctx, &root);
+    let ambient = threads_db
+        .as_ref()
+        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads));
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -638,6 +696,7 @@ fn events_db_if_wanted(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn serve(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
@@ -709,11 +768,79 @@ pub async fn serve(
     let root = engine.store().root().to_path_buf();
     let sock_path = root.join("recall.sock");
 
+    // Long-lived attention substrate state. The same Arc<ThreadsDb> backs
+    // (a) the IdleCurator's periodic tension sweep, (b) every per-trigger
+    // scan's ambient daemons (TurnObserver + AutoWeaver), and (c) the
+    // attention-mcp dispatch surfaced through the MCP server. Sharing the
+    // store means familiarity counters, tension transitions, and proposed
+    // threads written by one path are visible to the others without
+    // per-call re-open.
+    //
+    // Cancellation: the curator owns a CancellationToken that fires on
+    // process exit (Drop semantics of the local guard). Serve has no
+    // graceful-cancel surface yet — signal handling lives in main.rs and
+    // is out of scope for this wiring.
+    let serve_cancel = CancellationToken::new();
+    let serve_ctx: Option<ServeContext> = match open_threads_db_with_chain(&root) {
+        Ok(db) => {
+            let threads_arc: Arc<ThreadsDb> = Arc::new(db);
+            let attention_arc: Arc<InMemoryAttention> = Arc::new(InMemoryAttention::new());
+
+            if let Err(err) =
+                replay_chain_into_attention(&threads_arc, attention_arc.as_ref()).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    "chain replay failed; in-memory attention starts empty"
+                );
+            }
+
+            let attention_dyn: Arc<dyn AttentionForwardStore> = attention_arc.clone();
+            let curator = IdleCurator::new(
+                Arc::clone(&threads_arc),
+                Arc::clone(&attention_dyn),
+                CuratorConfig::default(),
+            );
+            let cancel = serve_cancel.clone();
+            tokio::spawn(async move {
+                if let Err(err) = curator.run(cancel).await {
+                    tracing::warn!(error = %err, "idle curator exited with error");
+                }
+            });
+
+            tracing::info!("attention substrate online (idle curator + shared threads ledger)");
+            Some(ServeContext {
+                threads: threads_arc,
+                attention: attention_arc,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "open threads ledger failed; serve runs without attention substrate"
+            );
+            None
+        }
+    };
+
+    let dispatch: Option<Arc<AttentionDispatch>> = serve_ctx.as_ref().map(|c| {
+        let attention_dyn: Arc<dyn AttentionForwardStore> = c.attention.clone();
+        Arc::new(AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)))
+    });
+
     // Spawn background scan trigger listener
     let config_path_for_bg = config_path.to_path_buf();
     let embedder_for_bg = Arc::clone(&embedder);
+    let ctx_for_bg = serve_ctx.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_socket_listener(&sock_path, config_path_for_bg, embedder_for_bg).await {
+        if let Err(e) = run_socket_listener(
+            &sock_path,
+            config_path_for_bg,
+            embedder_for_bg,
+            ctx_for_bg,
+        )
+        .await
+        {
             tracing::error!(error = %e, "background socket listener failed");
         }
     });
@@ -722,14 +849,92 @@ pub async fn serve(
         model = %engine.model(),
         dim = engine.store().dim(),
         audit = engine.has_audit(),
+        attention = dispatch.is_some(),
         "mcp serve --stdio starting"
     );
-    let server = Server::new(engine);
+    let server = match dispatch {
+        Some(d) => Server::new(engine).with_attention(d),
+        None => Server::new(engine),
+    };
     server
         .run_stdio()
         .await
         .map_err(|e| anyhow!("mcp stdio: {e}"))?;
+    // Cancel the curator on a clean exit so the tokio runtime can drain.
+    serve_cancel.cancel();
     tracing::info!("mcp serve exited cleanly");
+    Ok(())
+}
+
+/// Open `ThreadsDb` at `root` wired with a `SqliteChainSink`, so every
+/// mutation through this handle is durably appended to the `chain_log`
+/// table. The same `threads.sqlite` file holds both the row state and
+/// the chain — boot reads chain rows back via `iter_chain` to rebuild
+/// the in-memory score tier.
+fn open_threads_db_with_chain(root: &Path) -> Result<ThreadsDb> {
+    let sink: Arc<dyn ChainSink> = Arc::new(
+        SqliteChainSink::open(root).map_err(|e| anyhow!("open chain sink: {e}"))?,
+    );
+    ThreadsDb::open_with_sink(root, sink).map_err(|e| anyhow!("open threads db: {e}"))
+}
+
+/// Read every chain row from the threads ledger in order and replay the
+/// reconstructable subset through `InMemoryAttention`. The score tier is
+/// per-design rebuildable from the chain — every restart of `serve()`
+/// arrives at the same in-memory state.
+///
+/// V1 mapping (only the events the in-memory runtime can act on):
+/// - `ThreadCreate` → no-op (the thread row's anchor is per-scope; the
+///   score tier materialises threads lazily via `Fold` / `Familiarize`)
+/// - `FamiliarityBatch` → one `ReplayEvent::Familiarize` per entry
+///
+/// Other chain rows (`TensionTransition`, `EvidenceAdd`, etc.) describe
+/// durable ledger state already on disk; they do not contribute score-tier
+/// state that needs replay.
+async fn replay_chain_into_attention(
+    threads: &Arc<ThreadsDb>,
+    attention: &InMemoryAttention,
+) -> Result<()> {
+    use ostk_recall_store::ChainEvent;
+
+    let events = threads
+        .iter_chain()
+        .map_err(|e| anyhow!("iter_chain: {e}"))?;
+
+    let scope = AttentionScope {
+        project: None,
+        session_id: Some("replay".into()),
+        agent: Some("substrate".into()),
+        privacy_tier: PrivacyTier::T1Project,
+    };
+
+    let mut replay: Vec<ReplayEvent> = Vec::new();
+    for ev in events {
+        match ev {
+            ChainEvent::FamiliarityBatch { entries, .. } => {
+                for (handle, _post) in entries {
+                    replay.push(ReplayEvent::Familiarize {
+                        scope: scope.clone(),
+                        handle,
+                    });
+                }
+            }
+            ChainEvent::ThreadCreate { .. }
+            | ChainEvent::ThreadRename { .. }
+            | ChainEvent::ThreadDelete { .. }
+            | ChainEvent::EvidenceAdd { .. }
+            | ChainEvent::EvidenceRemove { .. }
+            | ChainEvent::EvidenceStateChange { .. }
+            | ChainEvent::TensionTransition { .. } => {}
+        }
+    }
+
+    let n = replay.len();
+    attention
+        .replay(&replay)
+        .await
+        .map_err(|e| anyhow!("replay: {e}"))?;
+    tracing::info!(events = n, "chain replay applied to in-memory attention");
     Ok(())
 }
 
@@ -769,6 +974,7 @@ async fn run_socket_listener(
     path: &Path,
     config_path: PathBuf,
     embedder: Arc<dyn ChunkEmbedder>,
+    ctx: Option<ServeContext>,
 ) -> Result<()> {
     use tokio::sync::Mutex;
     let scan_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -786,7 +992,7 @@ async fn run_socket_listener(
             match listener.accept().await {
                 Ok((mut stream, _addr)) => {
                     let paths = read_trigger_paths(&mut stream).await;
-                    spawn_scan_trigger(&scan_lock, &config_path, &embedder, paths);
+                    spawn_scan_trigger(&scan_lock, &config_path, &embedder, paths, ctx.clone());
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "socket accept failed");
@@ -819,7 +1025,7 @@ async fn run_socket_listener(
                     let mut connected = server;
                     server = ServerOptions::new().create(&pipe_name)?;
                     let paths = read_trigger_paths(&mut connected).await;
-                    spawn_scan_trigger(&scan_lock, &config_path, &embedder, paths);
+                    spawn_scan_trigger(&scan_lock, &config_path, &embedder, paths, ctx.clone());
                     drop(connected);
                 }
                 Err(e) => {
@@ -1272,6 +1478,7 @@ fn spawn_scan_trigger(
     config_path: &Path,
     embedder: &Arc<dyn ChunkEmbedder>,
     paths: Vec<PathBuf>,
+    ctx: Option<ServeContext>,
 ) {
     let scan_lock = Arc::clone(scan_lock);
     let config_path = config_path.to_path_buf();
@@ -1281,12 +1488,15 @@ fn spawn_scan_trigger(
             tracing::warn!("scan trigger received while a scan is already in flight; dropping");
             return;
         };
+        let ctx_ref = ctx.as_ref();
         let result = if paths.is_empty() {
             tracing::info!("scan trigger received (legacy scan-all)");
-            scan(&config_path, embedder, None, false).await.map(|_| ())
+            scan_with_context(&config_path, embedder, None, false, ctx_ref)
+                .await
+                .map(|_| ())
         } else {
             tracing::info!(paths = paths.len(), "scan trigger received (per-path)");
-            scan_paths(&config_path, embedder, &paths, false)
+            scan_paths_with_context(&config_path, embedder, &paths, false, ctx_ref)
                 .await
                 .map(|_| ())
         };
