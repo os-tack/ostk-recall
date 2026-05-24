@@ -43,6 +43,9 @@ ignore = { workspace = true }
 
 [dev-dependencies]
 ostk-recall-store = { workspace = true }
+ostk-recall-core = { workspace = true }
+ostk-recall-pipeline = { workspace = true }
+chrono = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
