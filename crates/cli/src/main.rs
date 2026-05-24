@@ -207,6 +207,13 @@ enum ThreadVerb {
         #[arg(long)]
         tension: Option<String>,
     },
+    /// List emergent-thread proposals that the auto-weaver detected
+    /// from chunk clusters but no operator has promoted yet.
+    ProposedList {
+        /// Limit the number of rows shown (most recent first).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 fn load_embedder(model_id: &str) -> Result<Arc<dyn ChunkEmbedder>> {
@@ -504,8 +511,40 @@ async fn run_thread(d: &AttentionDispatch, verb: ThreadVerb) -> Result<serde_jso
         } => attn_cli::run_thread_list(d, scope_project, tension)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ThreadVerb::ProposedList { limit } => run_thread_proposed_list(d, limit)?,
     };
     Ok(v)
+}
+
+/// Read the threads ledger directly for the proposed-list verb.
+///
+/// Proposed threads have no MCP surface in V1; we go straight to the
+/// `ThreadsDb` the dispatch was built with, format the rows as JSON,
+/// and let the outer printer render them.
+fn run_thread_proposed_list(
+    d: &AttentionDispatch,
+    limit: Option<usize>,
+) -> Result<serde_json::Value> {
+    let proposals = d
+        .threads
+        .list_proposed_threads()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let rows: Vec<serde_json::Value> = proposals
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "handle": p.proposed_handle,
+                "chunk_count": p.chunk_ids.len(),
+                "chunks": p.chunk_ids,
+                "cohesion": p.cohesion,
+                "created_at": p.created_at.to_rfc3339(),
+                "promoted_to": p.promoted_to,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "proposals": rows }))
 }
 
 fn resolve_context(inline: Option<String>, from_stdin: bool) -> Result<String> {

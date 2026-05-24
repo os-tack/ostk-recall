@@ -15,10 +15,12 @@
 //! future workpiece. Keeping the runtime abstract makes the math and
 //! scope-isolation invariants testable on their own.
 
+pub mod cluster;
 pub mod curator;
 pub mod observer;
 pub mod weaver;
 
+pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
 pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default};
 pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};

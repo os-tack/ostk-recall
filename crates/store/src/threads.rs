@@ -140,6 +140,23 @@ pub struct ThreadRecord {
     pub privacy_tier: PrivacyTier,
 }
 
+/// A row in the `threads_proposed` table.
+///
+/// The substrate writes proposals when it notices a chunk cluster
+/// without an existing thread anchor. Operators inspect proposals via
+/// `thread proposed-list` and promote one into an active thread by
+/// running `thread create` against the cluster's anchor chunk.
+#[derive(Debug, Clone)]
+pub struct ProposedThreadRecord {
+    pub id: i64,
+    pub proposed_handle: String,
+    pub chunk_ids: Vec<String>,
+    pub centroid_vec: Vec<f32>,
+    pub cohesion: f32,
+    pub created_at: DateTime<Utc>,
+    pub promoted_to: Option<String>,
+}
+
 /// A row in the `evidence_links` table.
 #[derive(Debug, Clone)]
 pub struct EvidenceLink {
@@ -319,6 +336,19 @@ CREATE TABLE IF NOT EXISTS evidence_links (
 CREATE INDEX IF NOT EXISTS idx_evidence_thread ON evidence_links(thread_handle);
 CREATE INDEX IF NOT EXISTS idx_evidence_state ON evidence_links(relation_state);
 CREATE INDEX IF NOT EXISTS idx_evidence_current_path ON evidence_links(current_path);
+
+CREATE TABLE IF NOT EXISTS threads_proposed (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposed_handle TEXT NOT NULL UNIQUE,
+    chunk_ids TEXT NOT NULL,
+    centroid_vec BLOB NOT NULL,
+    cohesion REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    promoted_to TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_threads_proposed_promoted ON threads_proposed(promoted_to);
+CREATE INDEX IF NOT EXISTS idx_threads_proposed_created ON threads_proposed(created_at);
 ",
         )?;
         Ok(())
@@ -712,6 +742,64 @@ CREATE INDEX IF NOT EXISTS idx_evidence_current_path ON evidence_links(current_p
             })
         })
     }
+
+    // ---------- proposed threads ----------
+
+    /// Insert a proposed-thread row. Caller owns the `proposed_handle`
+    /// (must be unique). Returns the assigned `id`. Does not chain —
+    /// proposals are pre-substrate until an operator promotes one via
+    /// `thread create`.
+    pub fn insert_proposed_thread(&self, rec: &ProposedThreadRecord) -> Result<i64> {
+        let chunk_ids_json = serde_json::to_string(&rec.chunk_ids).map_err(|e| {
+            StoreError::Lance(lancedb::Error::Other {
+                message: format!("threads ledger: serialize chunk_ids: {e}"),
+                source: None,
+            })
+        })?;
+        let centroid_bytes = f32_vec_to_bytes(&rec.centroid_vec);
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO threads_proposed
+             (proposed_handle, chunk_ids, centroid_vec, cohesion, created_at, promoted_to)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                rec.proposed_handle,
+                chunk_ids_json,
+                centroid_bytes,
+                f64::from(rec.cohesion),
+                rec.created_at.to_rfc3339(),
+                rec.promoted_to.as_deref(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// All proposed threads, newest first.
+    pub fn list_proposed_threads(&self) -> Result<Vec<ProposedThreadRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, proposed_handle, chunk_ids, centroid_vec, cohesion,
+                    created_at, promoted_to
+             FROM threads_proposed
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_proposed_thread)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows)
+    }
+
+    pub fn proposed_thread_count(&self) -> Result<u64> {
+        let conn = self.lock();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM threads_proposed", [], |r| r.get(0))?;
+        u64::try_from(n).map_err(|_| {
+            StoreError::Lance(lancedb::Error::Other {
+                message: format!("proposed_thread_count returned negative value: {n}"),
+                source: None,
+            })
+        })
+    }
 }
 
 // ---------- helpers ----------
@@ -863,6 +951,58 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
 
 fn to_sql_err(e: StoreError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+}
+
+fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+fn bytes_to_f32_vec(b: &[u8]) -> Result<Vec<f32>> {
+    if b.len() % 4 != 0 {
+        return Err(StoreError::Lance(lancedb::Error::Other {
+            message: format!("centroid_vec blob length {} not multiple of 4", b.len()),
+            source: None,
+        }));
+    }
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) yields [u8; 4]");
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
+fn row_to_proposed_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProposedThreadRecord> {
+    let id: i64 = r.get(0)?;
+    let proposed_handle: String = r.get(1)?;
+    let chunk_ids_s: String = r.get(2)?;
+    let centroid_bytes: Vec<u8> = r.get(3)?;
+    let cohesion_f: f64 = r.get(4)?;
+    let created_s: String = r.get(5)?;
+    let promoted_to: Option<String> = r.get(6)?;
+
+    let chunk_ids: Vec<String> = serde_json::from_str(&chunk_ids_s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let centroid_vec = bytes_to_f32_vec(&centroid_bytes).map_err(to_sql_err)?;
+    let created_at = parse_ts(&created_s).map_err(to_sql_err)?;
+    // SQLite REAL is f64; cohesion is an f32 (cosine value in [-1, 1]) so
+    // no overflow; mantissa truncation is acceptable for a display metric.
+    #[allow(clippy::cast_possible_truncation)]
+    let cohesion = cohesion_f as f32;
+    Ok(ProposedThreadRecord {
+        id,
+        proposed_handle,
+        chunk_ids,
+        centroid_vec,
+        cohesion,
+        created_at,
+        promoted_to,
+    })
 }
 
 // ---------- tests ----------
