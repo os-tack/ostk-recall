@@ -944,7 +944,9 @@ async fn replay_chain_into_attention(
             | ChainEvent::EvidenceAdd { .. }
             | ChainEvent::EvidenceRemove { .. }
             | ChainEvent::EvidenceStateChange { .. }
-            | ChainEvent::TensionTransition { .. } => {}
+            | ChainEvent::TensionTransition { .. }
+            | ChainEvent::ThreadLinkAdd { .. }
+            | ChainEvent::ThreadLinkRemove { .. } => {}
         }
     }
 

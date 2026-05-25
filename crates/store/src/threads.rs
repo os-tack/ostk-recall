@@ -237,6 +237,21 @@ pub enum ChainEvent {
         to: TensionState,
         ts: DateTime<Utc>,
     },
+    /// A new thread → thread evidence edge was added. The graph tier
+    /// (`thread_thread_links` table) is itself durable, so chain
+    /// replay does not re-materialize this row; the chain emission
+    /// exists so the audit trail is complete and a future recovery
+    /// utility can reconstruct the graph from chain alone.
+    ThreadLinkAdd {
+        from: ThreadHandle,
+        to: ThreadHandle,
+        category: String,
+        note: Option<String>,
+        ts: DateTime<Utc>,
+    },
+    /// A thread → thread evidence edge was deleted by id. Same
+    /// chain-as-audit semantics as [`Self::ThreadLinkAdd`].
+    ThreadLinkRemove { id: i64, ts: DateTime<Utc> },
 }
 
 /// Sink for substrate chain rows.
@@ -269,6 +284,8 @@ impl ChainEvent {
             Self::EvidenceStateChange { .. } => "evidence_state_change",
             Self::FamiliarityBatch { .. } => "familiarity_batch",
             Self::TensionTransition { .. } => "tension_transition",
+            Self::ThreadLinkAdd { .. } => "thread_link_add",
+            Self::ThreadLinkRemove { .. } => "thread_link_remove",
         }
     }
 
@@ -282,7 +299,9 @@ impl ChainEvent {
             | Self::EvidenceRemove { ts, .. }
             | Self::EvidenceStateChange { ts, .. }
             | Self::FamiliarityBatch { ts, .. }
-            | Self::TensionTransition { ts, .. } => ts,
+            | Self::TensionTransition { ts, .. }
+            | Self::ThreadLinkAdd { ts, .. }
+            | Self::ThreadLinkRemove { ts, .. } => ts,
         }
     }
 
@@ -345,6 +364,19 @@ impl ChainEvent {
                 "from": from.as_str(),
                 "to": to.as_str(),
             }),
+            Self::ThreadLinkAdd {
+                from,
+                to,
+                category,
+                note,
+                ..
+            } => serde_json::json!({
+                "from": from.as_str(),
+                "to": to.as_str(),
+                "category": category,
+                "note": note,
+            }),
+            Self::ThreadLinkRemove { id, .. } => serde_json::json!({ "id": id }),
         };
         serde_json::to_string(&v)
     }
@@ -483,6 +515,28 @@ impl ChainEvent {
                 to: TensionState::parse(&s_field("to")?)?,
                 ts,
             },
+            "thread_link_add" => Self::ThreadLinkAdd {
+                from: handle_field("from")?,
+                to: handle_field("to")?,
+                category: s_field("category")?,
+                note: v
+                    .get("note")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                ts,
+            },
+            "thread_link_remove" => {
+                let id = v
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "chain payload missing id for thread_link_remove".into(),
+                            source: None,
+                        })
+                    })?;
+                Self::ThreadLinkRemove { id, ts }
+            }
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
                     message: format!("unknown chain kind: {other}"),
@@ -1110,25 +1164,36 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     /// (CASCADE delete on either side); the caller does not need to
     /// pre-check that the threads exist.
     ///
-    /// v0.4.x: hand-edited only; no chain emission yet. Rows are
-    /// recoverable from the table directly. A future `ChainEvent`
-    /// variant + replay handler is tracked alongside the verb
-    /// consolidation work.
+    /// Emits [`ChainEvent::ThreadLinkAdd`] through the configured
+    /// [`ChainSink`] so the audit trail covers every link mutation.
+    /// The graph tier (`thread_thread_links` table) is itself durable,
+    /// so chain replay does not re-materialize this row — chain
+    /// emission exists for audit and for any future recovery utility.
     pub fn add_thread_thread_link(&self, link: &ThreadThreadLink) -> Result<i64> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO thread_thread_links
-             (from_thread, to_thread, category, note, created_at)
-             VALUES (?, ?, ?, ?, ?)",
-            params![
-                link.from_thread.as_str(),
-                link.to_thread.as_str(),
-                link.category,
-                link.note,
-                link.created_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
+        let id = {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO thread_thread_links
+                 (from_thread, to_thread, category, note, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![
+                    link.from_thread.as_str(),
+                    link.to_thread.as_str(),
+                    link.category,
+                    link.note,
+                    link.created_at.to_rfc3339(),
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+        self.sink.append(&ChainEvent::ThreadLinkAdd {
+            from: link.from_thread.clone(),
+            to: link.to_thread.clone(),
+            category: link.category.clone(),
+            note: link.note.clone(),
+            ts: link.created_at,
+        })?;
+        Ok(id)
     }
 
     /// All thread → thread edges where the given handle is the
@@ -1169,10 +1234,18 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(rows)
     }
 
-    /// Drop a thread → thread edge by id.
+    /// Drop a thread → thread edge by id. Emits
+    /// [`ChainEvent::ThreadLinkRemove`] for audit even when the row
+    /// was already absent — the chain records the operator's intent.
     pub fn delete_thread_thread_link(&self, id: i64) -> Result<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM thread_thread_links WHERE id = ?", params![id])?;
+        {
+            let conn = self.lock();
+            conn.execute("DELETE FROM thread_thread_links WHERE id = ?", params![id])?;
+        }
+        self.sink.append(&ChainEvent::ThreadLinkRemove {
+            id,
+            ts: Utc::now(),
+        })?;
         Ok(())
     }
 
@@ -1944,5 +2017,139 @@ mod tests {
         assert_eq!(db.thread_thread_link_count().unwrap(), 1);
         db.delete_thread_thread_link(id).unwrap();
         assert_eq!(db.thread_thread_link_count().unwrap(), 0);
+    }
+
+    // ---------- v0.4.1: chain emission for thread → thread links ----------
+
+    #[test]
+    fn add_thread_thread_link_emits_chain_event() {
+        let tmp = TempDir::new().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let db =
+            ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink) as Arc<dyn ChainSink>).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        // Drain the two ThreadCreate events so we can assert only on
+        // the link emission below.
+        let _ = sink.take();
+
+        let mut link = sample_thread_thread_link("a", "b", "cites");
+        link.note = Some("from the v0.3.0 hand-off".into());
+        db.add_thread_thread_link(&link).unwrap();
+
+        let events = sink.take();
+        assert_eq!(events.len(), 1, "exactly one chain event expected");
+        match &events[0] {
+            ChainEvent::ThreadLinkAdd {
+                from,
+                to,
+                category,
+                note,
+                ..
+            } => {
+                assert_eq!(from.as_str(), "a");
+                assert_eq!(to.as_str(), "b");
+                assert_eq!(category, "cites");
+                assert_eq!(note.as_deref(), Some("from the v0.3.0 hand-off"));
+            }
+            other => panic!("expected ThreadLinkAdd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_thread_thread_link_emits_chain_event() {
+        let tmp = TempDir::new().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let db =
+            ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink) as Arc<dyn ChainSink>).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        let id = db
+            .add_thread_thread_link(&sample_thread_thread_link("a", "b", "cites"))
+            .unwrap();
+        let _ = sink.take(); // discard the prior emissions
+
+        db.delete_thread_thread_link(id).unwrap();
+
+        let events = sink.take();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ChainEvent::ThreadLinkRemove { id: removed_id, .. } => {
+                assert_eq!(*removed_id, id);
+            }
+            other => panic!("expected ThreadLinkRemove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_link_chain_survives_reopen() {
+        // The whole point of chain integration: link mutations survive
+        // a process boundary via chain_log, so a future recovery tool
+        // can reconstruct the graph even if the table is lost.
+        let tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        let mut link = sample_thread_thread_link("a", "b", "supersedes");
+        link.note = Some("structural superseding".into());
+        let id = db.add_thread_thread_link(&link).unwrap();
+        db.delete_thread_thread_link(id).unwrap();
+
+        // Process boundary: drop the live handles and reopen.
+        drop(db);
+        drop(sink);
+
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let events = db.iter_chain().unwrap();
+        let add_count = events
+            .iter()
+            .filter(|e| matches!(e, ChainEvent::ThreadLinkAdd { .. }))
+            .count();
+        let remove_count = events
+            .iter()
+            .filter(|e| matches!(e, ChainEvent::ThreadLinkRemove { .. }))
+            .count();
+        assert_eq!(add_count, 1, "ThreadLinkAdd must survive reopen");
+        assert_eq!(remove_count, 1, "ThreadLinkRemove must survive reopen");
+    }
+
+    #[test]
+    fn chain_event_thread_link_payload_round_trip() {
+        // Wire-level round-trip: to_payload → from_row must reproduce
+        // every field we care about (ts excluded — it's re-derived).
+        let now = Utc::now();
+        let add = ChainEvent::ThreadLinkAdd {
+            from: handle("alpha"),
+            to: handle("beta"),
+            category: "cites".into(),
+            note: Some("payload test".into()),
+            ts: now,
+        };
+        let payload = add.to_payload().unwrap();
+        let decoded = ChainEvent::from_row(add.kind_str(), &payload).unwrap();
+        match decoded {
+            ChainEvent::ThreadLinkAdd {
+                from,
+                to,
+                category,
+                note,
+                ..
+            } => {
+                assert_eq!(from.as_str(), "alpha");
+                assert_eq!(to.as_str(), "beta");
+                assert_eq!(category, "cites");
+                assert_eq!(note.as_deref(), Some("payload test"));
+            }
+            other => panic!("expected ThreadLinkAdd, got {other:?}"),
+        }
+
+        let rm = ChainEvent::ThreadLinkRemove { id: 42, ts: now };
+        let payload = rm.to_payload().unwrap();
+        let decoded = ChainEvent::from_row(rm.kind_str(), &payload).unwrap();
+        match decoded {
+            ChainEvent::ThreadLinkRemove { id, .. } => assert_eq!(id, 42),
+            other => panic!("expected ThreadLinkRemove, got {other:?}"),
+        }
     }
 }

@@ -8,10 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - `ThreadThreadLink` Rust API on `ThreadsDb` (insert, list-from,
-  list-to, delete, count). MCP surface deferred — will land alongside
-  the v0.4.x verb consolidation pass (`thread_evidence`).
+  list-to, delete, count) now chain-emitting. MCP surface still
+  deferred — will land alongside the v0.4.x verb consolidation pass
+  (`thread_evidence`).
 
 ### Added
+
+- **Chain emission for thread → thread evidence edges.** Two new
+  `ChainEvent` variants — `ThreadLinkAdd { from, to, category, note,
+  ts }` and `ThreadLinkRemove { id, ts }` — emitted by
+  `add_thread_thread_link` and `delete_thread_thread_link`
+  respectively. Wire format covers both directions via `kind_str`,
+  `to_payload`, and `from_row`; chain replay path acknowledges the
+  variants (graph tier is itself durable, so the in-memory score tier
+  ignores them — see comment in `replay_chain_into_attention`).
+  Closes the v0.4.0 deferral: every link mutation now has an audit
+  row, so a future recovery utility can reconstruct the graph from
+  `chain_log` alone.
+- Four new tests in `crates/store/src/threads.rs`:
+  `add_thread_thread_link_emits_chain_event`,
+  `delete_thread_thread_link_emits_chain_event`,
+  `thread_link_chain_survives_reopen` (process boundary),
+  `chain_event_thread_link_payload_round_trip` (wire format).
+  Workspace gate: 329/0 (was 325/0).
+
+
 
 - **`thread_query` — the multi-signal verb (v0.4.1).** Single tool
   that runs density, activity, and novelty against the same recency
