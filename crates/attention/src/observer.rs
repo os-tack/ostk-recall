@@ -225,6 +225,21 @@ impl TurnObserver {
     ) -> Result<ObservationResult, ObserverError> {
         let known_snapshot: HashSet<ThreadHandle> = self.known_handles.read().await.clone();
 
+        // Hoisted: every observation updates the scope's in-memory
+        // attention vector with the current turn's text. Done once per
+        // call so the auto-promotion and known-handle paths share the
+        // same fresh anchor seed when they call `familiarize` below.
+        // Best-effort — a failing in-memory store must never abort the
+        // durable observation.
+        if let Some(attn) = &self.attention {
+            if let Err(err) = attn.attend(scope, turn_text).await {
+                tracing::warn!(
+                    error = %err,
+                    "persistent-attention: attend failed at observe entry"
+                );
+            }
+        }
+
         // (a) membrane chunks — recognition-language detection.
         let triggers = detect_recognition_triggers(turn_text);
         let chunks = build_membrane_chunks(turn_text, &triggers, session_id, turn_seq);
@@ -268,7 +283,23 @@ impl TurnObserver {
                 }
             }
             if !entries.is_empty() {
-                self.store.record_familiarity_batch(entries, turn_seq)?;
+                self.store.record_familiarity_batch(entries.clone(), turn_seq)?;
+                // Mirror the durable familiarity bumps into the in-memory
+                // score tier so `surface()` / `score_thread()` see them
+                // without waiting for chain replay on next boot. Matches
+                // the v0.4.0 fix for auto-promotion; closes the parallel
+                // gap on the known-handle path. Best-effort.
+                if let Some(attn) = &self.attention {
+                    for (handle, _) in &entries {
+                        if let Err(err) = attn.familiarize(scope, handle).await {
+                            tracing::warn!(
+                                error = %err,
+                                handle = %handle,
+                                "persistent-attention: familiarize failed on known-handle mention"
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -363,19 +394,10 @@ impl TurnObserver {
                 // Mirror the durable familiarity bump into the in-memory
                 // score tier so the curator's next tick sees a non-zero
                 // score and doesn't demote a freshly-promoted thread to
-                // Dormant. `attend` pushes the turn's conversational text
-                // into the scope's attention vector so the resonance term
-                // of the score formula sees real signal too. Best-effort:
-                // a failing in-memory store should not abort the durable
-                // observation that already succeeded.
+                // Dormant. The scope's attention_vec was already populated
+                // by the hoisted `attend` at the top of `observe`, so the
+                // resonance term will see real signal here. Best-effort.
                 if let Some(attn) = &self.attention {
-                    if let Err(err) = attn.attend(scope, turn_text).await {
-                        tracing::warn!(
-                            error = %err,
-                            handle = %handle,
-                            "persistent-attention: attend failed on auto-promotion"
-                        );
-                    }
                     if let Err(err) = attn.familiarize(scope, &handle).await {
                         tracing::warn!(
                             error = %err,
@@ -1441,6 +1463,76 @@ mod tests {
         assert!(
             pages.iter().any(|p| p.handle == h.as_str()),
             "surface() must include the promoted thread"
+        );
+    }
+
+    // ---- (12) known-handle familiarity bumps light up in-memory score ----
+    //
+    // Symmetric to (11): v0.4.0 closed the gap for new threads via
+    // auto-promotion. This closes the same gap for *existing* threads.
+    // Before this wiring, a turn that mentioned a known handle only
+    // updated the SQLite counter and the chain; the in-memory store
+    // stayed at score=0 until the next chain-replay on boot, leaving
+    // `thread_query`'s activity axis quietly dishonest for any
+    // long-running thread.
+
+    #[tokio::test]
+    async fn known_handle_mention_lights_up_in_memory_score() {
+        let (pipeline, _corpus_tmp) = make_pipeline(16).await;
+        let store_tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(RecordingSink::default());
+        let db = ThreadsDb::open_with_sink(store_tmp.path(), sink).unwrap();
+        let attention: Arc<dyn crate::AttentionForwardStore> =
+            Arc::new(crate::InMemoryAttention::new());
+
+        // Seed an existing thread directly through the ledger so the
+        // observer's known_handles cache picks it up.
+        let h = handle("abi-as-sovereign-boundary");
+        let now = chrono::Utc::now();
+        db.upsert_thread(&ostk_recall_store::ThreadRecord {
+            handle: h.clone(),
+            tension: ostk_recall_store::TensionState::Slack,
+            familiarity: 0,
+            last_touched_at: now,
+            anchor_chunk_id: None,
+            fold_override: None,
+            created_at: now,
+            created_scope_key: None,
+            privacy_tier: PrivacyTier::T1Project,
+        })
+        .unwrap();
+
+        let obs = TurnObserver::new(pipeline, Arc::new(db))
+            .with_attention(Arc::clone(&attention));
+        obs.refresh_known_handles().await.unwrap();
+
+        // Pre-condition: no in-memory score yet.
+        let pre = attention.score_thread(&h).await.unwrap();
+        assert_eq!(pre, 0.0, "in-memory score must be zero before observation");
+
+        let turn = "back to abi-as-sovereign-boundary — the ABI is what \
+            makes the implementation replaceable.";
+        let res = obs
+            .observe(&scope(), turn, 1, "sess-known", None)
+            .await
+            .unwrap();
+        assert!(
+            res.familiarity_increments.iter().any(|m| *m == h),
+            "the known handle must be reported as a familiarity increment"
+        );
+
+        // Post-condition: score is now > 0 in-memory, without any chain
+        // replay or curator tick.
+        let post = attention.score_thread(&h).await.unwrap();
+        assert!(
+            post > 0.0,
+            "in-memory score must be > 0 after a turn mentioning the handle; got {post}"
+        );
+
+        let pages = attention.surface(&scope(), 10).await.unwrap();
+        assert!(
+            pages.iter().any(|p| p.handle == h.as_str()),
+            "surface() must include the mentioned thread"
         );
     }
 }

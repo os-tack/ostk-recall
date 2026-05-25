@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Persistent attention on known-handle mentions.** `TurnObserver`
+  now mirrors every `record_familiarity_batch` call through to the
+  attached `AttentionForwardStore` via `familiarize(scope, handle)`,
+  not just on auto-promotion. Closes the parallel gap to v0.4.0 for
+  long-running threads: a turn that mentions an existing handle now
+  lights up the in-memory score tier immediately, with no
+  stale-until-next-boot lag. Without this, `thread_query`'s activity
+  axis (v0.4.1) would be quietly dishonest for every thread already in
+  the ledger.
+- **Hoisted `attend(scope, turn_text)`** to fire once per `observe()`
+  call when an in-memory store is wired. Previously the auto-promotion
+  path called `attend` per promotion; the hoist makes the
+  attention-vector update unconditional and removes the
+  redundant per-promotion call. Both code paths (known-handle and
+  auto-promotion) now share the same fresh anchor seed when they call
+  `familiarize`.
+- New test `known_handle_mention_lights_up_in_memory_score` in
+  `crates/attention/src/observer.rs` — symmetric to the v0.4.0
+  `auto_promotion_lights_up_in_memory_score` test, asserting
+  pre/post-observation that `score_thread(handle)` transitions from
+  0.0 to > 0 within a single turn.
 - `thread_thread_links` table for thread → thread evidence edges.
   Schema: `(id, from_thread, to_thread, category, note, created_at)`
   with `UNIQUE(from_thread, to_thread, category)` and
