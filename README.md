@@ -1,11 +1,16 @@
 # ostk-recall
 
-Local-first cross-corpus retrieval MCP server. One binary built on
+Local-first cross-corpus memory substrate. One binary built on
 [model2vec-rs](https://github.com/MinishLab/model2vec-rs) for static
 embeddings, [LanceDB](https://lancedb.com/) (Arrow + Tantivy BM25) for the
 vector + full-text store, [SQLite](https://www.sqlite.org/) (via rusqlite)
-for the ingest manifest and audit event log, and [fastembed-rs](https://github.com/Anush008/fastembed-rs)
-for the optional cross-encoder reranker.
+for the ingest manifest, the audit event log, and the threads ledger, and
+[fastembed-rs](https://github.com/Anush008/fastembed-rs) for the optional
+cross-encoder reranker.
+
+Two organs share one binary: **recall** (corpus retrieval, query-shaped)
+and **attention** (live thread/scope runtime, process-shaped). Eighteen
+MCP tools total — see below.
 
 ## What it solves
 
@@ -13,9 +18,17 @@ Claude, Cursor, and ChatGPT each maintain their own siloed context — notes
 you dumped into one app are invisible to the others, and every new session
 starts cold. ostk-recall ingests your markdown trees, Claude Code session
 logs, haystack `.ostk/` directories, or arbitrary globs into a single local
-corpus. It then exposes a hybrid (dense + BM25) search tool over MCP so any
-MCP-speaking client can recall context across projects without shipping
-your data off-box.
+corpus, then exposes a hybrid (dense + BM25) recall surface plus a live
+thread/attention surface over MCP so any MCP-speaking client can recall
+context across projects without shipping your data off-box.
+
+A turn observer running in the same process watches the conversational
+stream, proposes thread stubs from recurring noun phrases, and lets
+high-confidence ones auto-promote. An auto-weaver matches new chunks
+against thread anchor vectors and writes derived evidence links. An
+idle curator fades inactive threads through tension thresholds. The
+substrate stays mechanical — surfaces report axes, the caller decides
+what's interesting.
 
 ## Status
 
@@ -23,15 +36,24 @@ Pre-alpha but functional. Used in production by the maintainer's own stack.
 
 Works today:
 
-- Seven source scanners (markdown, code, claude_code, file_glob, zip_export,
-  gemini, ostk_project composite).
-- Five MCP tools — `recall`, `recall_link`, `recall_stats`, `recall_audit`,
-  and `recall_fault` (synthesizes hits into virtual-memory pages for
-  haystack's [`mem.fault_recall`](https://github.com/os-tack/haystack)
-  driver-relay path).
+- Eight source scanners (markdown, code, claude_code, gemini, file_glob,
+  zip_export, ostk_project composite, threads) plus a synthetic
+  `membrane` kind for in-process observer chunks.
+- **Eighteen MCP tools** across two families:
+  - **Recall** (5): `recall`, `recall_link`, `recall_stats`,
+    `recall_audit`, `recall_fault` (synthesizes hits into virtual-memory
+    pages for haystack's
+    [`mem.fault_recall`](https://github.com/os-tack/haystack)
+    driver-relay path).
+  - **Attention/threads** (13): five `attention_*` verbs (attend,
+    surface, fold, familiarize, decay) and eight `thread_*` verbs
+    (create, link, unlink, promote, list, emergent, attention, novelty).
 - Hybrid retrieval with RRF fusion over LanceDB's dense and Tantivy BM25
   indexes, plus an optional cross-encoder rerank pass (fastembed-rs;
   default `jina-reranker-v1-turbo-en`).
+- Live attention runtime: TurnObserver (per turn), AutoWeaver (per
+  ingest event), IdleCurator (timer). `InMemoryAttention` score tier
+  rebuilt on boot via chain replay from `threads.sqlite`.
 - Idempotent re-ingest via `chunk_id = sha256(source:source_id:chunk_index)`
   and LanceDB `merge_insert`.
 - File-watcher (`ostk-recall watch`) that pokes a running `serve` whenever
@@ -152,16 +174,46 @@ make serve
 | `file_glob`    | arbitrary glob, ingested as plain text                           | paragraph split, soft-wrap at ~400 tokens        |
 | `zip_export`   | Claude.ai data-export `.zip` bundles                             | per-conversation-turn chunks                     |
 | `ostk_project` | haystack `.ostk/` dirs — decisions, needles, audit, specs, code  | composite; one chunk per record or source chunk  |
+| `threads`      | `.ostk/threads/*.md` files; tension state captured as metadata    | one chunk per thread file                        |
 
 ## MCP tools exposed
+
+Eighteen tools total across two families. All callable from any MCP
+client (Claude Desktop, Cursor, Claude Code, haystack kernel, etc.) via
+the same `ostk-recall serve --stdio` process.
+
+### Recall family — corpus retrieval (`crates/mcp`)
 
 | tool           | input schema (one-line)                                                                                      |
 | -------------- | ------------------------------------------------------------------------------------------------------------ |
 | `recall`       | `{ query: string, project?: string, source?: string, since?: rfc3339, limit?: 1..100 }`                      |
 | `recall_link`  | `{ chunk_id: string }` — returns the chunk plus its parent chain                                             |
-| `recall_stats` | `{}` — returns total count, breakdown by source, model info, last-scan timestamp                             |
+| `recall_stats` | `{}` — total count, breakdown by source, model info, last-scan timestamp                                     |
 | `recall_fault` | `{ query: string, intent?: "symbol"\|"narrative"\|"trace"\|"general", limit?: int, max_per_source_id?: int }` — synthesizes hits into named virtual-memory pages; haystack's `mem.fault_recall` calls this |
 | `recall_audit` | `{ sql: string }` — raw SELECT over the SQLite `audit_events` table (ostk_project sources only; single statement) |
+
+### Attention family — live thread/scope runtime (`crates/attention-mcp`)
+
+Every tool that takes an `AttentionScope` carries it as
+`{ project?, session_id?, agent?, privacy_tier? }` — absence defaults to
+`(project=None, privacy_tier=t1_project)`. Pages carry `ScoreAttribution`
+per the `abi-as-sovereign-boundary` doctrine.
+
+| tool                    | input schema (one-line)                                                                |
+| ----------------------- | -------------------------------------------------------------------------------------- |
+| `attention_attend`      | `{ scope?, context: string }` — ingest context into the scope's attention vector       |
+| `attention_surface`     | `{ scope?, limit?: 1..200 }` — pages above `ARCHIVE_THRESHOLD`                         |
+| `attention_fold`        | `{ scope?, handle: string, depth: folded\|half\|full }`                                |
+| `attention_familiarize` | `{ scope?, handle: string }` — increment familiarity counter                           |
+| `attention_decay`       | `{ handle: string, factor: number }` — multiplicative fade factor on the floor        |
+| `thread_create`         | `{ scope?, handle: string, body?: string, tension?: active\|slack\|dormant }`         |
+| `thread_link`           | `{ scope?, handle: string, target_path: string, category: string }`                   |
+| `thread_unlink`         | `{ evidence_id: integer }`                                                             |
+| `thread_promote`        | `{ handle_from_proposed: string, target_tier: active\|slack }`                        |
+| `thread_list`           | `{ scope?, tension?: active\|slack\|dormant }`                                        |
+| `thread_emergent`       | `{ since_hours?, limit?, min_cluster_size?, cohesion_threshold?, min_neighbours?, persist? }` — embedding-density clusters from the corpus |
+| `thread_attention`      | `{ since_hours?, limit?, samples_per_burst?, decay_hours? }` — activity-burst surface  |
+| `thread_novelty`        | `{ since_hours?, baseline_days?, limit?, min_cluster_size?, recluster_threshold?, min_mean_novelty? }` — divergence-from-baseline clusters |
 
 ## Hook into clients
 
@@ -256,33 +308,64 @@ query on CPU, ~80 MB to the model cache. Opt out with
 ## Architecture
 
 ```
-                                           ┌─► MCP (stdio, RO)  ──► clients
-  sources ──► scanners ──► pipeline ──► store
-   (fs)       (.rs x7)    (embed +     (LanceDB   ▲
-              ▲           chunk +      + SQLite)  │
-              │           merge)                  │
-              │                                   │
-              └─── scan_paths ◄─── trigger.sock ◄─┘
-                   (per-path)      (line-delim    │
-                                    UTF-8)        │
-                                                  │
-              fs events ──► watch ────────────────┘
-              (debounced)
+                                          ┌─► MCP (stdio)  ──► clients
+  sources ──► scanners ──► pipeline ──► store    (18 tools)    ▲
+   (fs)      (8 kinds)    chunk+embed   │                       │
+                          + merge_insert │                       │
+                                         │  ┌──────────────┐    │
+                                         ├──┤ corpus.lance ├────┤
+                                         │  │ + Tantivy    │    │ recall_*
+                                         │  └──────────────┘    │ (5 tools)
+                                         │                       │
+                                         │  ┌──────────────┐    │
+                                         ├──┤ manifest +   │    │
+                                         │  │ audit_events │    │
+                                         │  └──────────────┘    │
+                                         │                       │
+                                         │  ┌──────────────┐    │ attention_*
+                                         └──┤ threads.sqlite├───┤ thread_*
+                                            │ + chain ledger│    │ (13 tools)
+                                            └──────┬───────┘    │
+                                                   │             │
+              ┌────────────────────────────────────┴─────┐       │
+              ▼                                          ▼       │
+       ┌────────────────┐  ┌────────────────┐  ┌──────────────┐  │
+       │ TurnObserver   │  │ AutoWeaver     │  │ IdleCurator  │──┘
+       │ per turn       │  │ per ingest     │  │ timer-driven │
+       │ → membrane     │  │ → evidence     │  │ → fade +     │
+       │   chunks +     │  │   links        │  │   tension    │
+       │   stubs        │  │                │  │   transitions│
+       └────────────────┘  └────────────────┘  └──────────────┘
+                                                       ▲
+                          fs events ──► watch ─────────┤
+                          (debounced)                   │
+                                          trigger.sock ─┘
+                                          (per-path scan)
 ```
 
-**Read path** (kernel agents → corpus): `serve --stdio` runs as the
-`fcp-recall` driver under haystack; `recall_fault` MCP tool synthesizes
-hits into virtual-memory pages.
+**Read path** (clients → corpus): `serve --stdio` runs as a stdio MCP
+server. Used as the `fcp-recall` driver under haystack v6+; equally
+callable from Claude Desktop, Cursor, Claude Code, etc.
 
 **Write path** (operator edits → corpus): `serve` (no `--stdio`) binds
 `recall.sock`; `watch` debounces filesystem events and pokes the socket
 with the changed paths; `Pipeline::scan_paths` does per-path ingest.
-Read and write daemons share `corpus.lance` via Lance MVCC.
+
+**Attention loop** (conversational stream → live state): TurnObserver
+emits membrane chunks via `Pipeline::ingest_synthetic`; AutoWeaver
+subscribes to `Pipeline::subscribe_ingest` and writes derived evidence
+links; IdleCurator scores fade on a timer and transitions tension
+states.
+
+Read and write daemons share `corpus.lance` via Lance MVCC. The
+`InMemoryAttention` score tier is per-process; it rebuilds from the
+`threads.sqlite` chain ledger on boot.
 
 Stack: model2vec-rs (embedder) ▶ LanceDB vector + Tantivy BM25 (store)
-+ SQLite (manifest + audit) ▶ pipeline (scan ▶ chunk ▶ embed ▶
-`merge_insert`) ▶ query (dense + BM25 with RRF fusion, then optional
-fastembed-rs cross-encoder rerank) ▶ MCP server (five tools).
++ SQLite (manifest + audit + threads ledger) ▶ pipeline (scan ▶ chunk
+▶ embed ▶ `merge_insert`) ▶ query (dense + BM25 with RRF fusion, then
+optional fastembed-rs cross-encoder rerank) ▶ attention runtime
+(observer/weaver/curator) ▶ MCP server (18 tools).
 
 See [`docs/architecture.md`](./docs/architecture.md) and
 [`docs/spec/driver-protocol.md`](./docs/spec/driver-protocol.md) for the

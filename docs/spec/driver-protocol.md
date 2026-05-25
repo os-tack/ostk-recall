@@ -1,35 +1,70 @@
 # `ostk-recall-serve` driver protocol
 
-Wire protocol between the haystack kernel (client) and the recall daemon
-(`ostk-recall serve --stdio`). Spec for haystack →1846 cut #3 (→1848).
+Wire protocol between any MCP client (the haystack kernel, Claude Desktop,
+Cursor, Claude Code, etc.) and the recall daemon (`ostk-recall serve
+--stdio`).
 
 ## Status
 
-**`v0.2` — pivoted to MCP tool surface.** The original `v0.1` draft below
-specified a custom JSON-RPC method namespace (`recall.fault`,
-`initialize`, `ping`). Reading `haystack/src/serve/dispatch.rs:5247`
-revealed the kernel driver protocol IS MCP and the daemon entry point
-IS the existing `ostk-recall serve --stdio` MCP server (not a separate
-binary). The pivot: instead of a custom method, expose `recall_fault`
-as an MCP **tool** alongside the existing `recall` / `recall_link` /
-`recall_stats` / `recall_audit` tools. See decision
-`cut3_pivot_to_mcp_tool_2026_05_09`.
+**MCP 2025-06-18 over stdio, 18 tools across two families.** The daemon
+is a standard MCP server; any conforming MCP client can drive it. The
+haystack kernel uses it as the `fcp-recall` driver, but no haystack
+specifics are baked into the protocol.
 
-The text below is the original `v0.1` draft, retained for context. The
-authoritative protocol is now: **MCP 2025-06-18 with a `recall_fault`
-tool**, params `{ query, intent?, limit?, max_per_source_id? }`,
-result `{ pages: [{ name, content }, ...] }` wrapped in MCP
-`content[0].text` JSON. The lifecycle / transport / framing sections
-below remain accurate for MCP-over-stdio.
+### Tool surface (as of v0.3.1)
 
-A doc-rewrite pass is filed as a follow-up; the new tool is already
-implemented in `crates/mcp/src/tools.rs::tool_recall_fault` and
-`crates/mcp/src/server.rs` `recall_fault` handler, and tested in
-`tools_list_includes_all_five`.
+**Recall family — corpus retrieval** (`crates/mcp/src/tools.rs`):
+
+| tool | purpose |
+|---|---|
+| `recall` | Hybrid (dense + BM25 + RRF) retrieval over the Lance corpus |
+| `recall_link` | Chunk + parent chain by chunk_id |
+| `recall_stats` | Corpus totals, model info, last-scan timestamp |
+| `recall_fault` | Synthesizes hits into virtual-memory pages (kernel-facing) |
+| `recall_audit` | Raw `SELECT` over `audit_events` (only when an `ostk_project` source is configured) |
+
+**Attention family — live thread/scope runtime** (`crates/attention-mcp/src/tools.rs`):
+
+| tool | purpose |
+|---|---|
+| `attention_attend` | Ingest current context into the scope's attention vector |
+| `attention_surface` | Surface pages above `ARCHIVE_THRESHOLD` for a scope, with `ScoreAttribution` |
+| `attention_fold` | Set fold depth (folded\|half\|full) for a handle within a scope |
+| `attention_familiarize` | Increment familiarity counter for a handle |
+| `attention_decay` | Apply a multiplicative fade factor to a handle's floor |
+| `thread_create` | Insert-or-replace a thread row in the durable ledger |
+| `thread_link` | Add a curated evidence link from a thread to a target path |
+| `thread_unlink` | Drop an evidence row by id |
+| `thread_promote` | Promote a proposed thread to an active tension state |
+| `thread_list` | List threads, filtered by tension; honors `PrivacyTier` |
+| `thread_emergent` | Embedding-density clusters from the existing corpus |
+| `thread_attention` | Activity-burst surface — `(project, source_id)` groups ranked by recency-weighted count |
+| `thread_novelty` | Divergence-from-baseline novelty clusters |
+
+Five additional surfaces (`thread_query`, attention-biased `recall`,
+`thread_evidence`, `attention_history`, `attention_ingest`) are tracked
+for v0.4.x and v1.0.0 — see `.ostk/threads/post-v0.3.0.md`.
+
+### `recall_fault` — the kernel-facing call
+
+The haystack kernel's `kernel::recall::vm::fault_recall` calls
+`recall_fault` exclusively. The daemon performs embedding, Lance
+search, RRF reranking, and synthesis (`Synthesizer::collapse`). It
+does NOT write to disk — `name`/`content` pairs are returned and the
+kernel calls `store_page_owned()` itself.
+
+**Params:** `{ query, intent?, limit?, max_per_source_id? }`
+**Result:** `{ pages: [{ name, content }, ...] }` wrapped in MCP
+`content[0].text` JSON.
+
+`content` is the JSON serialization of `ostk_recall_core::SynthesizedPage`.
+
+Other tools are also callable from the kernel via the same MCP
+dispatch, but `recall_fault` is the primary load-bearing call.
 
 ---
 
-## Original v0.1 draft
+## Original v0.1 draft (transport / framing reference)
 
 ## Transport
 
