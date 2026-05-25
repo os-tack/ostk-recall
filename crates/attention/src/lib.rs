@@ -17,6 +17,7 @@
 
 pub mod cluster;
 pub mod curator;
+pub mod emergent;
 pub mod observer;
 pub mod weaver;
 

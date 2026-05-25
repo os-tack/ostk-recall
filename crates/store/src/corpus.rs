@@ -382,6 +382,98 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Sample non-stale chunks ingested since `since`, up to `limit` rows.
+    /// Returns `(chunk_id, embedding)` pairs for use with emergent
+    /// clustering. Ordering is whatever Lance returns — callers that
+    /// care about strict recency should request a smaller window.
+    ///
+    /// Empty result is fine; the caller treats "no recent activity" as
+    /// "nothing to surface."
+    pub async fn sample_recent_chunks(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        use arrow_array::Array;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        // Lance accepts SQL-flavoured timestamp literals via cast.
+        let filter = format!(
+            "stale = false AND ts >= TIMESTAMP '{}'",
+            since.format("%Y-%m-%d %H:%M:%S")
+        );
+        let stream = table
+            .query()
+            .only_if(filter)
+            .limit(limit)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "embedding".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+        for batch in &batches {
+            let id_col = batch.column_by_name("chunk_id").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "chunk_id column missing in projection".into(),
+                ))
+            })?;
+            let ids_arr = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "chunk_id expected to be Utf8".into(),
+                    ))
+                })?;
+            let emb_col = batch.column_by_name("embedding").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "embedding column missing in projection".into(),
+                ))
+            })?;
+            let emb_arr = emb_col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding expected to be FixedSizeList".into(),
+                    ))
+                })?;
+            let f32_values = emb_arr
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding inner expected to be Float32".into(),
+                    ))
+                })?;
+            let dim = usize::try_from(emb_arr.value_length()).map_err(|_| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                    "embedding value_length not representable as usize: {}",
+                    emb_arr.value_length()
+                )))
+            })?;
+            for i in 0..batch.num_rows() {
+                if emb_arr.is_null(i) {
+                    continue;
+                }
+                let start = i * dim;
+                let slice = &f32_values.values()[start..start + dim];
+                out.push((ids_arr.value(i).to_string(), slice.to_vec()));
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Mark a batch of chunks as stale by their unique `chunk_id`.
     pub async fn mark_chunks_stale(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {

@@ -375,7 +375,7 @@ struct MatchPassOutcome {
 /// repeated scans of the same cluster collapse to one row (the unique
 /// constraint absorbs the duplicate), short enough to fit
 /// `ThreadHandle`'s 64-char / 4-hyphen budget.
-fn generate_proposed_handle(chunk_ids: &[String], ts: chrono::DateTime<Utc>) -> String {
+pub(crate) fn generate_proposed_handle(chunk_ids: &[String], ts: chrono::DateTime<Utc>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for id in chunk_ids {

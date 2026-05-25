@@ -14,13 +14,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
+use ostk_recall_attention::emergent::{
+    DEFAULT_LIMIT as EMERGENT_DEFAULT_LIMIT, DEFAULT_MIN_CLUSTER_SIZE,
+    DEFAULT_SINCE_HOURS as EMERGENT_DEFAULT_SINCE_HOURS, EmergentError, discover_and_surface,
+};
 use ostk_recall_attention::{AttentionError, AttentionForwardStore};
 use ostk_recall_core::{
     AttentionPage, AttentionScope, FoldDepth, PrivacyTier, ThreadHandle, ThreadHandleError,
 };
 use ostk_recall_store::{
-    AssociationType, EvidenceLink, RelationState, StoreError, TensionState, ThreadRecord, ThreadsDb,
+    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, TensionState,
+    ThreadRecord, ThreadsDb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,6 +44,10 @@ pub enum AttentionHandlersError {
     Store(#[from] StoreError),
     #[error("privacy tier {0:?} is not permitted for this caller")]
     PrivacyForbidden(PrivacyTier),
+    #[error("emergent surfacing requires CorpusStore — wire one via AttentionDispatch::with_corpus")]
+    CorpusUnavailable,
+    #[error("emergent surfacing failed: {0}")]
+    Emergent(#[from] EmergentError),
 }
 
 /// Bag of dependencies threaded through every dispatch call.
@@ -49,6 +58,12 @@ pub enum AttentionHandlersError {
 pub struct AttentionDispatch {
     pub attention: Arc<dyn AttentionForwardStore>,
     pub threads: Arc<ThreadsDb>,
+    /// Optional corpus handle. Required for emergent surfacing
+    /// (`thread_emergent`) — the dispatcher errors with
+    /// `CorpusUnavailable` when a request needs it and `None` is set.
+    /// Wired by `serve()` and the CLI builder; left `None` in
+    /// lightweight test contexts.
+    pub corpus: Option<Arc<CorpusStore>>,
     /// Maximum allowed `PrivacyTier`. Defaults to `T3Public` — every
     /// tier is permitted. Set to a lower tier to reject elevated
     /// requests at the boundary (per §Refinement §6 of the plan).
@@ -61,8 +76,15 @@ impl AttentionDispatch {
         Self {
             attention,
             threads,
+            corpus: None,
             max_privacy_tier: PrivacyTier::T3Public,
         }
+    }
+
+    #[must_use]
+    pub fn with_corpus(mut self, corpus: Arc<CorpusStore>) -> Self {
+        self.corpus = Some(corpus);
+        self
     }
 
     #[must_use]
@@ -93,6 +115,7 @@ impl DefaultAttentionHandlers for AttentionDispatch {
             "thread_unlink" => thread_unlink(self, args).await,
             "thread_promote" => thread_promote(self, args).await,
             "thread_list" => thread_list(self, args).await,
+            "thread_emergent" => thread_emergent(self, args).await,
             other => Err(AttentionHandlersError::InvalidParams(format!(
                 "unknown attention/thread tool: {other}"
             ))),
@@ -371,6 +394,82 @@ pub async fn thread_list(
         .collect();
     let records: Vec<Value> = rows.iter().map(thread_record_to_json).collect();
     Ok(json!({ "records": records }))
+}
+
+/// Discover emergent thread candidates from the existing corpus.
+///
+/// Arguments (all optional):
+/// - `since_hours: u32` — look-back window. Default
+///   [`EMERGENT_DEFAULT_SINCE_HOURS`].
+/// - `limit: usize` — max chunks fed to the clusterer. Default
+///   [`EMERGENT_DEFAULT_LIMIT`].
+/// - `min_cluster_size: usize` — minimum members per surfaced
+///   cluster. Default [`DEFAULT_MIN_CLUSTER_SIZE`].
+/// - `persist: bool` — write proposals to `threads_proposed`. Default
+///   `true` (idempotent on the UNIQUE constraint).
+///
+/// Returns `{"clusters": [{handle, members, cohesion, samples}, ...]}`
+/// sorted by cohesion desc. Empty `clusters` means nothing stood out
+/// in the window.
+pub async fn thread_emergent(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let Some(corpus) = d.corpus.as_ref() else {
+        return Err(AttentionHandlersError::CorpusUnavailable);
+    };
+    let since_hours = args
+        .get("since_hours")
+        .and_then(Value::as_u64)
+        .and_then(|n| i64::try_from(n).ok())
+        .unwrap_or(EMERGENT_DEFAULT_SINCE_HOURS);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(EMERGENT_DEFAULT_LIMIT);
+    let min_cluster_size = args
+        .get("min_cluster_size")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_MIN_CLUSTER_SIZE);
+    let persist = args
+        .get("persist")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let since = Utc::now() - ChronoDuration::hours(since_hours);
+    let reports = discover_and_surface(
+        corpus,
+        &d.threads,
+        since,
+        limit,
+        min_cluster_size,
+        ostk_recall_attention::cluster::EMERGENT_THRESHOLD,
+        persist,
+    )
+    .await?;
+
+    let clusters: Vec<Value> = reports
+        .into_iter()
+        .map(|r| {
+            json!({
+                "handle": r.handle,
+                "members": r.members,
+                "cohesion": r.cohesion,
+                "samples": r.samples,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "clusters": clusters,
+        "params": {
+            "since_hours": since_hours,
+            "limit": limit,
+            "min_cluster_size": min_cluster_size,
+            "persist": persist,
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------

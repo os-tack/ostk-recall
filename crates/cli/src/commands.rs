@@ -829,7 +829,14 @@ pub async fn serve(
 
     let dispatch: Option<Arc<AttentionDispatch>> = serve_ctx.as_ref().map(|c| {
         let attention_dyn: Arc<dyn AttentionForwardStore> = c.attention.clone();
-        Arc::new(AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)))
+        let dispatch =
+            AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)).with_corpus(
+                // Reuse the engine's CorpusStore so the emergent
+                // surface reads the same lance corpus the MCP recall
+                // verbs query.
+                Arc::clone(engine.store()),
+            );
+        Arc::new(dispatch)
     });
 
     // Spawn background scan trigger listener

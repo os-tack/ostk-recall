@@ -192,6 +192,27 @@ pub fn tool_thread_list() -> Value {
     })
 }
 
+#[must_use]
+pub fn tool_thread_emergent() -> Value {
+    json!({
+        "name": "thread_emergent",
+        "description": "Discover thread candidates from the existing corpus by clustering recent chunks. Returns clusters sorted by cohesion. Writes idempotent `proposed-<hash>` rows to the threads_proposed table unless `persist: false`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_hours": { "type": "integer", "minimum": 1,
+                                  "description": "Look-back window in hours. Default 12." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 5000,
+                            "description": "Max chunks fed to the clusterer. Default 500." },
+                "min_cluster_size": { "type": "integer", "minimum": 2,
+                                       "description": "Minimum members per surfaced cluster. Default 5." },
+                "persist": { "type": "boolean",
+                              "description": "Write proposed rows to threads_proposed. Default true." }
+            }
+        }
+    })
+}
+
 /// Names of all attention-namespace tools (used by tests + introspection).
 pub const ATTENTION_TOOL_NAMES: &[&str] = &[
     "attention_attend",
@@ -208,6 +229,7 @@ pub const THREAD_TOOL_NAMES: &[&str] = &[
     "thread_unlink",
     "thread_promote",
     "thread_list",
+    "thread_emergent",
 ];
 
 #[must_use]
@@ -229,6 +251,7 @@ pub fn thread_tools() -> Vec<Value> {
         tool_thread_unlink(),
         tool_thread_promote(),
         tool_thread_list(),
+        tool_thread_emergent(),
     ]
 }
 
