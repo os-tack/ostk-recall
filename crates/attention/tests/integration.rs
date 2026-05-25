@@ -163,7 +163,7 @@ async fn familiarity_increments_ledger_and_emits_batch_with_turn_seq() {
     let turn = "we keep circling three-time-scales because it explains \
         why the score tier is in-memory.";
     let res = observer
-        .observe(&scope_for("haystack"), turn, 42, "sess-1")
+        .observe(&scope_for("haystack"), turn, 42, "sess-1", None)
         .await
         .unwrap();
     assert_eq!(res.familiarity_increments, vec![h.clone()]);
@@ -177,7 +177,7 @@ async fn familiarity_increments_ledger_and_emits_batch_with_turn_seq() {
     // Re-observe the same handle in a different turn — the column
     // must advance again, and the second batch must carry turn_seq=43.
     let _ = observer
-        .observe(&scope_for("haystack"), turn, 43, "sess-1")
+        .observe(&scope_for("haystack"), turn, 43, "sess-1", None)
         .await
         .unwrap();
     let after_two = db.get_thread(&h).unwrap().unwrap().familiarity;

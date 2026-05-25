@@ -1117,6 +1117,22 @@ CREATE INDEX IF NOT EXISTS idx_chain_kind ON chain_log(kind);
             })
         })
     }
+
+    /// Set `promoted_to` on a `threads_proposed` row. Returns the number
+    /// of rows updated (0 if absent — caller treats 0 as "raced, nothing
+    /// to update"). Idempotent: same target twice is a no-op replacement.
+    pub fn mark_proposed_thread_promoted(
+        &self,
+        proposed_handle: &str,
+        promoted_to: &ThreadHandle,
+    ) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE threads_proposed SET promoted_to = ? WHERE proposed_handle = ?",
+            params![promoted_to.as_str(), proposed_handle],
+        )?;
+        Ok(n)
+    }
 }
 
 // ---------- helpers ----------

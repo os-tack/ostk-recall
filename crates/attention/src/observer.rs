@@ -21,14 +21,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use chrono::Utc;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier, ThreadHandle, ThreadHandleError};
 use ostk_recall_core::{Chunk, Links, Source};
 use ostk_recall_pipeline::{Pipeline, PipelineError, SyntheticSourceMeta};
 use ostk_recall_store::corpus::{CorpusStore, StoreError};
-use ostk_recall_store::ThreadsDb;
+use ostk_recall_store::{ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb};
 use regex::Regex;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 // --- public types -----------------------------------------------------
 
-/// Three outputs of a single [`TurnObserver::observe`] call.
+/// Outputs of a single [`TurnObserver::observe`] call.
 #[derive(Debug, Clone, Default)]
 pub struct ObservationResult {
     /// How many membrane chunks the pipeline actually ingested (post
@@ -46,10 +46,20 @@ pub struct ObservationResult {
     /// Handles that were already known AND appeared in this turn.
     /// One entry per distinct handle; per-turn de-duped before counting.
     pub familiarity_increments: Vec<ThreadHandle>,
-    /// Handle-shaped phrases that appeared >=2 times in the turn but
-    /// aren't yet in [`TurnObserver::known_handles`]. Surfaced as
-    /// proposals; the operator decides whether to promote them.
+    /// Handle-shaped phrases that appeared >=`STUB_MIN_OCCURRENCES`
+    /// times in the turn but didn't clear the promotion gate. Persisted
+    /// to `threads_proposed` and surfaced here for operator review.
     pub proposed_stubs: Vec<ProposedThreadStub>,
+    /// Handles auto-promoted to `Slack` threads in this observation.
+    /// Empty unless the originating chunk hit
+    /// `PROMOTE_MIN_OCCURRENCES` AND the session-wide promotion cap
+    /// has room. See `TurnObserver::PROMOTION_CAP_PER_SESSION`.
+    pub promoted_handles: Vec<ThreadHandle>,
+    /// Count of `threads_proposed` rows written during this observation
+    /// (both promotable and not-yet-promoted, idempotent on the proposed
+    /// handle). Zero when `originating_chunk_id` is `None` — proposals
+    /// require an anchor chunk for the audit trail.
+    pub proposed_persisted: usize,
 }
 
 /// A candidate thread the observer wants the operator to consider.
@@ -93,6 +103,20 @@ pub const STUB_MIN_OCCURRENCES: usize = 2;
 /// Past this many occurrences the confidence stops climbing.
 pub const MAX_CONFIDENCE_OCCURRENCES: usize = 6;
 
+/// Minimum within-chunk occurrences for auto-promotion (count is the
+/// binding gate; confidence is informational only — they're coupled in
+/// the linear formula and over-constraining produces no usable knob).
+/// Sized for transcript chunks, which are the only source kind where
+/// repeated kebab-shaped phrases reliably surface; code chunks rarely
+/// repeat handle-shaped tokens and will not auto-promote.
+pub const PROMOTE_MIN_OCCURRENCES: usize = 3;
+
+/// Hard cap on auto-promotions per `TurnObserver` instance (which
+/// equals one session for the ambient daemon). Curator fade is the
+/// long-term hygiene; this cap protects against the runaway
+/// "mass-mention spam → hundreds of fake rows" failure mode.
+pub const PROMOTION_CAP_PER_SESSION: usize = 8;
+
 // --- the observer -----------------------------------------------------
 
 /// In-process daemon that observes each conversational turn.
@@ -104,6 +128,10 @@ pub struct TurnObserver {
     pipeline: Arc<Pipeline>,
     store: Arc<ThreadsDb>,
     known_handles: Arc<RwLock<HashSet<ThreadHandle>>>,
+    /// Count of auto-promotions performed by this observer instance.
+    /// Compared against [`PROMOTION_CAP_PER_SESSION`] before each new
+    /// promotion attempt. Atomic so cloned observers share the cap.
+    promotions_this_session: Arc<AtomicUsize>,
 }
 
 impl TurnObserver {
@@ -116,6 +144,7 @@ impl TurnObserver {
             pipeline,
             store,
             known_handles: Arc::new(RwLock::new(HashSet::new())),
+            promotions_this_session: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -145,13 +174,32 @@ impl TurnObserver {
     }
 
     /// Observe a single turn. Single pass over `turn_text` produces
-    /// the three outputs documented on [`ObservationResult`].
+    /// the outputs documented on [`ObservationResult`].
+    ///
+    /// `originating_chunk_id` is the corpus chunk_id whose text drove
+    /// this observation. When `Some`, proposed stubs are persisted to
+    /// `threads_proposed` and candidates at or above
+    /// [`PROMOTE_MIN_OCCURRENCES`] auto-promote to `Slack` threads with
+    /// this chunk_id as anchor (subject to
+    /// [`PROMOTION_CAP_PER_SESSION`]). When `None`, no rows are written
+    /// and the proposed-stubs path returns candidates only — used by
+    /// unit tests where no real chunk exists.
+    //
+    // TODO(persistent-attention): a freshly auto-promoted Slack thread
+    // exists in SQLite but not in the running `InMemoryAttention` — the
+    // live observer path never calls `attention.familiarize`. The
+    // curator's stale-touch guard protects newly-touched threads for
+    // one tick_interval (default 60s); after that, in-memory score=0
+    // demotes the thread to Dormant. Wiring the live observer into the
+    // attention store is the follow-up.
+    #[allow(clippy::too_many_arguments)]
     pub async fn observe(
         &self,
         scope: &AttentionScope,
         turn_text: &str,
         turn_seq: u64,
         session_id: &str,
+        originating_chunk_id: Option<&str>,
     ) -> Result<ObservationResult, ObserverError> {
         let known_snapshot: HashSet<ThreadHandle> = self.known_handles.read().await.clone();
 
@@ -184,7 +232,7 @@ impl TurnObserver {
         // Calling record_familiarity_batch alone (the original Phase 6 shape)
         // chained the event but never advanced the counter, leaving
         // familiarity-based fold-depth defaults inert.
-        let mentioned = handles_mentioned(turn_text, &known_snapshot);
+        let mut mentioned = handles_mentioned(turn_text, &known_snapshot);
         if !mentioned.is_empty() {
             // Skip handles that are in the in-memory cache but not in the
             // ledger (cache can drift briefly ahead of the ledger,
@@ -202,14 +250,122 @@ impl TurnObserver {
             }
         }
 
-        // (c) proposed thread stubs — kebab-case phrases recurring in
-        // the turn that aren't known yet.
-        let proposed_stubs = detect_proposed_stubs(turn_text, &known_snapshot);
+        // (c) candidate scan — kebab-case phrases recurring in the
+        // turn that aren't known yet. `counts` carries the raw counts
+        // so we can route between the "propose only" and "auto-promote"
+        // arms without a second regex pass.
+        let counts = count_unknown_kebab_phrases(turn_text, &known_snapshot);
+
+        let mut proposed_stubs: Vec<ProposedThreadStub> = Vec::new();
+        let mut promoted_handles: Vec<ThreadHandle> = Vec::new();
+        let mut proposed_persisted: usize = 0;
+
+        for (phrase, count, first_start, first_end) in counts {
+            if count < STUB_MIN_OCCURRENCES {
+                continue;
+            }
+            let snippet = token_window(turn_text, first_start, first_end, CONTEXT_SNIPPET_TOKENS);
+            let confidence = stub_confidence(count);
+            let stub = ProposedThreadStub {
+                handle_guess: phrase.clone(),
+                context_snippet: snippet,
+                confidence,
+            };
+
+            // Persistence requires an originating chunk for the audit
+            // trail. Without one, fall through to "candidate only" so
+            // unit tests can still exercise the detection logic.
+            let Some(anchor_chunk_id) = originating_chunk_id else {
+                proposed_stubs.push(stub);
+                continue;
+            };
+
+            let qualifies_for_promotion = count >= PROMOTE_MIN_OCCURRENCES
+                && self.promotions_this_session.load(Ordering::Relaxed)
+                    < PROMOTION_CAP_PER_SESSION;
+            let promoted_to_handle = if qualifies_for_promotion {
+                ThreadHandle::new(phrase.clone()).ok()
+            } else {
+                None
+            };
+
+            // Persist a `threads_proposed` row in both arms — keeps a
+            // clean audit trail of every kebab-shape the substrate
+            // noticed, with `promoted_to` set IFF we also promoted.
+            let proposed_record = ProposedThreadRecord {
+                id: 0,
+                proposed_handle: phrase.clone(),
+                chunk_ids: vec![anchor_chunk_id.to_string()],
+                centroid_vec: Vec::new(),
+                cohesion: confidence,
+                created_at: Utc::now(),
+                promoted_to: promoted_to_handle.as_ref().map(|h| h.as_str().to_string()),
+            };
+            match self.store.insert_proposed_thread(&proposed_record) {
+                Ok(_) => proposed_persisted += 1,
+                Err(StoreError::UniqueViolation { .. }) => {
+                    // Phrase was already proposed (earlier observation
+                    // this session or a previous boot). If we're
+                    // promoting now, repoint the existing row.
+                    if let Some(target) = &promoted_to_handle {
+                        let _ = self.store.mark_proposed_thread_promoted(&phrase, target);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            if let Some(handle) = promoted_to_handle {
+                // Promotion: upsert the threads row with the
+                // originating chunk as anchor, then bump familiarity to
+                // 1 so the InMemoryAttention sees a non-zero floor when
+                // chain replay materializes the thread. Cache the
+                // handle so subsequent chunks in this batch route
+                // through the familiarity path, not stub detection.
+                let now = Utc::now();
+                let thread_record = ThreadRecord {
+                    handle: handle.clone(),
+                    tension: TensionState::Slack,
+                    familiarity: 0,
+                    last_touched_at: now,
+                    anchor_chunk_id: Some(anchor_chunk_id.to_string()),
+                    fold_override: None,
+                    created_at: now,
+                    created_scope_key: None,
+                    privacy_tier: scope.privacy_tier,
+                };
+                self.store.upsert_thread(&thread_record)?;
+                if let Ok(new_fam) = self.store.increment_familiarity(&handle) {
+                    self.store
+                        .record_familiarity_batch(vec![(handle.clone(), new_fam)], turn_seq)?;
+                }
+                self.known_handles.write().await.insert(handle.clone());
+                self.promotions_this_session.fetch_add(1, Ordering::Relaxed);
+                promoted_handles.push(handle.clone());
+                if !mentioned.iter().any(|h| *h == handle) {
+                    mentioned.push(handle);
+                }
+            } else {
+                proposed_stubs.push(stub);
+            }
+        }
+
+        // Stable order: highest confidence first, then alphabetical.
+        proposed_stubs.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.handle_guess.cmp(&b.handle_guess))
+        });
+        promoted_handles.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        mentioned.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        mentioned.dedup();
 
         Ok(ObservationResult {
             membrane_chunks_ingested,
             familiarity_increments: mentioned,
             proposed_stubs,
+            promoted_handles,
+            proposed_persisted,
         })
     }
 
@@ -268,7 +424,7 @@ impl TurnObserver {
                                 let s = seq.fetch_add(1, Ordering::Relaxed);
                                 let session = format!("ambient:{chunk_id}");
                                 if let Err(err) = self
-                                    .observe(&scope, &text, s, &session)
+                                    .observe(&scope, &text, s, &session, Some(chunk_id.as_str()))
                                     .await
                                 {
                                     tracing::warn!(
@@ -309,7 +465,9 @@ impl TurnObserver {
                         for (chunk_id, text) in texts {
                             let s = seq.fetch_add(1, Ordering::Relaxed);
                             let session = format!("ambient:{chunk_id}");
-                            let _ = self.observe(&scope, &text, s, &session).await;
+                            let _ = self
+                                .observe(&scope, &text, s, &session, Some(chunk_id.as_str()))
+                                .await;
                         }
                     }
                     return Ok(());
@@ -570,25 +728,25 @@ fn kebab_phrase_regex() -> &'static Regex {
     })
 }
 
-fn detect_proposed_stubs(
+/// Scan `turn_text` for kebab-case phrases not already in `known`.
+/// Returns `(phrase, count, first_match_start, first_match_end)` for
+/// each candidate that passes handle-validation. The caller is
+/// responsible for filtering by occurrence count and ordering.
+fn count_unknown_kebab_phrases(
     turn_text: &str,
     known: &HashSet<ThreadHandle>,
-) -> Vec<ProposedThreadStub> {
-    // Lowered text so case-insensitivity in the rest of the turn doesn't
-    // dodge the match (handles are kebab-case-lowercase by construction).
+) -> Vec<(String, usize, usize, usize)> {
+    // Lower-case so phrases survive the regex regardless of the
+    // surrounding text's casing; handles themselves are kebab-lowercase
+    // by construction.
     let lowered = turn_text.to_lowercase();
-    // Count occurrences and remember first match position per candidate.
     let mut counts: HashMap<String, (usize, usize, usize)> = HashMap::new();
     for caps in kebab_phrase_regex().captures_iter(&lowered) {
         let Some(m) = caps.get(1) else { continue };
         let phrase = m.as_str().to_string();
-        // Drop candidates that fail handle validation (e.g. too long,
-        // too many hyphens) — they can never become a real ThreadHandle
-        // anyway.
         if ThreadHandle::new(phrase.clone()).is_err() {
             continue;
         }
-        // Known handles aren't proposals — they're familiarity ticks.
         if known.iter().any(|h| h.as_str() == phrase) {
             continue;
         }
@@ -597,30 +755,12 @@ fn detect_proposed_stubs(
             .or_insert_with(|| (0, m.start(), m.end()));
         entry.0 += 1;
     }
-
-    let mut stubs: Vec<ProposedThreadStub> = counts
+    let mut out: Vec<(String, usize, usize, usize)> = counts
         .into_iter()
-        .filter(|(_, (n, _, _))| *n >= STUB_MIN_OCCURRENCES)
-        .map(|(phrase, (n, start, end))| {
-            // Window the snippet from the original turn_text, not the
-            // lowered version, so casing is preserved when surfaced.
-            let context = token_window(turn_text, start, end, CONTEXT_SNIPPET_TOKENS);
-            let confidence = stub_confidence(n);
-            ProposedThreadStub {
-                handle_guess: phrase,
-                context_snippet: context,
-                confidence,
-            }
-        })
+        .map(|(phrase, (n, start, end))| (phrase, n, start, end))
         .collect();
-    // Stable order: highest confidence first, then alphabetical.
-    stubs.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.handle_guess.cmp(&b.handle_guess))
-    });
-    stubs
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -799,7 +939,7 @@ mod tests {
         let turn = "We keep returning to hoberman-thread-primitive, \
             and hoberman-thread-primitive shows up again in this turn, \
             because hoberman-thread-primitive is everywhere.";
-        let res = obs.observe(&scope(), turn, 5, "sess-1").await.unwrap();
+        let res = obs.observe(&scope(), turn, 5, "sess-1", None).await.unwrap();
         assert_eq!(
             res.familiarity_increments.len(),
             1,
@@ -837,7 +977,7 @@ mod tests {
         let _ = sink.take();
 
         let turn = "We talked about not-a-real-handle and never mentioned it again.";
-        let res = obs.observe(&scope(), turn, 1, "sess-1").await.unwrap();
+        let res = obs.observe(&scope(), turn, 1, "sess-1", None).await.unwrap();
         assert!(
             res.familiarity_increments.is_empty(),
             "unknown handle must not increment familiarity"
@@ -859,7 +999,7 @@ mod tests {
 
         // Single mention => no stub.
         let single = "I keep thinking about idle-curator-fade in passing.";
-        let res = obs.observe(&scope(), single, 1, "sess-1").await.unwrap();
+        let res = obs.observe(&scope(), single, 1, "sess-1", None).await.unwrap();
         assert!(
             !res.proposed_stubs
                 .iter()
@@ -870,7 +1010,7 @@ mod tests {
         // Double mention => stub.
         let double = "We saw idle-curator-fade come up twice. \
             Then idle-curator-fade again, in the second sentence.";
-        let res = obs.observe(&scope(), double, 2, "sess-1").await.unwrap();
+        let res = obs.observe(&scope(), double, 2, "sess-1", None).await.unwrap();
         assert!(
             res.proposed_stubs
                 .iter()
@@ -890,7 +1030,7 @@ mod tests {
 
         let turn = "Look at hoberman-thread-primitive and \
             hoberman-thread-primitive once more — it keeps showing up.";
-        let res = obs.observe(&scope(), turn, 3, "sess-1").await.unwrap();
+        let res = obs.observe(&scope(), turn, 3, "sess-1", None).await.unwrap();
         assert!(
             !res.proposed_stubs
                 .iter()
@@ -966,7 +1106,7 @@ mod tests {
             That also points at attention-substrate-mvp, \
             and attention-substrate-mvp is worth a thread.";
 
-        let res = obs.observe(&scope(), turn, 11, "sess-1").await.unwrap();
+        let res = obs.observe(&scope(), turn, 11, "sess-1", None).await.unwrap();
 
         assert!(
             res.membrane_chunks_ingested >= 1,
@@ -993,5 +1133,213 @@ mod tests {
             "expected attention-substrate-mvp as a stub, got: {:?}",
             res.proposed_stubs
         );
+    }
+
+    // ---- (9) promotion at PROMOTE_MIN_OCCURRENCES with anchor ----
+
+    #[tokio::test]
+    async fn promotes_phrase_at_three_occurrences_with_anchor() {
+        let (obs, sink, _c, _s) = make_observer().await;
+        let _ = sink.take();
+
+        let chunk_id = "membrane:sess-1:42:0";
+        // Three within-chunk mentions of the same kebab phrase.
+        let turn = "we keep returning to fade-is-concentration, \
+            and fade-is-concentration is the move here, \
+            because fade-is-concentration explains the curator.";
+
+        let res = obs
+            .observe(&scope(), turn, 7, "sess-1", Some(chunk_id))
+            .await
+            .unwrap();
+
+        // The promoted handle appears in res.promoted_handles and NOT
+        // in res.proposed_stubs (it cleared the gate).
+        assert_eq!(
+            res.promoted_handles
+                .iter()
+                .map(|h| h.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["fade-is-concentration".to_string()],
+        );
+        assert!(
+            !res.proposed_stubs
+                .iter()
+                .any(|s| s.handle_guess == "fade-is-concentration"),
+            "promoted phrase must not appear in proposed_stubs"
+        );
+        assert!(
+            res.proposed_persisted >= 1,
+            "at least one proposed row written"
+        );
+
+        // The threads row is Slack with the originating chunk as anchor.
+        let row = obs
+            .store
+            .get_thread(&handle("fade-is-concentration"))
+            .unwrap()
+            .expect("promoted thread must exist in ledger");
+        assert_eq!(row.tension, TensionState::Slack);
+        assert_eq!(row.anchor_chunk_id.as_deref(), Some(chunk_id));
+
+        // The threads_proposed row carries promoted_to.
+        let props = obs.store.list_proposed_threads().unwrap();
+        let p = props
+            .iter()
+            .find(|p| p.proposed_handle == "fade-is-concentration")
+            .expect("proposed-thread row must exist for audit trail");
+        assert_eq!(
+            p.promoted_to.as_deref(),
+            Some("fade-is-concentration"),
+            "promoted_to must point at the new thread for provenance"
+        );
+
+        // The chain log records the ThreadCreate + a FamiliarityBatch
+        // (familiarity bumped on promote so the in-memory floor is
+        // non-zero on next chain replay).
+        let events = sink.take();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChainEvent::ThreadCreate { handle, .. }
+                    if handle.as_str() == "fade-is-concentration")),
+            "ThreadCreate must chain for the promoted handle"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChainEvent::FamiliarityBatch { entries, .. }
+                    if entries.iter().any(|(h, _)| h.as_str() == "fade-is-concentration"))),
+            "FamiliarityBatch must include the promoted handle"
+        );
+    }
+
+    // ---- (10) below-threshold mentions stay as proposed stubs ----
+
+    #[tokio::test]
+    async fn two_mentions_propose_but_do_not_promote() {
+        let (obs, _sink, _c, _s) = make_observer().await;
+        let chunk_id = "membrane:sess-1:1:0";
+
+        let turn = "saw idle-curator-fade twice. \
+            then idle-curator-fade again. \
+            but that's it for now.";
+        let res = obs
+            .observe(&scope(), turn, 1, "sess-1", Some(chunk_id))
+            .await
+            .unwrap();
+
+        assert!(
+            res.promoted_handles.is_empty(),
+            "2 mentions must not promote"
+        );
+        assert!(
+            res.proposed_stubs
+                .iter()
+                .any(|s| s.handle_guess == "idle-curator-fade"),
+            "2 mentions should appear in proposed_stubs"
+        );
+        assert!(
+            res.proposed_persisted >= 1,
+            "the stub is persisted to threads_proposed with promoted_to=NULL"
+        );
+
+        let props = obs.store.list_proposed_threads().unwrap();
+        let p = props
+            .iter()
+            .find(|p| p.proposed_handle == "idle-curator-fade")
+            .expect("proposed-thread row must exist");
+        assert!(
+            p.promoted_to.is_none(),
+            "below-threshold stub must have promoted_to=NULL"
+        );
+    }
+
+    // ---- (11) promotion cap enforced per session ----
+
+    #[tokio::test]
+    async fn session_promotion_cap_enforced() {
+        let (obs, _sink, _c, _s) = make_observer().await;
+        // Build a turn with N distinct phrases each mentioned 3 times,
+        // where N exceeds PROMOTION_CAP_PER_SESSION. Only the first
+        // PROMOTION_CAP_PER_SESSION should promote; the rest fall
+        // through to proposed-stub.
+        // Build N distinct kebab phrases (all-letter segments so they
+        // pass ThreadHandle validation) each mentioned 3+ times. The
+        // suffix bank gives PROMOTION_CAP_PER_SESSION + 3 = 11 phrases
+        // when the cap is 8.
+        let n = PROMOTION_CAP_PER_SESSION + 3;
+        assert!(
+            n <= 12,
+            "test assumes <=12 phrases; expand suffixes if cap grows"
+        );
+        let suffixes = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
+            "theta", "iota", "kappa", "lambda", "mu",
+        ];
+        let mut turn = String::new();
+        for suffix in suffixes.iter().take(n) {
+            let phrase = format!("cap-trigger-{suffix}");
+            // Interleave non-kebab "fillerN" tokens between mentions so
+            // the kebab-phrase regex (which consumes its leading
+            // boundary char) fires on every occurrence, not just every
+            // other one. Mirrors the existing 2-occurrence test shape.
+            for k in 0..3 {
+                turn.push_str(&phrase);
+                turn.push_str(&format!(" filler{k} "));
+            }
+        }
+
+        let res = obs
+            .observe(&scope(), &turn, 1, "sess-1", Some("anchor-chunk"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.promoted_handles.len(),
+            PROMOTION_CAP_PER_SESSION,
+            "promotion count must hit cap, not exceed it"
+        );
+        // Remaining candidates must surface as stubs (not silently dropped).
+        assert!(
+            res.proposed_stubs.len() >= n - PROMOTION_CAP_PER_SESSION,
+            "post-cap candidates must surface as proposed_stubs: got {} stubs from {} excess",
+            res.proposed_stubs.len(),
+            n - PROMOTION_CAP_PER_SESSION
+        );
+
+        // Second observation: cap already saturated, zero new promotions
+        // even with a fresh chunk anchor.
+        let res2 = obs
+            .observe(&scope(), &turn, 2, "sess-1", Some("anchor-chunk-2"))
+            .await
+            .unwrap();
+        assert!(
+            res2.promoted_handles.is_empty(),
+            "session cap persists across calls; second observe must not promote"
+        );
+    }
+
+    // ---- (12) None anchor → no persistence, still detects stubs ----
+
+    #[tokio::test]
+    async fn no_anchor_chunk_means_no_persistence() {
+        let (obs, _sink, _c, _s) = make_observer().await;
+        let turn = "anchor-less-phrase came up. \
+            anchor-less-phrase showed up. \
+            anchor-less-phrase one more.";
+        let res = obs.observe(&scope(), turn, 1, "sess-1", None).await.unwrap();
+
+        // 3 mentions but no anchor → no row written; falls through to
+        // the proposed-stubs return path (legacy behavior for tests).
+        assert!(res.promoted_handles.is_empty());
+        assert_eq!(res.proposed_persisted, 0);
+        assert!(
+            res.proposed_stubs
+                .iter()
+                .any(|s| s.handle_guess == "anchor-less-phrase"),
+            "stub should still surface in the return value"
+        );
+        assert_eq!(obs.store.proposed_thread_count().unwrap(), 0);
     }
 }
