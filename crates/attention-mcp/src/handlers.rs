@@ -135,6 +135,7 @@ impl DefaultAttentionHandlers for AttentionDispatch {
             "thread_attention" => thread_attention(self, args).await,
             "thread_novelty" => thread_novelty(self, args).await,
             "thread_query" => thread_query(self, args).await,
+            "thread_evidence" => thread_evidence(self, args).await,
             other => Err(AttentionHandlersError::InvalidParams(format!(
                 "unknown attention/thread tool: {other}"
             ))),
@@ -430,6 +431,122 @@ pub async fn thread_list(
 /// Returns `{"clusters": [{handle, members, cohesion, samples}, ...]}`
 /// sorted by cohesion desc. Empty `clusters` means nothing stood out
 /// in the window.
+/// Thread → thread evidence-edge surface (v0.4.2).
+///
+/// Single action-routed verb covering `add`, `list`, and `delete` on
+/// `thread_thread_links`. Mirrors the verb-condensation move
+/// `thread_query` started — one tool, caller-chosen action, instead
+/// of three near-identical verbs.
+///
+/// Actions:
+/// - `{ action: "add", from, to, category, note? }` →
+///   `{ id, chained: true }`
+/// - `{ action: "list", handle, direction: "from"|"to" }` →
+///   `{ edges: [{id, from, to, category, note, created_at}, ...] }`
+/// - `{ action: "delete", id }` → `{}`
+pub async fn thread_evidence(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    use ostk_recall_store::ThreadThreadLink;
+
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AttentionHandlersError::InvalidParams(
+                "thread_evidence: missing required `action`".into(),
+            )
+        })?;
+    match action {
+        "add" => {
+            let from = args
+                .get("from")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AttentionHandlersError::InvalidParams("thread_evidence add: missing `from`".into())
+                })?;
+            let to = args.get("to").and_then(Value::as_str).ok_or_else(|| {
+                AttentionHandlersError::InvalidParams("thread_evidence add: missing `to`".into())
+            })?;
+            let category = args
+                .get("category")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AttentionHandlersError::InvalidParams(
+                        "thread_evidence add: missing `category`".into(),
+                    )
+                })?;
+            let note = args
+                .get("note")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let link = ThreadThreadLink {
+                id: 0,
+                from_thread: ThreadHandle::new(from)?,
+                to_thread: ThreadHandle::new(to)?,
+                category: category.to_string(),
+                note,
+                created_at: Utc::now(),
+            };
+            let id = d.threads.add_thread_thread_link(&link)?;
+            Ok(json!({ "id": id, "chained": true }))
+        }
+        "list" => {
+            let handle_str = args
+                .get("handle")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AttentionHandlersError::InvalidParams(
+                        "thread_evidence list: missing `handle`".into(),
+                    )
+                })?;
+            let handle = ThreadHandle::new(handle_str)?;
+            let direction = args
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or("from");
+            let edges = match direction {
+                "from" => d.threads.list_thread_thread_links_from(&handle)?,
+                "to" => d.threads.list_thread_thread_links_to(&handle)?,
+                other => {
+                    return Err(AttentionHandlersError::InvalidParams(format!(
+                        "thread_evidence list: direction must be \"from\" or \"to\", got {other:?}"
+                    )));
+                }
+            };
+            let edges_json: Vec<Value> = edges
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "id": e.id,
+                        "from": e.from_thread.as_str(),
+                        "to": e.to_thread.as_str(),
+                        "category": e.category,
+                        "note": e.note,
+                        "created_at": e.created_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "edges": edges_json,
+                "direction": direction,
+                "handle": handle.as_str(),
+            }))
+        }
+        "delete" => {
+            let id = args.get("id").and_then(Value::as_i64).ok_or_else(|| {
+                AttentionHandlersError::InvalidParams("thread_evidence delete: missing `id`".into())
+            })?;
+            d.threads.delete_thread_thread_link(id)?;
+            Ok(json!({}))
+        }
+        other => Err(AttentionHandlersError::InvalidParams(format!(
+            "thread_evidence: unknown action {other:?} (expected add|list|delete)"
+        ))),
+    }
+}
+
 // TODO(verb-condensation): legacy single-axis verb superseded by
 // `thread_query` (v0.4.1). Kept for back-compat through the v0.4.x
 // line; slated for removal at v1.0.0 once callers migrate. Today it
@@ -1048,6 +1165,118 @@ mod tests {
                 .iter()
                 .any(|r| r["handle"].as_str() == Some("secret-thread"))
         );
+    }
+
+    // ---- thread_evidence (v0.4.2) ------------------------------------
+
+    #[tokio::test]
+    async fn thread_evidence_add_list_delete_round_trip() {
+        let (_tmp, d) = build_dispatch();
+        // Seed two endpoint threads so the CASCADE FKs are satisfied.
+        thread_create(
+            &d,
+            json!({"scope": {"project": "p"}, "handle": "abi-as-sovereign-boundary"}),
+        )
+        .await
+        .unwrap();
+        thread_create(
+            &d,
+            json!({"scope": {"project": "p"}, "handle": "three-time-scales"}),
+        )
+        .await
+        .unwrap();
+
+        let add = thread_evidence(
+            &d,
+            json!({
+                "action": "add",
+                "from": "abi-as-sovereign-boundary",
+                "to": "three-time-scales",
+                "category": "cites",
+                "note": "the doctrine that makes the substrate replaceable"
+            }),
+        )
+        .await
+        .unwrap();
+        let id = add["id"].as_i64().expect("id returned");
+        assert!(id > 0);
+        assert_eq!(add["chained"].as_bool(), Some(true));
+
+        // list direction=from
+        let listed_from = thread_evidence(
+            &d,
+            json!({"action": "list", "handle": "abi-as-sovereign-boundary", "direction": "from"}),
+        )
+        .await
+        .unwrap();
+        let edges = listed_from["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["to"].as_str(), Some("three-time-scales"));
+        assert_eq!(edges[0]["category"].as_str(), Some("cites"));
+        assert_eq!(
+            edges[0]["note"].as_str(),
+            Some("the doctrine that makes the substrate replaceable")
+        );
+
+        // list direction=to
+        let listed_to = thread_evidence(
+            &d,
+            json!({"action": "list", "handle": "three-time-scales", "direction": "to"}),
+        )
+        .await
+        .unwrap();
+        let edges = listed_to["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["from"].as_str(), Some("abi-as-sovereign-boundary"));
+
+        // delete
+        thread_evidence(&d, json!({"action": "delete", "id": id}))
+            .await
+            .unwrap();
+        let after = thread_evidence(
+            &d,
+            json!({"action": "list", "handle": "abi-as-sovereign-boundary", "direction": "from"}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            after["edges"].as_array().unwrap().is_empty(),
+            "edge gone after delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_evidence_rejects_unknown_action() {
+        let (_tmp, d) = build_dispatch();
+        let err = thread_evidence(&d, json!({"action": "shrug"}))
+            .await
+            .unwrap_err();
+        match err {
+            AttentionHandlersError::InvalidParams(msg) => {
+                assert!(msg.contains("unknown action"), "got {msg}");
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_evidence_missing_required_fields() {
+        let (_tmp, d) = build_dispatch();
+        // add without from/to/category
+        let err = thread_evidence(&d, json!({"action": "add"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttentionHandlersError::InvalidParams(_)));
+        // list without handle
+        let err = thread_evidence(&d, json!({"action": "list"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttentionHandlersError::InvalidParams(_)));
+        // delete without id
+        let err = thread_evidence(&d, json!({"action": "delete"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttentionHandlersError::InvalidParams(_)));
     }
 
     // ---- thread_query (v0.4.1) ---------------------------------------

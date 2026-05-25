@@ -263,6 +263,39 @@ pub fn tool_thread_novelty() -> Value {
     })
 }
 
+/// Thread → thread evidence-edge surface (v0.4.2). Single
+/// action-routed verb covering add / list / delete on
+/// `thread_thread_links`. Mirrors the verb-condensation pattern
+/// `thread_query` introduced — one tool, caller-chosen action.
+pub fn tool_thread_evidence() -> Value {
+    json!({
+        "name": "thread_evidence",
+        "description": "Manage thread → thread evidence edges (the v0.4.x graph of 'this thread cites that one'). Action-routed: { action: 'add', from, to, category, note? } adds an edge and emits a ChainEvent::ThreadLinkAdd; { action: 'list', handle, direction: 'from'|'to' } returns edges where handle is the source or target; { action: 'delete', id } removes by id and chains ThreadLinkRemove. Edges enforce UNIQUE(from, to, category) and reject self-loops via the schema CHECK.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["add", "list", "delete"],
+                             "description": "Which operation to perform on the thread→thread edge graph." },
+                "from": { "type": "string",
+                           "description": "Source thread handle. Required for action=add." },
+                "to": { "type": "string",
+                         "description": "Target thread handle. Required for action=add." },
+                "category": { "type": "string",
+                               "description": "Edge category, e.g. 'cites', 'supersedes', 'companion'. Required for action=add." },
+                "note": { "type": "string",
+                           "description": "Optional human-readable note on the edge." },
+                "handle": { "type": "string",
+                             "description": "Thread handle to look up. Required for action=list." },
+                "direction": { "type": "string", "enum": ["from", "to"],
+                                "description": "For action=list: 'from' returns edges where handle is the source; 'to' returns edges where it is the target. Default 'from'." },
+                "id": { "type": "integer",
+                         "description": "Edge id. Required for action=delete." }
+            },
+            "required": ["action"]
+        }
+    })
+}
+
 /// Multi-signal thread query (v0.4.1). Runs density, activity, and
 /// novelty against the same recency window and returns a unified
 /// cluster list with caller-supplied ranking. Replaces the hidden
@@ -327,6 +360,7 @@ pub const THREAD_TOOL_NAMES: &[&str] = &[
     "thread_attention",
     "thread_novelty",
     "thread_query",
+    "thread_evidence",
 ];
 
 #[must_use]
@@ -352,6 +386,7 @@ pub fn thread_tools() -> Vec<Value> {
         tool_thread_attention(),
         tool_thread_novelty(),
         tool_thread_query(),
+        tool_thread_evidence(),
     ]
 }
 

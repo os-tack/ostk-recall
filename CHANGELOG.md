@@ -8,11 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - `ThreadThreadLink` Rust API on `ThreadsDb` (insert, list-from,
-  list-to, delete, count) now chain-emitting. MCP surface still
-  deferred — will land alongside the v0.4.x verb consolidation pass
-  (`thread_evidence`).
+  list-to, delete, count) now chain-emitting AND exposed through MCP
+  via the new `thread_evidence` action-routed verb.
 
 ### Added
+
+- **`thread_evidence` MCP verb (v0.4.2).** Action-routed surface
+  exposing the v0.4.x `thread_thread_links` graph through MCP. Single
+  tool, three actions: `add` (from, to, category, note? → id +
+  ChainEvent::ThreadLinkAdd), `list` (handle + direction:from|to →
+  edges), `delete` (id → removed + ChainEvent::ThreadLinkRemove).
+  Mirrors the verb-condensation pattern `thread_query` introduced —
+  one tool, caller-chosen action, instead of three near-identical
+  verbs. Tool count: 15 (was 14). Three new dispatch tests
+  (`thread_evidence_add_list_delete_round_trip`,
+  `thread_evidence_rejects_unknown_action`,
+  `thread_evidence_missing_required_fields`). Workspace gate: 333/0
+  (was 330/0).
 
 - **Chain emission for thread → thread evidence edges.** Two new
   `ChainEvent` variants — `ThreadLinkAdd { from, to, category, note,
