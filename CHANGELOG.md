@@ -13,6 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`thread_query` — the multi-signal verb (v0.4.1).** Single tool
+  that runs density, activity, and novelty against the same recency
+  window and returns a unified cluster list with per-axis scores, a
+  caller-rankable `composite_score`, and a decomposable
+  `ThreadQueryAttribution` (`{ axes: [{axis, weight, score,
+  contribution}], composite }`). Defaults are honest:
+  `composite_weights` is uniform (1/3 each — the only neutral default
+  for a combiner), all axis floors are 0.0, all three signals on.
+  Caller picks `rank_by` and weights; substrate stops having opinions
+  about which axis matters. Supersedes `thread_emergent`,
+  `thread_attention`, and `thread_novelty` for callers that want a
+  composable answer; the three legacy verbs remain available
+  (marked `TODO(verb-condensation)`) and slated for removal at v1.0.0.
+- New crate module `crates/attention/src/query.rs` exporting `Axis`,
+  `CompositeWeights`, `RankBy`, `ThreadQueryParams`,
+  `ThreadQueryReport`, `ThreadQueryAttribution`, and `run_query(...)`.
+- New tool schema `tool_thread_query()` + dispatch wiring in
+  `crates/attention-mcp`. Tool count: 14 (was 13).
 - **Persistent attention on known-handle mentions.** `TurnObserver`
   now mirrors every `record_familiarity_batch` call through to the
   attached `AttentionForwardStore` via `familiarize(scope, handle)`,

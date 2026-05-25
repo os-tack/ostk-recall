@@ -263,6 +263,50 @@ pub fn tool_thread_novelty() -> Value {
     })
 }
 
+/// Multi-signal thread query (v0.4.1). Runs density, activity, and
+/// novelty against the same recency window and returns a unified
+/// cluster list with caller-supplied ranking. Replaces the hidden
+/// rank-by-axis opinion the legacy three verbs encode.
+pub fn tool_thread_query() -> Value {
+    json!({
+        "name": "thread_query",
+        "description": "Unified multi-signal thread query. Computes density (embedding cohesion), activity (recency-decayed bursts), and novelty (divergence from project baseline) against the same recency window and returns one cluster list with per-axis scores, a composite_score, and decomposable attribution. The substrate stays neutral — caller picks `rank_by` and `composite_weights`. Defaults: uniform weights, no axis floors, all signals on. Supersedes thread_emergent / thread_attention / thread_novelty for callers that want a composable answer; the legacy verbs remain available until v1.0.0.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_hours": { "type": "integer", "minimum": 1,
+                                  "description": "Recency window in hours. Default 24." },
+                "baseline_days": { "type": "integer", "minimum": 1,
+                                    "description": "Per-project baseline window for the novelty axis. Default 7." },
+                "signals": { "type": "array",
+                              "items": { "type": "string", "enum": ["density", "activity", "novelty"] },
+                              "description": "Which axes to compute. Default all three. Pass a subset to skip axes you don't need." },
+                "rank_by": { "type": "string", "enum": ["composite", "density", "activity", "novelty"],
+                              "description": "Which score drives the sort order. Default `composite` (weighted sum of populated axes)." },
+                "composite_weights": { "type": "object",
+                                        "properties": {
+                                            "density": { "type": "number", "minimum": 0.0 },
+                                            "activity": { "type": "number", "minimum": 0.0 },
+                                            "novelty": { "type": "number", "minimum": 0.0 }
+                                        },
+                                        "description": "Per-axis weights for the composite score. Default uniform (1/3 each) — the only honest default for a combiner. All-zero or negative falls back to uniform." },
+                "min_density": { "type": "number", "minimum": 0.0,
+                                  "description": "Drop clusters whose density score is below this. Default 0.0 (off). No-baked-filters discipline." },
+                "min_activity": { "type": "number", "minimum": 0.0,
+                                   "description": "Drop clusters whose activity score is below this. Default 0.0." },
+                "min_novelty": { "type": "number", "minimum": 0.0,
+                                  "description": "Drop clusters whose novelty score is below this. Default 0.0." },
+                "min_cluster_size": { "type": "integer", "minimum": 2,
+                                       "description": "Minimum members per surfaced cluster for density / novelty axes. Default 3 (matches `cluster::MIN_CLUSTER_SIZE`)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200,
+                            "description": "Max clusters returned (after floor + sort). Default 10." },
+                "samples_per_cluster": { "type": "integer", "minimum": 0, "maximum": 20,
+                                          "description": "Sample text snippets per cluster. Default 3." }
+            }
+        }
+    })
+}
+
 /// Names of all attention-namespace tools (used by tests + introspection).
 pub const ATTENTION_TOOL_NAMES: &[&str] = &[
     "attention_attend",
@@ -282,6 +326,7 @@ pub const THREAD_TOOL_NAMES: &[&str] = &[
     "thread_emergent",
     "thread_attention",
     "thread_novelty",
+    "thread_query",
 ];
 
 #[must_use]
@@ -306,6 +351,7 @@ pub fn thread_tools() -> Vec<Value> {
         tool_thread_emergent(),
         tool_thread_attention(),
         tool_thread_novelty(),
+        tool_thread_query(),
     ]
 }
 

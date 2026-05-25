@@ -21,9 +21,14 @@ pub mod curator;
 pub mod emergent;
 pub mod novelty;
 pub mod observer;
+pub mod query;
 pub mod weaver;
 
 pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
+pub use query::{
+    Axis, AxisAttribution, CompositeWeights, RankBy, ThreadQueryAttribution, ThreadQueryError,
+    ThreadQueryParams, ThreadQueryReport, run_query,
+};
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
 pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default};
 pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};

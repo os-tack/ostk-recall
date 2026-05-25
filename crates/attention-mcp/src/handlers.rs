@@ -134,6 +134,7 @@ impl DefaultAttentionHandlers for AttentionDispatch {
             "thread_emergent" => thread_emergent(self, args).await,
             "thread_attention" => thread_attention(self, args).await,
             "thread_novelty" => thread_novelty(self, args).await,
+            "thread_query" => thread_query(self, args).await,
             other => Err(AttentionHandlersError::InvalidParams(format!(
                 "unknown attention/thread tool: {other}"
             ))),
@@ -429,6 +430,11 @@ pub async fn thread_list(
 /// Returns `{"clusters": [{handle, members, cohesion, samples}, ...]}`
 /// sorted by cohesion desc. Empty `clusters` means nothing stood out
 /// in the window.
+// TODO(verb-condensation): legacy single-axis verb superseded by
+// `thread_query` (v0.4.1). Kept for back-compat through the v0.4.x
+// line; slated for removal at v1.0.0 once callers migrate. Today it
+// hides which axis the substrate is ranking on (density only) — the
+// sentiment-trap exhibit the multi-signal verb dissolves.
 pub async fn thread_emergent(
     d: &AttentionDispatch,
     args: Value,
@@ -524,6 +530,8 @@ pub async fn thread_emergent(
 ///   [`DEFAULT_SAMPLES_PER_BURST`] (3).
 /// - `decay_hours: f32` — recency half-life in hours. Default
 ///   [`DEFAULT_DECAY_HOURS`] (6.0).
+// TODO(verb-condensation): legacy single-axis verb superseded by
+// `thread_query` (v0.4.1). See same note on `thread_emergent`.
 pub async fn thread_attention(
     d: &AttentionDispatch,
     args: Value,
@@ -604,6 +612,8 @@ pub async fn thread_attention(
 ///
 /// Returns `{ "clusters": [...], "params": {...} }`. Empty `clusters`
 /// is the expected null state when nothing novel enough surfaces.
+// TODO(verb-condensation): legacy single-axis verb superseded by
+// `thread_query` (v0.4.1). See same note on `thread_emergent`.
 pub async fn thread_novelty(
     d: &AttentionDispatch,
     args: Value,
@@ -684,6 +694,166 @@ pub async fn thread_novelty(
             "min_cluster_size": min_cluster,
             "recluster_threshold": recluster_threshold,
             "min_mean_novelty": min_mean_novelty,
+        }
+    }))
+}
+
+/// Multi-signal thread query (v0.4.1).
+///
+/// Runs density / activity / novelty against the same recency window
+/// and returns a unified list of clusters carrying all three axis
+/// scores (`None` for axes that didn't surface this cluster), plus a
+/// `composite_score` and full `ScoreAttribution`-style breakdown.
+///
+/// See `crates/attention/src/query.rs` for the doctrine notes; the
+/// short version: this verb is the single architectural move the
+/// v0.3.0 hand-off identified as load-bearing, because it dissolves
+/// "should we add another surface?" — new questions become new
+/// rankings (caller-side), not new verbs (substrate-side).
+pub async fn thread_query(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    use ostk_recall_attention::{
+        Axis, CompositeWeights, RankBy, ThreadQueryParams, run_query,
+    };
+
+    let Some(corpus) = d.corpus.as_ref() else {
+        return Err(AttentionHandlersError::CorpusUnavailable);
+    };
+
+    let mut params = ThreadQueryParams::default();
+    if let Some(v) = args.get("since_hours").and_then(Value::as_u64) {
+        if let Ok(n) = i64::try_from(v) {
+            params.since_hours = n;
+        }
+    }
+    if let Some(v) = args.get("baseline_days").and_then(Value::as_u64) {
+        if let Ok(n) = i64::try_from(v) {
+            params.baseline_days = n;
+        }
+    }
+    if let Some(arr) = args.get("signals").and_then(Value::as_array) {
+        let mut sigs: Vec<Axis> = Vec::new();
+        for s in arr {
+            if let Some(name) = s.as_str() {
+                if let Some(a) = Axis::parse(name) {
+                    if !sigs.contains(&a) {
+                        sigs.push(a);
+                    }
+                }
+            }
+        }
+        if !sigs.is_empty() {
+            params.signals = sigs;
+        }
+    }
+    if let Some(rb) = args.get("rank_by").and_then(Value::as_str) {
+        if let Some(parsed) = RankBy::parse(rb) {
+            params.rank_by = parsed;
+        }
+    }
+    if let Some(w) = args.get("composite_weights") {
+        #[allow(clippy::cast_possible_truncation)]
+        let pick = |key: &str| -> Option<f32> {
+            w.get(key).and_then(Value::as_f64).map(|v| v as f32)
+        };
+        let d = pick("density").unwrap_or(params.composite_weights.density);
+        let a = pick("activity").unwrap_or(params.composite_weights.activity);
+        let n = pick("novelty").unwrap_or(params.composite_weights.novelty);
+        params.composite_weights = CompositeWeights::new(d, a, n);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        if let Some(v) = args.get("min_density").and_then(Value::as_f64) {
+            params.min_density = v as f32;
+        }
+        if let Some(v) = args.get("min_activity").and_then(Value::as_f64) {
+            params.min_activity = v as f32;
+        }
+        if let Some(v) = args.get("min_novelty").and_then(Value::as_f64) {
+            params.min_novelty = v as f32;
+        }
+    }
+    if let Some(v) = args.get("min_cluster_size").and_then(Value::as_u64) {
+        if let Ok(n) = usize::try_from(v) {
+            params.min_cluster_size = n;
+        }
+    }
+    if let Some(v) = args.get("limit").and_then(Value::as_u64) {
+        if let Ok(n) = usize::try_from(v) {
+            params.limit = n;
+        }
+    }
+    if let Some(v) = args.get("samples_per_cluster").and_then(Value::as_u64) {
+        if let Ok(n) = usize::try_from(v) {
+            params.samples_per_cluster = n;
+        }
+    }
+
+    let rows = run_query(corpus, &d.threads, params.clone())
+        .await
+        .map_err(|e| -> AttentionHandlersError {
+            match e {
+                ostk_recall_attention::ThreadQueryError::Emergent(e) => e.into(),
+                ostk_recall_attention::ThreadQueryError::Activity(e) => e.into(),
+                ostk_recall_attention::ThreadQueryError::Novelty(e) => e.into(),
+            }
+        })?;
+
+    let clusters: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            let axes_json: Vec<Value> = r
+                .attribution
+                .axes
+                .iter()
+                .map(|a| {
+                    json!({
+                        "axis": a.axis.as_str(),
+                        "weight": a.weight,
+                        "score": a.score,
+                        "contribution": a.contribution,
+                    })
+                })
+                .collect();
+            json!({
+                "cluster_id": r.cluster_id,
+                "origin": r.origin.as_str(),
+                "project": r.project,
+                "members": r.members,
+                "density_score": r.density_score,
+                "activity_score": r.activity_score,
+                "novelty_score": r.novelty_score,
+                "composite_score": r.composite_score,
+                "samples": r.samples,
+                "attribution": {
+                    "axes": axes_json,
+                    "composite": r.attribution.composite,
+                }
+            })
+        })
+        .collect();
+
+    let signals_echo: Vec<&str> = params.signals.iter().map(|a| a.as_str()).collect();
+    Ok(json!({
+        "clusters": clusters,
+        "params": {
+            "since_hours": params.since_hours,
+            "baseline_days": params.baseline_days,
+            "signals": signals_echo,
+            "rank_by": params.rank_by.as_str(),
+            "composite_weights": {
+                "density": params.composite_weights.density,
+                "activity": params.composite_weights.activity,
+                "novelty": params.composite_weights.novelty,
+            },
+            "min_density": params.min_density,
+            "min_activity": params.min_activity,
+            "min_novelty": params.min_novelty,
+            "min_cluster_size": params.min_cluster_size,
+            "limit": params.limit,
+            "samples_per_cluster": params.samples_per_cluster,
         }
     }))
 }
@@ -877,6 +1047,229 @@ mod tests {
                 .iter()
                 .any(|r| r["handle"].as_str() == Some("secret-thread"))
         );
+    }
+
+    // ---- thread_query (v0.4.1) ---------------------------------------
+
+    #[tokio::test]
+    async fn thread_query_without_corpus_errors() {
+        let (_tmp, d) = build_dispatch();
+        let err = thread_query(&d, json!({})).await.unwrap_err();
+        match err {
+            AttentionHandlersError::CorpusUnavailable => {}
+            other => panic!("expected CorpusUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_query_returns_decomposable_clusters() {
+        use ostk_recall_core::{Chunk, Links, Source};
+        use ostk_recall_store::CorpusStore;
+        use std::sync::Arc as StdArc;
+
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+
+        // Build a corpus that will produce at least one density cluster
+        // AND one novelty cluster, so the dispatch exercises multiple
+        // primitives and the join logic.
+        let tmp_corpus = TempDir::new().unwrap();
+        let dim = 16;
+        let corpus = StdArc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+        let now = Utc::now();
+
+        // Baseline: 20 chunks aligned to axis 0 (per-project).
+        let mut chunks = Vec::new();
+        let mut embs: Vec<Vec<f32>> = Vec::new();
+        for i in 0..20 {
+            chunks.push(Chunk {
+                chunk_id: format!("base-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: format!("base-{i}.md"),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: format!("baseline-{i}"),
+                sha256: Chunk::content_hash(&format!("base-{i}")),
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[0] = 1.0;
+            for slot in v.iter_mut().skip(1) {
+                *slot = 0.001;
+            }
+            embs.push(v);
+        }
+        // Novel cluster: 4 chunks aligned to axis 7.
+        for i in 0..4 {
+            chunks.push(Chunk {
+                chunk_id: format!("novel-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: format!("novel-{i}.md"),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: format!("novel-thought-{i}"),
+                sha256: Chunk::content_hash(&format!("novel-{i}")),
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[7] = 1.0;
+            v[0] = 0.001 + (i as f32) * 0.0001;
+            embs.push(v);
+        }
+        corpus.upsert(&chunks, &embs).await.unwrap();
+
+        let d = AttentionDispatch::new(attention, threads).with_corpus(corpus);
+
+        // Request all signals; uniform composite weights (the default).
+        let out = thread_query(
+            &d,
+            json!({
+                "since_hours": 1,
+                "limit": 20,
+                "min_cluster_size": 3,
+            }),
+        )
+        .await
+        .expect("thread_query should succeed against a seeded corpus");
+
+        let clusters = out["clusters"].as_array().expect("clusters array");
+        assert!(
+            !clusters.is_empty(),
+            "expected at least one cluster from the seeded corpus"
+        );
+
+        // Each cluster must carry a cluster_id, origin, attribution.axes
+        // covering all three axes, and contributions that sum to
+        // composite (the substrate-level decomposability promise).
+        for c in clusters {
+            assert!(c["cluster_id"].is_string(), "cluster_id present");
+            let origin = c["origin"].as_str().expect("origin present");
+            assert!(
+                matches!(origin, "density" | "activity" | "novelty"),
+                "origin in known set, got {origin:?}"
+            );
+            let axes = c["attribution"]["axes"]
+                .as_array()
+                .expect("attribution.axes");
+            assert_eq!(axes.len(), 3, "all three axes always attributed");
+            let composite = c["composite_score"].as_f64().unwrap();
+            let attr_composite = c["attribution"]["composite"].as_f64().unwrap();
+            assert!(
+                (composite - attr_composite).abs() < 1e-6,
+                "composite mirrors attribution.composite"
+            );
+            let sum: f64 = axes
+                .iter()
+                .map(|a| a["contribution"].as_f64().unwrap_or(0.0))
+                .sum();
+            assert!(
+                (sum - composite).abs() < 1e-5,
+                "contributions sum to composite: {sum} vs {composite}"
+            );
+        }
+
+        // Params echo includes the defaulted composite_weights (uniform)
+        // — sentiment-trap discipline visible in the response.
+        let weights = &out["params"]["composite_weights"];
+        let third = 1.0_f64 / 3.0;
+        assert!(
+            (weights["density"].as_f64().unwrap() - third).abs() < 1e-5,
+            "default density weight is 1/3"
+        );
+        assert!(
+            (weights["activity"].as_f64().unwrap() - third).abs() < 1e-5,
+            "default activity weight is 1/3"
+        );
+        assert!(
+            (weights["novelty"].as_f64().unwrap() - third).abs() < 1e-5,
+            "default novelty weight is 1/3"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_query_signals_subset_skips_other_primitives() {
+        use ostk_recall_core::{Chunk, Links, Source};
+        use ostk_recall_store::CorpusStore;
+        use std::sync::Arc as StdArc;
+
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+
+        let tmp_corpus = TempDir::new().unwrap();
+        let dim = 16;
+        let corpus = StdArc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+        let now = Utc::now();
+        // Seed a single (project, source_id) burst — enough for the
+        // activity primitive to surface but not the density primitive
+        // (only one source_id, no cohesion neighbourhood).
+        let mut chunks = Vec::new();
+        let mut embs = Vec::new();
+        for i in 0..4 {
+            chunks.push(Chunk {
+                chunk_id: format!("c-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "single.md".into(),
+                chunk_index: i,
+                ts: Some(now),
+                role: None,
+                text: format!("text-{i}"),
+                sha256: Chunk::content_hash(&format!("c-{i}")),
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[0] = 1.0;
+            embs.push(v);
+        }
+        corpus.upsert(&chunks, &embs).await.unwrap();
+
+        let d = AttentionDispatch::new(attention, threads).with_corpus(corpus);
+
+        // Ask only for the activity signal — substrate should not even
+        // run density / novelty primitives. Echo confirms.
+        let out = thread_query(
+            &d,
+            json!({
+                "since_hours": 1,
+                "signals": ["activity"],
+                "limit": 10,
+            }),
+        )
+        .await
+        .unwrap();
+        let echoed = out["params"]["signals"].as_array().unwrap();
+        assert_eq!(echoed.len(), 1);
+        assert_eq!(echoed[0].as_str(), Some("activity"));
+        // Every surfaced cluster must have `origin == "activity"`.
+        for c in out["clusters"].as_array().unwrap() {
+            assert_eq!(
+                c["origin"].as_str(),
+                Some("activity"),
+                "signals: [activity] must only produce activity-origin clusters"
+            );
+            // density_score and novelty_score must be null (we didn't
+            // run those primitives and don't backfill yet in v0.4.1).
+            assert!(c["density_score"].is_null());
+            assert!(c["novelty_score"].is_null());
+            assert!(c["activity_score"].is_number());
+        }
     }
 
     #[tokio::test]
