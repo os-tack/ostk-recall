@@ -32,7 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `chain_event_thread_link_payload_round_trip` (wire format).
   Workspace gate: 329/0 (was 325/0).
 
-
+- **Cross-axis backfill for `thread_query` (v0.4.2 honesty upgrade).**
+  Every cluster surfaced by any primitive now gets its other two axis
+  scores computed from its own membership: density via
+  `cluster::mean_pairwise_cosine` over member embeddings, activity via
+  per-chunk timestamps + recency decay, novelty via mean per-chunk
+  novelty against the project baseline. `composite_score` is no longer
+  degenerate for cross-axis questions ("activity ∩ novelty");
+  attribution remains decomposable (`contributions.sum() ≈ composite`).
+- `ThreadQueryReport.chunk_ids` exposes full cluster membership.
+  Plumbed by additively extending `ActivityBurst`, `EmergentReport`,
+  `NoveltyReport`, and the corpus-level `ActivityBurst` with
+  `chunk_ids` (sorted lexicographically for stable identity).
+- `CorpusStore::fetch_timestamps(chunk_ids)` — one-shot ts lookup
+  used by the activity backfill.
+- `cluster::mean_pairwise_cosine(embeddings)` — public flat-slice
+  variant of the existing private cohesion metric, used by density
+  backfill.
+- One new test in `crates/attention-mcp/src/handlers.rs`:
+  `thread_query_cross_axis_backfill_populates_other_axes` — seeds a
+  tight activity burst (4 chunks on axis 7) against a baseline (axis
+  0), confirms the burst's `density_score` backfills to > 0.8 and
+  `novelty_score` > 0.5. Workspace: 330/0 (was 329/0).
 
 - **`thread_query` — the multi-signal verb (v0.4.1).** Single tool
   that runs density, activity, and novelty against the same recency

@@ -43,9 +43,11 @@
 //! - activity → `burst:<project>:<source_id>`
 //! - novelty → `novelty:<8-hex>` of a stable shape
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use ostk_recall_store::corpus::StoreError as CorpusError;
 use ostk_recall_store::{CorpusStore, ThreadsDb};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -54,7 +56,8 @@ use crate::activity::{
     AttentionBurstError, AttentionBurstReport, DEFAULT_DECAY_HOURS, DEFAULT_SAMPLES_PER_BURST,
     surface_attention,
 };
-use crate::cluster::{EMERGENT_THRESHOLD, MIN_NEIGHBOURS_IN_CLUSTER};
+use crate::cluster::{EMERGENT_THRESHOLD, MIN_NEIGHBOURS_IN_CLUSTER, mean_pairwise_cosine};
+use crate::cosine_similarity;
 use crate::emergent::{DEFAULT_MIN_CLUSTER_SIZE as EMERGENT_DEFAULT_MIN_CLUSTER, EmergentError,
     EmergentReport, discover_and_surface};
 use crate::novelty::{
@@ -204,6 +207,10 @@ pub struct ThreadQueryReport {
     pub origin: Axis,
     pub project: String,
     pub members: usize,
+    /// Full cluster membership (sorted lexicographically). Used by the
+    /// cross-axis backfill pass and by callers who want to correlate
+    /// the cluster across queries by exact chunk identity.
+    pub chunk_ids: Vec<String>,
     pub density_score: Option<f32>,
     pub activity_score: Option<f32>,
     pub novelty_score: Option<f32>,
@@ -256,6 +263,8 @@ pub enum ThreadQueryError {
     Activity(#[from] AttentionBurstError),
     #[error("novelty signal failed: {0}")]
     Novelty(#[from] NoveltyError),
+    #[error("corpus error during backfill: {0}")]
+    Corpus(#[from] CorpusError),
 }
 
 /// Run a multi-signal query over the corpus + threads ledger.
@@ -323,6 +332,14 @@ pub async fn run_query(
         }
     }
 
+    // Cross-axis backfill — every cluster gets every enabled axis
+    // scored against its own membership, so composite_score is honest
+    // for "activity ∩ novelty"-style questions rather than degenerating
+    // to the single surfacing axis. Skipped for clusters with no
+    // chunk_ids (defensive — should not happen post-v0.4.2 since every
+    // primitive carries them).
+    backfill_cross_axis(corpus, &mut rows, since, &params).await?;
+
     rows.retain(|r| {
         let d_ok = r
             .density_score
@@ -353,6 +370,165 @@ pub async fn run_query(
     Ok(rows)
 }
 
+// --- cross-axis backfill ----------------------------------------------
+
+/// For each cluster, compute the axis scores the surfacing primitive
+/// didn't supply. Activity needs per-chunk timestamps; density needs
+/// embeddings; novelty needs embeddings + the per-project baseline.
+/// Embeddings and timestamps are fetched in two corpus queries each
+/// (one batched call per kind), so the cost is bounded by the total
+/// number of cluster members, not by the number of clusters.
+async fn backfill_cross_axis(
+    corpus: &Arc<CorpusStore>,
+    rows: &mut [ThreadQueryReport],
+    since: DateTime<Utc>,
+    params: &ThreadQueryParams,
+) -> Result<(), ThreadQueryError> {
+    // Collect every chunk_id we might need, deduplicated. Skip clusters
+    // that already have all enabled axes populated (no work to do).
+    let mut all_ids: Vec<String> = Vec::new();
+    for r in rows.iter() {
+        let needs_any = (params.signals.contains(&Axis::Density) && r.density_score.is_none())
+            || (params.signals.contains(&Axis::Activity) && r.activity_score.is_none())
+            || (params.signals.contains(&Axis::Novelty) && r.novelty_score.is_none());
+        if needs_any {
+            all_ids.extend(r.chunk_ids.iter().cloned());
+        }
+    }
+    if all_ids.is_empty() {
+        return Ok(());
+    }
+    all_ids.sort();
+    all_ids.dedup();
+
+    // One shot each for the two corpus-side lookups.
+    let embeddings: HashMap<String, Vec<f32>> = corpus.fetch_embeddings(&all_ids).await?;
+    let timestamps: HashMap<String, DateTime<Utc>> = corpus.fetch_timestamps(&all_ids).await?;
+
+    // Baselines for novelty backfill — keyed by Option<project>, with a
+    // None fallback for clusters whose project is the empty string.
+    let mut baselines: HashMap<Option<String>, Option<Vec<f32>>> = HashMap::new();
+    if params.signals.contains(&Axis::Novelty) {
+        baselines.insert(None, corpus.project_baseline_mean(None, params.baseline_days).await?);
+        let mut projects: Vec<String> = rows
+            .iter()
+            .filter(|r| !r.project.is_empty())
+            .map(|r| r.project.clone())
+            .collect();
+        projects.sort();
+        projects.dedup();
+        for p in projects {
+            let b = corpus.project_baseline_mean(Some(&p), params.baseline_days).await?;
+            baselines.insert(Some(p), b);
+        }
+    }
+
+    let now = Utc::now();
+    #[allow(clippy::cast_precision_loss)]
+    let decay_hours_recip = 1.0_f32 / DEFAULT_DECAY_HOURS.max(0.01);
+
+    for r in rows.iter_mut() {
+        if r.chunk_ids.is_empty() {
+            continue;
+        }
+        // Density: average pairwise cosine over the cluster's embeddings.
+        if params.signals.contains(&Axis::Density) && r.density_score.is_none() {
+            let vecs: Vec<Vec<f32>> = r
+                .chunk_ids
+                .iter()
+                .filter_map(|id| embeddings.get(id).cloned())
+                .collect();
+            if vecs.len() >= 2 {
+                r.density_score = Some(mean_pairwise_cosine(&vecs));
+            }
+        }
+        // Activity: count_in_window * exp(-(now - max_ts) / decay_hours).
+        if params.signals.contains(&Axis::Activity) && r.activity_score.is_none() {
+            let mut in_window: usize = 0;
+            let mut max_ts: Option<DateTime<Utc>> = None;
+            for id in &r.chunk_ids {
+                if let Some(&ts) = timestamps.get(id) {
+                    if ts >= since {
+                        in_window += 1;
+                    }
+                    max_ts = Some(max_ts.map_or(ts, |cur| cur.max(ts)));
+                }
+            }
+            if in_window > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                let count = in_window as f32;
+                let decay = max_ts.map_or(1.0, |t| {
+                    let dt_hours = ((now - t).num_seconds().max(0) as f32) / 3600.0;
+                    (-dt_hours * decay_hours_recip).exp()
+                });
+                r.activity_score = Some(count * decay);
+            }
+        }
+        // Novelty: mean of (1 - cos(emb, baseline)) over the cluster.
+        // Falls back to the global baseline if the project's is None.
+        if params.signals.contains(&Axis::Novelty) && r.novelty_score.is_none() {
+            let baseline = lookup_baseline(&baselines, &r.project);
+            if let Some(b) = baseline {
+                let mut total = 0.0_f32;
+                let mut n: u32 = 0;
+                for id in &r.chunk_ids {
+                    if let Some(v) = embeddings.get(id) {
+                        total += 1.0 - cosine_similarity(v, b);
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    r.novelty_score = Some(total / f32::from(u16::try_from(n).unwrap_or(u16::MAX)));
+                }
+            }
+        }
+        // Re-finalize composite_score + attribution to reflect newly
+        // populated axes. Cheap; runs once per cluster.
+        refresh_attribution(r, params);
+    }
+
+    Ok(())
+}
+
+fn lookup_baseline<'a>(
+    cache: &'a HashMap<Option<String>, Option<Vec<f32>>>,
+    project: &str,
+) -> Option<&'a Vec<f32>> {
+    if !project.is_empty() {
+        if let Some(Some(v)) = cache.get(&Some(project.to_string())) {
+            return Some(v);
+        }
+    }
+    if let Some(Some(v)) = cache.get(&None) {
+        return Some(v);
+    }
+    None
+}
+
+fn refresh_attribution(row: &mut ThreadQueryReport, p: &ThreadQueryParams) {
+    let weights = p.composite_weights;
+    let mut axes: Vec<AxisAttribution> = Vec::with_capacity(3);
+    let mut composite = 0.0_f32;
+    for axis in Axis::all() {
+        let score = match axis {
+            Axis::Density => row.density_score,
+            Axis::Activity => row.activity_score,
+            Axis::Novelty => row.novelty_score,
+        };
+        let weight = weights.for_axis(axis);
+        let contribution = score.map_or(0.0, |s| weight * s);
+        composite += contribution;
+        axes.push(AxisAttribution {
+            axis,
+            weight,
+            score,
+            contribution,
+        });
+    }
+    row.composite_score = composite;
+    row.attribution = ThreadQueryAttribution { axes, composite };
+}
+
 // --- per-primitive adapters -------------------------------------------
 
 fn from_emergent(r: EmergentReport, p: &ThreadQueryParams) -> ThreadQueryReport {
@@ -361,6 +537,7 @@ fn from_emergent(r: EmergentReport, p: &ThreadQueryParams) -> ThreadQueryReport 
         Axis::Density,
         String::new(),
         r.members,
+        r.chunk_ids,
         r.samples,
     );
     row.density_score = Some(r.cohesion);
@@ -369,23 +546,28 @@ fn from_emergent(r: EmergentReport, p: &ThreadQueryParams) -> ThreadQueryReport 
 
 fn from_activity(r: AttentionBurstReport, p: &ThreadQueryParams) -> ThreadQueryReport {
     let cluster_id = format!("burst:{}:{}", r.project, r.source_id);
-    let mut row = base_row(cluster_id, Axis::Activity, r.project, r.count, r.samples);
+    let mut row = base_row(
+        cluster_id,
+        Axis::Activity,
+        r.project,
+        r.count,
+        r.chunk_ids,
+        r.samples,
+    );
     row.activity_score = Some(r.score);
     finalize(row, p)
 }
 
 fn from_novelty(r: NoveltyReport, p: &ThreadQueryParams) -> ThreadQueryReport {
-    // Novelty primitive doesn't expose member chunk_ids today; derive a
-    // stable id from project + members + the joined samples shape. Two
-    // runs over the same corpus produce the same cluster_id because the
-    // samples are deterministic (sorted member ids + take()).
+    // chunk_ids are sorted lexicographically by the primitive, so the
+    // hash is stable across runs over the same corpus.
     let mut h = Sha256::new();
     h.update(r.project.as_bytes());
     h.update(b":");
     h.update(r.members.to_le_bytes());
-    for s in &r.samples {
+    for id in &r.chunk_ids {
         h.update(b"|");
-        h.update(s.as_bytes());
+        h.update(id.as_bytes());
     }
     let cluster_id = format!("novelty:{}", &hex_short(&h.finalize()));
     let mut row = base_row(
@@ -393,6 +575,7 @@ fn from_novelty(r: NoveltyReport, p: &ThreadQueryParams) -> ThreadQueryReport {
         Axis::Novelty,
         r.project,
         r.members,
+        r.chunk_ids,
         r.samples,
     );
     row.novelty_score = Some(r.mean_novelty);
@@ -404,6 +587,7 @@ fn base_row(
     origin: Axis,
     project: String,
     members: usize,
+    chunk_ids: Vec<String>,
     samples: Vec<String>,
 ) -> ThreadQueryReport {
     ThreadQueryReport {
@@ -411,6 +595,7 @@ fn base_row(
         origin,
         project,
         members,
+        chunk_ids,
         density_score: None,
         activity_score: None,
         novelty_score: None,
@@ -507,6 +692,7 @@ mod tests {
             members: 4,
             mean_novelty: 0.9,
             max_novelty: 1.0,
+            chunk_ids: vec!["c1".into(), "c2".into(), "c3".into(), "c4".into()],
             samples: vec!["s".into()],
         };
         let row = from_novelty(r, &p);
@@ -540,6 +726,7 @@ mod tests {
                 members: 3,
                 mean_novelty: 1.5,
                 max_novelty: 1.8,
+                chunk_ids: vec!["h1".into(), "h2".into(), "h3".into()],
                 samples: vec!["h".into()],
             },
             &p,
@@ -550,6 +737,7 @@ mod tests {
                 members: 3,
                 mean_novelty: 0.2,
                 max_novelty: 0.3,
+                chunk_ids: vec!["l1".into(), "l2".into(), "l3".into()],
                 samples: vec!["l".into()],
             },
             &p,

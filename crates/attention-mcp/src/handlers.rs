@@ -798,6 +798,7 @@ pub async fn thread_query(
                 ostk_recall_attention::ThreadQueryError::Emergent(e) => e.into(),
                 ostk_recall_attention::ThreadQueryError::Activity(e) => e.into(),
                 ostk_recall_attention::ThreadQueryError::Novelty(e) => e.into(),
+                ostk_recall_attention::ThreadQueryError::Corpus(e) => e.into(),
             }
         })?;
 
@@ -1195,6 +1196,138 @@ mod tests {
             (weights["novelty"].as_f64().unwrap() - third).abs() < 1e-5,
             "default novelty weight is 1/3"
         );
+    }
+
+    #[tokio::test]
+    async fn thread_query_cross_axis_backfill_populates_other_axes() {
+        // The v0.4.2 honesty upgrade: a cluster surfaced by one
+        // primitive gets its other axes computed from its own
+        // membership. Seed a tight activity burst (4 similar chunks in
+        // one source_id), confirm density_score is backfilled from the
+        // embedding cohesion of those chunks and novelty_score is
+        // backfilled against the project baseline.
+        use ostk_recall_core::{Chunk, Links, Source};
+        use ostk_recall_store::CorpusStore;
+        use std::sync::Arc as StdArc;
+
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+
+        let tmp_corpus = TempDir::new().unwrap();
+        let dim = 16;
+        let corpus = StdArc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+        let now = Utc::now();
+
+        // Baseline (axis 0) — defines the project's "usual" direction.
+        let mut chunks = Vec::new();
+        let mut embs: Vec<Vec<f32>> = Vec::new();
+        for i in 0..15 {
+            chunks.push(Chunk {
+                chunk_id: format!("base-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: format!("base-{i}.md"),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: format!("baseline-{i}"),
+                sha256: Chunk::content_hash(&format!("base-{i}")),
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[0] = 1.0;
+            embs.push(v);
+        }
+        // Activity burst: 4 chunks all in same source_id, all on axis 7
+        // (very different from baseline → high novelty when backfilled).
+        for i in 0..4 {
+            chunks.push(Chunk {
+                chunk_id: format!("burst-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "burst.md".into(),
+                chunk_index: i,
+                ts: Some(now),
+                role: None,
+                text: format!("burst-thought-{i}"),
+                sha256: Chunk::content_hash(&format!("burst-{i}")),
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[7] = 1.0;
+            embs.push(v);
+        }
+        corpus.upsert(&chunks, &embs).await.unwrap();
+
+        let d = AttentionDispatch::new(attention, threads).with_corpus(corpus);
+        let out = thread_query(
+            &d,
+            json!({"since_hours": 1, "limit": 20, "min_cluster_size": 3}),
+        )
+        .await
+        .unwrap();
+
+        // Find the activity-origin cluster for our burst source.
+        let burst = out["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| {
+                c["origin"].as_str() == Some("activity")
+                    && c["cluster_id"].as_str() == Some("burst:p:burst.md")
+            })
+            .expect("activity burst for burst.md should surface");
+
+        // Activity is the surfacing axis — always populated.
+        assert!(burst["activity_score"].as_f64().unwrap() > 0.0);
+        // Cross-axis backfill: density from average pairwise cosine
+        // (all 4 chunks on axis 7 → cohesion ≈ 1.0) and novelty against
+        // the axis-0 baseline (≈ 1.0).
+        let density = burst["density_score"]
+            .as_f64()
+            .expect("density backfilled from cluster embeddings");
+        assert!(
+            density > 0.8,
+            "density backfill should be high for axis-aligned cluster; got {density}"
+        );
+        let novelty = burst["novelty_score"]
+            .as_f64()
+            .expect("novelty backfilled against project baseline");
+        assert!(
+            novelty > 0.5,
+            "novelty backfill should be high vs baseline; got {novelty}"
+        );
+
+        // Attribution stays decomposable post-backfill: contributions
+        // sum to composite, every axis carries weight + score + contribution.
+        let axes = burst["attribution"]["axes"].as_array().unwrap();
+        let sum: f64 = axes
+            .iter()
+            .map(|a| a["contribution"].as_f64().unwrap_or(0.0))
+            .sum();
+        let composite = burst["composite_score"].as_f64().unwrap();
+        assert!(
+            (sum - composite).abs() < 1e-5,
+            "post-backfill contributions still sum to composite"
+        );
+        // All three axes should now have non-null scores on the burst.
+        for axis_name in ["density", "activity", "novelty"] {
+            let row = axes
+                .iter()
+                .find(|a| a["axis"].as_str() == Some(axis_name))
+                .unwrap();
+            assert!(
+                row["score"].is_number(),
+                "{axis_name} score should be populated after backfill"
+            );
+        }
     }
 
     #[tokio::test]

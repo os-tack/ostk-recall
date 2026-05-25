@@ -33,6 +33,9 @@ pub struct EmergentReport {
     pub members: usize,
     /// Mean pairwise cosine similarity within the cluster (`0.0–1.0`).
     pub cohesion: f32,
+    /// Full cluster membership, sorted lexicographically. Used by
+    /// `thread_query`'s v0.4.1+ cross-axis backfill.
+    pub chunk_ids: Vec<String>,
     /// Short snippets from the cluster members — first ~120 chars of
     /// each, up to a configurable cap.
     pub samples: Vec<String>,
@@ -147,6 +150,7 @@ pub async fn discover_and_surface(
             handle,
             members: cluster.chunk_ids.len(),
             cohesion: cluster.cohesion,
+            chunk_ids: cluster.chunk_ids.clone(),
             samples,
         });
     }

@@ -51,6 +51,10 @@ pub enum AttentionBurstError {
 
 /// Single surfaced burst — one `(project, source_id)` with score,
 /// counts, time bounds, and a few sample snippets.
+///
+/// `chunk_ids` is the full burst membership (sorted lexicographically);
+/// `samples` is the truncated human-readable view. v0.4.1+ cross-axis
+/// backfill in `thread_query` joins on `chunk_ids`.
 #[derive(Debug, Clone)]
 pub struct AttentionBurstReport {
     pub project: String,
@@ -59,6 +63,7 @@ pub struct AttentionBurstReport {
     pub score: f32,
     pub max_ts: DateTime<Utc>,
     pub min_ts: DateTime<Utc>,
+    pub chunk_ids: Vec<String>,
     pub samples: Vec<String>,
 }
 
@@ -109,6 +114,7 @@ fn score_burst(b: ActivityBurst, now: DateTime<Utc>, decay_hours: f32) -> Attent
         score,
         max_ts: b.max_ts,
         min_ts: b.min_ts,
+        chunk_ids: b.chunk_ids,
         samples,
     }
 }

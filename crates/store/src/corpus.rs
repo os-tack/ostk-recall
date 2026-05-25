@@ -792,6 +792,7 @@ impl CorpusStore {
                         count: 0,
                         min_ts: ts,
                         max_ts: ts,
+                        chunk_ids: Vec::new(),
                         samples: Vec::new(),
                     });
                 entry.count += 1;
@@ -801,19 +802,82 @@ impl CorpusStore {
                 if ts > entry.max_ts {
                     entry.max_ts = ts;
                 }
+                entry.chunk_ids.push(chunk_id.clone());
                 // Keep up to `samples_per_group` of the most-recent
                 // (chunk_id, ts, text) tuples. We sort by ts at the end.
                 entry.samples.push((chunk_id, ts, text));
             }
         }
 
-        // Finalise: keep only the N most-recent samples per group.
+        // Finalise: keep only the N most-recent samples per group, and
+        // give chunk_ids a stable lexicographic order so identity hashes
+        // are reproducible across runs.
         let mut out: Vec<ActivityBurst> = groups.into_values().collect();
         for burst in &mut out {
             burst
                 .samples
                 .sort_by(|a, b| b.1.cmp(&a.1));
             burst.samples.truncate(samples_per_group);
+            burst.chunk_ids.sort();
+        }
+        Ok(out)
+    }
+
+    /// Fetch `(chunk_id, ts)` for each requested id. Returns a map; ids
+    /// not found in the corpus (or with NULL ts) are absent from the
+    /// result. Used by `thread_query`'s cross-axis backfill to compute
+    /// an activity score over a cluster whose surfacing primitive
+    /// didn't carry timestamps.
+    pub async fn fetch_timestamps(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>> {
+        use arrow_array::Array;
+        use std::collections::HashMap;
+
+        if chunk_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let quoted: Vec<String> = chunk_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        let filter = format!("chunk_id IN ({})", quoted.join(","));
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "ts".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut out: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        for batch in &batches {
+            let id_arr = column_as_str(batch, "chunk_id")?;
+            let ts_col = batch.column_by_name("ts").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "ts column missing in projection".into(),
+                ))
+            })?;
+            let ts_arr = ts_col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "ts expected to be TimestampMicrosecond".into(),
+                    ))
+                })?;
+            for i in 0..batch.num_rows() {
+                if ts_arr.is_null(i) {
+                    continue;
+                }
+                let micros = ts_arr.value(i);
+                let Some(ts) = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
+                else {
+                    continue;
+                };
+                out.insert(id_arr.value(i).to_string(), ts);
+            }
         }
         Ok(out)
     }
@@ -877,6 +941,12 @@ impl CorpusStore {
 /// time bounds, and a small sample of `(chunk_id, ts, text)` tuples
 /// (most recent first). Caller (e.g. attention crate) computes the
 /// recency-weighted score and ranks.
+///
+/// `chunk_ids` is the full membership of the burst (sorted lexicographically
+/// for stable identity), separate from the truncated `samples` used for
+/// human-readable snippets. v0.4.1+ cross-axis backfill in `thread_query`
+/// joins on chunk_ids; the samples remain bounded by `samples_per_group`
+/// to keep response payloads reasonable.
 #[derive(Debug, Clone)]
 pub struct ActivityBurst {
     pub project: String,
@@ -884,6 +954,7 @@ pub struct ActivityBurst {
     pub count: usize,
     pub min_ts: chrono::DateTime<chrono::Utc>,
     pub max_ts: chrono::DateTime<chrono::Utc>,
+    pub chunk_ids: Vec<String>,
     pub samples: Vec<(String, chrono::DateTime<chrono::Utc>, String)>,
 }
 

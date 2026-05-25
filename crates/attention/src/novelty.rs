@@ -101,6 +101,9 @@ pub struct NoveltyReport {
     pub mean_novelty: f32,
     /// Maximum novelty score within the cluster. Range `[0, 2]`.
     pub max_novelty: f32,
+    /// Full cluster membership, sorted lexicographically. Used by
+    /// `thread_query`'s v0.4.1+ cross-axis backfill.
+    pub chunk_ids: Vec<String>,
     /// Sample text snippets pulled from the cluster's members.
     pub samples: Vec<String>,
 }
@@ -227,6 +230,7 @@ pub async fn surface_novelty(
                 members: c.chunk_ids.len(),
                 mean_novelty,
                 max_novelty,
+                chunk_ids: c.chunk_ids.clone(),
                 samples,
             }
         })

@@ -170,6 +170,29 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
+/// Mean pairwise cosine similarity over a flat slice of embeddings.
+/// Exposed for `thread_query`'s cross-axis density backfill — same
+/// formula as the internal cluster cohesion metric, but takes a plain
+/// vector instead of indices into a `(id, vec)` slice.
+#[must_use]
+pub fn mean_pairwise_cosine(embeddings: &[Vec<f32>]) -> f32 {
+    if embeddings.len() < 2 {
+        return 0.0;
+    }
+    let mut total = 0.0_f32;
+    let mut pairs = 0_u32;
+    for i in 0..embeddings.len() {
+        for j in (i + 1)..embeddings.len() {
+            total += cosine_similarity(&embeddings[i], &embeddings[j]);
+            pairs += 1;
+        }
+    }
+    if pairs == 0 {
+        return 0.0;
+    }
+    total / f32::from(u16::try_from(pairs).unwrap_or(u16::MAX))
+}
+
 fn average_pairwise_cosine(chunks: &[(String, Vec<f32>)], members: &[usize]) -> f32 {
     if members.len() < 2 {
         return 0.0;
