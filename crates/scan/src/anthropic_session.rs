@@ -298,6 +298,49 @@ fn truncate_tool_block(text: &str) -> String {
     format!("{head}…[truncated {dropped} chars]")
 }
 
+/// Drop chunks whose text is Claude Code's slash-command surface scaffolding
+/// — `<local-command-caveat>...`, `<command-name>...</command-name>`,
+/// `<local-command-stdout>...`, etc. These chunks have `block_kind=user`
+/// (Claude Code emits them as user messages wrapping the slash invocation)
+/// so [`drop_tool_blocks`] does not catch them, but they are procedurally
+/// identical: high-volume meta scaffolding with no thinking content. Left
+/// in, they dominate emergent surfacing once tool blocks are removed.
+#[must_use]
+pub fn drop_local_command_wrappers(chunks: Vec<Chunk>) -> Vec<Chunk> {
+    chunks
+        .into_iter()
+        .filter(|c| {
+            let head = c.text.trim_start();
+            !(head.starts_with("<local-command-")
+                || head.starts_with("<command-name>")
+                || head.starts_with("</command-name>")
+                || head.starts_with("<command-message>")
+                || head.starts_with("<command-args>"))
+        })
+        .collect()
+}
+
+/// Drop chunks whose `extra.block_kind` is `tool_use` or `tool_result`.
+///
+/// The parser itself preserves every block as a separate chunk so a future
+/// tool-usage indexer can consume the full stream from the same source.
+/// Callers feeding the attention corpus should run their parse output
+/// through this filter — those blocks dominate the corpus by volume but
+/// carry no thinking-substrate signal, and they were burying substantive
+/// clusters in [`crate::attention::emergent`] surfacing.
+#[must_use]
+pub fn drop_tool_blocks(chunks: Vec<Chunk>) -> Vec<Chunk> {
+    chunks
+        .into_iter()
+        .filter(|c| {
+            c.extra
+                .get("block_kind")
+                .and_then(|v| v.as_str())
+                .is_none_or(|kind| kind != "tool_use" && kind != "tool_result")
+        })
+        .collect()
+}
+
 /// Materialize blocks into chunks. `chunk_index` is monotonic across the
 /// session; `parent_ids` holds the previous chunk's id so `recall_link`
 /// can chain backward through the session.
@@ -598,6 +641,91 @@ mod tests {
         // Every alpha-bravo occurrence is preserved.
         let count = body.matches("alpha-bravo").count();
         assert_eq!(count, 1000);
+    }
+
+    /// `drop_local_command_wrappers` filters Claude Code's slash-command
+    /// surface scaffolding (which lands as `block_kind=user`) but leaves
+    /// substantive user prose untouched.
+    #[test]
+    fn drop_local_command_wrappers_filters_scaffolding() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Substantive user prose
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"think about this design"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+        )
+        .unwrap();
+        // Slash command scaffolding
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"<command-name>/compact</command-name>"}},"timestamp":"2026-04-17T10:00:02Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"<local-command-stdout>Reconnected.</local-command-stdout>"}},"timestamp":"2026-04-17T10:00:03Z"}}"#
+        )
+        .unwrap();
+        // Another substantive line
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"here's an idea"}},"timestamp":"2026-04-17T10:00:04Z"}}"#
+        )
+        .unwrap();
+        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(raw.len(), 5);
+        let kept = drop_local_command_wrappers(raw);
+        assert_eq!(kept.len(), 2);
+        let texts: Vec<&str> = kept.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["think about this design", "here's an idea"]);
+    }
+
+    /// `drop_tool_blocks` filters tool_use/tool_result chunks but keeps
+    /// user/assistant_text — and preserves their order + content.
+    #[test]
+    fn drop_tool_blocks_keeps_prose_only() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // user + assistant text + tool_use + tool_result + assistant text
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"q"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"a1"}},{{"type":"tool_use","name":"r","input":{{}}}}]}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","content":"x"}}]}},"timestamp":"2026-04-17T10:00:02Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"a2"}}]}},"timestamp":"2026-04-17T10:00:03Z"}}"#
+        )
+        .unwrap();
+        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, None).unwrap();
+        assert_eq!(raw.len(), 5);
+        let kept = drop_tool_blocks(raw);
+        assert_eq!(kept.len(), 3);
+        let kinds: Vec<&str> = kept
+            .iter()
+            .map(|c| c.extra.get("block_kind").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["user", "assistant_text", "assistant_text"]);
+        let texts: Vec<&str> = kept.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["q", "a1", "a2"]);
     }
 
     /// Skip wrapper types that aren't user/assistant.

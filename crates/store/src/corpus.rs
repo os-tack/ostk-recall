@@ -11,6 +11,7 @@ use lancedb::Connection;
 use lancedb::index::Index;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::OptimizeAction;
 use ostk_recall_core::Chunk;
 use thiserror::Error;
 
@@ -496,6 +497,231 @@ impl CorpusStore {
             .await?;
         Ok(ids.len() as u64)
     }
+
+    /// Count rows matching `stale = false AND <filter>`. Used for
+    /// before/after diffs on maintenance sweeps where we don't have ids
+    /// up-front.
+    pub async fn count_active(&self, filter: &str) -> Result<u64> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let full = format!("stale = false AND ({filter})");
+        let mut stream = table
+            .query()
+            .only_if(&full)
+            .select(Select::Columns(vec!["chunk_id".to_string()]))
+            .execute()
+            .await?;
+        let mut n: u64 = 0;
+        while let Some(batch) = stream.try_next().await? {
+            n += batch.num_rows() as u64;
+        }
+        Ok(n)
+    }
+
+    /// Run Lance's full optimize pass on the corpus table — merges small
+    /// fragments, reindexes new data into existing indices, and prunes
+    /// versions older than the lance default retention window (so files
+    /// from an in-flight reader/writer are not removed). After a bulk
+    /// mutation such as [`Self::mark_tool_blocks_stale`] this is what
+    /// actually collapses the per-batch fragments and lets serve return
+    /// to idle.
+    pub async fn optimize_all(&self) -> Result<()> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        table.optimize(OptimizeAction::All).await?;
+        Ok(())
+    }
+
+    /// Aggregate non-stale chunks ingested since `since` into per-source
+    /// activity bursts — one row per `(project, source_id)` pair, with
+    /// the chunk count, time bounds, and up to `samples_per_group` text
+    /// snippets pulled from the most recent chunks in the group.
+    ///
+    /// This is the data layer for the activity-burst attention surface
+    /// (`thread_attention` in attention-mcp): "where did most of the
+    /// ingest happen in the last N hours, and what does it look like."
+    /// Robust to the "thoughts are unique" problem because it doesn't
+    /// touch embeddings — pure timestamp + source aggregation.
+    pub async fn activity_bursts(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        samples_per_group: usize,
+    ) -> Result<Vec<ActivityBurst>> {
+        use std::collections::HashMap;
+
+        use arrow_array::Array;
+
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let filter = format!(
+            "stale = false AND ts >= TIMESTAMP '{}'",
+            since.format("%Y-%m-%d %H:%M:%S")
+        );
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "project".into(),
+                "source_id".into(),
+                "ts".into(),
+                "text".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        // Key = (project, source_id). project may be null → use empty
+        // string so the group still aggregates (rather than dropping).
+        let mut groups: HashMap<(String, String), ActivityBurst> = HashMap::new();
+        for batch in &batches {
+            let id_arr = column_as_str(batch, "chunk_id")?;
+            let proj_arr = column_as_str(batch, "project")?;
+            let src_arr = column_as_str(batch, "source_id")?;
+            let text_arr = column_as_str(batch, "text")?;
+            let ts_col = batch.column_by_name("ts").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "ts column missing in projection".into(),
+                ))
+            })?;
+            let ts_arr = ts_col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "ts expected to be TimestampMicrosecond".into(),
+                    ))
+                })?;
+
+            for i in 0..batch.num_rows() {
+                if ts_arr.is_null(i) {
+                    continue;
+                }
+                let micros = ts_arr.value(i);
+                let Some(ts) = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
+                else {
+                    continue;
+                };
+                let project = if proj_arr.is_null(i) {
+                    String::new()
+                } else {
+                    proj_arr.value(i).to_string()
+                };
+                let source_id = src_arr.value(i).to_string();
+                let chunk_id = id_arr.value(i).to_string();
+                let text = text_arr.value(i).to_string();
+
+                let entry = groups
+                    .entry((project.clone(), source_id.clone()))
+                    .or_insert_with(|| ActivityBurst {
+                        project,
+                        source_id,
+                        count: 0,
+                        min_ts: ts,
+                        max_ts: ts,
+                        samples: Vec::new(),
+                    });
+                entry.count += 1;
+                if ts < entry.min_ts {
+                    entry.min_ts = ts;
+                }
+                if ts > entry.max_ts {
+                    entry.max_ts = ts;
+                }
+                // Keep up to `samples_per_group` of the most-recent
+                // (chunk_id, ts, text) tuples. We sort by ts at the end.
+                entry.samples.push((chunk_id, ts, text));
+            }
+        }
+
+        // Finalise: keep only the N most-recent samples per group.
+        let mut out: Vec<ActivityBurst> = groups.into_values().collect();
+        for burst in &mut out {
+            burst
+                .samples
+                .sort_by(|a, b| b.1.cmp(&a.1));
+            burst.samples.truncate(samples_per_group);
+        }
+        Ok(out)
+    }
+
+    /// Mark every active chunk whose `extra_json` reports a `block_kind`
+    /// of `tool_use` or `tool_result` as stale. Returns the row count
+    /// matched before the update (so the caller can report what changed).
+    ///
+    /// The filter relies on the JSON serializer keeping the literal
+    /// `"block_kind":"tool_use"` / `"block_kind":"tool_result"` substring
+    /// — the only writer is [`crate::schema`] via
+    /// `crates/scan/src/anthropic_session.rs::build_chunks`, which emits
+    /// that exact shape with no whitespace.
+    pub async fn mark_tool_blocks_stale(&self) -> Result<u64> {
+        let filter = r#"extra_json LIKE '%"block_kind":"tool_use"%' OR extra_json LIKE '%"block_kind":"tool_result"%'"#;
+        let matched = self.count_active(filter).await?;
+        if matched == 0 {
+            return Ok(0);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let full = format!("stale = false AND ({filter})");
+        table
+            .update()
+            .only_if(&full)
+            .column("stale", "true")
+            .execute()
+            .await?;
+        Ok(matched)
+    }
+
+    /// Mark every active chunk whose `text` begins with Claude Code's
+    /// slash-command surface scaffolding (`<local-command-…>`,
+    /// `<command-name>`, `<command-message>`, `<command-args>`,
+    /// `</command-name>`) as stale. These chunks carry `block_kind=user`
+    /// so [`Self::mark_tool_blocks_stale`] does not catch them, but they
+    /// are procedurally identical: high-volume meta scaffolding with no
+    /// thinking content.
+    pub async fn mark_local_command_wrappers_stale(&self) -> Result<u64> {
+        let filter = "text LIKE '<local-command-%' \
+            OR text LIKE '<command-name>%' \
+            OR text LIKE '</command-name>%' \
+            OR text LIKE '<command-message>%' \
+            OR text LIKE '<command-args>%'";
+        let matched = self.count_active(filter).await?;
+        if matched == 0 {
+            return Ok(0);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let full = format!("stale = false AND ({filter})");
+        table
+            .update()
+            .only_if(&full)
+            .column("stale", "true")
+            .execute()
+            .await?;
+        Ok(matched)
+    }
+}
+
+/// Activity burst — one `(project, source_id)` group with chunk count,
+/// time bounds, and a small sample of `(chunk_id, ts, text)` tuples
+/// (most recent first). Caller (e.g. attention crate) computes the
+/// recency-weighted score and ranks.
+#[derive(Debug, Clone)]
+pub struct ActivityBurst {
+    pub project: String,
+    pub source_id: String,
+    pub count: usize,
+    pub min_ts: chrono::DateTime<chrono::Utc>,
+    pub max_ts: chrono::DateTime<chrono::Utc>,
+    pub samples: Vec<(String, chrono::DateTime<chrono::Utc>, String)>,
+}
+
+fn column_as_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+            "{name} column missing in projection"
+        )))
+    })?;
+    col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::CastError(format!(
+            "{name} expected to be Utf8"
+        )))
+    })
 }
 
 /// Escape single quotes for inlining into a `LanceDB` filter expression.

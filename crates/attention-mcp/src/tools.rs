@@ -213,6 +213,26 @@ pub fn tool_thread_emergent() -> Value {
     })
 }
 
+pub fn tool_thread_attention() -> Value {
+    json!({
+        "name": "thread_attention",
+        "description": "Activity-burst attention surface. Groups recent non-stale chunks by (project, source_id) and ranks each group by `count * exp(-(now - max_ts) / decay_hours)`. Returns the per-source focus areas of the recency window with sample snippets. Robust to the 'thoughts are unique' problem because it doesn't touch embeddings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_hours": { "type": "integer", "minimum": 1,
+                                  "description": "Look-back window in hours. Default 24." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100,
+                            "description": "Max bursts returned. Default 10." },
+                "samples_per_burst": { "type": "integer", "minimum": 0, "maximum": 20,
+                                        "description": "Sample snippets per burst. Default 3." },
+                "decay_hours": { "type": "number", "minimum": 0.1,
+                                  "description": "Half-life-style recency decay constant in hours. Default 6.0." }
+            }
+        }
+    })
+}
+
 /// Names of all attention-namespace tools (used by tests + introspection).
 pub const ATTENTION_TOOL_NAMES: &[&str] = &[
     "attention_attend",
@@ -230,6 +250,7 @@ pub const THREAD_TOOL_NAMES: &[&str] = &[
     "thread_promote",
     "thread_list",
     "thread_emergent",
+    "thread_attention",
 ];
 
 #[must_use]
@@ -252,6 +273,7 @@ pub fn thread_tools() -> Vec<Value> {
         tool_thread_promote(),
         tool_thread_list(),
         tool_thread_emergent(),
+        tool_thread_attention(),
     ]
 }
 

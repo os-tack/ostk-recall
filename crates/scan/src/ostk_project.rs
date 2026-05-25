@@ -34,7 +34,7 @@ use ostk_recall_core::{
 use ostk_recall_store::{AuditEventRow, EventsDb};
 use serde::Deserialize;
 
-use crate::anthropic_session::parse_session_file;
+use crate::anthropic_session::{drop_local_command_wrappers, drop_tool_blocks, parse_session_file};
 use crate::code::walk_and_window;
 use crate::fcp_rust;
 use crate::markdown::split_markdown;
@@ -860,7 +860,7 @@ fn scan_sessions(root: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
         let mtime = file_mtime_utc(path).ok();
         let session_chunks =
             parse_session_file(path, Source::OstkSession, &source_id, project, mtime)?;
-        chunks.extend(session_chunks);
+        chunks.extend(drop_local_command_wrappers(drop_tool_blocks(session_chunks)));
     }
     Ok(chunks)
 }
@@ -878,6 +878,8 @@ fn scan_one_session(path: &Path, project: Option<&str>) -> Result<Vec<Chunk>> {
         .unwrap_or_default();
     let mtime = file_mtime_utc(path).ok();
     parse_session_file(path, Source::OstkSession, &source_id, project, mtime)
+        .map(drop_tool_blocks)
+        .map(drop_local_command_wrappers)
 }
 
 // ──────────────────────────────── memory ────────────────────────────────

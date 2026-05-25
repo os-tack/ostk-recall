@@ -15,6 +15,7 @@
 //! future workpiece. Keeping the runtime abstract makes the math and
 //! scope-isolation invariants testable on their own.
 
+pub mod activity;
 pub mod cluster;
 pub mod curator;
 pub mod emergent;

@@ -24,7 +24,7 @@ use ostk_recall_core::{
 };
 use walkdir::WalkDir;
 
-use crate::anthropic_session::parse_session_file;
+use crate::anthropic_session::{drop_local_command_wrappers, drop_tool_blocks, parse_session_file};
 
 /// Scanner for Claude Code session logs.
 #[derive(Debug, Default)]
@@ -90,6 +90,8 @@ impl Scanner for ClaudeCodeScanner {
             item.project.as_deref(),
             mtime,
         )
+        .map(drop_tool_blocks)
+        .map(drop_local_command_wrappers)
     }
 }
 
@@ -205,21 +207,28 @@ mod tests {
         for item in scanner.discover(&cfg).filter_map(Result::ok) {
             all_chunks.extend(scanner.parse(item).unwrap());
         }
-        // Per-message chunking (Phase H):
+        // Per-message chunking (Phase H) + ingest-side drop_tool_blocks:
         //   simple session: user "hello" + assistant text "hi back" = 2
-        //   tool_use session: user + assistant text "start" + tool_use + assistant text "end" = 4
-        assert_eq!(all_chunks.len(), 6, "expected 6 per-block chunks");
+        //   tool_use session: user + assistant "start" + assistant "end" = 3
+        //     (the tool_use block is dropped at the scanner)
+        assert_eq!(all_chunks.len(), 5, "expected 5 per-block chunks");
 
-        let tool_chunk = all_chunks
-            .iter()
-            .find(|c| c.text.contains("tool_use read"))
-            .expect("tool_use chunk present");
-        assert_eq!(tool_chunk.role.as_deref(), Some("tool"));
-        assert_eq!(tool_chunk.project.as_deref(), Some("foo"));
+        // Tool blocks are filtered at the scanner — they may still appear
+        // in the raw parser output but never reach the ingest pipeline.
+        assert!(
+            all_chunks
+                .iter()
+                .all(|c| c.role.as_deref() != Some("tool")
+                    && c.role.as_deref() != Some("tool_result")),
+            "scanner should drop tool_use/tool_result chunks"
+        );
 
-        // The "start" / "end" prose now lives in their own assistant_text
-        // chunks rather than smeared together with the tool_use.
+        // The "start" / "end" prose lives in its own assistant_text chunks.
         assert!(all_chunks.iter().any(|c| c.text == "start"));
         assert!(all_chunks.iter().any(|c| c.text == "end"));
+        assert!(
+            all_chunks.iter().any(|c| c.project.as_deref() == Some("foo")),
+            "project carried through"
+        );
     }
 }

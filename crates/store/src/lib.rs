@@ -8,7 +8,7 @@ pub mod ingest;
 pub mod schema;
 pub mod threads;
 
-pub use corpus::{CorpusStore, StoreError};
+pub use corpus::{ActivityBurst, CorpusStore, StoreError};
 pub use events::{AuditEventRow, EventsDb};
 pub use ingest::{IngestChunkRow, IngestDb};
 pub use schema::{CORPUS_TABLE, corpus_schema};

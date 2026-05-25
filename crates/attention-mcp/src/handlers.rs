@@ -15,6 +15,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
+use ostk_recall_attention::activity::{
+    AttentionBurstError, DEFAULT_DECAY_HOURS, DEFAULT_LIMIT as ATTENTION_DEFAULT_LIMIT,
+    DEFAULT_SAMPLES_PER_BURST, DEFAULT_SINCE_HOURS as ATTENTION_DEFAULT_SINCE_HOURS,
+    surface_attention,
+};
 use ostk_recall_attention::emergent::{
     DEFAULT_LIMIT as EMERGENT_DEFAULT_LIMIT, DEFAULT_MIN_CLUSTER_SIZE,
     DEFAULT_SINCE_HOURS as EMERGENT_DEFAULT_SINCE_HOURS, EmergentError, discover_and_surface,
@@ -48,6 +53,8 @@ pub enum AttentionHandlersError {
     CorpusUnavailable,
     #[error("emergent surfacing failed: {0}")]
     Emergent(#[from] EmergentError),
+    #[error("attention surfacing failed: {0}")]
+    Attention2(#[from] AttentionBurstError),
 }
 
 /// Bag of dependencies threaded through every dispatch call.
@@ -116,6 +123,7 @@ impl DefaultAttentionHandlers for AttentionDispatch {
             "thread_promote" => thread_promote(self, args).await,
             "thread_list" => thread_list(self, args).await,
             "thread_emergent" => thread_emergent(self, args).await,
+            "thread_attention" => thread_attention(self, args).await,
             other => Err(AttentionHandlersError::InvalidParams(format!(
                 "unknown attention/thread tool: {other}"
             ))),
@@ -468,6 +476,80 @@ pub async fn thread_emergent(
             "limit": limit,
             "min_cluster_size": min_cluster_size,
             "persist": persist,
+        }
+    }))
+}
+
+/// Activity-burst attention surface — "what are we paying attention to."
+///
+/// Robust alternative to `thread_emergent` (which clusters by embedding
+/// density and is biased toward repetition). This verb groups recent
+/// non-stale chunks by `(project, source_id)` and ranks each group by
+/// `count * exp(-(now - max_ts) / decay_hours)`. The result is the
+/// per-source focus areas of the recency window — without any
+/// embedding similarity in the loop.
+///
+/// Arguments (all optional):
+/// - `since_hours: u32` — look-back window. Default
+///   [`ATTENTION_DEFAULT_SINCE_HOURS`] (24h).
+/// - `limit: usize` — max bursts returned. Default
+///   [`ATTENTION_DEFAULT_LIMIT`] (10).
+/// - `samples_per_burst: usize` — sample snippets per burst. Default
+///   [`DEFAULT_SAMPLES_PER_BURST`] (3).
+/// - `decay_hours: f32` — recency half-life in hours. Default
+///   [`DEFAULT_DECAY_HOURS`] (6.0).
+pub async fn thread_attention(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let Some(corpus) = d.corpus.as_ref() else {
+        return Err(AttentionHandlersError::CorpusUnavailable);
+    };
+    let since_hours = args
+        .get("since_hours")
+        .and_then(Value::as_u64)
+        .and_then(|n| i64::try_from(n).ok())
+        .unwrap_or(ATTENTION_DEFAULT_SINCE_HOURS);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(ATTENTION_DEFAULT_LIMIT);
+    let samples_per_burst = args
+        .get("samples_per_burst")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_SAMPLES_PER_BURST);
+    #[allow(clippy::cast_possible_truncation)]
+    let decay_hours = args
+        .get("decay_hours")
+        .and_then(Value::as_f64)
+        .map_or(DEFAULT_DECAY_HOURS, |v| v as f32);
+
+    let since = Utc::now() - ChronoDuration::hours(since_hours);
+    let bursts = surface_attention(corpus, since, limit, samples_per_burst, decay_hours).await?;
+
+    let bursts_json: Vec<Value> = bursts
+        .into_iter()
+        .map(|b| {
+            json!({
+                "project": b.project,
+                "source_id": b.source_id,
+                "count": b.count,
+                "score": b.score,
+                "max_ts": b.max_ts.to_rfc3339(),
+                "min_ts": b.min_ts.to_rfc3339(),
+                "samples": b.samples,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "bursts": bursts_json,
+        "params": {
+            "since_hours": since_hours,
+            "limit": limit,
+            "samples_per_burst": samples_per_burst,
+            "decay_hours": decay_hours,
         }
     }))
 }
