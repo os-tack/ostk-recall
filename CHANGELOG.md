@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## v0.4.0 — Persistent attention (TurnObserver → InMemoryAttention)
+
+Closes the v0.3.0 hand-off gap where auto-promoted threads existed in
+`threads.sqlite` but had `score_thread(handle) == 0` in the running
+`InMemoryAttention` — the curator's stale-touch grace expired after
+one tick (~60s) and demoted the freshly-promoted thread to Dormant.
+
+The hand-off named this v0.4.1 (after `thread_query` as v0.4.0); we
+flipped the order because this work is plumbing the multi-signal verb
+will load-bear on. Cleaner to ship it first and let `thread_query`
+build on an honest in-real-time activity axis.
+
+### Added
+
+- `TurnObserver::with_attention(Arc<dyn AttentionForwardStore>)` —
+  builder method that attaches the in-memory score tier to the
+  observer. Optional; observers without an attached store work
+  exactly as before (test fixtures unchanged).
+- `spawn_ambient_daemons` (cli) now takes the attention store as a
+  parameter and threads it through to the observer it spawns. Both
+  `serve` call sites already had `ctx: &ServeContext`, which carries
+  the `Arc<InMemoryAttention>`.
+
+### Changed
+
+- On every successful auto-promotion, `TurnObserver::observe` now
+  calls `attend(scope, turn_text)` and `familiarize(scope, handle)`
+  on the in-memory store. Failures are logged but don't abort the
+  durable observation (best-effort).
+- The `TODO(persistent-attention)` comment in `observer.rs` is
+  replaced with a doc paragraph describing the wiring.
+
+### Tests
+
+- New: `observer::tests::auto_promotion_lights_up_in_memory_score`.
+  Builds an observer with `with_attention(InMemoryAttention::new())`,
+  promotes a stub at `PROMOTE_MIN_OCCURRENCES`, asserts
+  `score_thread(handle) > 0` *immediately* (no waiting on chain
+  replay) and that `surface()` includes the new thread.
+- Workspace: 310/0 (was 309/0).
+
 ## v0.3.1 — No-baked-filters discipline (constants → tool args)
 
 Applies the v0.3.0 hand-off's discipline rule ("any threshold not derived

@@ -264,8 +264,13 @@ fn spawn_ambient_daemons(
     pipeline: &Arc<Pipeline>,
     corpus: &Arc<CorpusStore>,
     threads: &Arc<ThreadsDb>,
+    attention: Option<Arc<dyn AttentionForwardStore>>,
 ) -> AmbientHandles {
-    let observer = Arc::new(TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads)));
+    let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads));
+    if let Some(attn) = attention {
+        observer = observer.with_attention(attn);
+    }
+    let observer = Arc::new(observer);
     let weaver = Arc::new(AutoWeaver::new(
         Arc::clone(threads),
         Arc::clone(corpus),
@@ -347,9 +352,11 @@ pub async fn scan_with_context(
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
-    let ambient = threads_db
-        .as_ref()
-        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads));
+    let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
+        ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
+    let ambient = threads_db.as_ref().map(|threads| {
+        spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone())
+    });
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -464,9 +471,11 @@ pub async fn scan_paths_with_context(
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
-    let ambient = threads_db
-        .as_ref()
-        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads));
+    let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
+        ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
+    let ambient = threads_db.as_ref().map(|threads| {
+        spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone())
+    });
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;

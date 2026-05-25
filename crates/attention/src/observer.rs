@@ -132,12 +132,25 @@ pub struct TurnObserver {
     /// Compared against [`PROMOTION_CAP_PER_SESSION`] before each new
     /// promotion attempt. Atomic so cloned observers share the cap.
     promotions_this_session: Arc<AtomicUsize>,
+    /// Optional handle to the in-memory attention store. When set, the
+    /// observer calls `attend` + `familiarize` on every auto-promotion
+    /// so the in-memory score tier sees the new thread immediately
+    /// (otherwise the curator's stale-touch grace would expire one
+    /// tick later, demoting the freshly-promoted thread to Dormant).
+    /// Optional so test fixtures and library callers without a live
+    /// score tier work unchanged.
+    attention: Option<Arc<dyn crate::AttentionForwardStore>>,
 }
 
 impl TurnObserver {
     /// Build a new observer. `known_handles` starts empty; call
     /// [`Self::refresh_known_handles`] before the first turn (or
     /// periodically thereafter) to sync from the ledger.
+    ///
+    /// The in-memory attention store is not wired by default. Call
+    /// [`Self::with_attention`] to attach one — production wiring in
+    /// `cli::commands::spawn_ambient_daemons` does this; tests that
+    /// only exercise the ledger path skip it.
     #[must_use]
     pub fn new(pipeline: Arc<Pipeline>, store: Arc<ThreadsDb>) -> Self {
         Self {
@@ -145,7 +158,17 @@ impl TurnObserver {
             store,
             known_handles: Arc::new(RwLock::new(HashSet::new())),
             promotions_this_session: Arc::new(AtomicUsize::new(0)),
+            attention: None,
         }
+    }
+
+    /// Attach an in-memory attention store. Used by production wiring
+    /// to make auto-promoted threads visible to the score tier
+    /// immediately (rather than waiting for chain replay on next boot).
+    #[must_use]
+    pub fn with_attention(mut self, attention: Arc<dyn crate::AttentionForwardStore>) -> Self {
+        self.attention = Some(attention);
+        self
     }
 
     /// Reload the in-memory known-handles set from the ledger.
@@ -184,14 +207,13 @@ impl TurnObserver {
     /// [`PROMOTION_CAP_PER_SESSION`]). When `None`, no rows are written
     /// and the proposed-stubs path returns candidates only — used by
     /// unit tests where no real chunk exists.
-    //
-    // TODO(persistent-attention): a freshly auto-promoted Slack thread
-    // exists in SQLite but not in the running `InMemoryAttention` — the
-    // live observer path never calls `attention.familiarize`. The
-    // curator's stale-touch guard protects newly-touched threads for
-    // one tick_interval (default 60s); after that, in-memory score=0
-    // demotes the thread to Dormant. Wiring the live observer into the
-    // attention store is the follow-up.
+    ///
+    /// When [`Self::with_attention`] has attached an in-memory store,
+    /// every auto-promotion also calls `attend(scope, turn_text)` and
+    /// `familiarize(scope, handle)` on it so the score tier sees the
+    /// thread immediately. v0.3.0 had a known gap here — the curator's
+    /// stale-touch grace expired after one tick (default 60s) and
+    /// demoted promotions to Dormant; v0.4.1 closes it.
     #[allow(clippy::too_many_arguments)]
     pub async fn observe(
         &self,
@@ -337,6 +359,30 @@ impl TurnObserver {
                 if let Ok(new_fam) = self.store.increment_familiarity(&handle) {
                     self.store
                         .record_familiarity_batch(vec![(handle.clone(), new_fam)], turn_seq)?;
+                }
+                // Mirror the durable familiarity bump into the in-memory
+                // score tier so the curator's next tick sees a non-zero
+                // score and doesn't demote a freshly-promoted thread to
+                // Dormant. `attend` pushes the turn's conversational text
+                // into the scope's attention vector so the resonance term
+                // of the score formula sees real signal too. Best-effort:
+                // a failing in-memory store should not abort the durable
+                // observation that already succeeded.
+                if let Some(attn) = &self.attention {
+                    if let Err(err) = attn.attend(scope, turn_text).await {
+                        tracing::warn!(
+                            error = %err,
+                            handle = %handle,
+                            "persistent-attention: attend failed on auto-promotion"
+                        );
+                    }
+                    if let Err(err) = attn.familiarize(scope, &handle).await {
+                        tracing::warn!(
+                            error = %err,
+                            handle = %handle,
+                            "persistent-attention: familiarize failed on auto-promotion"
+                        );
+                    }
                 }
                 self.known_handles.write().await.insert(handle.clone());
                 self.promotions_this_session.fetch_add(1, Ordering::Relaxed);
@@ -1341,5 +1387,60 @@ mod tests {
             "stub should still surface in the return value"
         );
         assert_eq!(obs.store.proposed_thread_count().unwrap(), 0);
+    }
+
+    // ---- (11) v0.4.1 — persistent attention: auto-promotion writes
+    //               through to the in-memory score tier ----
+
+    #[tokio::test]
+    async fn auto_promotion_lights_up_in_memory_score() {
+        // Build the observer, then attach a fresh InMemoryAttention via
+        // with_attention. Before v0.4.1, the curator would demote this
+        // freshly-promoted thread to Dormant after one tick because the
+        // in-memory score was 0; the wiring this test exercises closes
+        // that gap.
+        let (pipeline, _corpus_tmp) = make_pipeline(16).await;
+        let store_tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(RecordingSink::default());
+        let db = ThreadsDb::open_with_sink(store_tmp.path(), sink).unwrap();
+        let attention: Arc<dyn crate::AttentionForwardStore> =
+            Arc::new(crate::InMemoryAttention::new());
+        let obs = TurnObserver::new(pipeline, Arc::new(db))
+            .with_attention(Arc::clone(&attention));
+
+        let chunk_id = "membrane:sess-1:42:0";
+        let turn = "we keep returning to fade-is-concentration, \
+            and fade-is-concentration is the move here, \
+            because fade-is-concentration explains the curator.";
+
+        let res = obs
+            .observe(&scope(), turn, 7, "sess-1", Some(chunk_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.promoted_handles.len(),
+            1,
+            "exactly one auto-promotion expected"
+        );
+
+        // The acceptance criterion from the v0.3.0 hand-off: after
+        // promotion, score_thread(handle) > 0 (no waiting on chain
+        // replay or the curator's stale-touch grace).
+        let h = handle("fade-is-concentration");
+        let score = attention.score_thread(&h).await.unwrap();
+        assert!(
+            score > 0.0,
+            "in-memory score must be > 0 immediately after promotion; got {score}"
+        );
+
+        // And surface(...) sees the thread (score above ARCHIVE_THRESHOLD).
+        let pages = attention
+            .surface(&scope(), 10)
+            .await
+            .unwrap();
+        assert!(
+            pages.iter().any(|p| p.handle == h.as_str()),
+            "surface() must include the promoted thread"
+        );
     }
 }
