@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `ThreadThreadLink` Rust API on `ThreadsDb` (insert, list-from,
+  list-to, delete, count). MCP surface deferred — will land alongside
+  the v0.4.x verb consolidation pass (`thread_evidence`).
+
+### Added
+
+- `thread_thread_links` table for thread → thread evidence edges.
+  Schema: `(id, from_thread, to_thread, category, note, created_at)`
+  with `UNIQUE(from_thread, to_thread, category)` and
+  `CHECK(from_thread <> to_thread)`. Both endpoints CASCADE on thread
+  delete.
+- `ThreadThreadLink` struct exported from `ostk-recall-store`.
+- `ThreadsDb` methods: `add_thread_thread_link`,
+  `list_thread_thread_links_from`, `list_thread_thread_links_to`,
+  `delete_thread_thread_link`, `thread_thread_link_count`.
+- Use case: the v0.3.0 hand-off cites `abi-as-sovereign-boundary`,
+  `three-time-scales`, and `fade-is-concentration` as evidence —
+  the data shape now exists. v0 is hand-edited only; weaver
+  auto-proposal of thread → thread edges deferred.
+
+### Tests
+
+- Five new tests in `crates/store/src/threads.rs`: round-trip,
+  unique constraint, self-loop rejected, cascade delete on either
+  endpoint, delete-by-id. Workspace: 315/0 (was 310/0).
+
+### Internal
+
+- Chain integration deferred: `add_thread_thread_link` does not yet
+  emit a `ChainEvent`. v0 rows are recoverable from the table
+  directly, not from chain_log. A future `ChainEvent::ThreadLinkAdd`
+  variant + replay handler is tracked alongside verb consolidation.
+
 ## v0.4.0 — Persistent attention (TurnObserver → InMemoryAttention)
 
 Closes the v0.3.0 hand-off gap where auto-promoted threads existed in

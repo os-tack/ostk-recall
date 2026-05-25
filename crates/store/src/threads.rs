@@ -174,6 +174,22 @@ pub struct EvidenceLink {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A row in the `thread_thread_links` table — directed evidence edge
+/// from one thread to another. Used when a thread cites another thread
+/// as evidence (the v0.3.0 hand-off lists abi-as-sovereign-boundary,
+/// three-time-scales, etc. as evidence-for-itself). Separate table
+/// from `evidence_links` because the source endpoint is a thread handle
+/// rather than a path/chunk; the schemas would diverge if merged.
+#[derive(Debug, Clone)]
+pub struct ThreadThreadLink {
+    pub id: i64,
+    pub from_thread: ThreadHandle,
+    pub to_thread: ThreadHandle,
+    pub category: String,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Substrate-changing events emitted by ledger mutations.
 ///
 /// The set is the one defined in `chain-as-cognition-history`: anything
@@ -640,6 +656,28 @@ CREATE TABLE IF NOT EXISTS chain_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_kind ON chain_log(kind);
+
+-- thread → thread evidence edges (v0.4.x). evidence_links is
+-- chunk → thread (path-shaped source); this table captures the
+-- thread-cites-thread case, where the v0.3.0 hand-off lists
+-- thread:abi-as-sovereign-boundary as evidence for itself, etc.
+-- Both endpoints CASCADE delete with the threads they reference.
+-- v0 is hand-edited only; auto-proposal by the weaver is deferred.
+-- Chain replay is not yet wired — v0 rows are recoverable from
+-- the table directly, not from chain_log.
+CREATE TABLE IF NOT EXISTS thread_thread_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_thread TEXT NOT NULL REFERENCES threads(handle) ON DELETE CASCADE,
+    to_thread TEXT NOT NULL REFERENCES threads(handle) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(from_thread, to_thread, category),
+    CHECK (from_thread <> to_thread)
+);
+
+CREATE INDEX IF NOT EXISTS idx_thread_thread_from ON thread_thread_links(from_thread);
+CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread);
 ",
         )?;
         Ok(())
@@ -1060,6 +1098,97 @@ CREATE INDEX IF NOT EXISTS idx_chain_kind ON chain_log(kind);
         })
     }
 
+    // ---------- thread → thread evidence edges (v0.4.x) ----------
+
+    /// Insert a thread → thread evidence edge and return the new `id`.
+    ///
+    /// Honors the `(from_thread, to_thread, category)` uniqueness
+    /// constraint and the `from_thread <> to_thread` CHECK — duplicate
+    /// or self-referential inserts surface as a [`StoreError`].
+    ///
+    /// Both endpoints are validated by the FOREIGN KEY constraints
+    /// (CASCADE delete on either side); the caller does not need to
+    /// pre-check that the threads exist.
+    ///
+    /// v0.4.x: hand-edited only; no chain emission yet. Rows are
+    /// recoverable from the table directly. A future `ChainEvent`
+    /// variant + replay handler is tracked alongside the verb
+    /// consolidation work.
+    pub fn add_thread_thread_link(&self, link: &ThreadThreadLink) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO thread_thread_links
+             (from_thread, to_thread, category, note, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                link.from_thread.as_str(),
+                link.to_thread.as_str(),
+                link.category,
+                link.note,
+                link.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// All thread → thread edges where the given handle is the
+    /// **source**. Ordered by `created_at ASC, id ASC`.
+    pub fn list_thread_thread_links_from(
+        &self,
+        handle: &ThreadHandle,
+    ) -> Result<Vec<ThreadThreadLink>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, from_thread, to_thread, category, note, created_at
+             FROM thread_thread_links
+             WHERE from_thread = ?
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![handle.as_str()], row_to_thread_thread_link)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows)
+    }
+
+    /// All thread → thread edges where the given handle is the
+    /// **target** — "which threads cite this one as evidence."
+    pub fn list_thread_thread_links_to(
+        &self,
+        handle: &ThreadHandle,
+    ) -> Result<Vec<ThreadThreadLink>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, from_thread, to_thread, category, note, created_at
+             FROM thread_thread_links
+             WHERE to_thread = ?
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![handle.as_str()], row_to_thread_thread_link)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows)
+    }
+
+    /// Drop a thread → thread edge by id.
+    pub fn delete_thread_thread_link(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM thread_thread_links WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    /// Count of all thread → thread edges. Test/diagnostic helper.
+    pub fn thread_thread_link_count(&self) -> Result<u64> {
+        let conn = self.lock();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM thread_thread_links", [], |r| r.get(0))?;
+        u64::try_from(n).map_err(|_| {
+            StoreError::Lance(lancedb::Error::Other {
+                message: format!("thread_thread_link_count returned negative value: {n}"),
+                source: None,
+            })
+        })
+    }
+
     // ---------- proposed threads ----------
 
     /// Insert a proposed-thread row. Caller owns the `proposed_handle`
@@ -1279,6 +1408,34 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
         similarity,
         created_at,
         updated_at,
+    })
+}
+
+fn row_to_thread_thread_link(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ThreadThreadLink> {
+    let id: i64 = r.get(0)?;
+    let from_s: String = r.get(1)?;
+    let to_s: String = r.get(2)?;
+    let category: String = r.get(3)?;
+    let note: Option<String> = r.get(4)?;
+    let created_s: String = r.get(5)?;
+
+    let from_thread = ThreadHandle::new(from_s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let to_thread = ThreadHandle::new(to_s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at = parse_ts(&created_s).map_err(to_sql_err)?;
+
+    Ok(ThreadThreadLink {
+        id,
+        from_thread,
+        to_thread,
+        category,
+        note,
+        created_at,
     })
 }
 
@@ -1678,5 +1835,114 @@ mod tests {
             }
             other => panic!("expected TensionTransition, got {other:?}"),
         }
+    }
+
+    // ---------- v0.4.x: thread → thread evidence edges ----------
+
+    fn sample_thread_thread_link(from: &str, to: &str, category: &str) -> ThreadThreadLink {
+        ThreadThreadLink {
+            id: 0,
+            from_thread: handle(from),
+            to_thread: handle(to),
+            category: category.into(),
+            note: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn thread_thread_link_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("post-release")).unwrap();
+        db.upsert_thread(&sample_thread("abi-as-sovereign-boundary"))
+            .unwrap();
+
+        let link = sample_thread_thread_link(
+            "post-release",
+            "abi-as-sovereign-boundary",
+            "cites",
+        );
+        let id = db.add_thread_thread_link(&link).unwrap();
+        assert!(id > 0);
+
+        let from_rows = db.list_thread_thread_links_from(&handle("post-release")).unwrap();
+        assert_eq!(from_rows.len(), 1);
+        assert_eq!(from_rows[0].to_thread.as_str(), "abi-as-sovereign-boundary");
+        assert_eq!(from_rows[0].category, "cites");
+
+        let to_rows = db
+            .list_thread_thread_links_to(&handle("abi-as-sovereign-boundary"))
+            .unwrap();
+        assert_eq!(to_rows.len(), 1);
+        assert_eq!(to_rows[0].from_thread.as_str(), "post-release");
+
+        assert_eq!(db.thread_thread_link_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn thread_thread_link_unique_constraint() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+
+        let link = sample_thread_thread_link("a", "b", "cites");
+        db.add_thread_thread_link(&link).unwrap();
+        // Same (from, to, category) → UNIQUE violation
+        let err = db.add_thread_thread_link(&link).unwrap_err();
+        match err {
+            StoreError::Sqlite(_) | StoreError::UniqueViolation { .. } => {}
+            other => panic!("expected sqlite unique violation, got {other:?}"),
+        }
+
+        // Different category → allowed (same pair, different relation).
+        let link2 = sample_thread_thread_link("a", "b", "supersedes");
+        db.add_thread_thread_link(&link2).unwrap();
+        assert_eq!(db.thread_thread_link_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn thread_thread_link_self_loop_rejected() {
+        // CHECK (from_thread <> to_thread) — a thread can't cite itself.
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        let link = sample_thread_thread_link("a", "a", "cites");
+        let err = db.add_thread_thread_link(&link).unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+    }
+
+    #[test]
+    fn thread_thread_link_cascade_delete() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        db.upsert_thread(&sample_thread("c")).unwrap();
+
+        db.add_thread_thread_link(&sample_thread_thread_link("a", "b", "cites"))
+            .unwrap();
+        db.add_thread_thread_link(&sample_thread_thread_link("b", "c", "cites"))
+            .unwrap();
+        assert_eq!(db.thread_thread_link_count().unwrap(), 2);
+
+        // Deleting 'b' should cascade to both edges (b is in both rows).
+        db.delete_thread(&handle("b")).unwrap();
+        assert_eq!(db.thread_thread_link_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn thread_thread_link_delete_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        let id = db
+            .add_thread_thread_link(&sample_thread_thread_link("a", "b", "cites"))
+            .unwrap();
+        assert_eq!(db.thread_thread_link_count().unwrap(), 1);
+        db.delete_thread_thread_link(id).unwrap();
+        assert_eq!(db.thread_thread_link_count().unwrap(), 0);
     }
 }
