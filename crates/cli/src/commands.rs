@@ -10,7 +10,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use notify_debouncer_full::notify::EventKind;
 use ostk_recall_attention::{
     AttentionForwardStore, AutoWeaver, CuratorConfig, IdleCurator, InMemoryAttention, ReplayEvent,
     TurnObserver, WeaverThresholds, ambient_scope_default,
@@ -1160,92 +1159,10 @@ where
 /// starts will fire. Errors from the underlying notify backend are
 /// surfaced through `tracing::warn`.
 #[allow(clippy::too_many_lines)]
-/// Bounded thread count for the initial parallel ignore-walk.
-///
-/// Half the machine's parallelism, clamped to [1, 8] — enough to saturate
-/// SSD I/O on a typical dev box without monopolising cores for the rest of
-/// the watch process or competing scans.
-fn walk_threads() -> usize {
-    std::thread::available_parallelism().map_or(2, |p| (p.get() / 2).clamp(1, 8))
-}
-
 /// Per-source minimum interval between scan-trigger kicks. Paths
 /// accumulated during a rate-limited gap are buffered and flushed on the
 /// next allowed kick.
 const KICK_RATE_LIMIT: Duration = Duration::from_secs(3);
-
-/// Filenames whose modification implies the surrounding source root's
-/// ignore rules changed, so the watch set must be reconciled. `.git/info/
-/// exclude` is intentionally omitted — it changes rarely and would require
-/// a more complex path-component test.
-fn is_ignorefile(p: &Path) -> bool {
-    p.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == ".gitignore" || n == ".ostk-recall-ignore")
-}
-
-/// Build a configured ignore walker for `root` honouring the standard
-/// gitignore stack plus the per-source `ignore` patterns.
-fn build_walk_filter(root: &Path, source: &SourceConfig, threads: usize) -> ignore::WalkBuilder {
-    let mut b = ignore::WalkBuilder::new(root);
-    b.standard_filters(true)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".ostk-recall-ignore")
-        .follow_links(false)
-        .threads(threads);
-    if !source.ignore.is_empty() {
-        let mut ov = ignore::overrides::OverrideBuilder::new(root);
-        for pat in &source.ignore {
-            let needs_bang = !pat.starts_with('!');
-            let normalized = if needs_bang {
-                format!("!{pat}")
-            } else {
-                pat.clone()
-            };
-            if let Err(e) = ov.add(&normalized) {
-                tracing::warn!(pattern = %pat, error = %e, "ignore: bad override pattern");
-            }
-        }
-        match ov.build() {
-            Ok(o) => {
-                b.overrides(o);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "ignore: failed to build overrides");
-            }
-        }
-    }
-    b
-}
-
-/// Walk `root` in parallel and return every directory that survives the
-/// ignore filter AND the hardcoded noise-segment denylist. Excludes the
-/// root itself; the caller registers that separately.
-fn discover_watch_dirs(root: &Path, source: &SourceConfig, threads: usize) -> HashSet<PathBuf> {
-    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
-    let builder = build_walk_filter(root, source, threads);
-    let root_owned = root.to_path_buf();
-    builder.build_parallel().run(|| {
-        let tx = tx.clone();
-        let root = root_owned.clone();
-        Box::new(move |result| {
-            if let Ok(entry) = result {
-                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    let p = entry.path();
-                    if p != root && !path_has_noise_segment(p) {
-                        let _ = tx.send(p.to_path_buf());
-                    }
-                }
-            }
-            ignore::WalkState::Continue
-        })
-    });
-    drop(tx);
-    rx.into_iter().collect()
-}
 
 /// Per-source kick gate: rate-limits scan-trigger sends while
 /// accumulating any paths suppressed during the gap so the eventual
@@ -1366,59 +1283,35 @@ pub async fn watch(config_path: &Path) -> Result<()> {
     )
     .context("creating filesystem debouncer")?;
 
-    // Tracks every directory currently subscribed for events. Mutated by
-    // the dir-create and ignorefile-rewalk handlers so dynamic discovery
-    // converges to the current `.gitignore` state without restart.
-    let mut watched_leaves: HashSet<PathBuf> = HashSet::new();
-
-    // Initial walk: full depth, parallel, NonRecursive per surviving
-    // directory. Avoids subscribing to noisy subtrees in the first place
-    // — the kernel never tells us about events under e.g.
-    // `taynik-platform/shared/node_modules/.pnpm/next@.../...` because we
-    // never asked.
-    let threads = walk_threads();
-    for (root, source) in &watched_roots {
-        if root.is_file() {
-            debouncer
-                .watch(root, RecursiveMode::NonRecursive)
-                .with_context(|| format!("registering watch on file {}", root.display()))?;
-            watched_leaves.insert(root.clone());
-            tracing::info!(path = %root.display(), "watching file");
-            continue;
-        }
-        // Watch the root itself so new top-level children surface as
-        // Create events (the trigger for dynamic registration below).
+    // Register each root once as Recursive and let the OS deliver every
+    // event in the subtree. `notify::RecursiveMode::NonRecursive` on
+    // macOS is a client-side filter, not an OS-level subscription bound
+    // — every descendant event still arrives and is rejected per-event
+    // inside the notify callback. Per-leaf NonRecursive (commit 14d7434)
+    // *grew* notify's filter HashMap from O(roots) to O(all-source-dirs),
+    // costing millions of `starts_with` ops/sec inside the FFI callback
+    // during cargo-build storms. Recursive-per-root collapses that work;
+    // the cheap event-side `path_has_noise_segment` filter (below) drops
+    // `target/`/`node_modules/` events at O(NOISE_PATH_SEGMENTS) each.
+    for (root, _source) in &watched_roots {
+        let mode = if root.is_file() {
+            RecursiveMode::NonRecursive
+        } else {
+            RecursiveMode::Recursive
+        };
         debouncer
-            .watch(root, RecursiveMode::NonRecursive)
-            .with_context(|| format!("registering base watch on {}", root.display()))?;
-        watched_leaves.insert(root.clone());
-
-        let leaves = discover_watch_dirs(root, source, threads);
-        let mut registered = 0usize;
-        for leaf in leaves {
-            if watched_leaves.insert(leaf.clone()) {
-                match debouncer.watch(&leaf, RecursiveMode::NonRecursive) {
-                    Ok(()) => registered += 1,
-                    Err(e) => tracing::warn!(
-                        path = %leaf.display(),
-                        error = %e,
-                        "watch register failed; descendants under this dir won't surface events"
-                    ),
-                }
-            }
-        }
+            .watch(root, mode)
+            .with_context(|| format!("registering watch on {}", root.display()))?;
         tracing::info!(
-            root = %root.display(),
-            leaves = registered,
-            "watching tree (NonRecursive per leaf)"
+            path = %root.display(),
+            recursive = !root.is_file(),
+            "watching"
         );
     }
     tracing::info!(
         socket = %socket_path.display(),
         debounce_ms = watch_cfg.debounce_ms,
-        sources = watched_roots.len(),
-        watched_leaves = watched_leaves.len(),
-        walk_threads = threads,
+        roots = watched_roots.len(),
         "scan-trigger watcher started"
     );
 
@@ -1436,101 +1329,14 @@ pub async fn watch(config_path: &Path) -> Result<()> {
                 let Some(result) = maybe else { break };
                 match result {
                     Ok(events) => {
-                        // Phase 1: dynamic registration. Each Create(dir)
-                        // event might bring a whole new subtree we should
-                        // start watching — walk it with the ignore filter
-                        // and register every survivor NonRecursive.
-                        for ev in &events {
-                            if !matches!(ev.event.kind, EventKind::Create(_)) {
-                                continue;
-                            }
-                            for p in &ev.event.paths {
-                                if path_has_noise_segment(p) || !p.is_dir() {
-                                    continue;
-                                }
-                                let Some((_, source)) = watched_roots
-                                    .iter()
-                                    .find(|(r, _)| !r.is_file() && p.starts_with(r))
-                                else {
-                                    continue;
-                                };
-                                if watched_leaves.insert(p.clone()) {
-                                    let _ = debouncer.watch(p, RecursiveMode::NonRecursive);
-                                }
-                                let sub = discover_watch_dirs(p, source, 2);
-                                for new_p in sub {
-                                    if watched_leaves.insert(new_p.clone()) {
-                                        if let Err(e) = debouncer.watch(&new_p, RecursiveMode::NonRecursive) {
-                                            tracing::warn!(
-                                                path = %new_p.display(),
-                                                error = %e,
-                                                "dynamic watch register failed"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // Recursive-per-root means FSEvents delivers every
+                        // descendant event; the cheap segment-match filter
+                        // below drops `target/`/`node_modules/` etc. at
+                        // O(NOISE_PATH_SEGMENTS) per event. No dynamic
+                        // registration or ignorefile rewalk needed — the
+                        // OS-level subscription covers the whole subtree.
 
-                        // Phase 2: ignorefile changes reconcile the watch
-                        // set for the affected root. A user adding
-                        // `/node_modules/` to a project's `.gitignore`
-                        // mid-session triggers an unwatch of newly-ignored
-                        // leaves; removing an exclude triggers re-add.
-                        let mut roots_to_rewalk: HashSet<PathBuf> = HashSet::new();
-                        for ev in &events {
-                            for p in &ev.event.paths {
-                                if !is_ignorefile(p) {
-                                    continue;
-                                }
-                                if let Some((root, _)) = watched_roots
-                                    .iter()
-                                    .find(|(r, _)| !r.is_file() && p.starts_with(r))
-                                {
-                                    roots_to_rewalk.insert(root.clone());
-                                }
-                            }
-                        }
-                        for root in &roots_to_rewalk {
-                            let Some((_, source)) =
-                                watched_roots.iter().find(|(r, _)| r == root)
-                            else {
-                                continue;
-                            };
-                            let target_set = discover_watch_dirs(root, source, threads);
-                            // The root itself stays watched regardless.
-                            let removed: Vec<PathBuf> = watched_leaves
-                                .iter()
-                                .filter(|p| {
-                                    p.starts_with(root)
-                                        && p.as_path() != root.as_path()
-                                        && !target_set.contains(*p)
-                                })
-                                .cloned()
-                                .collect();
-                            for p in &removed {
-                                let _ = debouncer.unwatch(p);
-                                watched_leaves.remove(p);
-                            }
-                            let mut added = 0usize;
-                            for p in &target_set {
-                                if watched_leaves.insert(p.clone())
-                                    && debouncer
-                                        .watch(p, RecursiveMode::NonRecursive)
-                                        .is_ok()
-                                {
-                                    added += 1;
-                                }
-                            }
-                            tracing::info!(
-                                root = %root.display(),
-                                removed = removed.len(),
-                                added,
-                                "ignorefile change: watch set reconciled"
-                            );
-                        }
-
-                        // Phase 3: collect matched paths grouped by source.
+                        // Collect matched paths grouped by source.
                         // `matches_watched_root` already short-circuits on
                         // noise segments, so node_modules/etc. events that
                         // somehow slipped through (e.g. before a `.gitignore`
