@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use notify_debouncer_full::notify::EventKind;
 use ostk_recall_attention::{
     AttentionForwardStore, AutoWeaver, CuratorConfig, IdleCurator, InMemoryAttention, ReplayEvent,
     TurnObserver, WeaverThresholds, ambient_scope_default,
@@ -1149,6 +1153,141 @@ where
 /// starts will fire. Errors from the underlying notify backend are
 /// surfaced through `tracing::warn`.
 #[allow(clippy::too_many_lines)]
+/// Bounded thread count for the initial parallel ignore-walk.
+///
+/// Half the machine's parallelism, clamped to [1, 8] — enough to saturate
+/// SSD I/O on a typical dev box without monopolising cores for the rest of
+/// the watch process or competing scans.
+fn walk_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |p| (p.get() / 2).clamp(1, 8))
+}
+
+/// Per-source minimum interval between scan-trigger kicks. Paths
+/// accumulated during a rate-limited gap are buffered and flushed on the
+/// next allowed kick.
+const KICK_RATE_LIMIT: Duration = Duration::from_secs(3);
+
+/// Filenames whose modification implies the surrounding source root's
+/// ignore rules changed, so the watch set must be reconciled. `.git/info/
+/// exclude` is intentionally omitted — it changes rarely and would require
+/// a more complex path-component test.
+fn is_ignorefile(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == ".gitignore" || n == ".ostk-recall-ignore")
+}
+
+/// Build a configured ignore walker for `root` honouring the standard
+/// gitignore stack plus the per-source `ignore` patterns.
+fn build_walk_filter(root: &Path, source: &SourceConfig, threads: usize) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(root);
+    b.standard_filters(true)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".ostk-recall-ignore")
+        .follow_links(false)
+        .threads(threads);
+    if !source.ignore.is_empty() {
+        let mut ov = ignore::overrides::OverrideBuilder::new(root);
+        for pat in &source.ignore {
+            let needs_bang = !pat.starts_with('!');
+            let normalized = if needs_bang {
+                format!("!{pat}")
+            } else {
+                pat.clone()
+            };
+            if let Err(e) = ov.add(&normalized) {
+                tracing::warn!(pattern = %pat, error = %e, "ignore: bad override pattern");
+            }
+        }
+        match ov.build() {
+            Ok(o) => {
+                b.overrides(o);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ignore: failed to build overrides");
+            }
+        }
+    }
+    b
+}
+
+/// Walk `root` in parallel and return every directory that survives the
+/// ignore filter AND the hardcoded noise-segment denylist. Excludes the
+/// root itself; the caller registers that separately.
+fn discover_watch_dirs(root: &Path, source: &SourceConfig, threads: usize) -> HashSet<PathBuf> {
+    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let builder = build_walk_filter(root, source, threads);
+    let root_owned = root.to_path_buf();
+    builder.build_parallel().run(|| {
+        let tx = tx.clone();
+        let root = root_owned.clone();
+        Box::new(move |result| {
+            if let Ok(entry) = result {
+                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    let p = entry.path();
+                    if p != root && !path_has_noise_segment(p) {
+                        let _ = tx.send(p.to_path_buf());
+                    }
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    drop(tx);
+    rx.into_iter().collect()
+}
+
+/// Per-source kick gate: rate-limits scan-trigger sends while
+/// accumulating any paths suppressed during the gap so the eventual
+/// kick covers the full window.
+#[derive(Default)]
+struct KickGate {
+    last_kick: Option<Instant>,
+    pending: Vec<PathBuf>,
+}
+
+impl KickGate {
+    fn add(&mut self, paths: Vec<PathBuf>) {
+        self.pending.extend(paths);
+    }
+
+    /// Returns Some(paths) if a kick should fire now. `paths` is the
+    /// deduped, accumulated set since the last kick; the internal buffer
+    /// is cleared on emit.
+    fn try_emit(&mut self, now: Instant) -> Option<Vec<PathBuf>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let allowed = self
+            .last_kick
+            .is_none_or(|t| now.duration_since(t) >= KICK_RATE_LIMIT);
+        if !allowed {
+            return None;
+        }
+        self.last_kick = Some(now);
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let drained = std::mem::take(&mut self.pending);
+        let unique = drained
+            .into_iter()
+            .filter(|p| seen.insert(p.clone()))
+            .collect();
+        Some(unique)
+    }
+}
+
+/// Source label used as the `KickGate` key. Falls back to the source
+/// kind when the source has no explicit `project`.
+fn source_label(source: &SourceConfig) -> String {
+    source
+        .project
+        .clone()
+        .unwrap_or_else(|| source.kind.as_str().to_string())
+}
+
+#[allow(clippy::too_many_lines)]
 pub async fn watch(config_path: &Path) -> Result<()> {
     use std::time::Duration;
 
@@ -1220,119 +1359,264 @@ pub async fn watch(config_path: &Path) -> Result<()> {
     )
     .context("creating filesystem debouncer")?;
 
+    // Tracks every directory currently subscribed for events. Mutated by
+    // the dir-create and ignorefile-rewalk handlers so dynamic discovery
+    // converges to the current `.gitignore` state without restart.
+    let mut watched_leaves: HashSet<PathBuf> = HashSet::new();
+
+    // Initial walk: full depth, parallel, NonRecursive per surviving
+    // directory. Avoids subscribing to noisy subtrees in the first place
+    // — the kernel never tells us about events under e.g.
+    // `taynik-platform/shared/node_modules/.pnpm/next@.../...` because we
+    // never asked.
+    let threads = walk_threads();
     for (root, source) in &watched_roots {
         if root.is_file() {
             debouncer
                 .watch(root, RecursiveMode::NonRecursive)
                 .with_context(|| format!("registering watch on file {}", root.display()))?;
+            watched_leaves.insert(root.clone());
             tracing::info!(path = %root.display(), "watching file");
-        } else {
-            debouncer
-                .watch(root, RecursiveMode::NonRecursive)
-                .with_context(|| format!("registering base watch on {}", root.display()))?;
-            tracing::info!(path = %root.display(), "watching base directory");
+            continue;
+        }
+        // Watch the root itself so new top-level children surface as
+        // Create events (the trigger for dynamic registration below).
+        debouncer
+            .watch(root, RecursiveMode::NonRecursive)
+            .with_context(|| format!("registering base watch on {}", root.display()))?;
+        watched_leaves.insert(root.clone());
 
-            let mut builder = ignore::WalkBuilder::new(root);
-            builder
-                .standard_filters(true)
-                .hidden(true)
-                .git_ignore(true)
-                .git_global(true)
-                .git_exclude(true)
-                .add_custom_ignore_filename(".ostk-recall-ignore")
-                .follow_links(false)
-                .max_depth(Some(1));
-
-            if !source.ignore.is_empty() {
-                let mut overrides = ignore::overrides::OverrideBuilder::new(root);
-                for pat in &source.ignore {
-                    let needs_bang = !pat.starts_with('!');
-                    let normalized = if needs_bang {
-                        format!("!{pat}")
-                    } else {
-                        pat.clone()
-                    };
-                    if let Err(e) = overrides.add(&normalized) {
-                        tracing::warn!(pattern = %pat, error = %e, "ignore: bad override pattern");
-                    }
-                }
-                match overrides.build() {
-                    Ok(o) => {
-                        builder.overrides(o);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ignore: failed to build overrides");
-                    }
-                }
-            }
-
-            for entry in builder.build().filter_map(std::result::Result::ok) {
-                let path = entry.path();
-                if path == root {
-                    continue;
-                }
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if matches!(
-                        name,
-                        ".git" | "target" | "node_modules" | ".ostk" | ".worktrees" | ".next" | "dist" | "build"
-                    ) {
-                        continue;
-                    }
-                }
-                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    debouncer
-                        .watch(path, RecursiveMode::Recursive)
-                        .with_context(|| format!("registering recursive watch on {}", path.display()))?;
-                    tracing::info!(path = %path.display(), "watching recursively");
+        let leaves = discover_watch_dirs(root, source, threads);
+        let mut registered = 0usize;
+        for leaf in leaves {
+            if watched_leaves.insert(leaf.clone()) {
+                match debouncer.watch(&leaf, RecursiveMode::NonRecursive) {
+                    Ok(()) => registered += 1,
+                    Err(e) => tracing::warn!(
+                        path = %leaf.display(),
+                        error = %e,
+                        "watch register failed; descendants under this dir won't surface events"
+                    ),
                 }
             }
         }
+        tracing::info!(
+            root = %root.display(),
+            leaves = registered,
+            "watching tree (NonRecursive per leaf)"
+        );
     }
     tracing::info!(
         socket = %socket_path.display(),
         debounce_ms = watch_cfg.debounce_ms,
         sources = watched_roots.len(),
+        watched_leaves = watched_leaves.len(),
+        walk_threads = threads,
         "scan-trigger watcher started"
     );
 
     let mode = watch_cfg.mode;
-    while let Some(result) = rx.recv().await {
-        match result {
-            Ok(events) => {
-                // Collect every matched path across the debounced batch.
-                // The same predicate that decides whether to kick decides
-                // which paths go on the wire. Dedup preserves first-seen
-                // order — line-delimited frame is order-insensitive but a
-                // stable order makes test assertions and log output
-                // friendlier.
-                let mut matched: Vec<PathBuf> = Vec::new();
-                for ev in &events {
-                    for p in &ev.event.paths {
-                        if matches_watched_root(p, &watched_roots) && !matched.contains(p) {
-                            matched.push(p.clone());
+    let mut kick_gates: HashMap<String, KickGate> = HashMap::new();
+    // 1 Hz wake-up so kick gates with pending paths flush even when no
+    // new events arrive within the rate-limit window.
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            maybe = rx.recv() => {
+                let Some(result) = maybe else { break };
+                match result {
+                    Ok(events) => {
+                        // Phase 1: dynamic registration. Each Create(dir)
+                        // event might bring a whole new subtree we should
+                        // start watching — walk it with the ignore filter
+                        // and register every survivor NonRecursive.
+                        for ev in &events {
+                            if !matches!(ev.event.kind, EventKind::Create(_)) {
+                                continue;
+                            }
+                            for p in &ev.event.paths {
+                                if path_has_noise_segment(p) || !p.is_dir() {
+                                    continue;
+                                }
+                                let Some((_, source)) = watched_roots
+                                    .iter()
+                                    .find(|(r, _)| !r.is_file() && p.starts_with(r))
+                                else {
+                                    continue;
+                                };
+                                if watched_leaves.insert(p.clone()) {
+                                    let _ = debouncer.watch(p, RecursiveMode::NonRecursive);
+                                }
+                                let sub = discover_watch_dirs(p, source, 2);
+                                for new_p in sub {
+                                    if watched_leaves.insert(new_p.clone()) {
+                                        if let Err(e) = debouncer.watch(&new_p, RecursiveMode::NonRecursive) {
+                                            tracing::warn!(
+                                                path = %new_p.display(),
+                                                error = %e,
+                                                "dynamic watch register failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Phase 2: ignorefile changes reconcile the watch
+                        // set for the affected root. A user adding
+                        // `/node_modules/` to a project's `.gitignore`
+                        // mid-session triggers an unwatch of newly-ignored
+                        // leaves; removing an exclude triggers re-add.
+                        let mut roots_to_rewalk: HashSet<PathBuf> = HashSet::new();
+                        for ev in &events {
+                            for p in &ev.event.paths {
+                                if !is_ignorefile(p) {
+                                    continue;
+                                }
+                                if let Some((root, _)) = watched_roots
+                                    .iter()
+                                    .find(|(r, _)| !r.is_file() && p.starts_with(r))
+                                {
+                                    roots_to_rewalk.insert(root.clone());
+                                }
+                            }
+                        }
+                        for root in &roots_to_rewalk {
+                            let Some((_, source)) =
+                                watched_roots.iter().find(|(r, _)| r == root)
+                            else {
+                                continue;
+                            };
+                            let target_set = discover_watch_dirs(root, source, threads);
+                            // The root itself stays watched regardless.
+                            let removed: Vec<PathBuf> = watched_leaves
+                                .iter()
+                                .filter(|p| {
+                                    p.starts_with(root)
+                                        && p.as_path() != root.as_path()
+                                        && !target_set.contains(*p)
+                                })
+                                .cloned()
+                                .collect();
+                            for p in &removed {
+                                let _ = debouncer.unwatch(p);
+                                watched_leaves.remove(p);
+                            }
+                            let mut added = 0usize;
+                            for p in &target_set {
+                                if watched_leaves.insert(p.clone())
+                                    && debouncer
+                                        .watch(p, RecursiveMode::NonRecursive)
+                                        .is_ok()
+                                {
+                                    added += 1;
+                                }
+                            }
+                            tracing::info!(
+                                root = %root.display(),
+                                removed = removed.len(),
+                                added,
+                                "ignorefile change: watch set reconciled"
+                            );
+                        }
+
+                        // Phase 3: collect matched paths grouped by source.
+                        // `matches_watched_root` already short-circuits on
+                        // noise segments, so node_modules/etc. events that
+                        // somehow slipped through (e.g. before a `.gitignore`
+                        // rewalk completed) still get dropped here.
+                        let mut by_source: HashMap<String, Vec<PathBuf>> = HashMap::new();
+                        for ev in &events {
+                            for p in &ev.event.paths {
+                                if path_has_noise_segment(p) {
+                                    continue;
+                                }
+                                for (root, source) in &watched_roots {
+                                    if !p.starts_with(root) {
+                                        continue;
+                                    }
+                                    let ext_ok = source.extensions.is_empty()
+                                        || p.extension()
+                                            .and_then(|e| e.to_str())
+                                            .is_some_and(|ext| {
+                                                source.extensions.iter().any(|x| x == ext)
+                                            });
+                                    if ext_ok {
+                                        by_source
+                                            .entry(source_label(source))
+                                            .or_default()
+                                            .push(p.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Phase 4: rate-limited kicks per source. Paths
+                        // suppressed during the rate-limit gap accumulate
+                        // in the gate so the eventual kick covers the
+                        // whole window.
+                        let now = Instant::now();
+                        for (label, paths) in by_source {
+                            let gate = kick_gates.entry(label.clone()).or_default();
+                            gate.add(paths);
+                            if let Some(to_send) = gate.try_emit(now) {
+                                let frame: &[PathBuf] = match mode {
+                                    WatchMode::Legacy => &[],
+                                    WatchMode::Incremental => &to_send,
+                                };
+                                if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
+                                    tracing::warn!(
+                                        socket = %socket_path.display(),
+                                        label = %label,
+                                        error = %e,
+                                        "scan-trigger kick failed; will retry on next event"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        label = %label,
+                                        paths = frame.len(),
+                                        "scan-trigger kicked"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(errors) => {
+                        for e in errors {
+                            tracing::warn!(error = %e, "watch backend error");
                         }
                     }
                 }
-                if matched.is_empty() {
-                    continue;
-                }
-                let frame: &[PathBuf] = match mode {
-                    WatchMode::Legacy => &[],
-                    WatchMode::Incremental => &matched,
-                };
-                if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
-                    tracing::warn!(
-                        socket = %socket_path.display(),
-                        error = %e,
-                        "scan-trigger kick failed; will retry on next event"
-                    );
-                } else {
-                    tracing::info!(paths = frame.len(), "scan-trigger kicked");
-                }
             }
-            Err(errors) => {
-                for e in errors {
-                    tracing::warn!(error = %e, "watch backend error");
+            _ = tick.tick() => {
+                // Wake-up flush: catches paths that landed in a kick gate
+                // during a rate-limited gap when no new events arrived to
+                // re-drive the loop.
+                let now = Instant::now();
+                for (label, gate) in &mut kick_gates {
+                    let Some(to_send) = gate.try_emit(now) else { continue };
+                    let frame: &[PathBuf] = match mode {
+                        WatchMode::Legacy => &[],
+                        WatchMode::Incremental => &to_send,
+                    };
+                    if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
+                        tracing::warn!(
+                            socket = %socket_path.display(),
+                            label = %label,
+                            error = %e,
+                            "scan-trigger flush-kick failed; will retry on next tick"
+                        );
+                    } else {
+                        tracing::info!(
+                            label = %label,
+                            paths = frame.len(),
+                            "scan-trigger kicked (flush)"
+                        );
+                    }
                 }
             }
         }
@@ -1367,37 +1651,6 @@ fn path_has_noise_segment(path: &Path) -> bool {
             .to_str()
             .is_some_and(|s| NOISE_PATH_SEGMENTS.contains(&s))
     })
-}
-
-/// True if `path` falls under one of the watched roots AND, if that
-/// root's source has a non-empty `extensions` filter, the path's
-/// extension is in the filter. Roots without an extensions filter
-/// match every path under them.
-///
-/// Returns false immediately if `path` contains any
-/// [`NOISE_PATH_SEGMENTS`] component anywhere — those events ride along
-/// under recursive watches that the depth-1 ignore filter at watch
-/// registration can't suppress.
-fn matches_watched_root(path: &Path, roots: &[(PathBuf, SourceConfig)]) -> bool {
-    if path_has_noise_segment(path) {
-        return false;
-    }
-    for (root, source) in roots {
-        if !path.starts_with(root) {
-            continue;
-        }
-        if source.extensions.is_empty() {
-            return true;
-        }
-        let ext_ok = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| source.extensions.iter().any(|x| x == ext));
-        if ext_ok {
-            return true;
-        }
-    }
-    false
 }
 
 /// Connect to the scan-trigger surface, write `paths` line-delimited
