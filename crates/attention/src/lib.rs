@@ -211,6 +211,20 @@ pub trait AttentionForwardStore: Send + Sync {
     async fn score_thread(&self, _handle: &ThreadHandle) -> Result<f32, AttentionError> {
         Ok(0.0)
     }
+
+    /// Current attention vector for the scope. The in-memory runtime
+    /// returns the latest `attend(scope, …)` write; stores without
+    /// per-scope state return `None`.
+    ///
+    /// Used by `attention-biased recall` to blend hybrid retrieval
+    /// scores with cosine similarity to the caller's current focus.
+    /// Default `None` keeps the trait additive for non-state stores.
+    async fn scope_vector(
+        &self,
+        _scope: &AttentionScope,
+    ) -> Result<Option<Vec<f32>>, AttentionError> {
+        Ok(None)
+    }
 }
 
 // --- in-memory implementation -----------------------------------------
@@ -523,6 +537,25 @@ impl AttentionForwardStore for InMemoryAttention {
             best = Some(best.map_or(score, |b| b.max(score)));
         }
         Ok(best.unwrap_or(0.0))
+    }
+
+    /// Return the current attention vector for the scope, or `None`
+    /// when the scope has never been attended to (so no `attend(...)`
+    /// has populated a vector yet). Returns an empty vec as `None` —
+    /// callers ranking by cosine treat an unattended scope as a no-op.
+    async fn scope_vector(
+        &self,
+        scope: &AttentionScope,
+    ) -> Result<Option<Vec<f32>>, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let inner = self.inner.read().await;
+        let Some(state) = inner.scopes.get(&key) else {
+            return Ok(None);
+        };
+        if state.attention_vec.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(state.attention_vec.clone()))
     }
 }
 

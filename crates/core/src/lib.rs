@@ -25,7 +25,8 @@ pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};
 pub use types::{
-    AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats,
+    AttentionBiasParams, AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats,
+    RerankerStats,
     SourceCount, SynthesizedPage,
 };
 

@@ -13,6 +13,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Attention-biased recall (Task #6 — the inflection point).**
+  Optional `attention_bias: { scope, weight }` rider on `RecallParams`.
+  When present, every hit's chunk_id is looked up in the threads graph
+  (via the new `ThreadsDb::find_threads_for_chunk` —
+  `anchor_chunk_id == chunk_id` ∪ `evidence_links.last_resolved_chunk_id`),
+  the max `score_thread(handle)` across those threads becomes the
+  hit's `attention_score` (clamped to `[0, 1]`), and the final ranking
+  uses `score = base_score + weight * attention_score`. Each hit now
+  carries decomposable attribution — `base_score`, `attention_score`,
+  `attention_weight` — when bias is applied; without bias, behavior is
+  unchanged and the new fields stay `None`.
+
+  This is the architectural transition the post-v0.4.0 hand-off named:
+  the substrate stops being a memory store and starts being a thinking
+  partner — corpus hits get reordered by what the operator is attending
+  to right now, with full attribution visible on every row.
+
+- New `AttentionForwardStore::scope_vector(scope)` trait method (default
+  `Ok(None)`) — overridden on `InMemoryAttention` to expose the current
+  attention vector. Not used by the v0.4.2 thread-mediated bias path,
+  but in place for a future embedding-mediated variant.
+- New `ThreadsDb::find_threads_for_chunk(chunk_id)` — lookup union of
+  `threads.anchor_chunk_id` and `evidence_links.last_resolved_chunk_id`.
+- `RecallParams.attention_bias: Option<AttentionBiasParams>` and three
+  new optional fields on `RecallHit` (`base_score`, `attention_score`,
+  `attention_weight`). Wire format additive: existing clients see no
+  change.
+- Three new tests in `crates/mcp/src/server.rs`:
+  `bias_lifts_anchored_hit_above_unrelated_hit` (the load-bearing
+  case — equal base scores, one anchored, anchored ranks higher),
+  `bias_with_zero_weight_preserves_order_and_scores` (weight=0 is
+  identity), `bias_with_no_anchor_leaves_score_unchanged` (no
+  accidental re-rank for chunks without anchoring threads). Workspace
+  gate: 336/0 (was 333/0).
+
 - **`thread_evidence` MCP verb (v0.4.2).** Action-routed surface
   exposing the v0.4.x `thread_thread_links` graph through MCP. Single
   tool, three actions: `add` (from, to, category, note? → id +

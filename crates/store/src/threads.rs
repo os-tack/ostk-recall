@@ -803,6 +803,38 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(())
     }
 
+    /// Return every thread handle that anchors on the given `chunk_id`
+    /// or has an evidence link whose `last_resolved_chunk_id` matches.
+    /// Used by attention-biased recall to lift hits whose chunk is
+    /// already cited by a thread the operator is paying attention to.
+    /// Deduplicated and sorted lexicographically.
+    pub fn find_threads_for_chunk(&self, chunk_id: &str) -> Result<Vec<ThreadHandle>> {
+        let conn = self.lock();
+        let mut handles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT handle FROM threads WHERE anchor_chunk_id = ?")?;
+            let rows = stmt.query_map(params![chunk_id], |r| r.get::<_, String>(0))?;
+            for h in rows {
+                handles.insert(h?);
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT thread_handle FROM evidence_links \
+                 WHERE last_resolved_chunk_id = ?",
+            )?;
+            let rows = stmt.query_map(params![chunk_id], |r| r.get::<_, String>(0))?;
+            for h in rows {
+                handles.insert(h?);
+            }
+        }
+        Ok(handles
+            .into_iter()
+            .filter_map(|h| ThreadHandle::new(h).ok())
+            .collect())
+    }
+
     pub fn get_thread(&self, handle: &ThreadHandle) -> Result<Option<ThreadRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(

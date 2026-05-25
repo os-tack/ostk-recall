@@ -143,6 +143,9 @@ mod tests {
             extra: serde_json::Value::Null,
             stale,
             role: None,
+            base_score: None,
+            attention_score: None,
+            attention_weight: None,
         }
     }
 

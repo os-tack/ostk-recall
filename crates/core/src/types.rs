@@ -9,9 +9,30 @@
 //! in v0.1.5 (cut #3 prep, →1848). The query crate keeps `pub use` re-exports
 //! for backward compatibility with existing consumers.
 
+use crate::attention::AttentionScope;
 use crate::{ContextRole, Links, RecallIntent};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Optional attention-bias rider for [`RecallParams`].
+///
+/// When present, the recall surface re-scores each hit by blending the
+/// base hybrid score with the cosine similarity between the hit's
+/// embedding and the scope's current in-memory attention vector
+/// (`InMemoryAttention::scope_vector`). The result is honest
+/// thinking-partner behaviour: what you're attending to right now lifts
+/// the relevant hits without the substrate forming an opinion about
+/// what "relevant" means.
+///
+/// Composition: `final_score = base_score + weight * attention_score`,
+/// with `attention_score ∈ [0, 1]` (cosine clamped to non-negative).
+/// `weight = 0.0` is identity; a sensible starting point is around
+/// `0.5–1.0` depending on how aggressive the bias should be.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionBiasParams {
+    pub scope: AttentionScope,
+    pub weight: f32,
+}
 
 /// Parameters for the `recall` tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,6 +54,11 @@ pub struct RecallParams {
     /// Intent-driven weighting for retrieval.
     #[serde(default)]
     pub intent: RecallIntent,
+    /// Optional attention-bias rider. See [`AttentionBiasParams`].
+    /// `None` is the historical behaviour: hits are ranked by the
+    /// hybrid score alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_bias: Option<AttentionBiasParams>,
 }
 
 /// One retrieval row, shaped for MCP consumers.
@@ -60,6 +86,20 @@ pub struct RecallHit {
     /// The role this hit plays in a synthesized page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<ContextRole>,
+    /// Hybrid-retrieval score before attention bias was applied.
+    /// `None` when no bias was applied (then `score` is the base).
+    /// When set, `score == base_score + attention_weight * attention_score`
+    /// (within float tolerance) — argue with the math, not the vibe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_score: Option<f32>,
+    /// Cosine similarity of the hit's embedding to the scope's current
+    /// in-memory attention vector, clamped to `[0, 1]`. Only present
+    /// when `RecallParams.attention_bias` was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_score: Option<f32>,
+    /// Echo of `AttentionBiasParams.weight` for caller-side reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_weight: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

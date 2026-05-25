@@ -435,6 +435,9 @@ mod tests {
             extra: serde_json::Value::Null,
             stale: false,
             role: None,
+            base_score: None,
+            attention_score: None,
+            attention_weight: None,
         }
     }
 
@@ -526,6 +529,9 @@ mod tests {
             extra: serde_json::Value::Null,
             stale: false,
             role: None,
+            base_score: None,
+            attention_score: None,
+            attention_weight: None,
         }
     }
 
@@ -616,6 +622,9 @@ mod tests {
                 extra: serde_json::Value::Null,
                 stale: false,
                 role: None,
+                base_score: None,
+                attention_score: None,
+                attention_weight: None,
             },
             RecallHit {
                 chunk_id: "code1".into(),
@@ -629,6 +638,9 @@ mod tests {
                 extra: serde_json::Value::Null,
                 stale: false,
                 role: None,
+                base_score: None,
+                attention_score: None,
+                attention_weight: None,
             },
         ];
         let out = boost_code_for_identifier_queries("alloc_page", candidates);
@@ -653,6 +665,9 @@ mod tests {
                 extra: serde_json::Value::Null,
                 stale: false,
                 role: None,
+                base_score: None,
+                attention_score: None,
+                attention_weight: None,
             },
             RecallHit {
                 chunk_id: "code1".into(),
@@ -666,6 +681,9 @@ mod tests {
                 extra: serde_json::Value::Null,
                 stale: false,
                 role: None,
+                base_score: None,
+                attention_score: None,
+                attention_weight: None,
             },
         ];
         let out = boost_code_for_identifier_queries("how do we wire the reranker", candidates);

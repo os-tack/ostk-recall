@@ -6,7 +6,10 @@ use ostk_recall_attention_mcp::{
     AttentionDispatch, AttentionHandlersError, DefaultAttentionHandlers, attention_tools,
     thread_tools,
 };
-use ostk_recall_query::{QueryEngine, QueryError, RecallParams, SynthesizedPage, Synthesizer};
+use ostk_recall_core::AttentionBiasParams;
+use ostk_recall_query::{
+    QueryEngine, QueryError, RecallHit, RecallParams, SynthesizedPage, Synthesizer,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};
@@ -167,7 +170,13 @@ impl Server {
             "recall" => {
                 let p: RecallParams = serde_json::from_value(args.clone())
                     .map_err(|e| JsonRpcError::invalid_params(format!("recall args: {e}")))?;
-                let hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                let bias = p.attention_bias.clone();
+                let mut hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                if let Some(bias) = bias {
+                    if let Some(dispatch) = self.attention.as_ref() {
+                        apply_attention_bias(&mut hits, &bias, dispatch).await;
+                    }
+                }
                 json!({ "hits": hits })
             }
             "recall_link" => {
@@ -285,6 +294,77 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Re-rank recall hits by what the caller is attending to right now.
+///
+/// For each hit, look up every thread that anchors on its chunk or
+/// has an evidence link resolved to it, then take the max
+/// `score_thread(handle)` from the in-memory attention store. The hit
+/// keeps its original `score` in `base_score`, gains `attention_score`
+/// (clamped to `[0, 1]`) and `attention_weight`, and ends up with
+/// `score = base_score + attention_weight * attention_score`. Hits
+/// with no anchoring thread get `attention_score = 0.0` and ride on
+/// their base score alone.
+///
+/// Discipline: this is the operator's lens, not the substrate's.
+/// `weight = 0.0` is identity; non-zero weights blend visibly through
+/// the per-hit attribution. Resort is stable on `score` descending.
+async fn apply_attention_bias(
+    hits: &mut Vec<RecallHit>,
+    bias: &AttentionBiasParams,
+    dispatch: &ostk_recall_attention_mcp::AttentionDispatch,
+) {
+    use ostk_recall_core::attention::ThreadHandle;
+
+    if hits.is_empty() {
+        return;
+    }
+    let weight = if bias.weight.is_finite() && bias.weight >= 0.0 {
+        bias.weight
+    } else {
+        0.0
+    };
+
+    for hit in hits.iter_mut() {
+        let base = hit.score;
+        let handles = match dispatch.threads.find_threads_for_chunk(&hit.chunk_id) {
+            Ok(h) => h,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chunk_id = %hit.chunk_id,
+                    "attention-bias: find_threads_for_chunk failed; treating as 0"
+                );
+                Vec::<ThreadHandle>::new()
+            }
+        };
+        let mut max_thread_score = 0.0_f32;
+        for handle in &handles {
+            match dispatch.attention.score_thread(handle).await {
+                Ok(s) if s.is_finite() && s > max_thread_score => max_thread_score = s,
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        handle = %handle,
+                        "attention-bias: score_thread failed; treating as 0"
+                    );
+                }
+            }
+        }
+        let attention = max_thread_score.clamp(0.0, 1.0);
+        hit.base_score = Some(base);
+        hit.attention_score = Some(attention);
+        hit.attention_weight = Some(weight);
+        hit.score = base + weight * attention;
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn query_error_to_rpc(err: QueryError) -> JsonRpcError {
     match err {
         QueryError::Forbidden(msg) => JsonRpcError::invalid_params(msg),
@@ -307,4 +387,172 @@ fn named_page_value(page: &SynthesizedPage) -> std::result::Result<Value, serde_
     let name = format!("recall:{slug}");
     let content = serde_json::to_string(page)?;
     Ok(json!({ "name": name, "content": content }))
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod attention_bias_tests {
+    use super::*;
+    use ostk_recall_attention::{AttentionForwardStore, InMemoryAttention};
+    use ostk_recall_attention_mcp::AttentionDispatch;
+    use ostk_recall_core::Links;
+    use ostk_recall_core::attention::{AttentionScope, PrivacyTier, ThreadHandle};
+    use ostk_recall_store::{TensionState, ThreadRecord, ThreadsDb};
+    use tempfile::TempDir;
+
+    fn scope() -> AttentionScope {
+        AttentionScope {
+            project: Some("p".into()),
+            session_id: Some("s".into()),
+            agent: Some("test".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        }
+    }
+
+    fn hit(chunk_id: &str, score: f32) -> RecallHit {
+        RecallHit {
+            chunk_id: chunk_id.into(),
+            project: Some("p".into()),
+            source: "markdown".into(),
+            source_id: format!("{chunk_id}.md"),
+            ts: None,
+            snippet: format!("text-{chunk_id}"),
+            score,
+            links: Links::default(),
+            extra: serde_json::Value::Null,
+            stale: false,
+            role: None,
+            base_score: None,
+            attention_score: None,
+            attention_weight: None,
+        }
+    }
+
+    async fn build_dispatch() -> (TempDir, Arc<AttentionDispatch>) {
+        let tmp = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp.path()).unwrap());
+        let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+        (
+            tmp,
+            Arc::new(AttentionDispatch::new(attention, threads)),
+        )
+    }
+
+    /// Seed a thread anchored to a chunk + light up its in-memory score.
+    async fn seed_anchored_thread(
+        d: &AttentionDispatch,
+        handle_str: &str,
+        anchor_chunk: &str,
+    ) -> ThreadHandle {
+        let handle = ThreadHandle::new(handle_str).unwrap();
+        let now = chrono::Utc::now();
+        d.threads
+            .upsert_thread(&ThreadRecord {
+                handle: handle.clone(),
+                tension: TensionState::Active,
+                familiarity: 0,
+                last_touched_at: now,
+                anchor_chunk_id: Some(anchor_chunk.into()),
+                fold_override: None,
+                created_at: now,
+                created_scope_key: None,
+                privacy_tier: PrivacyTier::T1Project,
+            })
+            .unwrap();
+        // attend + familiarize so the InMemoryAttention has a non-zero
+        // score for the handle. Bump familiarity multiple times so the
+        // floor stays above ARCHIVE_THRESHOLD.
+        d.attention.attend(&scope(), "active context").await.unwrap();
+        for _ in 0..5 {
+            d.attention.familiarize(&scope(), &handle).await.unwrap();
+        }
+        let score = d.attention.score_thread(&handle).await.unwrap();
+        assert!(
+            score > 0.0,
+            "seed_anchored_thread: score must be positive ({score})"
+        );
+        handle
+    }
+
+    #[tokio::test]
+    async fn bias_lifts_anchored_hit_above_unrelated_hit() {
+        let (_tmp, d) = build_dispatch().await;
+        let _h = seed_anchored_thread(&d, "fade-is-concentration", "anchored").await;
+
+        // Two hits with equal base scores; one anchored, one not.
+        let mut hits = vec![hit("anchored", 0.5), hit("unrelated", 0.5)];
+        let bias = AttentionBiasParams {
+            scope: scope(),
+            weight: 1.0,
+        };
+        apply_attention_bias(&mut hits, &bias, &d).await;
+
+        // Resorted: the anchored hit is first.
+        assert_eq!(hits[0].chunk_id, "anchored");
+        assert_eq!(hits[1].chunk_id, "unrelated");
+
+        // Anchored hit gained an attention contribution.
+        let a = &hits[0];
+        assert_eq!(a.base_score, Some(0.5));
+        assert!(a.attention_score.unwrap() > 0.0);
+        assert_eq!(a.attention_weight, Some(1.0));
+        // Math is decomposable: score == base_score + weight * attention_score
+        let expected = a.base_score.unwrap()
+            + a.attention_weight.unwrap() * a.attention_score.unwrap();
+        assert!(
+            (a.score - expected).abs() < 1e-5,
+            "score must equal base + weight*attention (got {} vs expected {expected})",
+            a.score
+        );
+
+        // Unrelated hit is fully attributed too; attention_score is 0.
+        let u = &hits[1];
+        assert_eq!(u.base_score, Some(0.5));
+        assert_eq!(u.attention_score, Some(0.0));
+        assert_eq!(u.score, 0.5);
+    }
+
+    #[tokio::test]
+    async fn bias_with_zero_weight_preserves_order_and_scores() {
+        let (_tmp, d) = build_dispatch().await;
+        seed_anchored_thread(&d, "abi-as-sovereign-boundary", "anchored").await;
+
+        let mut hits = vec![hit("anchored", 0.5), hit("unrelated", 0.7)];
+        let bias = AttentionBiasParams {
+            scope: scope(),
+            weight: 0.0,
+        };
+        apply_attention_bias(&mut hits, &bias, &d).await;
+
+        // weight=0 is identity on score. The base_score / attention_score
+        // fields are still populated for caller-side reasoning, but the
+        // final scores (and therefore the rank) are unchanged from the
+        // pre-bias state.
+        assert_eq!(hits[0].chunk_id, "unrelated");
+        assert_eq!(hits[0].score, 0.7);
+        assert_eq!(hits[1].chunk_id, "anchored");
+        assert_eq!(hits[1].score, 0.5);
+        for h in &hits {
+            assert_eq!(h.attention_weight, Some(0.0));
+            assert!(h.base_score.is_some());
+            assert!(h.attention_score.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn bias_with_no_anchor_leaves_score_unchanged() {
+        // A hit whose chunk has no anchoring thread carries
+        // attention_score=0 and its final score equals its base score
+        // regardless of `weight`. Proves the bias is local to anchored
+        // hits — it doesn't accidentally re-rank the whole list.
+        let (_tmp, d) = build_dispatch().await;
+        let mut hits = vec![hit("alpha", 0.6)];
+        let bias = AttentionBiasParams {
+            scope: scope(),
+            weight: 2.0,
+        };
+        apply_attention_bias(&mut hits, &bias, &d).await;
+        assert_eq!(hits[0].score, 0.6);
+        assert_eq!(hits[0].attention_score, Some(0.0));
+    }
 }

@@ -100,6 +100,9 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
             extra,
             stale: is_stale,
             role: None,
+            base_score: None,
+            attention_score: None,
+            attention_weight: None,
         });
     }
 
