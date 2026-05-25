@@ -1340,11 +1340,48 @@ pub async fn watch(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Path segments that should never trigger a scan even when they
+/// fall under a watched root. The depth-1 ignore filter applied at
+/// debouncer registration catches direct children, but nested
+/// occurrences (e.g. `<project>/shared/node_modules/...`) ride along
+/// under the parent's recursive watch and produce a flood of
+/// scan-trigger kicks for content that `scan()` would itself reject.
+///
+/// Matching is segment-exact (`node_modules` matches `/foo/node_modules/bar`
+/// but not `/foo/anode_modules/bar`).
+const NOISE_PATH_SEGMENTS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".ostk",
+    ".worktrees",
+    ".next",
+    "dist",
+    "build",
+];
+
+/// True if any component of `path` matches a noise segment exactly.
+fn path_has_noise_segment(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| NOISE_PATH_SEGMENTS.contains(&s))
+    })
+}
+
 /// True if `path` falls under one of the watched roots AND, if that
 /// root's source has a non-empty `extensions` filter, the path's
 /// extension is in the filter. Roots without an extensions filter
 /// match every path under them.
+///
+/// Returns false immediately if `path` contains any
+/// [`NOISE_PATH_SEGMENTS`] component anywhere — those events ride along
+/// under recursive watches that the depth-1 ignore filter at watch
+/// registration can't suppress.
 fn matches_watched_root(path: &Path, roots: &[(PathBuf, SourceConfig)]) -> bool {
+    if path_has_noise_segment(path) {
+        return false;
+    }
     for (root, source) in roots {
         if !path.starts_with(root) {
             continue;
