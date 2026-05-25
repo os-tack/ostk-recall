@@ -233,6 +233,28 @@ pub fn tool_thread_attention() -> Value {
     })
 }
 
+pub fn tool_thread_novelty() -> Value {
+    json!({
+        "name": "thread_novelty",
+        "description": "Divergence-from-baseline novelty surface. Scores recent chunks by `1 - cos(embedding, project_baseline)` (high = unlike baseline = novel), then re-clusters the top-K through the same density guard the emergent surface uses. Returns clusters of coherent novel chunks, sorted by mean novelty. Empty result is the expected null state when nothing novel enough surfaces — pair with thread_attention for the activity-burst complement.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_hours": { "type": "integer", "minimum": 1,
+                                  "description": "Look-back window in hours. Default 24." },
+                "baseline_days": { "type": "integer", "minimum": 1,
+                                    "description": "Per-project baseline window in days. Default 7." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100,
+                            "description": "Max clusters returned. Default 10." },
+                "min_cluster": { "type": "integer", "minimum": 2,
+                                  "description": "Minimum members per surfaced cluster. Default matches cluster::MIN_CLUSTER_SIZE (3)." },
+                "recluster_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0,
+                                          "description": "Re-cluster cosine threshold. Default matches cluster::EMERGENT_THRESHOLD (0.82)." }
+            }
+        }
+    })
+}
+
 /// Names of all attention-namespace tools (used by tests + introspection).
 pub const ATTENTION_TOOL_NAMES: &[&str] = &[
     "attention_attend",
@@ -251,6 +273,7 @@ pub const THREAD_TOOL_NAMES: &[&str] = &[
     "thread_list",
     "thread_emergent",
     "thread_attention",
+    "thread_novelty",
 ];
 
 #[must_use]
@@ -274,6 +297,7 @@ pub fn thread_tools() -> Vec<Value> {
         tool_thread_list(),
         tool_thread_emergent(),
         tool_thread_attention(),
+        tool_thread_novelty(),
     ]
 }
 

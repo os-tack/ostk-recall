@@ -24,6 +24,13 @@ use ostk_recall_attention::emergent::{
     DEFAULT_LIMIT as EMERGENT_DEFAULT_LIMIT, DEFAULT_MIN_CLUSTER_SIZE,
     DEFAULT_SINCE_HOURS as EMERGENT_DEFAULT_SINCE_HOURS, EmergentError, discover_and_surface,
 };
+use ostk_recall_attention::novelty::{
+    DEFAULT_BASELINE_DAYS as NOVELTY_DEFAULT_BASELINE_DAYS,
+    DEFAULT_LIMIT as NOVELTY_DEFAULT_LIMIT,
+    DEFAULT_MIN_CLUSTER as NOVELTY_DEFAULT_MIN_CLUSTER,
+    DEFAULT_RECLUSTER_THRESHOLD as NOVELTY_DEFAULT_RECLUSTER_THRESHOLD,
+    DEFAULT_SINCE_HOURS as NOVELTY_DEFAULT_SINCE_HOURS, NoveltyError, surface_novelty,
+};
 use ostk_recall_attention::{AttentionError, AttentionForwardStore};
 use ostk_recall_core::{
     AttentionPage, AttentionScope, FoldDepth, PrivacyTier, ThreadHandle, ThreadHandleError,
@@ -55,6 +62,8 @@ pub enum AttentionHandlersError {
     Emergent(#[from] EmergentError),
     #[error("attention surfacing failed: {0}")]
     Attention2(#[from] AttentionBurstError),
+    #[error("novelty surfacing failed: {0}")]
+    Novelty(#[from] NoveltyError),
 }
 
 /// Bag of dependencies threaded through every dispatch call.
@@ -124,6 +133,7 @@ impl DefaultAttentionHandlers for AttentionDispatch {
             "thread_list" => thread_list(self, args).await,
             "thread_emergent" => thread_emergent(self, args).await,
             "thread_attention" => thread_attention(self, args).await,
+            "thread_novelty" => thread_novelty(self, args).await,
             other => Err(AttentionHandlersError::InvalidParams(format!(
                 "unknown attention/thread tool: {other}"
             ))),
@@ -550,6 +560,98 @@ pub async fn thread_attention(
             "limit": limit,
             "samples_per_burst": samples_per_burst,
             "decay_hours": decay_hours,
+        }
+    }))
+}
+
+/// Divergence-from-baseline novelty surface.
+///
+/// Complement to [`thread_attention`] (the activity-burst "where's the
+/// focus" view) and [`thread_emergent`] (the embedding-density cluster
+/// view). Novelty answers "what's a new direction" — scores each
+/// recent chunk as `1 - cos(embedding, project_baseline)` and surfaces
+/// only clusters that pass the same density bar emergent uses.
+///
+/// Arguments (all optional):
+/// - `since_hours: u32` — recency window. Default
+///   [`NOVELTY_DEFAULT_SINCE_HOURS`] (24h).
+/// - `baseline_days: u32` — per-project baseline window. Default
+///   [`NOVELTY_DEFAULT_BASELINE_DAYS`] (7d).
+/// - `limit: usize` — max clusters returned. Default
+///   [`NOVELTY_DEFAULT_LIMIT`] (10).
+/// - `min_cluster: usize` — minimum members per surfaced cluster.
+///   Default [`NOVELTY_DEFAULT_MIN_CLUSTER`] (matches
+///   `cluster::MIN_CLUSTER_SIZE`).
+/// - `recluster_threshold: f32` — re-cluster cosine threshold. Default
+///   [`NOVELTY_DEFAULT_RECLUSTER_THRESHOLD`] (matches
+///   `cluster::EMERGENT_THRESHOLD`).
+///
+/// Returns `{ "clusters": [...], "params": {...} }`. Empty `clusters`
+/// is the expected null state when nothing novel enough surfaces.
+pub async fn thread_novelty(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let Some(corpus) = d.corpus.as_ref() else {
+        return Err(AttentionHandlersError::CorpusUnavailable);
+    };
+    let since_hours = args
+        .get("since_hours")
+        .and_then(Value::as_u64)
+        .and_then(|n| i64::try_from(n).ok())
+        .unwrap_or(NOVELTY_DEFAULT_SINCE_HOURS);
+    let baseline_days = args
+        .get("baseline_days")
+        .and_then(Value::as_u64)
+        .and_then(|n| i64::try_from(n).ok())
+        .unwrap_or(NOVELTY_DEFAULT_BASELINE_DAYS);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(NOVELTY_DEFAULT_LIMIT);
+    let min_cluster = args
+        .get("min_cluster")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(NOVELTY_DEFAULT_MIN_CLUSTER);
+    #[allow(clippy::cast_possible_truncation)]
+    let recluster_threshold = args
+        .get("recluster_threshold")
+        .and_then(Value::as_f64)
+        .map_or(NOVELTY_DEFAULT_RECLUSTER_THRESHOLD, |v| v as f32);
+
+    let since = Utc::now() - ChronoDuration::hours(since_hours);
+    let reports = surface_novelty(
+        corpus,
+        since,
+        baseline_days,
+        limit,
+        min_cluster,
+        recluster_threshold,
+    )
+    .await?;
+
+    let clusters: Vec<Value> = reports
+        .into_iter()
+        .map(|r| {
+            json!({
+                "project": r.project,
+                "members": r.members,
+                "mean_novelty": r.mean_novelty,
+                "max_novelty": r.max_novelty,
+                "samples": r.samples,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "clusters": clusters,
+        "params": {
+            "since_hours": since_hours,
+            "baseline_days": baseline_days,
+            "limit": limit,
+            "min_cluster": min_cluster,
+            "recluster_threshold": recluster_threshold,
         }
     }))
 }

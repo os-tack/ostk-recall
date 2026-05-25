@@ -475,6 +475,182 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Sibling of [`Self::sample_recent_chunks`] that also returns the
+    /// `project` column alongside `(chunk_id, embedding)`. Used by the
+    /// novelty surface to look up per-project baselines without a
+    /// separate fetch.
+    pub async fn sample_recent_chunks_with_project(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>, Vec<f32>)>> {
+        use arrow_array::Array;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let filter = format!(
+            "stale = false AND ts >= TIMESTAMP '{}'",
+            since.format("%Y-%m-%d %H:%M:%S")
+        );
+        let stream = table
+            .query()
+            .only_if(filter)
+            .limit(limit)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "project".into(),
+                "embedding".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut out: Vec<(String, Option<String>, Vec<f32>)> = Vec::new();
+        for batch in &batches {
+            let id_arr = column_as_str(batch, "chunk_id")?;
+            let proj_arr = column_as_str(batch, "project")?;
+            let emb_col = batch.column_by_name("embedding").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "embedding column missing in projection".into(),
+                ))
+            })?;
+            let emb_arr = emb_col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding expected to be FixedSizeList".into(),
+                    ))
+                })?;
+            let f32_values = emb_arr
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding inner expected to be Float32".into(),
+                    ))
+                })?;
+            let dim = usize::try_from(emb_arr.value_length()).map_err(|_| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                    "embedding value_length not representable as usize: {}",
+                    emb_arr.value_length()
+                )))
+            })?;
+            for i in 0..batch.num_rows() {
+                if emb_arr.is_null(i) {
+                    continue;
+                }
+                let start = i * dim;
+                let slice = &f32_values.values()[start..start + dim];
+                let project = if proj_arr.is_null(i) {
+                    None
+                } else {
+                    Some(proj_arr.value(i).to_string())
+                };
+                out.push((id_arr.value(i).to_string(), project, slice.to_vec()));
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compute the component-wise mean of `embedding` over non-stale
+    /// chunks ingested within the last `days` days, optionally filtered
+    /// to a single `project`. Returns `Ok(None)` when fewer than 10
+    /// qualifying chunks exist — the caller (novelty surface) falls
+    /// back to the global baseline in that case.
+    ///
+    /// Streams the embedding column; never materialises individual
+    /// vectors beyond a single accumulator of size `self.dim`.
+    pub async fn project_baseline_mean(
+        &self,
+        project: Option<&str>,
+        days: i64,
+    ) -> Result<Option<Vec<f32>>> {
+        use arrow_array::Array;
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+        let mut filter = format!(
+            "stale = false AND ts >= TIMESTAMP '{}'",
+            cutoff.format("%Y-%m-%d %H:%M:%S")
+        );
+        if let Some(p) = project {
+            filter.push_str(&format!(" AND project = '{}'", escape_sql(p)));
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["embedding".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        let mut sum: Vec<f64> = vec![0.0; self.dim];
+        let mut count: u64 = 0;
+        for batch in &batches {
+            let emb_col = batch.column_by_name("embedding").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "embedding column missing in projection".into(),
+                ))
+            })?;
+            let emb_arr = emb_col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding expected to be FixedSizeList".into(),
+                    ))
+                })?;
+            let f32_values = emb_arr
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding inner expected to be Float32".into(),
+                    ))
+                })?;
+            let dim = usize::try_from(emb_arr.value_length()).map_err(|_| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                    "embedding value_length not representable as usize: {}",
+                    emb_arr.value_length()
+                )))
+            })?;
+            if dim != self.dim {
+                return Err(StoreError::DimMismatch {
+                    have: dim,
+                    want: self.dim,
+                });
+            }
+            for i in 0..batch.num_rows() {
+                if emb_arr.is_null(i) {
+                    continue;
+                }
+                let start = i * dim;
+                let slice = &f32_values.values()[start..start + dim];
+                for (slot, x) in sum.iter_mut().zip(slice.iter()) {
+                    *slot += f64::from(*x);
+                }
+                count += 1;
+            }
+        }
+
+        if count < 10 {
+            return Ok(None);
+        }
+        // f64 accumulator → f32 mean. The mean magnitude is bounded by
+        // the embedding magnitude (unit-ish), so f32 precision is fine.
+        #[allow(clippy::cast_possible_truncation)]
+        let inv = 1.0_f64 / count as f64;
+        let mean: Vec<f32> = sum.into_iter().map(|s| (s * inv) as f32).collect();
+        Ok(Some(mean))
+    }
+
     /// Mark a batch of chunks as stale by their unique `chunk_id`.
     pub async fn mark_chunks_stale(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {
@@ -959,5 +1135,143 @@ mod tests {
         assert!(read_stale_for(&store, "a").await, "a should be stale");
         assert!(!read_stale_for(&store, "b").await, "b should NOT be stale");
         assert!(read_stale_for(&store, "c").await, "c should be stale");
+    }
+
+    fn chunk_with(id: &str, project: &str, ts: chrono::DateTime<chrono::Utc>) -> Chunk {
+        Chunk {
+            chunk_id: id.to_string(),
+            source: Source::Markdown,
+            project: Some(project.to_string()),
+            source_id: format!("{id}.md"),
+            chunk_index: 0,
+            ts: Some(ts),
+            role: None,
+            text: format!("text-{id}"),
+            sha256: Chunk::content_hash(id),
+            links: Links::default(),
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn project_baseline_mean_returns_none_below_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let mut chunks = Vec::new();
+        let mut embs = Vec::new();
+        for i in 0..9_u32 {
+            chunks.push(chunk_with(&format!("c{i}"), "alpha", now));
+            embs.push(vec![1.0_f32, 0.0, 0.0, 0.0]);
+        }
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        let out = store.project_baseline_mean(Some("alpha"), 7).await.unwrap();
+        assert!(out.is_none(), "9 chunks must be below the 10-chunk floor");
+    }
+
+    #[tokio::test]
+    async fn project_baseline_mean_computes_exact_mean() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let mut chunks = Vec::new();
+        let mut embs = Vec::new();
+        // 10 unit vectors on axis 0 + 10 on axis 1, all project=alpha.
+        for i in 0..10_u32 {
+            chunks.push(chunk_with(&format!("a{i}"), "alpha", now));
+            embs.push(vec![1.0_f32, 0.0, 0.0, 0.0]);
+        }
+        for i in 0..10_u32 {
+            chunks.push(chunk_with(&format!("b{i}"), "alpha", now));
+            embs.push(vec![0.0_f32, 1.0, 0.0, 0.0]);
+        }
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        let mean = store
+            .project_baseline_mean(Some("alpha"), 7)
+            .await
+            .unwrap()
+            .expect("20 chunks → Some(mean)");
+        assert_eq!(mean.len(), 4);
+        // Each axis sums 10 -> mean 0.5; remaining axes 0.
+        assert!((mean[0] - 0.5).abs() < 1e-6, "mean[0] = {}", mean[0]);
+        assert!((mean[1] - 0.5).abs() < 1e-6, "mean[1] = {}", mean[1]);
+        assert!(mean[2].abs() < 1e-6);
+        assert!(mean[3].abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn project_baseline_mean_respects_project_filter() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let mut chunks = Vec::new();
+        let mut embs = Vec::new();
+        // 10 chunks in `alpha` on axis 0.
+        for i in 0..10_u32 {
+            chunks.push(chunk_with(&format!("a{i}"), "alpha", now));
+            embs.push(vec![1.0_f32, 0.0, 0.0, 0.0]);
+        }
+        // 10 chunks in `beta` on axis 1.
+        for i in 0..10_u32 {
+            chunks.push(chunk_with(&format!("b{i}"), "beta", now));
+            embs.push(vec![0.0_f32, 1.0, 0.0, 0.0]);
+        }
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        let alpha = store
+            .project_baseline_mean(Some("alpha"), 7)
+            .await
+            .unwrap()
+            .expect("alpha has 10 chunks");
+        assert!((alpha[0] - 1.0).abs() < 1e-6);
+        assert!(alpha[1].abs() < 1e-6);
+
+        let beta = store
+            .project_baseline_mean(Some("beta"), 7)
+            .await
+            .unwrap()
+            .expect("beta has 10 chunks");
+        assert!(beta[0].abs() < 1e-6);
+        assert!((beta[1] - 1.0).abs() < 1e-6);
+
+        // Global baseline (no project filter): mean of all 20 = [0.5, 0.5, 0, 0].
+        let global = store
+            .project_baseline_mean(None, 7)
+            .await
+            .unwrap()
+            .expect("20 chunks total");
+        assert!((global[0] - 0.5).abs() < 1e-6);
+        assert!((global[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn sample_recent_chunks_with_project_returns_project_column() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let chunks = vec![
+            chunk_with("a", "alpha", now),
+            chunk_with("b", "beta", now),
+        ];
+        let embs = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        let since = now - chrono::Duration::hours(1);
+        let out = store
+            .sample_recent_chunks_with_project(since, 100)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        let by_id: std::collections::HashMap<String, (Option<String>, Vec<f32>)> =
+            out.into_iter().map(|(id, p, e)| (id, (p, e))).collect();
+        assert_eq!(by_id.get("a").unwrap().0.as_deref(), Some("alpha"));
+        assert_eq!(by_id.get("a").unwrap().1, vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(by_id.get("b").unwrap().0.as_deref(), Some("beta"));
     }
 }
