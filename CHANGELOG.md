@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## v0.3.1 — No-baked-filters discipline (constants → tool args)
+
+Applies the v0.3.0 hand-off's discipline rule ("any threshold not derived
+from a parser-level property is a tool arg") to the three thread surfaces.
+Purely additive on the MCP wire — every prior call site keeps working.
+
+### Added
+
+- `thread_emergent` accepts two new optional args:
+  - `cohesion_threshold: f32` (default `0.82`, was the baked
+    `cluster::EMERGENT_THRESHOLD`)
+  - `min_neighbours: usize` (default `2`, was the baked
+    `cluster::MIN_NEIGHBOURS_IN_CLUSTER`)
+- `thread_novelty` accepts two new optional args:
+  - `min_mean_novelty: f32` (default `0.0` — filter off, permissive per
+    discipline rule; pass `0.3` to recover pre-v0.3.1 behavior)
+  - `min_cluster_size: usize` — naming-consistency alias for the
+    existing `min_cluster` arg (both accepted; `min_cluster_size`
+    matches `thread_emergent`)
+
+### Changed
+
+- **`thread_novelty` MCP default behavior**: the post-cluster
+  `mean_novelty >= 0.3` filter is now off by default. Callers may see
+  more clusters surfaced, including coherent-but-low-novelty ones.
+  This is intentional — the substrate stops encoding "what's
+  interesting" and lets the caller decide. Pass
+  `min_mean_novelty: 0.3` to restore the v0.3.0 floor.
+- `thread_novelty` response `params` block reports `min_cluster_size`
+  (uniform with `thread_emergent`) and adds `min_mean_novelty`.
+- Library defaults preserved: `surface_default` in `novelty.rs` and
+  `discover_default` in `emergent.rs` still pass the historical
+  constants. Only the MCP handler defaults moved.
+
+### Internal
+
+- `discover_and_surface` (emergent.rs) takes a new
+  `min_in_cluster_neighbours` parameter and now calls
+  `find_clusters_with` directly (was wrapping `find_clusters` then
+  re-filtering).
+- `surface_novelty` (novelty.rs) takes a new `min_mean_novelty`
+  parameter; `0.0` disables the post-cluster filter entirely.
+
+### Tests
+
+- New test `novelty::tests::min_mean_novelty_zero_keeps_clusters_filter_drops`
+  proves the arg propagates: `0.0` floor surfaces ≥1 cluster (and
+  reveals that the historical `0.3` was hiding baseline-aligned
+  clusters); `1.5` floor returns empty. Workspace: 309/0 (was 308/0).
+
 ## v0.1.7 — Path-aware incremental scan (EPIC gh#8)
 
 Closes the loop between editor save and `recall_fault`: the watcher now

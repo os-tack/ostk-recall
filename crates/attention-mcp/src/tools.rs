@@ -206,6 +206,10 @@ pub fn tool_thread_emergent() -> Value {
                             "description": "Max chunks fed to the clusterer. Default 500." },
                 "min_cluster_size": { "type": "integer", "minimum": 2,
                                        "description": "Minimum members per surfaced cluster. Default 5." },
+                "cohesion_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0,
+                                         "description": "Pairwise cosine cut-off for cluster membership. Default matches cluster::EMERGENT_THRESHOLD (0.82). Lower = more permissive." },
+                "min_neighbours": { "type": "integer", "minimum": 1,
+                                     "description": "Minimum in-cluster neighbours each member must have. Default matches cluster::MIN_NEIGHBOURS_IN_CLUSTER (2). Density floor." },
                 "persist": { "type": "boolean",
                               "description": "Write proposed rows to threads_proposed. Default true." }
             }
@@ -246,10 +250,14 @@ pub fn tool_thread_novelty() -> Value {
                                     "description": "Per-project baseline window in days. Default 7." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100,
                             "description": "Max clusters returned. Default 10." },
+                "min_cluster_size": { "type": "integer", "minimum": 2,
+                                       "description": "Minimum members per surfaced cluster. Default matches cluster::MIN_CLUSTER_SIZE (3). (Aliased: also accepts `min_cluster` for v0.3.0 back-compat.)" },
                 "min_cluster": { "type": "integer", "minimum": 2,
-                                  "description": "Minimum members per surfaced cluster. Default matches cluster::MIN_CLUSTER_SIZE (3)." },
+                                  "description": "Deprecated alias for `min_cluster_size`. Kept for v0.3.0 back-compat; new callers should use `min_cluster_size`." },
                 "recluster_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0,
-                                          "description": "Re-cluster cosine threshold. Default matches cluster::EMERGENT_THRESHOLD (0.82)." }
+                                          "description": "Re-cluster cosine threshold. Default matches cluster::EMERGENT_THRESHOLD (0.82)." },
+                "min_mean_novelty": { "type": "number", "minimum": 0.0, "maximum": 2.0,
+                                       "description": "Drop clusters whose mean novelty is below this floor. Default 0.0 (filter off, permissive). The historical baked default was 0.3; pass that explicitly if you want pre-v0.3.1 behavior." }
             }
         }
     })

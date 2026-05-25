@@ -106,6 +106,17 @@ pub struct NoveltyReport {
 }
 
 /// Run the novelty surface against the corpus.
+///
+/// `min_mean_novelty` is the floor for the post-cluster filter that drops
+/// "coherent but uninteresting" clusters whose members happen to resemble
+/// each other near the baseline. `0.0` disables the filter entirely;
+/// [`MIN_MEAN_NOVELTY`] is the historically-baked default and the value
+/// [`surface_default`] continues to pass for back-compat. Callers wanting
+/// permissive output (the v0.3.1 discipline default) should pass `0.0`
+/// explicitly — see `crates/attention-mcp/src/handlers.rs::thread_novelty`.
+#[allow(clippy::too_many_lines)] // baseline computation + per-chunk scoring + recluster
+                                 // + filter is one logical pipeline; splitting hurts more
+                                 // than it helps. v0.4.0 `thread_query` consolidates this.
 pub async fn surface_novelty(
     corpus: &Arc<CorpusStore>,
     since: DateTime<Utc>,
@@ -113,6 +124,7 @@ pub async fn surface_novelty(
     limit: usize,
     min_cluster: usize,
     recluster_threshold: f32,
+    min_mean_novelty: f32,
 ) -> Result<Vec<NoveltyReport>, NoveltyError> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -220,13 +232,15 @@ pub async fn surface_novelty(
         })
         .collect();
 
-    // Drop clusters whose mean novelty is below MIN_MEAN_NOVELTY —
+    // Drop clusters whose mean novelty is below `min_mean_novelty` —
     // these are coherent-but-uninteresting clusters that survive
     // `find_clusters_with` simply because the chunks resemble each
     // other (e.g. baseline-aligned chunks form a cluster with mean
-    // novelty near zero). The novelty surface should only return
-    // clusters that are *both* coherent and meaningfully divergent.
-    reports.retain(|r| r.mean_novelty >= MIN_MEAN_NOVELTY);
+    // novelty near zero). Caller-tunable per v0.3.1 discipline rule
+    // (no baked filters); `0.0` disables the filter entirely.
+    if min_mean_novelty > 0.0 {
+        reports.retain(|r| r.mean_novelty >= min_mean_novelty);
+    }
     reports.sort_by(|a, b| {
         b.mean_novelty
             .partial_cmp(&a.mean_novelty)
@@ -283,7 +297,10 @@ fn snippet(text: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
-/// Convenience wrapper using all defaults.
+/// Convenience wrapper using all defaults. Preserves the pre-v0.3.1
+/// post-cluster `MIN_MEAN_NOVELTY` filter for back-compat with existing
+/// library callers; MCP callers go through `thread_novelty` which
+/// defaults to `0.0` (permissive) per the no-baked-filters discipline.
 pub async fn surface_default(
     corpus: &Arc<CorpusStore>,
     since: DateTime<Utc>,
@@ -295,6 +312,7 @@ pub async fn surface_default(
         DEFAULT_LIMIT,
         DEFAULT_MIN_CLUSTER,
         DEFAULT_RECLUSTER_THRESHOLD,
+        MIN_MEAN_NOVELTY,
     )
     .await
 }
@@ -379,7 +397,7 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD)
+        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
             .await
             .unwrap();
         assert_eq!(reports.len(), 1, "got {reports:#?}");
@@ -412,7 +430,7 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD)
+        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
             .await
             .unwrap();
         assert!(reports.is_empty(), "got {reports:#?}");
@@ -436,7 +454,7 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD)
+        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
             .await
             .unwrap();
         assert_eq!(reports.len(), 1);
@@ -444,6 +462,54 @@ mod tests {
         // Same caveat as `surface_novelty_scores_orthogonal_higher_than_aligned`:
         // baseline gets pulled by the novel chunks themselves.
         assert!(reports[0].mean_novelty > 0.8);
+    }
+
+    #[tokio::test]
+    async fn min_mean_novelty_zero_keeps_clusters_filter_drops() {
+        // v0.3.1 discipline: `min_mean_novelty = 0.0` disables the
+        // post-cluster filter (permissive default for MCP callers).
+        // A high floor (above the achievable score) drops everything.
+        // Uses the same setup as `surface_novelty_scores_orthogonal_higher_than_aligned`.
+        let tmp = TempDir::new().unwrap();
+        let dim = 16;
+        let store = Arc::new(CorpusStore::open_or_create(tmp.path(), dim).await.unwrap());
+        let now = chrono::Utc::now();
+
+        seed_baseline(&store, 20, dim, 0, now).await;
+
+        let mut chunks = Vec::new();
+        let mut embs = Vec::new();
+        for i in 0..3 {
+            chunks.push(chunk_at(&format!("novel-{i}"), now));
+            embs.push(near_axis(7, dim, 0.001));
+        }
+        store.upsert(&chunks, &embs).await.unwrap();
+
+        let since = now - chrono::Duration::hours(1);
+
+        // Permissive: 0.0 floor → at least the novel cluster surfaces.
+        // (May also surface the baseline-aligned cluster — proving the
+        // historical 0.3 default was a baked filter, which is exactly
+        // the discipline rule's point.)
+        let permissive = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, 0.0)
+            .await
+            .unwrap();
+        assert!(
+            !permissive.is_empty(),
+            "0.0 floor should surface ≥1 cluster"
+        );
+
+        // Strict: 1.5 floor (above the ~0.85 achievable here) → empty.
+        let strict = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, 1.5)
+            .await
+            .unwrap();
+        assert!(
+            strict.is_empty(),
+            "1.5 floor should drop all clusters; got {strict:#?}"
+        );
+
+        // Sanity: strict floor returns strictly fewer clusters than permissive.
+        assert!(strict.len() < permissive.len());
     }
 
     #[tokio::test]
@@ -462,7 +528,7 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD)
+        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
             .await
             .unwrap();
         assert!(reports.is_empty());

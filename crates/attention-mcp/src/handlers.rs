@@ -455,6 +455,19 @@ pub async fn thread_emergent(
         .get("persist")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    #[allow(clippy::cast_possible_truncation)]
+    let cohesion_threshold = args
+        .get("cohesion_threshold")
+        .and_then(Value::as_f64)
+        .map_or(
+            ostk_recall_attention::cluster::EMERGENT_THRESHOLD,
+            |v| v as f32,
+        );
+    let min_neighbours = args
+        .get("min_neighbours")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(ostk_recall_attention::cluster::MIN_NEIGHBOURS_IN_CLUSTER);
 
     let since = Utc::now() - ChronoDuration::hours(since_hours);
     let reports = discover_and_surface(
@@ -463,7 +476,8 @@ pub async fn thread_emergent(
         since,
         limit,
         min_cluster_size,
-        ostk_recall_attention::cluster::EMERGENT_THRESHOLD,
+        cohesion_threshold,
+        min_neighbours,
         persist,
     )
     .await?;
@@ -485,6 +499,8 @@ pub async fn thread_emergent(
             "since_hours": since_hours,
             "limit": limit,
             "min_cluster_size": min_cluster_size,
+            "cohesion_threshold": cohesion_threshold,
+            "min_neighbours": min_neighbours,
             "persist": persist,
         }
     }))
@@ -610,8 +626,12 @@ pub async fn thread_novelty(
         .and_then(Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(NOVELTY_DEFAULT_LIMIT);
+    // Accept `min_cluster_size` (consistent with thread_emergent) or
+    // `min_cluster` (legacy v0.3.0 name). The aliased name was a
+    // naming-inconsistency the v0.3.1 discipline pass normalizes.
     let min_cluster = args
-        .get("min_cluster")
+        .get("min_cluster_size")
+        .or_else(|| args.get("min_cluster"))
         .and_then(Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(NOVELTY_DEFAULT_MIN_CLUSTER);
@@ -620,6 +640,16 @@ pub async fn thread_novelty(
         .get("recluster_threshold")
         .and_then(Value::as_f64)
         .map_or(NOVELTY_DEFAULT_RECLUSTER_THRESHOLD, |v| v as f32);
+    // No-baked-filters discipline: default 0.0 (filter off). The
+    // historical 0.3 floor is still available as a constant for callers
+    // that want it (and `surface_default` continues to pass it for
+    // library back-compat), but MCP callers get an honest empty result
+    // rather than a hidden post-filter.
+    #[allow(clippy::cast_possible_truncation)]
+    let min_mean_novelty = args
+        .get("min_mean_novelty")
+        .and_then(Value::as_f64)
+        .map_or(0.0_f32, |v| v as f32);
 
     let since = Utc::now() - ChronoDuration::hours(since_hours);
     let reports = surface_novelty(
@@ -629,6 +659,7 @@ pub async fn thread_novelty(
         limit,
         min_cluster,
         recluster_threshold,
+        min_mean_novelty,
     )
     .await?;
 
@@ -650,8 +681,9 @@ pub async fn thread_novelty(
             "since_hours": since_hours,
             "baseline_days": baseline_days,
             "limit": limit,
-            "min_cluster": min_cluster,
+            "min_cluster_size": min_cluster,
             "recluster_threshold": recluster_threshold,
+            "min_mean_novelty": min_mean_novelty,
         }
     }))
 }

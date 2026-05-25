@@ -18,7 +18,9 @@ use ostk_recall_store::corpus::StoreError as CorpusError;
 use ostk_recall_store::{CorpusStore, ProposedThreadRecord, ThreadsDb};
 use thiserror::Error;
 
-use crate::cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters};
+use crate::cluster::{
+    EMERGENT_THRESHOLD, EmergentCluster, MIN_NEIGHBOURS_IN_CLUSTER, find_clusters_with,
+};
 use crate::weaver::generate_proposed_handle;
 
 /// Returned for each surfaced cluster — enough for an operator to decide
@@ -75,6 +77,9 @@ pub const SAMPLE_LIMIT: usize = 5;
 /// Returns an empty `Vec` when the recency window produced no chunks
 /// or no qualifying clusters — those are valid "nothing to surface"
 /// outcomes, not errors.
+#[allow(clippy::too_many_arguments)] // v0.3.1: discipline rule says expose constants
+                                     // as args; the v0.4.0 `thread_query` work absorbs
+                                     // this surface into a single multi-axis verb.
 pub async fn discover_and_surface(
     corpus: &Arc<CorpusStore>,
     threads: &Arc<ThreadsDb>,
@@ -82,16 +87,15 @@ pub async fn discover_and_surface(
     limit: usize,
     min_cluster_size: usize,
     threshold: f32,
+    min_in_cluster_neighbours: usize,
     persist: bool,
 ) -> Result<Vec<EmergentReport>, EmergentError> {
     let sample = corpus.sample_recent_chunks(since, limit).await?;
     if sample.is_empty() {
         return Ok(Vec::new());
     }
-    let clusters: Vec<EmergentCluster> = find_clusters(&sample, threshold)
-        .into_iter()
-        .filter(|c| c.chunk_ids.len() >= min_cluster_size)
-        .collect();
+    let clusters: Vec<EmergentCluster> =
+        find_clusters_with(&sample, threshold, min_cluster_size, min_in_cluster_neighbours);
     if clusters.is_empty() {
         return Ok(Vec::new());
     }
@@ -167,9 +171,9 @@ fn snippet(text: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
-/// Convenience wrapper using all defaults. Equivalent to:
-/// `discover_and_surface(corpus, threads, since, DEFAULT_LIMIT,
-/// DEFAULT_MIN_CLUSTER_SIZE, EMERGENT_THRESHOLD, true)`.
+/// Convenience wrapper using all defaults. Equivalent to
+/// `discover_and_surface` with `DEFAULT_LIMIT`, `DEFAULT_MIN_CLUSTER_SIZE`,
+/// `EMERGENT_THRESHOLD`, `MIN_NEIGHBOURS_IN_CLUSTER`, persist = true.
 pub async fn discover_default(
     corpus: &Arc<CorpusStore>,
     threads: &Arc<ThreadsDb>,
@@ -182,6 +186,7 @@ pub async fn discover_default(
         DEFAULT_LIMIT,
         DEFAULT_MIN_CLUSTER_SIZE,
         EMERGENT_THRESHOLD,
+        MIN_NEIGHBOURS_IN_CLUSTER,
         true,
     )
     .await
