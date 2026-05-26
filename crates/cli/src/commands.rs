@@ -780,6 +780,26 @@ pub async fn serve(
     let root = engine.store().root().to_path_buf();
     let sock_path = root.join("recall.sock");
 
+    // Startup assertion: the embedder driving `attend()` (via
+    // InMemoryAttention) and the embedder behind QueryEngine MUST
+    // produce dimension-compatible vectors with the corpus, or
+    // resonance / cosine-based ranking is meaningless. Both
+    // QueryEngine and InMemoryAttention below receive the same
+    // `Arc<dyn ChunkEmbedder>` clone, so the only way this assertion
+    // fails is if the operator pointed a fresh embedder model at a
+    // corpus that was indexed with a different model. Fail loud
+    // rather than ship silently-wrong scores.
+    let corpus_dim = engine.store().dim();
+    let embedder_dim = embedder.dim();
+    if corpus_dim != embedder_dim {
+        return Err(anyhow!(
+            "embedder/corpus dimension mismatch: embedder produces {embedder_dim}-dim vectors \
+             but corpus at {} was indexed at {corpus_dim} dims — re-index the corpus or \
+             configure the original embedder",
+            root.display()
+        ));
+    }
+
     // Long-lived attention substrate state. The same Arc<ThreadsDb> backs
     // (a) the IdleCurator's periodic tension sweep, (b) every per-trigger
     // scan's ambient daemons (TurnObserver + AutoWeaver), and (c) the
@@ -796,7 +816,12 @@ pub async fn serve(
     let serve_ctx: Option<ServeContext> = match open_threads_db_with_chain(&root) {
         Ok(db) => {
             let threads_arc: Arc<ThreadsDb> = Arc::new(db);
-            let attention_arc: Arc<InMemoryAttention> = Arc::new(InMemoryAttention::new());
+            // Share the same embedder Arc with QueryEngine so
+            // `attend()`-produced scope vectors are cosine-comparable
+            // with corpus chunk embeddings — the prerequisite for
+            // embedding-mediated attention bias (focus-feature Phase B).
+            let attention_arc: Arc<InMemoryAttention> =
+                Arc::new(InMemoryAttention::with_embedder(Arc::clone(&embedder)));
 
             if let Err(err) =
                 replay_chain_into_attention(&threads_arc, attention_arc.as_ref()).await
@@ -805,6 +830,29 @@ pub async fn serve(
                     error = %err,
                     "chain replay failed; in-memory attention starts empty"
                 );
+            }
+
+            // Re-anchor every thread from its persistent
+            // anchor_chunk_id → corpus chunk embedding. This makes
+            // resonance scoring meaningful from the first request:
+            // chain replay alone leaves materialised threads with
+            // empty anchors (familiarize takes its anchor from the
+            // scope's attention_vec, which is empty after replay).
+            // Sharing the same Arc<dyn ChunkEmbedder> as QueryEngine
+            // (asserted above) guarantees these vectors are
+            // cosine-comparable with the corpus.
+            match re_anchor_threads_from_corpus(
+                &threads_arc,
+                engine.store(),
+                attention_arc.as_ref(),
+            )
+            .await
+            {
+                Ok(n) => tracing::info!(seeded = n, "thread anchors re-seeded from corpus"),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "re-anchor pass failed; threads start with empty anchors"
+                ),
             }
 
             let attention_dyn: Arc<dyn AttentionForwardStore> = attention_arc.clone();
@@ -957,6 +1005,73 @@ async fn replay_chain_into_attention(
         .map_err(|e| anyhow!("replay: {e}"))?;
     tracing::info!(events = n, "chain replay applied to in-memory attention");
     Ok(())
+}
+
+/// Re-derive every thread's in-memory anchor from the durable
+/// `anchor_chunk_id` → corpus chunk embedding mapping. Run at boot
+/// after `replay_chain_into_attention` so the substrate starts with
+/// real-embedder anchors instead of:
+///  - the empty vectors that chain replay produces (no Attend events
+///    are replayed, so scope.attention_vec is empty when familiarize
+///    materialises a thread); or
+///  - stale stub-embedding anchors left over from a previous run
+///    with a different embedder (the focus-feature Phase A prereq).
+///
+/// Threads without an `anchor_chunk_id` are skipped — there's
+/// nothing to derive from. Threads whose anchor_chunk_id no longer
+/// exists in the corpus are also skipped (corpus drift); the chain
+/// row still attests to the thread's identity, but its anchor
+/// remains empty until the operator reassigns or removes it.
+///
+/// Returns the number of anchors actually installed.
+async fn re_anchor_threads_from_corpus(
+    threads: &Arc<ThreadsDb>,
+    corpus: &Arc<CorpusStore>,
+    attention: &InMemoryAttention,
+) -> Result<usize> {
+    let records = threads
+        .list_threads(None)
+        .map_err(|e| anyhow!("list_threads: {e}"))?;
+    let with_anchors: Vec<(ostk_recall_core::ThreadHandle, PrivacyTier, String)> = records
+        .into_iter()
+        .filter_map(|r| r.anchor_chunk_id.map(|id| (r.handle, r.privacy_tier, id)))
+        .collect();
+    if with_anchors.is_empty() {
+        return Ok(0);
+    }
+    let chunk_ids: Vec<String> = with_anchors.iter().map(|(_, _, id)| id.clone()).collect();
+    let embeddings = corpus
+        .fetch_embeddings(&chunk_ids)
+        .await
+        .map_err(|e| anyhow!("fetch_embeddings for re-anchor: {e}"))?;
+    let mut seeded = 0usize;
+    for (handle, tier, id) in with_anchors {
+        let Some(vec) = embeddings.get(&id) else {
+            // anchor_chunk_id points outside the current corpus
+            // table (stale or deleted chunk) — skip silently. The
+            // thread row is still on disk; an operator can reassign
+            // or delete it.
+            continue;
+        };
+        // Use the same single "replay" scope shape as
+        // `replay_chain_into_attention`. Re-anchoring lands in that
+        // scope so the boot-time materialised threads are visible
+        // to subsequent queries against the replay scope. Carrying
+        // the thread's `privacy_tier` keeps origin-private threads
+        // origin-restricted.
+        let scope = AttentionScope {
+            project: None,
+            session_id: Some("replay".into()),
+            agent: Some("substrate".into()),
+            privacy_tier: tier,
+        };
+        attention
+            .seed_anchor(&scope, handle, vec.clone())
+            .await
+            .map_err(|e| anyhow!("seed_anchor: {e}"))?;
+        seeded += 1;
+    }
+    Ok(seeded)
 }
 
 /// Listen for scan-trigger pokes from a local single-operator surface and

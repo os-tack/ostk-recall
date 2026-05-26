@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_core::attention::{
     AttentionPage, AttentionScope, FoldDepth, PrivacyTier, ScoreAttribution, ThreadHandle,
 };
@@ -299,12 +300,102 @@ fn compute_score_parts(
 #[derive(Clone, Default)]
 pub struct InMemoryAttention {
     inner: Arc<RwLock<Inner>>,
+    /// Optional real embedder. When `Some`, `attend()` and the
+    /// re-anchoring path embed text through it; when `None`,
+    /// `stub_embed` (32-dim SHA-256) is used. The `None` path stays
+    /// supported so unit tests can construct a runtime without
+    /// loading a model and so the bootstrap order in
+    /// `cli::commands::serve` does not have to put the embedder
+    /// first.
+    embedder: Option<Arc<dyn ChunkEmbedder>>,
 }
 
 impl InMemoryAttention {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct with a real embedder wired in. Production
+    /// (`cli::commands::serve`) MUST use this so attention vectors
+    /// are dimension-compatible with corpus chunk embeddings —
+    /// resonance / cosine ranking is meaningless otherwise. Pass
+    /// the *same* `Arc<dyn ChunkEmbedder>` that the
+    /// `QueryEngine` was constructed with; the substrate has no
+    /// way to detect a mismatch once both are running.
+    #[must_use]
+    pub fn with_embedder(embedder: Arc<dyn ChunkEmbedder>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner::default())),
+            embedder: Some(embedder),
+        }
+    }
+
+    /// Embed `text` through the configured embedder, or fall back
+    /// to [`stub_embed`] when no embedder is wired. Centralises the
+    /// branch so callers never re-implement it.
+    #[must_use]
+    pub fn embed(&self, text: &str) -> Vec<f32> {
+        if let Some(emb) = &self.embedder {
+            let mut out = emb.encode_batch(&[text]);
+            out.pop().unwrap_or_else(|| stub_embed(text))
+        } else {
+            stub_embed(text)
+        }
+    }
+
+    /// Dimension of vectors produced by [`Self::embed`]. Used by
+    /// `cli::commands::serve`'s startup assertion to confirm the
+    /// corpus dim matches the attention dim before anything is
+    /// served.
+    #[must_use]
+    pub fn embedder_dim(&self) -> Option<usize> {
+        self.embedder.as_ref().map(|e| e.dim())
+    }
+
+    /// Install or replace a thread's anchor vector. Used by the
+    /// boot-time re-anchoring pass in `cli::commands::serve` to
+    /// pull each thread's persistent `anchor_chunk_id` from the
+    /// corpus and seed its in-memory anchor with the real
+    /// embedder's vector. Without this, threads materialised by
+    /// chain replay carry empty anchors (resonance = 0) until
+    /// they're touched by a fresh `familiarize` or `fold` — and
+    /// even then, the anchor would only reflect the scope's
+    /// current attention vector, not the thread's persistent
+    /// identity in the corpus.
+    ///
+    /// The corresponding scope is implied by the caller (replay
+    /// scope today; could be the thread's `created_scope_key`
+    /// once that's plumbed through). If the thread already has
+    /// in-memory state, only the anchor is replaced — tension,
+    /// familiarity, last_touched_at, and depth are preserved.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn seed_anchor(
+        &self,
+        scope: &AttentionScope,
+        handle: ThreadHandle,
+        anchor: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        let key = ScopeKey::from(scope);
+        let was_private = scope.privacy_tier == PrivacyTier::T0Private;
+        let now = Utc::now();
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key.clone()).or_default();
+        scope_state
+            .threads
+            .entry(handle)
+            .and_modify(|t| t.anchor.clone_from(&anchor))
+            .or_insert_with(|| ThreadState {
+                tension: 0.0,
+                familiarity: 0,
+                last_touched_at: now,
+                depth: FoldDepth::Folded,
+                fade_multiplier: 1.0,
+                anchor,
+                origin: key,
+                origin_was_private: was_private,
+            });
+        Ok(())
     }
 
     /// Replay a deterministic event sequence into a fresh store. Used by
@@ -391,10 +482,11 @@ pub fn stub_embed(context: &str) -> Vec<f32> {
 #[async_trait]
 impl AttentionForwardStore for InMemoryAttention {
     async fn attend(&self, scope: &AttentionScope, context: &str) -> Result<(), AttentionError> {
+        let vec = self.embed(context);
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let entry = inner.scopes.entry(key).or_default();
-        entry.attention_vec = stub_embed(context);
+        entry.attention_vec = vec;
         Ok(())
     }
 
@@ -1029,5 +1121,132 @@ mod tests {
         assert!(approx_eq(familiarity_floor(0), 0.1, 1e-6));
         assert!(approx_eq(familiarity_floor(20), 1.0, 1e-6));
         assert!(approx_eq(familiarity_floor(40), 1.0, 1e-6));
+    }
+
+    // ---- Phase A: real-embedder path ---------------------------------
+
+    /// Deterministic non-trivial-dim fake embedder. 32 != dim, so a
+    /// regression that silently falls back to `stub_embed` (32-dim)
+    /// would fail the dim assertion below.
+    struct FakeEmbedder {
+        dim: usize,
+    }
+
+    impl ChunkEmbedder for FakeEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+            texts
+                .iter()
+                .map(|t| {
+                    let seed = ((t.len() % 100) as f32) * 0.01;
+                    (0..self.dim)
+                        .map(|i| (i as f32).mul_add(0.001, seed))
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn with_embedder_uses_real_dim_through_attend() {
+        const DIM: usize = 64;
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: DIM }));
+        assert_eq!(store.embedder_dim(), Some(DIM));
+        assert_eq!(store.embed("anything").len(), DIM);
+
+        let scope = scope_for("phase-a");
+        store.attend(&scope, "first attend").await.unwrap();
+        let vec = store
+            .scope_vector(&scope)
+            .await
+            .unwrap()
+            .expect("scope_vector after attend should be Some");
+        assert_eq!(
+            vec.len(),
+            DIM,
+            "scope_vector dim must match embedder, not 32-dim stub"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_without_embedder_falls_back_to_stub() {
+        // Back-compat: tests + bootstrapping paths that don't wire an
+        // embedder still get the stub. Important so existing tests
+        // never need to thread a FakeEmbedder through everywhere.
+        let store = InMemoryAttention::new();
+        assert_eq!(store.embedder_dim(), None);
+        let scope = scope_for("legacy");
+        store.attend(&scope, "no embedder here").await.unwrap();
+        let vec = store.scope_vector(&scope).await.unwrap().unwrap();
+        assert_eq!(vec.len(), 32, "stub_embed must produce 32-dim vectors");
+    }
+
+    #[tokio::test]
+    async fn seed_anchor_creates_thread_with_given_anchor() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("seed");
+        let h = handle("first-thread");
+        let anchor = vec![0.1_f32; 8];
+
+        store
+            .seed_anchor(&scope, h.clone(), anchor.clone())
+            .await
+            .unwrap();
+
+        // Familiarize must NOT clobber the seeded anchor — or_insert
+        // skips because the entry exists, so the stored anchor wins.
+        store.familiarize(&scope, &h).await.unwrap();
+
+        // Surface and confirm the thread is materialised. We can't
+        // read .anchor directly (private field), so cosine-equality
+        // through scope_vector is the available probe:
+        store.attend(&scope, "first-thread").await.unwrap();
+        let pages = store.surface(&scope, 10).await.unwrap();
+        assert!(
+            pages.iter().any(|p| p.handle == h.as_str()),
+            "seeded thread should surface; got {pages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_anchor_replaces_existing_anchor_in_place() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("replace");
+        let h = handle("renamed-thread");
+
+        // First seed installs the thread.
+        store
+            .seed_anchor(&scope, h.clone(), vec![0.0_f32; 8])
+            .await
+            .unwrap();
+        // Familiarize bumps the familiarity counter; the seeded
+        // entry should still exist after, with familiarity > 0.
+        store.familiarize(&scope, &h).await.unwrap();
+        store.familiarize(&scope, &h).await.unwrap();
+
+        // Second seed replaces the anchor without resetting the
+        // familiarity / last_touched_at fields — same thread,
+        // different identity vector.
+        store
+            .seed_anchor(&scope, h.clone(), vec![1.0_f32; 8])
+            .await
+            .unwrap();
+
+        // surface() proves the thread is still materialised and the
+        // familiarity bump survived (entry was preserved, not
+        // recreated).
+        store.attend(&scope, "renamed-thread").await.unwrap();
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let page = pages
+            .iter()
+            .find(|p| p.handle == h.as_str())
+            .expect("thread present");
+        assert!(
+            page.why.familiarity >= 2,
+            "familiarity bump must survive seed_anchor replace; got {}",
+            page.why.familiarity
+        );
     }
 }
