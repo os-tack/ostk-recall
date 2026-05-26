@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{FoldDepth, PrivacyTier, ThreadHandle};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::corpus::{Result, StoreError};
 
@@ -258,8 +258,23 @@ pub enum ChainEvent {
 ///
 /// The real implementation signs and journals; Phase 3 only needs the
 /// interface so mutation methods are chain-ready.
+///
+/// Sinks that write to the same SQLite file as the [`ThreadsDb`] should
+/// override [`Self::append_within`] to participate in caller-owned
+/// transactions. The default impl delegates to [`Self::append`] and
+/// gives only best-effort ordering — the chain row may be lost if the
+/// table commit succeeds and the standalone append errors.
 pub trait ChainSink: Send + Sync {
     fn append(&self, event: &ChainEvent) -> Result<()>;
+
+    /// Append `event` *through* `tx` so the chain row and whatever
+    /// mutation the caller wrapped in `tx` commit or rollback together.
+    /// The default forwards to [`Self::append`]; sinks backed by an
+    /// independent connection (e.g. remote / kafka) should keep the
+    /// default since they cannot participate in a SQLite transaction.
+    fn append_within(&self, event: &ChainEvent, _tx: &Transaction<'_>) -> Result<()> {
+        self.append(event)
+    }
 }
 
 /// Stub sink used when nothing wants the events yet.
@@ -577,10 +592,7 @@ impl SqliteChainSink {
 
 impl ChainSink for SqliteChainSink {
     fn append(&self, event: &ChainEvent) -> Result<()> {
-        let payload = event.to_payload().map_err(|e| StoreError::Lance(lancedb::Error::Other {
-            message: format!("chain serialize: {e}"),
-            source: None,
-        }))?;
+        let payload = chain_payload(event)?;
         let conn = self
             .conn
             .lock()
@@ -591,6 +603,33 @@ impl ChainSink for SqliteChainSink {
         )?;
         Ok(())
     }
+
+    /// When the caller owns a transaction on the same database file,
+    /// write the chain row through it instead of acquiring our own
+    /// write lock. Two independent connections cannot both hold the
+    /// SQLite write lock at once — WAL mode allows concurrent readers
+    /// but writers still serialize — so a standalone `append()` while
+    /// the caller's tx is open would block on the write lock until
+    /// `busy_timeout`, and the caller cannot commit until we return.
+    /// Going through `tx` sidesteps the contention and ties chain and
+    /// table writes to a single commit.
+    fn append_within(&self, event: &ChainEvent, tx: &Transaction<'_>) -> Result<()> {
+        let payload = chain_payload(event)?;
+        tx.execute(
+            "INSERT INTO chain_log (ts, kind, payload) VALUES (?, ?, ?)",
+            params![event.ts().to_rfc3339(), event.kind_str(), payload],
+        )?;
+        Ok(())
+    }
+}
+
+fn chain_payload(event: &ChainEvent) -> Result<String> {
+    event.to_payload().map_err(|e| {
+        StoreError::Lance(lancedb::Error::Other {
+            message: format!("chain serialize: {e}"),
+            source: None,
+        })
+    })
 }
 
 /// Threads-ledger handle (one per `<root>/threads.sqlite`).
@@ -1205,30 +1244,43 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     /// The graph tier (`thread_thread_links` table) is itself durable,
     /// so chain replay does not re-materialize this row — chain
     /// emission exists for audit and for any future recovery utility.
+    ///
+    /// **Atomic with chain emission for SQLite-backed sinks.** The
+    /// SQL insert runs inside a [`Transaction`] and the chain row is
+    /// written through the same transaction via
+    /// [`ChainSink::append_within`]. Either both commit or neither
+    /// does. Sinks that keep the default `append_within` (e.g. a
+    /// remote/audit sink that writes elsewhere) get best-effort
+    /// ordering and the link row may outlive a chain failure — but
+    /// they were never going to share fate with a SQLite transaction
+    /// anyway.
     pub fn add_thread_thread_link(&self, link: &ThreadThreadLink) -> Result<i64> {
-        let id = {
-            let conn = self.lock();
-            conn.execute(
-                "INSERT INTO thread_thread_links
-                 (from_thread, to_thread, category, note, created_at)
-                 VALUES (?, ?, ?, ?, ?)",
-                params![
-                    link.from_thread.as_str(),
-                    link.to_thread.as_str(),
-                    link.category,
-                    link.note,
-                    link.created_at.to_rfc3339(),
-                ],
-            )?;
-            conn.last_insert_rowid()
-        };
-        self.sink.append(&ChainEvent::ThreadLinkAdd {
-            from: link.from_thread.clone(),
-            to: link.to_thread.clone(),
-            category: link.category.clone(),
-            note: link.note.clone(),
-            ts: link.created_at,
-        })?;
+        let mut guard = self.lock();
+        let tx = guard.transaction()?;
+        tx.execute(
+            "INSERT INTO thread_thread_links
+             (from_thread, to_thread, category, note, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                link.from_thread.as_str(),
+                link.to_thread.as_str(),
+                link.category,
+                link.note,
+                link.created_at.to_rfc3339(),
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        self.sink.append_within(
+            &ChainEvent::ThreadLinkAdd {
+                from: link.from_thread.clone(),
+                to: link.to_thread.clone(),
+                category: link.category.clone(),
+                note: link.note.clone(),
+                ts: link.created_at,
+            },
+            &tx,
+        )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -1273,15 +1325,23 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     /// Drop a thread → thread edge by id. Emits
     /// [`ChainEvent::ThreadLinkRemove`] for audit even when the row
     /// was already absent — the chain records the operator's intent.
+    ///
+    /// Same transactional shape as [`Self::add_thread_thread_link`]:
+    /// the DELETE and chain emission share a single
+    /// [`Transaction`] via [`ChainSink::append_within`], so a sink
+    /// failure rolls back the row deletion.
     pub fn delete_thread_thread_link(&self, id: i64) -> Result<()> {
-        {
-            let conn = self.lock();
-            conn.execute("DELETE FROM thread_thread_links WHERE id = ?", params![id])?;
-        }
-        self.sink.append(&ChainEvent::ThreadLinkRemove {
-            id,
-            ts: Utc::now(),
-        })?;
+        let mut guard = self.lock();
+        let tx = guard.transaction()?;
+        tx.execute("DELETE FROM thread_thread_links WHERE id = ?", params![id])?;
+        self.sink.append_within(
+            &ChainEvent::ThreadLinkRemove {
+                id,
+                ts: Utc::now(),
+            },
+            &tx,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1627,6 +1687,27 @@ mod tests {
         fn append(&self, event: &ChainEvent) -> Result<()> {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
+        }
+    }
+
+    /// Errors on `append_within` — used to exercise the rollback path
+    /// for link mutations. Plain `append` (used by `upsert_thread`
+    /// and friends) still succeeds via the recording side so tests
+    /// can stage threads before the rollback step.
+    #[derive(Default)]
+    struct AtomicErrorSink {
+        recorded: StdMutex<Vec<ChainEvent>>,
+    }
+    impl ChainSink for AtomicErrorSink {
+        fn append(&self, event: &ChainEvent) -> Result<()> {
+            self.recorded.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+        fn append_within(&self, _event: &ChainEvent, _tx: &Transaction<'_>) -> Result<()> {
+            Err(StoreError::Lance(lancedb::Error::Other {
+                message: "synthetic atomic-sink failure".into(),
+                source: None,
+            }))
         }
     }
 
@@ -2148,6 +2229,96 @@ mod tests {
             .count();
         assert_eq!(add_count, 1, "ThreadLinkAdd must survive reopen");
         assert_eq!(remove_count, 1, "ThreadLinkRemove must survive reopen");
+    }
+
+    #[test]
+    fn add_thread_thread_link_rolls_back_on_sink_failure() {
+        // Atomic contract: when the sink's append_within errors, the
+        // INSERT must roll back so the link never lands in the table.
+        let tmp = TempDir::new().unwrap();
+        let sink = Arc::new(AtomicErrorSink::default());
+        let db = ThreadsDb::open_with_sink(
+            tmp.path(),
+            Arc::clone(&sink) as Arc<dyn ChainSink>,
+        )
+        .unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        let baseline = db.thread_thread_link_count().unwrap();
+
+        let result = db.add_thread_thread_link(&sample_thread_thread_link("a", "b", "cites"));
+        assert!(result.is_err(), "sink failure must propagate");
+        assert_eq!(
+            db.thread_thread_link_count().unwrap(),
+            baseline,
+            "INSERT must roll back when append_within fails"
+        );
+    }
+
+    #[test]
+    fn delete_thread_thread_link_rolls_back_on_sink_failure() {
+        // Same contract for delete: if append_within fails, the
+        // DELETE is rolled back and the row survives.
+        let tmp = TempDir::new().unwrap();
+        let recording = Arc::new(RecordingSink::default());
+        let db = ThreadsDb::open_with_sink(
+            tmp.path(),
+            Arc::clone(&recording) as Arc<dyn ChainSink>,
+        )
+        .unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+        let id = db
+            .add_thread_thread_link(&sample_thread_thread_link("a", "b", "cites"))
+            .unwrap();
+        drop(db);
+
+        let sink = Arc::new(AtomicErrorSink::default());
+        let db = ThreadsDb::open_with_sink(
+            tmp.path(),
+            Arc::clone(&sink) as Arc<dyn ChainSink>,
+        )
+        .unwrap();
+        assert_eq!(db.thread_thread_link_count().unwrap(), 1, "precondition");
+
+        let result = db.delete_thread_thread_link(id);
+        assert!(result.is_err(), "sink failure must propagate");
+        assert_eq!(
+            db.thread_thread_link_count().unwrap(),
+            1,
+            "DELETE must roll back when append_within fails"
+        );
+    }
+
+    #[test]
+    fn add_thread_thread_link_atomically_emits_chain_via_sqlite_sink() {
+        // End-to-end: with the real SqliteChainSink and one shared
+        // database file, the link row and the chain row must commit
+        // together — no busy/deadlock from competing writers.
+        let tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+        db.upsert_thread(&sample_thread("a")).unwrap();
+        db.upsert_thread(&sample_thread("b")).unwrap();
+
+        let id = db
+            .add_thread_thread_link(&sample_thread_thread_link("a", "b", "cites"))
+            .unwrap();
+        assert!(id > 0);
+        assert_eq!(db.thread_thread_link_count().unwrap(), 1);
+
+        // The chain log must show the add. Drop everything and reopen
+        // to read through a fresh handle.
+        drop(db);
+        drop(sink);
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let adds = db
+            .iter_chain()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e, ChainEvent::ThreadLinkAdd { .. }))
+            .count();
+        assert_eq!(adds, 1, "ThreadLinkAdd row must be visible after commit");
     }
 
     #[test]
