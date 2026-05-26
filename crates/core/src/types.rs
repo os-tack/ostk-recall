@@ -17,21 +17,51 @@ use serde::{Deserialize, Serialize};
 /// Optional attention-bias rider for [`RecallParams`].
 ///
 /// When present, the recall surface re-scores each hit by blending the
-/// base hybrid score with the cosine similarity between the hit's
-/// embedding and the scope's current in-memory attention vector
-/// (`InMemoryAttention::scope_vector`). The result is honest
-/// thinking-partner behaviour: what you're attending to right now lifts
-/// the relevant hits without the substrate forming an opinion about
-/// what "relevant" means.
+/// base hybrid score with two independent attention axes:
 ///
-/// Composition: `final_score = base_score + weight * attention_score`,
-/// with `attention_score ∈ [0, 1]` (cosine clamped to non-negative).
-/// `weight = 0.0` is identity; a sensible starting point is around
-/// `0.5–1.0` depending on how aggressive the bias should be.
+/// - **Thread-mediated** (`thread_weight`): the max
+///   `score_thread(h)` over every thread `h` that
+///   `find_threads_for_chunk(chunk_id)` returns. Lifts hits whose
+///   chunk is already cited by a thread the operator is paying
+///   attention to. This is the v0.4.x behaviour and is the default.
+/// - **Embedding-mediated** (`embedding_weight`): the cosine
+///   similarity between the hit's chunk embedding and the scope's
+///   current attention vector
+///   (`InMemoryAttention::scope_vector`). Lifts hits whose content
+///   matches the operator's stated focus directly — no thread
+///   required. Requires the attention runtime to share an embedder
+///   with the corpus (production: `cli::commands::serve` asserts
+///   this at startup). Opt-in (default 0.0) until callers opt in.
+///
+/// Composition: `final_score = base_score
+///                            + thread_weight * thread_score
+///                            + embedding_weight * embedding_score`,
+/// with both axis scores clamped to `[0, 1]`. Setting both weights
+/// to 0 is identity on the base score; mixing both lets the
+/// substrate honour graph-derived attention and direct content
+/// resonance at the same time. Same discipline as
+/// `ThreadQueryAttribution`: every aggregate decomposes into named,
+/// weighted contributions and shows up on the `RecallHit`.
+///
+/// **Back-compat:** the legacy `weight` field is accepted on the wire
+/// as an alias for `thread_weight` so v0.4.x callers keep working
+/// without changes. New callers should write `thread_weight` and
+/// `embedding_weight`; `weight` will be removed at v1.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttentionBiasParams {
     pub scope: AttentionScope,
-    pub weight: f32,
+    /// Weight on the thread-mediated score. Default 1.0 — preserves
+    /// pre-v0.5 behaviour for callers that omit this field.
+    #[serde(default = "default_thread_weight", alias = "weight")]
+    pub thread_weight: f32,
+    /// Weight on the embedding-mediated score. Default 0.0 —
+    /// opt-in for v0.5.x while clients migrate.
+    #[serde(default)]
+    pub embedding_weight: f32,
+}
+
+fn default_thread_weight() -> f32 {
+    1.0
 }
 
 /// Parameters for the `recall` tool.
@@ -88,16 +118,36 @@ pub struct RecallHit {
     pub role: Option<ContextRole>,
     /// Hybrid-retrieval score before attention bias was applied.
     /// `None` when no bias was applied (then `score` is the base).
-    /// When set, `score == base_score + attention_weight * attention_score`
+    /// When set, `score == base_score
+    ///                    + thread_weight  * thread_score
+    ///                    + embedding_weight * embedding_score`
     /// (within float tolerance) — argue with the math, not the vibe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_score: Option<f32>,
-    /// Cosine similarity of the hit's embedding to the scope's current
-    /// in-memory attention vector, clamped to `[0, 1]`. Only present
-    /// when `RecallParams.attention_bias` was supplied.
+    /// Thread-mediated bias contribution, clamped to `[0, 1]`. The
+    /// max `score_thread(h)` over threads anchoring this chunk. Only
+    /// present when `RecallParams.attention_bias` was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_score: Option<f32>,
+    /// Embedding-mediated bias contribution, clamped to `[0, 1]`.
+    /// Cosine of the chunk's embedding against the scope's current
+    /// attention vector. Only present when bias was supplied and
+    /// `embedding_weight > 0` (and the scope has been attended to
+    /// and the chunk is still in the corpus).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_score: Option<f32>,
+    /// Echo of `AttentionBiasParams.thread_weight`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_weight: Option<f32>,
+    /// Echo of `AttentionBiasParams.embedding_weight`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_weight: Option<f32>,
+    /// Deprecated alias for [`Self::thread_score`] (v0.4.x wire
+    /// shape). Populated identically; remove at v1.0.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_score: Option<f32>,
-    /// Echo of `AttentionBiasParams.weight` for caller-side reasoning.
+    /// Deprecated alias for [`Self::thread_weight`] (v0.4.x wire
+    /// shape). Populated identically; remove at v1.0.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_weight: Option<f32>,
 }

@@ -144,6 +144,10 @@ mod tests {
             stale,
             role: None,
             base_score: None,
+            thread_score: None,
+            embedding_score: None,
+            thread_weight: None,
+            embedding_weight: None,
             attention_score: None,
             attention_weight: None,
         }

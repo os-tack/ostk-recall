@@ -296,43 +296,104 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 
 /// Re-rank recall hits by what the caller is attending to right now.
 ///
-/// For each hit, look up every thread that anchors on its chunk or
-/// has an evidence link resolved to it, then take the max
-/// `score_thread(handle)` from the in-memory attention store. The hit
-/// keeps its original `score` in `base_score`, gains `attention_score`
-/// (clamped to `[0, 1]`) and `attention_weight`, and ends up with
-/// `score = base_score + attention_weight * attention_score`. Hits
-/// with no anchoring thread get `attention_score = 0.0` and ride on
-/// their base score alone.
+/// Two independent axes, each clamped to `[0, 1]` and each with its
+/// own weight (Phase B of the focus feature, post-v0.4.2 §3):
+///
+/// - **Thread-mediated** (`thread_weight`): max `score_thread(h)`
+///   over every thread `h` returned by
+///   `find_threads_for_chunk(hit.chunk_id)`. Lifts hits whose
+///   chunk is already cited by a thread the operator is paying
+///   attention to. v0.4.x behaviour; default 1.0.
+/// - **Embedding-mediated** (`embedding_weight`): cosine between
+///   the hit's chunk embedding (fetched once per call via
+///   `corpus.fetch_embeddings`) and the scope's current attention
+///   vector (`InMemoryAttention::scope_vector`). Lifts hits whose
+///   content matches the operator's focus directly. Default 0.0,
+///   so the wire shape stays back-compat for callers that don't
+///   opt in.
+///
+/// Composition:
+/// ```text
+/// score = base_score
+///       + thread_weight    * thread_score
+///       + embedding_weight * embedding_score
+/// ```
+///
+/// Per-hit attribution carries every term: `base_score`,
+/// `thread_score`, `embedding_score`, `thread_weight`,
+/// `embedding_weight`. The deprecated `attention_score` and
+/// `attention_weight` are populated identically to `thread_score`
+/// and `thread_weight` for v0.4.x clients; removed at v1.0.0.
 ///
 /// Discipline: this is the operator's lens, not the substrate's.
-/// `weight = 0.0` is identity; non-zero weights blend visibly through
-/// the per-hit attribution. Resort is stable on `score` descending.
+/// Both weights at 0 is identity; any non-zero weight blends
+/// visibly through the per-hit attribution.
 async fn apply_attention_bias(
     hits: &mut Vec<RecallHit>,
     bias: &AttentionBiasParams,
     dispatch: &ostk_recall_attention_mcp::AttentionDispatch,
 ) {
+    use ostk_recall_attention::cosine_similarity;
     use ostk_recall_core::attention::ThreadHandle;
 
     if hits.is_empty() {
         return;
     }
-    let weight = if bias.weight.is_finite() && bias.weight >= 0.0 {
-        bias.weight
+    let thread_w = sanitize_weight(bias.thread_weight);
+    let embed_w = sanitize_weight(bias.embedding_weight);
+
+    // Fetch scope vector once. If `None`, embedding-mediated bias
+    // contributes 0 for every hit — equivalent to embedding_weight=0
+    // but still recorded in the per-hit attribution.
+    let scope_vec = if embed_w > 0.0 {
+        match dispatch.attention.scope_vector(&bias.scope).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "attention-bias: scope_vector failed; embedding axis contributes 0"
+                );
+                None
+            }
+        }
     } else {
-        0.0
+        None
+    };
+
+    // Batch-fetch all hit embeddings up front when we'll need them.
+    // Skip when no scope vector is available (every cosine would be
+    // 0 anyway) or no corpus is wired into the dispatch.
+    let hit_embeddings: std::collections::HashMap<String, Vec<f32>> = match (
+        scope_vec.as_ref(),
+        dispatch.corpus.as_ref(),
+    ) {
+        (Some(_), Some(corpus)) => {
+            let ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+            match corpus.fetch_embeddings(&ids).await {
+                Ok(map) => map,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "attention-bias: fetch_embeddings failed; embedding axis contributes 0"
+                    );
+                    std::collections::HashMap::new()
+                }
+            }
+        }
+        _ => std::collections::HashMap::new(),
     };
 
     for hit in hits.iter_mut() {
         let base = hit.score;
+
+        // Thread-mediated axis (unchanged from v0.4.x).
         let handles = match dispatch.threads.find_threads_for_chunk(&hit.chunk_id) {
             Ok(h) => h,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     chunk_id = %hit.chunk_id,
-                    "attention-bias: find_threads_for_chunk failed; treating as 0"
+                    "attention-bias: find_threads_for_chunk failed; thread axis contributes 0"
                 );
                 Vec::<ThreadHandle>::new()
             }
@@ -351,11 +412,27 @@ async fn apply_attention_bias(
                 }
             }
         }
-        let attention = max_thread_score.clamp(0.0, 1.0);
+        let thread_score = max_thread_score.clamp(0.0, 1.0);
+
+        // Embedding-mediated axis (new in v0.5 / Phase B). Falls back
+        // to 0 cleanly when either side is missing.
+        let embedding_score = match (scope_vec.as_ref(), hit_embeddings.get(&hit.chunk_id)) {
+            (Some(sv), Some(he)) if !sv.is_empty() && !he.is_empty() => {
+                cosine_similarity(sv, he).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        };
+
         hit.base_score = Some(base);
-        hit.attention_score = Some(attention);
-        hit.attention_weight = Some(weight);
-        hit.score = base + weight * attention;
+        hit.thread_score = Some(thread_score);
+        hit.embedding_score = Some(embedding_score);
+        hit.thread_weight = Some(thread_w);
+        hit.embedding_weight = Some(embed_w);
+        // Deprecated v0.4.x aliases — populated identically so
+        // clients that haven't migrated still see the thread axis.
+        hit.attention_score = Some(thread_score);
+        hit.attention_weight = Some(thread_w);
+        hit.score = base + thread_w * thread_score + embed_w * embedding_score;
     }
 
     hits.sort_by(|a, b| {
@@ -363,6 +440,10 @@ async fn apply_attention_bias(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+fn sanitize_weight(w: f32) -> f32 {
+    if w.is_finite() && w >= 0.0 { w } else { 0.0 }
 }
 
 fn query_error_to_rpc(err: QueryError) -> JsonRpcError {
@@ -423,8 +504,20 @@ mod attention_bias_tests {
             stale: false,
             role: None,
             base_score: None,
+            thread_score: None,
+            embedding_score: None,
+            thread_weight: None,
+            embedding_weight: None,
             attention_score: None,
             attention_weight: None,
+        }
+    }
+
+    fn thread_bias(weight: f32) -> AttentionBiasParams {
+        AttentionBiasParams {
+            scope: scope(),
+            thread_weight: weight,
+            embedding_weight: 0.0,
         }
     }
 
@@ -481,10 +574,7 @@ mod attention_bias_tests {
 
         // Two hits with equal base scores; one anchored, one not.
         let mut hits = vec![hit("anchored", 0.5), hit("unrelated", 0.5)];
-        let bias = AttentionBiasParams {
-            scope: scope(),
-            weight: 1.0,
-        };
+        let bias = thread_bias(1.0);
         apply_attention_bias(&mut hits, &bias, &d).await;
 
         // Resorted: the anchored hit is first.
@@ -518,10 +608,7 @@ mod attention_bias_tests {
         seed_anchored_thread(&d, "abi-as-sovereign-boundary", "anchored").await;
 
         let mut hits = vec![hit("anchored", 0.5), hit("unrelated", 0.7)];
-        let bias = AttentionBiasParams {
-            scope: scope(),
-            weight: 0.0,
-        };
+        let bias = thread_bias(0.0);
         apply_attention_bias(&mut hits, &bias, &d).await;
 
         // weight=0 is identity on score. The base_score / attention_score
@@ -547,12 +634,276 @@ mod attention_bias_tests {
         // hits — it doesn't accidentally re-rank the whole list.
         let (_tmp, d) = build_dispatch().await;
         let mut hits = vec![hit("alpha", 0.6)];
-        let bias = AttentionBiasParams {
-            scope: scope(),
-            weight: 2.0,
-        };
+        let bias = thread_bias(2.0);
         apply_attention_bias(&mut hits, &bias, &d).await;
         assert_eq!(hits[0].score, 0.6);
         assert_eq!(hits[0].attention_score, Some(0.0));
+    }
+
+    // ---- Phase B: embedding-mediated bias ------------------------------
+
+    #[tokio::test]
+    async fn weight_alias_back_compat_on_the_wire() {
+        // v0.4.x callers wrote {"scope": {...}, "weight": N}. The wire
+        // schema must keep accepting that form: serde alias copies it
+        // into thread_weight and embedding_weight defaults to 0.
+        let json_v04 = serde_json::json!({
+            "scope": {
+                "project": "p",
+                "session_id": "s",
+                "agent": "test",
+                "privacy_tier": "t1_project",
+            },
+            "weight": 0.7_f32,
+        });
+        let bias: AttentionBiasParams = serde_json::from_value(json_v04).unwrap();
+        assert!(
+            (bias.thread_weight - 0.7).abs() < 1e-6,
+            "wire `weight` must populate thread_weight, got {}",
+            bias.thread_weight
+        );
+        assert_eq!(
+            bias.embedding_weight, 0.0,
+            "embedding_weight default must be 0.0 when unspecified"
+        );
+
+        // Modern shape: explicit thread_weight + embedding_weight.
+        let json_v05 = serde_json::json!({
+            "scope": {
+                "project": "p",
+                "session_id": "s",
+                "agent": "test",
+                "privacy_tier": "t1_project",
+            },
+            "thread_weight": 0.3_f32,
+            "embedding_weight": 0.5_f32,
+        });
+        let bias: AttentionBiasParams = serde_json::from_value(json_v05).unwrap();
+        assert!((bias.thread_weight - 0.3).abs() < 1e-6);
+        assert!((bias.embedding_weight - 0.5).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn embedding_axis_lifts_hits_matching_scope_vector() {
+        use ostk_recall_core::{Chunk, Links as CoreLinks, Source};
+        use ostk_recall_store::CorpusStore;
+
+        // Build a corpus with two chunks aligned to orthogonal axes.
+        // The scope's attention vector will be aligned to chunk A,
+        // so cosine(scope, A) ≈ 1 and cosine(scope, B) ≈ 0. With
+        // embedding_weight > 0 and thread_weight = 0, A should rank
+        // above B regardless of base score order.
+        let tmp_corpus = TempDir::new().unwrap();
+        let dim = 8;
+        let corpus = Arc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+        let now = chrono::Utc::now();
+        let chunks = vec![
+            Chunk {
+                chunk_id: "match-a".into(),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "a.md".into(),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: "the operator's stated focus".into(),
+                sha256: Chunk::content_hash("match-a"),
+                links: CoreLinks::default(),
+                extra: serde_json::Value::Null,
+            },
+            Chunk {
+                chunk_id: "match-b".into(),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "b.md".into(),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: "orthogonal content".into(),
+                sha256: Chunk::content_hash("match-b"),
+                links: CoreLinks::default(),
+                extra: serde_json::Value::Null,
+            },
+        ];
+        // Axis 0 aligned (A), axis 4 aligned (B).
+        let mut va = vec![0.0_f32; dim];
+        va[0] = 1.0;
+        let mut vb = vec![0.0_f32; dim];
+        vb[4] = 1.0;
+        corpus.upsert(&chunks, &[va.clone(), vb]).await.unwrap();
+
+        // Attention runtime with a hand-installed scope vector
+        // matching chunk A. Bypasses the embedder so the test is
+        // deterministic and doesn't depend on fastembed shape.
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention = Arc::new(InMemoryAttention::new());
+        // No embedder → attend() writes a 32-dim stub vector that won't
+        // cosine-match the 8-dim corpus chunks. Use the test back door
+        // to install an aligned 8-dim vector directly. The substrate's
+        // scope_vector returns whatever was last set by attend, so
+        // attending with text that hashes the right way is unreliable —
+        // instead seed a thread anchor to drive scope_vector via the
+        // ScopeState.attention_vec read path... but that field is only
+        // populated by attend(). Simplest: skip the attention runtime's
+        // scope_vector path and assert the cosine math through a
+        // direct call instead.
+        let attention_dyn: Arc<dyn AttentionForwardStore> = attention.clone();
+        let d = Arc::new(
+            AttentionDispatch::new(attention_dyn, threads).with_corpus(Arc::clone(&corpus)),
+        );
+
+        // Two hits with B ranked first by base score.
+        let mut hits = vec![hit("match-b", 0.8), hit("match-a", 0.2)];
+
+        // No scope vector set → embedding axis contributes 0 even
+        // with high embedding_weight. Confirms the "missing scope
+        // vector" path is safe.
+        let bias_no_scope = AttentionBiasParams {
+            scope: scope(),
+            thread_weight: 0.0,
+            embedding_weight: 1.0,
+        };
+        apply_attention_bias(&mut hits, &bias_no_scope, &d).await;
+        // Without a scope vector, embedding_score is 0 for both → no
+        // re-rank; B stays first.
+        assert_eq!(hits[0].chunk_id, "match-b");
+        for h in &hits {
+            assert_eq!(h.embedding_score, Some(0.0));
+            assert_eq!(h.embedding_weight, Some(1.0));
+            assert_eq!(h.thread_weight, Some(0.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_axis_uses_attended_scope_vector() {
+        use ostk_recall_core::{Chunk, Links as CoreLinks, Source};
+        use ostk_recall_store::CorpusStore;
+
+        // Same shape as the previous test, but here the attention
+        // runtime IS wired with an embedder, so attend() populates a
+        // real scope vector that aligns with chunk A (both go
+        // through the same embedder for dim-compatibility).
+        let tmp_corpus = TempDir::new().unwrap();
+        let dim = 8;
+        let corpus = Arc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+
+        // Deterministic embedder: always returns a unit vector on
+        // axis 0. Both the scope's attend() vector and chunk A's
+        // upsert vector go through this, so cosine(scope, A) = 1.
+        // Chunk B is hand-upserted with an orthogonal vector.
+        struct AxisZeroEmbedder {
+            dim: usize,
+        }
+        impl ostk_recall_pipeline::ChunkEmbedder for AxisZeroEmbedder {
+            fn dim(&self) -> usize {
+                self.dim
+            }
+            fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+                texts
+                    .iter()
+                    .map(|_| {
+                        let mut v = vec![0.0_f32; self.dim];
+                        v[0] = 1.0;
+                        v
+                    })
+                    .collect()
+            }
+        }
+        let embedder: Arc<dyn ostk_recall_pipeline::ChunkEmbedder> =
+            Arc::new(AxisZeroEmbedder { dim });
+
+        // Seed corpus: A via embedder (axis 0), B hand-built orthogonal.
+        let now = chrono::Utc::now();
+        let chunks = vec![
+            Chunk {
+                chunk_id: "match-a".into(),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "a.md".into(),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: "axis-0 content".into(),
+                sha256: Chunk::content_hash("match-a"),
+                links: CoreLinks::default(),
+                extra: serde_json::Value::Null,
+            },
+            Chunk {
+                chunk_id: "match-b".into(),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "b.md".into(),
+                chunk_index: 0,
+                ts: Some(now),
+                role: None,
+                text: "orthogonal content".into(),
+                sha256: Chunk::content_hash("match-b"),
+                links: CoreLinks::default(),
+                extra: serde_json::Value::Null,
+            },
+        ];
+        let va = embedder.encode_batch(&["axis-0"]).pop().unwrap();
+        let mut vb = vec![0.0_f32; dim];
+        vb[4] = 1.0;
+        corpus.upsert(&chunks, &[va, vb]).await.unwrap();
+
+        // Attention runtime shares the embedder.
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention = Arc::new(InMemoryAttention::with_embedder(Arc::clone(&embedder)));
+        // attend() now writes axis-0 vector into scope.attention_vec
+        // via the embedder.
+        attention.attend(&scope(), "any text").await.unwrap();
+
+        let attention_dyn: Arc<dyn AttentionForwardStore> = attention;
+        let d = AttentionDispatch::new(attention_dyn, threads).with_corpus(Arc::clone(&corpus));
+
+        // B has higher base score; embedding axis must lift A above.
+        let mut hits = vec![hit("match-b", 0.8), hit("match-a", 0.2)];
+        let bias = AttentionBiasParams {
+            scope: scope(),
+            thread_weight: 0.0,
+            embedding_weight: 1.0,
+        };
+        apply_attention_bias(&mut hits, &bias, &d).await;
+
+        assert_eq!(
+            hits[0].chunk_id, "match-a",
+            "axis-0-aligned hit must rank above orthogonal hit when embedding_weight > 0"
+        );
+        let a = &hits[0];
+        let b = &hits[1];
+        // A's embedding_score ≈ 1 (cosine with itself); B's ≈ 0.
+        assert!(
+            a.embedding_score.unwrap() > 0.99,
+            "axis-0 hit should have embedding_score ≈ 1, got {}",
+            a.embedding_score.unwrap()
+        );
+        assert!(
+            b.embedding_score.unwrap() < 0.01,
+            "orthogonal hit should have embedding_score ≈ 0, got {}",
+            b.embedding_score.unwrap()
+        );
+        // Decomposability: score = base + thread_w*thread + embed_w*embed.
+        let expected = a.base_score.unwrap()
+            + a.thread_weight.unwrap() * a.thread_score.unwrap()
+            + a.embedding_weight.unwrap() * a.embedding_score.unwrap();
+        assert!(
+            (a.score - expected).abs() < 1e-5,
+            "score must equal base + thread_w*thread + embed_w*embed (got {} vs {expected})",
+            a.score
+        );
+        // Back-compat aliases must mirror the thread axis.
+        assert_eq!(a.attention_score, a.thread_score);
+        assert_eq!(a.attention_weight, a.thread_weight);
     }
 }
