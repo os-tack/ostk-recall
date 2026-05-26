@@ -976,6 +976,12 @@ async fn replay_chain_into_attention(
     };
 
     let mut replay: Vec<ReplayEvent> = Vec::new();
+    // FocusSet rows are applied inline because their replay needs the
+    // chain-row vec verbatim (no re-embed), the row's own timestamp,
+    // and the chain row's scope (not the synthetic replay scope used
+    // by Familiarize). Type inferred from the ChainEvent::FocusSet
+    // pattern below.
+    let mut focus_events = Vec::new();
     for ev in events {
         match ev {
             ChainEvent::FamiliarityBatch { entries, .. } => {
@@ -985,6 +991,14 @@ async fn replay_chain_into_attention(
                         handle,
                     });
                 }
+            }
+            ChainEvent::FocusSet {
+                scope: ev_scope,
+                query,
+                vec,
+                ts,
+            } => {
+                focus_events.push((ev_scope, query, vec, ts));
             }
             ChainEvent::ThreadCreate { .. }
             | ChainEvent::ThreadRename { .. }
@@ -1003,7 +1017,20 @@ async fn replay_chain_into_attention(
         .replay(&replay)
         .await
         .map_err(|e| anyhow!("replay: {e}"))?;
-    tracing::info!(events = n, "chain replay applied to in-memory attention");
+    let focus_n = focus_events.len();
+    for (ev_scope, query, vec, ts) in focus_events {
+        if let Err(err) = attention
+            .apply_focus_set_from_chain(&ev_scope, query, vec, ts)
+            .await
+        {
+            tracing::warn!(error = %err, "focus_set replay skipped");
+        }
+    }
+    tracing::info!(
+        events = n,
+        focus_events = focus_n,
+        "chain replay applied to in-memory attention"
+    );
     Ok(())
 }
 

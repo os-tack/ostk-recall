@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use ostk_recall_core::attention::AttentionScope;
 use ostk_recall_core::{FoldDepth, PrivacyTier, ThreadHandle};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -252,6 +253,26 @@ pub enum ChainEvent {
     /// A thread → thread evidence edge was deleted by id. Same
     /// chain-as-audit semantics as [`Self::ThreadLinkAdd`].
     ThreadLinkRemove { id: i64, ts: DateTime<Utc> },
+    /// The operator's pinned focus on a scope changed. Emitted on
+    /// every `attention_focus` / `attention_refocus` / `attention_unfocus`
+    /// (Phase C of the focus feature). The chain is authoritative
+    /// for focus state across restarts: replay reconstructs
+    /// `pinned_focus + focus_history` from the FocusSet sequence
+    /// using the runtime's push-current-then-set rule plus the
+    /// merge-on-dedupe rule.
+    ///
+    /// `query` and `vec` are both `None` for `unfocus` (no pin
+    /// after the call). Both `Some` for `focus`/`refocus`. The vec
+    /// is carried verbatim — not re-embedded on replay — so
+    /// ping-ponging between two pins is exactly the same lens it
+    /// was originally, and stochastic embedders don't drift on
+    /// boot.
+    FocusSet {
+        scope: AttentionScope,
+        query: Option<String>,
+        vec: Option<Vec<f32>>,
+        ts: DateTime<Utc>,
+    },
 }
 
 /// Sink for substrate chain rows.
@@ -301,6 +322,7 @@ impl ChainEvent {
             Self::TensionTransition { .. } => "tension_transition",
             Self::ThreadLinkAdd { .. } => "thread_link_add",
             Self::ThreadLinkRemove { .. } => "thread_link_remove",
+            Self::FocusSet { .. } => "focus_set",
         }
     }
 
@@ -316,7 +338,8 @@ impl ChainEvent {
             | Self::FamiliarityBatch { ts, .. }
             | Self::TensionTransition { ts, .. }
             | Self::ThreadLinkAdd { ts, .. }
-            | Self::ThreadLinkRemove { ts, .. } => ts,
+            | Self::ThreadLinkRemove { ts, .. }
+            | Self::FocusSet { ts, .. } => ts,
         }
     }
 
@@ -392,6 +415,11 @@ impl ChainEvent {
                 "note": note,
             }),
             Self::ThreadLinkRemove { id, .. } => serde_json::json!({ "id": id }),
+            Self::FocusSet { scope, query, vec, .. } => serde_json::json!({
+                "scope": scope,
+                "query": query,
+                "vec": vec,
+            }),
         };
         serde_json::to_string(&v)
     }
@@ -551,6 +579,60 @@ impl ChainEvent {
                         })
                     })?;
                 Self::ThreadLinkRemove { id, ts }
+            }
+            "focus_set" => {
+                let scope: AttentionScope = serde_json::from_value(
+                    v.get("scope")
+                        .cloned()
+                        .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                            message: "focus_set payload missing scope".into(),
+                            source: None,
+                        }))?,
+                )
+                .map_err(|e| StoreError::Lance(lancedb::Error::Other {
+                    message: format!("focus_set scope decode: {e}"),
+                    source: None,
+                }))?;
+                let query = v
+                    .get("query")
+                    .and_then(|x| {
+                        if x.is_null() {
+                            None
+                        } else {
+                            x.as_str().map(ToString::to_string)
+                        }
+                    });
+                let vec = match v.get("vec") {
+                    Some(serde_json::Value::Null) | None => None,
+                    Some(arr) => {
+                        let parsed: Vec<f32> = serde_json::from_value(arr.clone()).map_err(|e| {
+                            StoreError::Lance(lancedb::Error::Other {
+                                message: format!("focus_set vec decode: {e}"),
+                                source: None,
+                            })
+                        })?;
+                        Some(parsed)
+                    }
+                };
+                // Schema invariant: either both present (focus/refocus)
+                // or both absent (unfocus). Reject the mixed case so a
+                // bug in the writer can't silently corrupt replay.
+                if query.is_some() != vec.is_some() {
+                    return Err(StoreError::Lance(lancedb::Error::Other {
+                        message: format!(
+                            "focus_set payload: query and vec must agree on presence (query={}, vec={})",
+                            query.is_some(),
+                            vec.is_some()
+                        ),
+                        source: None,
+                    }));
+                }
+                Self::FocusSet {
+                    scope,
+                    query,
+                    vec,
+                    ts,
+                }
             }
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
@@ -976,6 +1058,25 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         self.sink.append(&ChainEvent::FamiliarityBatch {
             entries,
             turn_seq,
+            ts: Utc::now(),
+        })
+    }
+
+    /// Emit a [`ChainEvent::FocusSet`] for the operator's pinned-focus
+    /// change on `scope`. Both `query` and `vec` should be `Some`
+    /// for focus/refocus (the new pin), or both `None` for unfocus.
+    /// The vec is carried verbatim so replay reconstructs the same
+    /// lens — important for stochastic embedders.
+    pub fn record_focus_set(
+        &self,
+        scope: &AttentionScope,
+        query: Option<String>,
+        vec: Option<Vec<f32>>,
+    ) -> Result<()> {
+        self.sink.append(&ChainEvent::FocusSet {
+            scope: scope.clone(),
+            query,
+            vec,
             ts: Utc::now(),
         })
     }
@@ -2357,6 +2458,105 @@ mod tests {
         match decoded {
             ChainEvent::ThreadLinkRemove { id, .. } => assert_eq!(id, 42),
             other => panic!("expected ThreadLinkRemove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_event_focus_set_payload_round_trip() {
+        use ostk_recall_core::attention::AttentionScope;
+        use ostk_recall_core::PrivacyTier;
+
+        let scope = AttentionScope {
+            project: Some("p".into()),
+            session_id: Some("s".into()),
+            agent: Some("focus-test".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        };
+        let vec = vec![0.1_f32, -0.2, 0.3, 0.0];
+        let now = Utc::now();
+
+        // focus / refocus row.
+        let focused = ChainEvent::FocusSet {
+            scope: scope.clone(),
+            query: Some("the API surface".into()),
+            vec: Some(vec.clone()),
+            ts: now,
+        };
+        let payload = focused.to_payload().unwrap();
+        let decoded = ChainEvent::from_row(focused.kind_str(), &payload).unwrap();
+        match decoded {
+            ChainEvent::FocusSet { query, vec: v, .. } => {
+                assert_eq!(query.as_deref(), Some("the API surface"));
+                assert_eq!(v, Some(vec));
+            }
+            other => panic!("expected FocusSet, got {other:?}"),
+        }
+
+        // Unfocus row — both fields None.
+        let unfocused = ChainEvent::FocusSet {
+            scope,
+            query: None,
+            vec: None,
+            ts: now,
+        };
+        let payload = unfocused.to_payload().unwrap();
+        let decoded = ChainEvent::from_row(unfocused.kind_str(), &payload).unwrap();
+        match decoded {
+            ChainEvent::FocusSet { query, vec, .. } => {
+                assert!(query.is_none());
+                assert!(vec.is_none());
+            }
+            other => panic!("expected FocusSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_focus_set_persists_through_sqlite_chain_sink() {
+        // End-to-end: record_focus_set through SqliteChainSink lands
+        // a row that iter_chain reads back as the same FocusSet
+        // payload, including the vec — proves the wire format
+        // survives a disk round-trip.
+        use ostk_recall_core::attention::AttentionScope;
+        use ostk_recall_core::PrivacyTier;
+
+        let tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+        let scope = AttentionScope {
+            project: Some("p".into()),
+            session_id: Some("s".into()),
+            agent: Some("focus-roundtrip".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        };
+        let vec = vec![1.0_f32, 0.0, -1.0];
+
+        db.record_focus_set(&scope, Some("X".into()), Some(vec.clone()))
+            .unwrap();
+        db.record_focus_set(&scope, None, None).unwrap(); // unfocus
+
+        drop(db);
+        drop(sink);
+
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let events: Vec<_> = db
+            .iter_chain()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e, ChainEvent::FocusSet { .. }))
+            .collect();
+        assert_eq!(events.len(), 2, "two FocusSet rows must survive reopen");
+        match &events[0] {
+            ChainEvent::FocusSet { query, vec: v, .. } => {
+                assert_eq!(query.as_deref(), Some("X"));
+                assert_eq!(v.as_deref(), Some(vec.as_slice()));
+            }
+            _ => unreachable!(),
+        }
+        match &events[1] {
+            ChainEvent::FocusSet { query, vec, .. } => {
+                assert!(query.is_none() && vec.is_none(), "unfocus row");
+            }
+            _ => unreachable!(),
         }
     }
 }

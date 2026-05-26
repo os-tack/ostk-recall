@@ -136,6 +136,12 @@ pub enum AttentionError {
     ThreadNotFound(String),
     #[error("invalid score: {0}")]
     InvalidScore(String),
+    /// Refocus was called with a query that isn't in the scope's
+    /// focus history. The operator can call `focus()` instead to
+    /// pin a fresh query, or `focus_status()` to see what's available
+    /// to refocus to.
+    #[error("focus history miss: query '{0}' not in scope's history")]
+    FocusHistoryMiss(String),
 }
 
 // --- scope key ---------------------------------------------------------
@@ -250,10 +256,83 @@ struct ThreadState {
     origin_was_private: bool,
 }
 
+/// Operator-pinned focus for a scope. Set via `attention_focus`,
+/// rotated via `attention_refocus`, cleared via `attention_unfocus`.
+/// While a pin is active it drives all ranking in the scope (surface,
+/// recall bias, score_thread, thread_query resonance); the transient
+/// per-turn vector continues to be updated by `attend` but is shadowed
+/// at read-time so the operator's stated lens stays authoritative.
+#[derive(Debug, Clone)]
+pub struct PinnedFocus {
+    /// Verbatim natural-language input the operator pinned.
+    pub query: String,
+    /// `embedder.embed(query)` at pin time. Carried verbatim across
+    /// rotations so a refocus on the same query is exactly the same
+    /// lens — important for stochastic embedders.
+    pub vec: Vec<f32>,
+    pub pinned_at: DateTime<Utc>,
+}
+
+/// Maximum entries kept in `ScopeState::focus_history`. LRU eviction:
+/// pushing onto a full ring drops the oldest. 9 holds an arc of
+/// focus changes without bloating responses; raise it via config if a
+/// session ever needs more (cheap, just a `VecDeque` cap bump).
+pub const FOCUS_HISTORY_MAX: usize = 9;
+
+/// Result of any focus-mutating call (`focus` / `refocus` / `unfocus`).
+/// Carries the pre- and post-state so the MCP layer can return a
+/// fully-described transition to the operator without re-querying.
+#[derive(Debug, Clone)]
+pub struct FocusOutcome {
+    /// The pin that was active *before* this call, if any.
+    pub previous: Option<PinnedFocus>,
+    /// The pin that is active *after* this call. `None` for
+    /// `unfocus`.
+    pub pinned: Option<PinnedFocus>,
+    /// Snapshot of `focus_history` after the operation, most-recent
+    /// first.
+    pub history: Vec<PinnedFocus>,
+}
+
+/// Read-only focus snapshot returned by `focus_status`. `pinned ==
+/// None` AND `transient_active == true` means ranking is being
+/// driven by the conversational transient — no explicit lens. Both
+/// `pinned == None` AND `transient_active == false` means the scope
+/// has never been attended to in this process run.
+#[derive(Debug, Clone)]
+pub struct FocusStatus {
+    pub pinned: Option<PinnedFocus>,
+    pub history: Vec<PinnedFocus>,
+    pub transient_active: bool,
+}
+
 #[derive(Debug, Default)]
 struct ScopeState {
-    attention_vec: Vec<f32>,
+    /// Continuously updated by `attend()` — the running per-turn
+    /// embedding of conversational context. Drives ranking only when
+    /// no pin is set. Never overwrites the pin.
+    transient_vec: Vec<f32>,
+    /// Operator-controlled focus. When `Some`, `effective_vec` returns
+    /// this vector instead of `transient_vec`.
+    pinned_focus: Option<PinnedFocus>,
+    /// Bounded ring of previously-pinned foci. Front is most-recent;
+    /// LRU eviction pops the back when capacity is hit.
+    focus_history: std::collections::VecDeque<PinnedFocus>,
     threads: HashMap<ThreadHandle, ThreadState>,
+}
+
+impl ScopeState {
+    /// The vector ranking should use right now: pinned focus if the
+    /// operator has set one, otherwise the conversational transient.
+    /// Returns an empty slice when neither has been populated — every
+    /// cosine downstream treats an empty slice as 0 so the result is
+    /// "no contribution", same as the pre-pin behavior.
+    fn effective_vec(&self) -> &[f32] {
+        match &self.pinned_focus {
+            Some(pin) => &pin.vec,
+            None => &self.transient_vec,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -398,6 +477,226 @@ impl InMemoryAttention {
         Ok(())
     }
 
+    /// Pin a focus query to a scope. If `query` is already in
+    /// `focus_history`, the existing entry is **promoted** to the
+    /// pin slot — its original `vec` and `pinned_at` are preserved
+    /// (merge-on-dedupe; important for stochastic embedders). The
+    /// previously-pinned focus, if any, is pushed onto
+    /// `focus_history` front; LRU eviction drops the oldest when
+    /// the ring overflows [`FOCUS_HISTORY_MAX`].
+    ///
+    /// Dedupe is by exact `query` string equality. Operators who
+    /// want to distinguish two similar foci should vary the wording.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn focus(
+        &self,
+        scope: &AttentionScope,
+        query: String,
+    ) -> Result<FocusOutcome, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key).or_default();
+
+        // Merge-on-dedupe path: if the query is already in history,
+        // take it out (preserving its original vec + pinned_at).
+        let existing = scope_state
+            .focus_history
+            .iter()
+            .position(|p| p.query == query)
+            .map(|i| scope_state.focus_history.remove(i).expect("position is valid"));
+
+        // Construct the new pin: either the existing history entry,
+        // or a fresh one with current timestamp and a freshly-embedded
+        // vec. The freshly-embedded path uses self.embed() so it
+        // shares the same embedder as attend() — pin and transient
+        // are cosine-comparable in the same vector space.
+        let new_pin = existing.unwrap_or_else(|| PinnedFocus {
+            vec: self.embed(&query),
+            query,
+            pinned_at: Utc::now(),
+        });
+
+        // Demote current pin (if any) to history front; cap to MAX.
+        let previous = scope_state.pinned_focus.take();
+        if let Some(prev) = previous.clone() {
+            scope_state.focus_history.push_front(prev);
+            while scope_state.focus_history.len() > FOCUS_HISTORY_MAX {
+                scope_state.focus_history.pop_back();
+            }
+        }
+        scope_state.pinned_focus = Some(new_pin.clone());
+
+        Ok(FocusOutcome {
+            previous,
+            pinned: Some(new_pin),
+            history: scope_state.focus_history.iter().cloned().collect(),
+        })
+    }
+
+    /// Promote a focus from history to the pin slot. Errors with
+    /// [`AttentionError::FocusHistoryMiss`] when the query is not
+    /// in the scope's `focus_history` — callers wanting "pin this
+    /// query whether new or known" should use [`Self::focus`].
+    ///
+    /// The currently-pinned focus, if any, is pushed to history
+    /// front (same eviction rule as `focus()`). Refocus never
+    /// embeds — it always reuses the stored vec.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn refocus(
+        &self,
+        scope: &AttentionScope,
+        query: String,
+    ) -> Result<FocusOutcome, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key).or_default();
+
+        let pos = scope_state
+            .focus_history
+            .iter()
+            .position(|p| p.query == query)
+            .ok_or_else(|| AttentionError::FocusHistoryMiss(query.clone()))?;
+        let promoted = scope_state
+            .focus_history
+            .remove(pos)
+            .expect("position is valid");
+
+        let previous = scope_state.pinned_focus.take();
+        if let Some(prev) = previous.clone() {
+            scope_state.focus_history.push_front(prev);
+            // No eviction needed: we just removed one entry and added
+            // one, so len is unchanged. The cap check is still cheap
+            // and guards against future code paths that get this
+            // arithmetic wrong.
+            while scope_state.focus_history.len() > FOCUS_HISTORY_MAX {
+                scope_state.focus_history.pop_back();
+            }
+        }
+        scope_state.pinned_focus = Some(promoted.clone());
+
+        Ok(FocusOutcome {
+            previous,
+            pinned: Some(promoted),
+            history: scope_state.focus_history.iter().cloned().collect(),
+        })
+    }
+
+    /// Clear the scope's pin. The cleared focus is pushed to
+    /// history front (with the same LRU eviction). Idempotent —
+    /// unfocusing an already-unfocused scope is a no-op and returns
+    /// a `FocusOutcome` with `previous = pinned = None`.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn unfocus(
+        &self,
+        scope: &AttentionScope,
+    ) -> Result<FocusOutcome, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key).or_default();
+
+        let previous = scope_state.pinned_focus.take();
+        if let Some(prev) = previous.clone() {
+            scope_state.focus_history.push_front(prev);
+            while scope_state.focus_history.len() > FOCUS_HISTORY_MAX {
+                scope_state.focus_history.pop_back();
+            }
+        }
+
+        Ok(FocusOutcome {
+            previous,
+            pinned: None,
+            history: scope_state.focus_history.iter().cloned().collect(),
+        })
+    }
+
+    /// Replay-side application of a chain `FocusSet` row. Used by
+    /// `cli::commands::serve`'s boot path to reconstruct
+    /// `pinned_focus + focus_history` from the durable chain.
+    ///
+    /// Differs from [`Self::focus`] / [`Self::unfocus`] in two ways:
+    /// (1) the embedder is never called — the vec is supplied by the
+    /// chain row verbatim, so stochastic embedders never drift across
+    /// restart; (2) the `pinned_at` timestamp is taken from the chain
+    /// row rather than `Utc::now()`. The mutation logic (push-current
+    /// to history, merge-on-dedupe, LRU eviction) matches the live
+    /// runtime exactly so the derived view is identical.
+    ///
+    /// `query.is_some() != vec.is_some()` is treated as an unfocus —
+    /// the writer-side schema invariant should prevent this, but
+    /// replay must never refuse to make progress on a malformed row.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn apply_focus_set_from_chain(
+        &self,
+        scope: &AttentionScope,
+        query: Option<String>,
+        vec: Option<Vec<f32>>,
+        ts: DateTime<Utc>,
+    ) -> Result<(), AttentionError> {
+        let key = ScopeKey::from(scope);
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key).or_default();
+
+        match (query, vec) {
+            (Some(q), Some(v)) => {
+                // Merge-on-dedupe: if this query was already in
+                // history, take it out first so we don't double up
+                // after we install the new pin.
+                if let Some(pos) =
+                    scope_state.focus_history.iter().position(|p| p.query == q)
+                {
+                    let _ = scope_state.focus_history.remove(pos);
+                }
+                // Demote current pin to history front.
+                if let Some(prev) = scope_state.pinned_focus.take() {
+                    scope_state.focus_history.push_front(prev);
+                    while scope_state.focus_history.len() > FOCUS_HISTORY_MAX {
+                        scope_state.focus_history.pop_back();
+                    }
+                }
+                scope_state.pinned_focus = Some(PinnedFocus {
+                    query: q,
+                    vec: v,
+                    pinned_at: ts,
+                });
+            }
+            _ => {
+                // Unfocus (both None, or the malformed-mixed case
+                // which we treat as unfocus). Push current pin to
+                // history if any.
+                if let Some(prev) = scope_state.pinned_focus.take() {
+                    scope_state.focus_history.push_front(prev);
+                    while scope_state.focus_history.len() > FOCUS_HISTORY_MAX {
+                        scope_state.focus_history.pop_back();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read-only snapshot of the scope's focus state. Cheap; clones
+    /// the history into a Vec for the caller's convenience.
+    pub async fn focus_status(
+        &self,
+        scope: &AttentionScope,
+    ) -> Result<FocusStatus, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let inner = self.inner.read().await;
+        let Some(state) = inner.scopes.get(&key) else {
+            return Ok(FocusStatus {
+                pinned: None,
+                history: Vec::new(),
+                transient_active: false,
+            });
+        };
+        Ok(FocusStatus {
+            pinned: state.pinned_focus.clone(),
+            history: state.focus_history.iter().cloned().collect(),
+            transient_active: state.pinned_focus.is_none()
+                && !state.transient_vec.is_empty(),
+        })
+    }
+
     /// Replay a deterministic event sequence into a fresh store. Used by
     /// `restart_rebuilds_scores_from_chain` to demonstrate that score
     /// tier is reconstructible from the chain.
@@ -486,7 +785,9 @@ impl AttentionForwardStore for InMemoryAttention {
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let entry = inner.scopes.entry(key).or_default();
-        entry.attention_vec = vec;
+        // attend() only ever writes the transient channel — it must
+        // never clobber the operator's pinned focus.
+        entry.transient_vec = vec;
         Ok(())
     }
 
@@ -507,7 +808,7 @@ impl AttentionForwardStore for InMemoryAttention {
             .iter()
             .filter(|(_, t)| should_surface_thread(t, &key))
             .filter_map(|(handle, state)| {
-                let parts = compute_score_parts(state, &scope_state.attention_vec, now);
+                let parts = compute_score_parts(state, scope_state.effective_vec(), now);
                 if parts.score < ARCHIVE_THRESHOLD {
                     return None;
                 }
@@ -546,7 +847,11 @@ impl AttentionForwardStore for InMemoryAttention {
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let scope_state = inner.scopes.entry(key.clone()).or_default();
-        let anchor_seed = scope_state.attention_vec.clone();
+        // Anchor reads transient (conversational state), not pinned
+        // focus. Anchor is the thread's identity at materialisation;
+        // pinned focus is a ranking lens. Seeding anchors from a pin
+        // would conflate identity with stance.
+        let anchor_seed = scope_state.transient_vec.clone();
         let was_private = scope.privacy_tier == PrivacyTier::T0Private;
         let thread = scope_state
             .threads
@@ -573,7 +878,8 @@ impl AttentionForwardStore for InMemoryAttention {
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let scope_state = inner.scopes.entry(key.clone()).or_default();
-        let anchor_seed = scope_state.attention_vec.clone();
+        // Same anchor-seed reasoning as fold(): transient only.
+        let anchor_seed = scope_state.transient_vec.clone();
         let was_private = scope.privacy_tier == PrivacyTier::T0Private;
         let thread = scope_state
             .threads
@@ -625,7 +931,7 @@ impl AttentionForwardStore for InMemoryAttention {
             let Some(state) = scope_state.threads.get(handle) else {
                 continue;
             };
-            let score = compute_score_parts(state, &scope_state.attention_vec, now).score;
+            let score = compute_score_parts(state, scope_state.effective_vec(), now).score;
             best = Some(best.map_or(score, |b| b.max(score)));
         }
         Ok(best.unwrap_or(0.0))
@@ -644,10 +950,11 @@ impl AttentionForwardStore for InMemoryAttention {
         let Some(state) = inner.scopes.get(&key) else {
             return Ok(None);
         };
-        if state.attention_vec.is_empty() {
+        let eff = state.effective_vec();
+        if eff.is_empty() {
             return Ok(None);
         }
-        Ok(Some(state.attention_vec.clone()))
+        Ok(Some(eff.to_vec()))
     }
 }
 
@@ -1248,5 +1555,219 @@ mod tests {
             "familiarity bump must survive seed_anchor replace; got {}",
             page.why.familiarity
         );
+    }
+
+    // ---- Phase C: focus pin + history -------------------------------
+
+    #[tokio::test]
+    async fn focus_sets_pin_and_attend_does_not_clobber() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-1");
+
+        let outcome = store.focus(&scope, "the API surface".into()).await.unwrap();
+        assert!(outcome.previous.is_none());
+        assert_eq!(outcome.pinned.as_ref().unwrap().query, "the API surface");
+        let pinned_vec = outcome.pinned.as_ref().unwrap().vec.clone();
+
+        // attend() must NOT replace the pin's vector — it writes to
+        // the transient channel, which is shadowed by the pin at read.
+        store.attend(&scope, "something else entirely").await.unwrap();
+        let v = store.scope_vector(&scope).await.unwrap().unwrap();
+        assert_eq!(v, pinned_vec, "scope_vector must return pinned vec, not transient");
+    }
+
+    #[tokio::test]
+    async fn focus_replaces_pin_and_demotes_previous_to_history() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-2");
+
+        store.focus(&scope, "A".into()).await.unwrap();
+        let out = store.focus(&scope, "B".into()).await.unwrap();
+        assert_eq!(out.previous.as_ref().unwrap().query, "A");
+        assert_eq!(out.pinned.as_ref().unwrap().query, "B");
+        assert_eq!(out.history.len(), 1);
+        assert_eq!(out.history[0].query, "A");
+    }
+
+    #[tokio::test]
+    async fn focus_merge_on_dedupe_promotes_existing_history_entry() {
+        // Hand-off locked decision: focus(query=X) where X is already
+        // in history must promote the EXISTING entry (preserving its
+        // original vec) rather than re-embedding. Critical for
+        // stochastic embedders.
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-3");
+
+        let out_a = store.focus(&scope, "A".into()).await.unwrap();
+        let original_a_vec = out_a.pinned.as_ref().unwrap().vec.clone();
+        let original_a_ts = out_a.pinned.as_ref().unwrap().pinned_at;
+
+        store.focus(&scope, "B".into()).await.unwrap();
+        // A is now in history. Re-focus on A.
+        let out = store.focus(&scope, "A".into()).await.unwrap();
+        let promoted = out.pinned.as_ref().unwrap();
+        assert_eq!(promoted.query, "A");
+        assert_eq!(
+            promoted.vec, original_a_vec,
+            "merge must preserve the original vec, not re-embed"
+        );
+        assert_eq!(
+            promoted.pinned_at, original_a_ts,
+            "merge must preserve the original pinned_at"
+        );
+        // B was demoted to history; A came out of history; history
+        // contains exactly [B], no duplicate A.
+        assert_eq!(out.history.len(), 1);
+        assert_eq!(out.history[0].query, "B");
+    }
+
+    #[tokio::test]
+    async fn refocus_promotes_from_history_and_errors_on_miss() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-4");
+
+        store.focus(&scope, "A".into()).await.unwrap();
+        store.focus(&scope, "B".into()).await.unwrap(); // A → history
+        let out = store.refocus(&scope, "A".into()).await.unwrap();
+        assert_eq!(out.pinned.as_ref().unwrap().query, "A");
+        assert_eq!(out.previous.as_ref().unwrap().query, "B");
+        // Ping-pong: history stays at [B] (B was demoted, A was taken
+        // out). No growth from refocus.
+        assert_eq!(out.history.len(), 1);
+        assert_eq!(out.history[0].query, "B");
+
+        // refocus on a query that's never been pinned must error.
+        let err = store.refocus(&scope, "C".into()).await.unwrap_err();
+        assert!(matches!(err, AttentionError::FocusHistoryMiss(_)));
+    }
+
+    #[tokio::test]
+    async fn unfocus_clears_pin_and_pushes_to_history() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-5");
+
+        store.focus(&scope, "A".into()).await.unwrap();
+        let out = store.unfocus(&scope).await.unwrap();
+        assert_eq!(out.previous.as_ref().unwrap().query, "A");
+        assert!(out.pinned.is_none());
+        assert_eq!(out.history[0].query, "A");
+
+        // Unfocus on an already-unfocused scope is idempotent.
+        let out = store.unfocus(&scope).await.unwrap();
+        assert!(out.previous.is_none());
+        assert!(out.pinned.is_none());
+        // History unchanged: still has A from the first unfocus.
+        assert_eq!(out.history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn focus_history_caps_at_max() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-6");
+
+        // Each focus(N) (for N >= 1) demotes pin-{N-1} to history,
+        // so after N focuses the history has N-1 entries. To force
+        // an eviction we need N - 1 > FOCUS_HISTORY_MAX, i.e. N >=
+        // MAX + 2 focuses.
+        let total = FOCUS_HISTORY_MAX + 2;
+        for i in 0..total {
+            store
+                .focus(&scope, format!("pin-{i}"))
+                .await
+                .unwrap();
+        }
+        let status = store.focus_status(&scope).await.unwrap();
+        assert_eq!(
+            status.history.len(),
+            FOCUS_HISTORY_MAX,
+            "history must cap at FOCUS_HISTORY_MAX"
+        );
+        // pin-0 was the oldest demoted entry — it must have been
+        // evicted by the LRU pop on the (MAX+2)th focus.
+        assert!(
+            !status.history.iter().any(|p| p.query == "pin-0"),
+            "oldest pin must be evicted; got {:?}",
+            status.history.iter().map(|p| &p.query).collect::<Vec<_>>()
+        );
+        // pin-1 should still be present (it's now the oldest).
+        assert!(
+            status.history.iter().any(|p| p.query == "pin-1"),
+            "pin-1 should be the new oldest"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_status_reports_transient_active() {
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-7");
+
+        let st = store.focus_status(&scope).await.unwrap();
+        assert!(st.pinned.is_none());
+        assert!(!st.transient_active, "fresh scope has no transient");
+
+        store.attend(&scope, "hello").await.unwrap();
+        let st = store.focus_status(&scope).await.unwrap();
+        assert!(st.transient_active, "attend must light up transient_active");
+
+        store.focus(&scope, "X".into()).await.unwrap();
+        let st = store.focus_status(&scope).await.unwrap();
+        assert!(
+            !st.transient_active,
+            "with a pin set, transient_active must be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_focus_set_from_chain_rebuilds_pin_and_history() {
+        // Simulates the boot replay path: feed a sequence of
+        // FocusSet rows in chronological order, then verify the
+        // reconstructed pin + history match what live runtime
+        // would produce.
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("focus-replay");
+        let vec_a = vec![0.1_f32; 8];
+        let vec_b = vec![0.2_f32; 8];
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(1);
+        let t2 = t0 + Duration::seconds(2);
+
+        // Row 1: focus("A")
+        store
+            .apply_focus_set_from_chain(&scope, Some("A".into()), Some(vec_a.clone()), t0)
+            .await
+            .unwrap();
+        // Row 2: focus("B")
+        store
+            .apply_focus_set_from_chain(&scope, Some("B".into()), Some(vec_b.clone()), t1)
+            .await
+            .unwrap();
+        // Row 3: re-focus("A") — chain carries vec_a verbatim (the
+        // writer-side merge-on-dedupe reuses the original).
+        store
+            .apply_focus_set_from_chain(&scope, Some("A".into()), Some(vec_a.clone()), t2)
+            .await
+            .unwrap();
+
+        let st = store.focus_status(&scope).await.unwrap();
+        let pinned = st.pinned.as_ref().expect("pin must be set");
+        assert_eq!(pinned.query, "A");
+        assert_eq!(pinned.vec, vec_a, "vec must come from chain row verbatim");
+        assert_eq!(
+            pinned.pinned_at, t2,
+            "pinned_at must reflect chain row ts, not Utc::now()"
+        );
+        // History: [B] only — A was deduped out before B was demoted.
+        assert_eq!(st.history.len(), 1);
+        assert_eq!(st.history[0].query, "B");
+
+        // Row 4: unfocus — pin clears, A goes to history front.
+        store
+            .apply_focus_set_from_chain(&scope, None, None, t2 + Duration::seconds(1))
+            .await
+            .unwrap();
+        let st = store.focus_status(&scope).await.unwrap();
+        assert!(st.pinned.is_none());
+        assert_eq!(st.history[0].query, "A");
+        assert_eq!(st.history[1].query, "B");
     }
 }
