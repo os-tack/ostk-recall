@@ -668,6 +668,8 @@ CREATE TABLE IF NOT EXISTS threads (
 
 CREATE INDEX IF NOT EXISTS idx_threads_tension ON threads(tension);
 CREATE INDEX IF NOT EXISTS idx_threads_familiarity ON threads(familiarity);
+CREATE INDEX IF NOT EXISTS idx_threads_anchor ON threads(anchor_chunk_id)
+    WHERE anchor_chunk_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS evidence_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -688,6 +690,8 @@ CREATE TABLE IF NOT EXISTS evidence_links (
 CREATE INDEX IF NOT EXISTS idx_evidence_thread ON evidence_links(thread_handle);
 CREATE INDEX IF NOT EXISTS idx_evidence_state ON evidence_links(relation_state);
 CREATE INDEX IF NOT EXISTS idx_evidence_current_path ON evidence_links(current_path);
+CREATE INDEX IF NOT EXISTS idx_evidence_resolved ON evidence_links(last_resolved_chunk_id)
+    WHERE last_resolved_chunk_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS threads_proposed (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
