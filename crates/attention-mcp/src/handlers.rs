@@ -1634,6 +1634,95 @@ mod tests {
         }
     }
 
+    /// Wire-shape contract: neither `thread_attention` nor
+    /// `thread_query` may echo the internal `chunk_ids` field — a
+    /// `(project, source_id)` group can contain thousands of chunks
+    /// and the field is unbounded by design. Regression guard for
+    /// any future handler change that copy-pastes the report struct
+    /// into JSON without explicit field selection.
+    #[tokio::test]
+    async fn wire_shape_omits_unbounded_chunk_ids() {
+        use ostk_recall_core::{Chunk, Links, Source};
+        use ostk_recall_store::CorpusStore;
+        use std::sync::Arc as StdArc;
+
+        fn assert_no_chunk_ids(v: &Value, path: &str) {
+            match v {
+                Value::Object(map) => {
+                    assert!(
+                        !map.contains_key("chunk_ids"),
+                        "chunk_ids must not appear on the wire — found at {path}"
+                    );
+                    for (k, val) in map {
+                        assert_no_chunk_ids(val, &format!("{path}.{k}"));
+                    }
+                }
+                Value::Array(arr) => {
+                    for (i, val) in arr.iter().enumerate() {
+                        assert_no_chunk_ids(val, &format!("{path}[{i}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+        let tmp_corpus = TempDir::new().unwrap();
+        let dim = 16;
+        let corpus = StdArc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+        let now = Utc::now();
+        let mut chunks = Vec::new();
+        let mut embs = Vec::new();
+        for i in 0..4 {
+            chunks.push(Chunk {
+                chunk_id: format!("c-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "single.md".into(),
+                chunk_index: i,
+                ts: Some(now),
+                role: None,
+                text: format!("text-{i}"),
+                sha256: Chunk::content_hash(&format!("c-{i}")),
+                links: Links::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[0] = 1.0;
+            embs.push(v);
+        }
+        corpus.upsert(&chunks, &embs).await.unwrap();
+
+        let d = AttentionDispatch::new(attention, threads).with_corpus(corpus);
+
+        let attn_out = thread_attention(&d, json!({ "since_hours": 1 }))
+            .await
+            .unwrap();
+        assert!(
+            !attn_out["bursts"].as_array().unwrap().is_empty(),
+            "precondition: seeded burst should surface"
+        );
+        assert_no_chunk_ids(&attn_out, "thread_attention");
+
+        let q_out = thread_query(
+            &d,
+            json!({ "since_hours": 1, "signals": ["activity"], "limit": 10 }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !q_out["clusters"].as_array().unwrap().is_empty(),
+            "precondition: seeded activity cluster should surface"
+        );
+        assert_no_chunk_ids(&q_out, "thread_query");
+    }
+
     #[tokio::test]
     async fn thread_create_then_list_round_trip() {
         let (_tmp, d) = build_dispatch();

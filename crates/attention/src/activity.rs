@@ -52,9 +52,14 @@ pub enum AttentionBurstError {
 /// Single surfaced burst — one `(project, source_id)` with score,
 /// counts, time bounds, and a few sample snippets.
 ///
-/// `chunk_ids` is the full burst membership (sorted lexicographically);
-/// `samples` is the truncated human-readable view. v0.4.1+ cross-axis
-/// backfill in `thread_query` joins on `chunk_ids`.
+/// `samples` is the truncated human-readable view. `chunk_ids` is the
+/// full burst membership (sorted lexicographically) and is **internal
+/// to the attention crate** — used by `thread_query`'s v0.4.1+
+/// cross-axis backfill, which needs exact membership. MCP handlers
+/// must not echo `chunk_ids` directly to the wire: a single
+/// `(project, source_id)` can contain thousands of chunks and the
+/// list is unbounded by design. See
+/// `attention_mcp::handlers::thread_attention` for the contract.
 #[derive(Debug, Clone)]
 pub struct AttentionBurstReport {
     pub project: String,

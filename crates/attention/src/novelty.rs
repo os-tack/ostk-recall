@@ -101,8 +101,10 @@ pub struct NoveltyReport {
     pub mean_novelty: f32,
     /// Maximum novelty score within the cluster. Range `[0, 2]`.
     pub max_novelty: f32,
-    /// Full cluster membership, sorted lexicographically. Used by
-    /// `thread_query`'s v0.4.1+ cross-axis backfill.
+    /// Full cluster membership, sorted lexicographically. **Internal
+    /// to the attention crate** — fed to `thread_query`'s v0.4.1+
+    /// cross-axis backfill (which needs exact membership). Unbounded
+    /// in size; MCP handlers must not echo it to the wire.
     pub chunk_ids: Vec<String>,
     /// Sample text snippets pulled from the cluster's members.
     pub samples: Vec<String>,

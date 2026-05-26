@@ -33,8 +33,10 @@ pub struct EmergentReport {
     pub members: usize,
     /// Mean pairwise cosine similarity within the cluster (`0.0–1.0`).
     pub cohesion: f32,
-    /// Full cluster membership, sorted lexicographically. Used by
-    /// `thread_query`'s v0.4.1+ cross-axis backfill.
+    /// Full cluster membership, sorted lexicographically. **Internal
+    /// to the attention crate** — fed to `thread_query`'s v0.4.1+
+    /// cross-axis backfill (which needs exact membership). Unbounded
+    /// in size; MCP handlers must not echo it to the wire.
     pub chunk_ids: Vec<String>,
     /// Short snippets from the cluster members — first ~120 chars of
     /// each, up to a configurable cap.

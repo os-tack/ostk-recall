@@ -207,9 +207,11 @@ pub struct ThreadQueryReport {
     pub origin: Axis,
     pub project: String,
     pub members: usize,
-    /// Full cluster membership (sorted lexicographically). Used by the
-    /// cross-axis backfill pass and by callers who want to correlate
-    /// the cluster across queries by exact chunk identity.
+    /// Full cluster membership (sorted lexicographically). **Internal
+    /// to the attention crate** — feeds the cross-axis backfill pass.
+    /// Available to Rust callers that want to correlate the cluster
+    /// across queries by exact chunk identity, but unbounded in size;
+    /// MCP handlers must not echo it to the wire.
     pub chunk_ids: Vec<String>,
     pub density_score: Option<f32>,
     pub activity_score: Option<f32>,
