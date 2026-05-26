@@ -347,6 +347,10 @@ pub const ATTENTION_TOOL_NAMES: &[&str] = &[
     "attention_fold",
     "attention_familiarize",
     "attention_decay",
+    "attention_focus",
+    "attention_refocus",
+    "attention_unfocus",
+    "attention_status",
 ];
 
 /// Names of all thread-namespace tools.
@@ -371,7 +375,79 @@ pub fn attention_tools() -> Vec<Value> {
         tool_attention_fold(),
         tool_attention_familiarize(),
         tool_attention_decay(),
+        tool_attention_focus(),
+        tool_attention_refocus(),
+        tool_attention_unfocus(),
+        tool_attention_status(),
     ]
+}
+
+/// Pin a focus query for a scope so all subsequent ranking
+/// (`thread_query`, `attention_surface`, `recall` with
+/// `attention_bias`) is shaped by what the operator is attending
+/// to right now. Phase D of the focus feature.
+pub fn tool_attention_focus() -> Value {
+    json!({
+        "name": "attention_focus",
+        "description": "Pin a focus query for the scope. While pinned, all ranking (attention_surface, recall bias, score_thread) uses the pinned vector instead of the conversational transient. If the query is already in this scope's focus_history, the existing entry is promoted (preserving its original vec — important for stochastic embedders). Previous pin is demoted to history; LRU eviction caps the ring at FOCUS_HISTORY_MAX entries. Emits ChainEvent::FocusSet so the pin survives restart.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "scope": { "type": "object", "description": "Default: standard scope (project=None, T1Project)." },
+                "query": { "type": "string", "description": "Natural-language focus statement. Dedupe is by exact string equality." },
+                "surface_limit": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Cap on the `surface` snippet returned with the response (so the operator sees ranking feedback). Default 10." }
+            }
+        }
+    })
+}
+
+/// Rotate the pin to a previously-pinned focus from history.
+pub fn tool_attention_refocus() -> Value {
+    json!({
+        "name": "attention_refocus",
+        "description": "Promote a previously-pinned focus from history back to the pin slot. The currently-pinned focus is demoted to history; the rotated-in vec is reused verbatim (no re-embed). Errors if `query` is not in the scope's focus_history — use attention_focus to pin anything new. Emits ChainEvent::FocusSet.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "scope": { "type": "object" },
+                "query": { "type": "string", "description": "Must match a query already in focus_history exactly." },
+                "surface_limit": { "type": "integer", "minimum": 0, "maximum": 100 }
+            }
+        }
+    })
+}
+
+/// Clear the focus pin; ranking returns to the conversational
+/// transient driven by `attention_attend`.
+pub fn tool_attention_unfocus() -> Value {
+    json!({
+        "name": "attention_unfocus",
+        "description": "Clear the scope's pin. The cleared focus is pushed to history front. Idempotent. Emits ChainEvent::FocusSet with both query and vec null so the unfocus survives restart.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scope": { "type": "object" },
+                "surface_limit": { "type": "integer", "minimum": 0, "maximum": 100 }
+            }
+        }
+    })
+}
+
+/// Read-only inspection of the scope's focus state.
+pub fn tool_attention_status() -> Value {
+    json!({
+        "name": "attention_status",
+        "description": "Read-only snapshot of the scope's focus state: current pin (if any), bounded history (most-recent first), and `transient_active` (true iff no pin and attention_attend has populated something). Includes the same `surface` snippet as the focus-mutating verbs for ranking visibility.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scope": { "type": "object" },
+                "surface_limit": { "type": "integer", "minimum": 0, "maximum": 100 }
+            }
+        }
+    })
 }
 
 #[must_use]

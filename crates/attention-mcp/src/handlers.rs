@@ -31,7 +31,9 @@ use ostk_recall_attention::novelty::{
     DEFAULT_RECLUSTER_THRESHOLD as NOVELTY_DEFAULT_RECLUSTER_THRESHOLD,
     DEFAULT_SINCE_HOURS as NOVELTY_DEFAULT_SINCE_HOURS, NoveltyError, surface_novelty,
 };
-use ostk_recall_attention::{AttentionError, AttentionForwardStore};
+use ostk_recall_attention::{
+    AttentionError, AttentionForwardStore, FocusOutcome, FocusStatus, PinnedFocus,
+};
 use ostk_recall_core::{
     AttentionPage, AttentionScope, FoldDepth, PrivacyTier, ThreadHandle, ThreadHandleError,
 };
@@ -136,6 +138,10 @@ impl DefaultAttentionHandlers for AttentionDispatch {
             "thread_novelty" => thread_novelty(self, args).await,
             "thread_query" => thread_query(self, args).await,
             "thread_evidence" => thread_evidence(self, args).await,
+            "attention_focus" => attention_focus(self, args).await,
+            "attention_refocus" => attention_refocus(self, args).await,
+            "attention_unfocus" => attention_unfocus(self, args).await,
+            "attention_status" => attention_status(self, args).await,
             other => Err(AttentionHandlersError::InvalidParams(format!(
                 "unknown attention/thread tool: {other}"
             ))),
@@ -1044,6 +1050,186 @@ fn thread_record_to_json(r: &ThreadRecord) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------
+// Focus pin verbs (Phase D of the focus feature, post-v0.4.2 §3)
+// ---------------------------------------------------------------------
+
+fn pinned_focus_to_json(p: &PinnedFocus) -> Value {
+    json!({
+        "query": p.query,
+        "pinned_at": p.pinned_at.to_rfc3339(),
+    })
+}
+
+fn history_to_json(history: &[PinnedFocus]) -> Vec<Value> {
+    history
+        .iter()
+        .map(|p| {
+            json!({
+                "query": p.query,
+                "last_seen_at": p.pinned_at.to_rfc3339(),
+            })
+        })
+        .collect()
+}
+
+fn focus_outcome_to_json(
+    outcome: &FocusOutcome,
+    pinned_label: &str,
+    previous_label: &str,
+    surface: Vec<AttentionPage>,
+) -> Value {
+    json!({
+        previous_label: outcome.previous.as_ref().map(pinned_focus_to_json),
+        pinned_label: outcome.pinned.as_ref().map(pinned_focus_to_json),
+        "history": history_to_json(&outcome.history),
+        "surface": surface,
+    })
+}
+
+/// Default surface limit echoed after every focus mutation so the
+/// operator can see ranking feedback from the pin change. Small
+/// enough to keep the response tight; configurable via `surface_limit`.
+const DEFAULT_FOCUS_SURFACE_LIMIT: usize = 10;
+
+async fn surface_after_focus(
+    d: &AttentionDispatch,
+    scope: &AttentionScope,
+    args: &Value,
+) -> Vec<AttentionPage> {
+    let limit = args
+        .get("surface_limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_FOCUS_SURFACE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(DEFAULT_FOCUS_SURFACE_LIMIT)
+        });
+    d.attention.surface(scope, limit).await.unwrap_or_default()
+}
+
+/// Pin a focus query to a scope. Embeds the query through the
+/// shared embedder, demotes any previous pin to history, and emits
+/// a `ChainEvent::FocusSet` so the pin survives restart.
+///
+/// Args:
+/// - `scope` (optional): defaults to the standard scope.
+/// - `query` (required): natural-language focus statement.
+/// - `surface_limit` (optional): cap on the `surface` snippet
+///   returned for ranking feedback. Default
+///   [`DEFAULT_FOCUS_SURFACE_LIMIT`].
+///
+/// Response:
+/// ```jsonc
+/// {
+///   "previous": { "query": "...", "pinned_at": "..." } | null,
+///   "pinned":   { "query": "...", "pinned_at": "..." },
+///   "history":  [ { "query": "...", "last_seen_at": "..." }, ... ],
+///   "surface":  [ ... ]
+/// }
+/// ```
+pub async fn attention_focus(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let scope = default_scope(&args)?;
+    validate_privacy_tier(&scope, d.max_privacy_tier)?;
+    let query = require_str(&args, "query")?;
+
+    let outcome = d.attention.focus(&scope, query).await?;
+    // Chain emission AFTER the in-memory mutation, mirroring the
+    // existing record_familiarity_batch pattern. Best-effort: a sink
+    // failure leaves the pin in memory but no audit row — the
+    // operator can re-pin. Log so the gap is visible.
+    let (q, v) = match outcome.pinned.as_ref() {
+        Some(pin) => (Some(pin.query.clone()), Some(pin.vec.clone())),
+        None => (None, None),
+    };
+    if let Err(err) = d.threads.record_focus_set(&scope, q, v) {
+        tracing::warn!(
+            error = %err,
+            "attention_focus: chain emission failed; pin survives in memory only"
+        );
+    }
+    let surface = surface_after_focus(d, &scope, &args).await;
+    Ok(focus_outcome_to_json(&outcome, "pinned", "previous", surface))
+}
+
+/// Promote a previously-pinned focus from history back to the pin
+/// slot. The currently-pinned focus is demoted to history. No
+/// re-embedding — the stored vec is reused, so ping-ponging
+/// between two foci is exactly the same lens each time.
+///
+/// Errors with `FocusHistoryMiss` if `query` is not in the scope's
+/// history; callers that want "pin whether new or known" should
+/// use `attention_focus` instead.
+pub async fn attention_refocus(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let scope = default_scope(&args)?;
+    validate_privacy_tier(&scope, d.max_privacy_tier)?;
+    let query = require_str(&args, "query")?;
+
+    let outcome = d.attention.refocus(&scope, query).await?;
+    let (q, v) = match outcome.pinned.as_ref() {
+        Some(pin) => (Some(pin.query.clone()), Some(pin.vec.clone())),
+        None => (None, None),
+    };
+    if let Err(err) = d.threads.record_focus_set(&scope, q, v) {
+        tracing::warn!(
+            error = %err,
+            "attention_refocus: chain emission failed; pin survives in memory only"
+        );
+    }
+    let surface = surface_after_focus(d, &scope, &args).await;
+    // Response uses `swapped_out` instead of `previous` so callers
+    // can tell apart "I pinned a fresh query" from "I rotated to a
+    // known one." Same field shape otherwise.
+    Ok(focus_outcome_to_json(&outcome, "pinned", "swapped_out", surface))
+}
+
+/// Clear the scope's pin. The cleared focus is pushed to history
+/// front. Idempotent — unfocusing an unpinned scope is a no-op
+/// (returns `unpinned: null`).
+pub async fn attention_unfocus(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let scope = default_scope(&args)?;
+    validate_privacy_tier(&scope, d.max_privacy_tier)?;
+
+    let outcome = d.attention.unfocus(&scope).await?;
+    // Unfocus chain row: both query and vec are None.
+    if let Err(err) = d.threads.record_focus_set(&scope, None, None) {
+        tracing::warn!(
+            error = %err,
+            "attention_unfocus: chain emission failed; clear survives in memory only"
+        );
+    }
+    let surface = surface_after_focus(d, &scope, &args).await;
+    Ok(focus_outcome_to_json(&outcome, "pinned", "unpinned", surface))
+}
+
+/// Read-only snapshot of the scope's focus state. Returns the
+/// current pin (if any), the bounded history, and whether the
+/// conversational `transient_vec` is driving ranking (true only
+/// when no pin is set and `attend()` has populated something).
+pub async fn attention_status(
+    d: &AttentionDispatch,
+    args: Value,
+) -> Result<Value, AttentionHandlersError> {
+    let scope = default_scope(&args)?;
+    validate_privacy_tier(&scope, d.max_privacy_tier)?;
+
+    let status: FocusStatus = d.attention.focus_status(&scope).await?;
+    let surface = surface_after_focus(d, &scope, &args).await;
+    Ok(json!({
+        "pinned": status.pinned.as_ref().map(pinned_focus_to_json),
+        "history": history_to_json(&status.history),
+        "transient_active": status.transient_active,
+        "surface": surface,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,5 +2032,144 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AttentionHandlersError::PrivacyForbidden(_)));
+    }
+
+    // ---- Phase D: attention_focus / refocus / unfocus / status ------
+
+    #[tokio::test]
+    async fn attention_focus_pins_and_returns_outcome() {
+        let (_tmp, d) = build_dispatch();
+        let out = attention_focus(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "query": "the CLI surface"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(out["previous"].is_null());
+        assert_eq!(out["pinned"]["query"].as_str(), Some("the CLI surface"));
+        assert!(out["history"].as_array().unwrap().is_empty());
+        assert!(out["surface"].is_array(), "surface snippet must be present");
+    }
+
+    #[tokio::test]
+    async fn attention_focus_demotes_previous_to_history() {
+        let (_tmp, d) = build_dispatch();
+        let scope = json!({"project": "p"});
+        attention_focus(&d, json!({"scope": scope, "query": "A"}))
+            .await
+            .unwrap();
+        let out = attention_focus(&d, json!({"scope": scope, "query": "B"}))
+            .await
+            .unwrap();
+        assert_eq!(out["previous"]["query"].as_str(), Some("A"));
+        assert_eq!(out["pinned"]["query"].as_str(), Some("B"));
+        let history = out["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["query"].as_str(), Some("A"));
+    }
+
+    #[tokio::test]
+    async fn attention_refocus_rotates_from_history_and_errors_on_miss() {
+        let (_tmp, d) = build_dispatch();
+        let scope = json!({"project": "p"});
+        attention_focus(&d, json!({"scope": scope, "query": "A"}))
+            .await
+            .unwrap();
+        attention_focus(&d, json!({"scope": scope, "query": "B"}))
+            .await
+            .unwrap(); // A demoted to history
+
+        let out = attention_refocus(&d, json!({"scope": scope, "query": "A"}))
+            .await
+            .unwrap();
+        assert_eq!(out["pinned"]["query"].as_str(), Some("A"));
+        // refocus uses "swapped_out" instead of "previous" to flag intent.
+        assert_eq!(out["swapped_out"]["query"].as_str(), Some("B"));
+
+        // Refocus on a query that's never been pinned errors.
+        let err = attention_refocus(&d, json!({"scope": scope, "query": "ZZZ"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AttentionHandlersError::Attention(AttentionError::FocusHistoryMiss(_))),
+            "expected FocusHistoryMiss, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attention_unfocus_clears_pin_idempotently() {
+        let (_tmp, d) = build_dispatch();
+        let scope = json!({"project": "p"});
+        attention_focus(&d, json!({"scope": scope, "query": "X"}))
+            .await
+            .unwrap();
+        let out = attention_unfocus(&d, json!({"scope": scope})).await.unwrap();
+        assert_eq!(out["unpinned"]["query"].as_str(), Some("X"));
+        assert!(out["pinned"].is_null());
+        assert_eq!(out["history"].as_array().unwrap()[0]["query"].as_str(), Some("X"));
+
+        // Idempotent second call: nothing to clear, history unchanged.
+        let out = attention_unfocus(&d, json!({"scope": scope})).await.unwrap();
+        assert!(out["unpinned"].is_null());
+        assert!(out["pinned"].is_null());
+        assert_eq!(out["history"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attention_status_reports_pin_and_transient() {
+        let (_tmp, d) = build_dispatch();
+        let scope = json!({"project": "p"});
+
+        // Fresh scope: nothing pinned, no transient.
+        let out = attention_status(&d, json!({"scope": scope})).await.unwrap();
+        assert!(out["pinned"].is_null());
+        assert!(out["history"].as_array().unwrap().is_empty());
+        assert_eq!(out["transient_active"].as_bool(), Some(false));
+
+        // attend() lights up transient_active.
+        d.attention
+            .attend(&serde_json::from_value(scope.clone()).unwrap(), "hello")
+            .await
+            .unwrap();
+        let out = attention_status(&d, json!({"scope": scope})).await.unwrap();
+        assert_eq!(out["transient_active"].as_bool(), Some(true));
+
+        // Pinning shadows the transient — transient_active falls back
+        // to false because the pin is what ranking uses.
+        attention_focus(&d, json!({"scope": scope, "query": "Y"}))
+            .await
+            .unwrap();
+        let out = attention_status(&d, json!({"scope": scope})).await.unwrap();
+        assert_eq!(out["pinned"]["query"].as_str(), Some("Y"));
+        assert_eq!(out["transient_active"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_all_four_focus_verbs() {
+        // Contract test: every new verb name resolves through the
+        // dispatcher (would catch a forgotten match arm).
+        let (_tmp, d) = build_dispatch();
+        let scope = json!({"project": "p"});
+
+        let _ = d
+            .dispatch("attention_focus", json!({"scope": scope, "query": "X"}))
+            .await
+            .unwrap();
+        let _ = d
+            .dispatch("attention_status", json!({"scope": scope}))
+            .await
+            .unwrap();
+        let _ = d
+            .dispatch("attention_unfocus", json!({"scope": scope}))
+            .await
+            .unwrap();
+        // refocus after unfocus: X is in history now.
+        let _ = d
+            .dispatch("attention_refocus", json!({"scope": scope, "query": "X"}))
+            .await
+            .unwrap();
     }
 }

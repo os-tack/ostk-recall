@@ -232,6 +232,53 @@ pub trait AttentionForwardStore: Send + Sync {
     ) -> Result<Option<Vec<f32>>, AttentionError> {
         Ok(None)
     }
+
+    // --- focus pin (Phase C/D) ----------------------------------------
+    // Default impls fall through to an empty outcome so stores without
+    // per-scope state remain trait-compatible; the in-memory runtime
+    // overrides each.
+
+    async fn focus(
+        &self,
+        _scope: &AttentionScope,
+        _query: String,
+    ) -> Result<FocusOutcome, AttentionError> {
+        Ok(FocusOutcome {
+            previous: None,
+            pinned: None,
+            history: Vec::new(),
+        })
+    }
+
+    async fn refocus(
+        &self,
+        _scope: &AttentionScope,
+        query: String,
+    ) -> Result<FocusOutcome, AttentionError> {
+        Err(AttentionError::FocusHistoryMiss(query))
+    }
+
+    async fn unfocus(
+        &self,
+        _scope: &AttentionScope,
+    ) -> Result<FocusOutcome, AttentionError> {
+        Ok(FocusOutcome {
+            previous: None,
+            pinned: None,
+            history: Vec::new(),
+        })
+    }
+
+    async fn focus_status(
+        &self,
+        _scope: &AttentionScope,
+    ) -> Result<FocusStatus, AttentionError> {
+        Ok(FocusStatus {
+            pinned: None,
+            history: Vec::new(),
+            transient_active: false,
+        })
+    }
 }
 
 // --- in-memory implementation -----------------------------------------
@@ -955,6 +1002,43 @@ impl AttentionForwardStore for InMemoryAttention {
             return Ok(None);
         }
         Ok(Some(eff.to_vec()))
+    }
+
+    // --- focus pin (Phase D dispatch) ---------------------------------
+    // The inherent impl on InMemoryAttention owns the mutation logic;
+    // these trait method bodies just forward so callers holding an
+    // `Arc<dyn AttentionForwardStore>` (the MCP dispatch path) reach
+    // the same behavior. Inherent methods take precedence on the
+    // concrete type, so existing direct call sites are unaffected.
+
+    async fn focus(
+        &self,
+        scope: &AttentionScope,
+        query: String,
+    ) -> Result<FocusOutcome, AttentionError> {
+        Self::focus(self, scope, query).await
+    }
+
+    async fn refocus(
+        &self,
+        scope: &AttentionScope,
+        query: String,
+    ) -> Result<FocusOutcome, AttentionError> {
+        Self::refocus(self, scope, query).await
+    }
+
+    async fn unfocus(
+        &self,
+        scope: &AttentionScope,
+    ) -> Result<FocusOutcome, AttentionError> {
+        Self::unfocus(self, scope).await
+    }
+
+    async fn focus_status(
+        &self,
+        scope: &AttentionScope,
+    ) -> Result<FocusStatus, AttentionError> {
+        Self::focus_status(self, scope).await
     }
 }
 
