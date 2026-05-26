@@ -17,6 +17,7 @@ ostk-recall-store = { workspace = true }
 ostk-recall-pipeline = { workspace = true }
 ostk-recall-attention-mcp = { workspace = true }
 ostk-recall-attention = { workspace = true }
+chrono = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +25,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-chrono = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

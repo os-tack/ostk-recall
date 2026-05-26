@@ -172,12 +172,22 @@ impl Server {
                     .map_err(|e| JsonRpcError::invalid_params(format!("recall args: {e}")))?;
                 let bias = p.attention_bias.clone();
                 let mut hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                // Phase F: lens declaration. Capture the pinned focus
+                // (if any) BEFORE applying bias so we can attach a
+                // `lens` block when the response is shaped by a pin.
+                // Absence of `lens` ⇔ ranking is unbiased by any pin.
+                let mut lens = None;
                 if let Some(bias) = bias {
                     if let Some(dispatch) = self.attention.as_ref() {
+                        let status = dispatch.attention.focus_status(&bias.scope).await.ok();
+                        lens = build_recall_lens(&bias, status.as_ref());
                         apply_attention_bias(&mut hits, &bias, dispatch).await;
                     }
                 }
-                json!({ "hits": hits })
+                match lens {
+                    Some(lens) => json!({ "hits": hits, "lens": lens }),
+                    None => json!({ "hits": hits }),
+                }
             }
             "recall_link" => {
                 let chunk_id = args
@@ -444,6 +454,33 @@ async fn apply_attention_bias(
 
 fn sanitize_weight(w: f32) -> f32 {
     if w.is_finite() && w >= 0.0 { w } else { 0.0 }
+}
+
+/// Build the Phase F `lens` block for a recall response. Returns
+/// `Some(json)` when a pinned focus shaped this query (caller
+/// supplied `attention_bias` AND a pin exists on the bias's scope);
+/// `None` otherwise.
+///
+/// The substrate-level invariant: presence of `lens` ⇔ response was
+/// shaped by a pin. Pulled out of `handle_tools_call` so the lens
+/// shape is unit-testable without spinning up a full QueryEngine.
+fn build_recall_lens(
+    bias: &AttentionBiasParams,
+    status: Option<&ostk_recall_attention::FocusStatus>,
+) -> Option<Value> {
+    let pin = status?.pinned.as_ref()?;
+    let age_secs = (chrono::Utc::now() - pin.pinned_at)
+        .num_seconds()
+        .max(0);
+    Some(json!({
+        "focus_query": pin.query,
+        "pinned_at": pin.pinned_at.to_rfc3339(),
+        "focus_age_secs": age_secs,
+        "applied": {
+            "thread_weight": bias.thread_weight,
+            "embedding_weight": bias.embedding_weight,
+        },
+    }))
 }
 
 fn query_error_to_rpc(err: QueryError) -> JsonRpcError {
@@ -905,5 +942,60 @@ mod attention_bias_tests {
         // Back-compat aliases must mirror the thread axis.
         assert_eq!(a.attention_score, a.thread_score);
         assert_eq!(a.attention_weight, a.thread_weight);
+    }
+
+    // ---- Phase F: recall lens declaration ----------------------------
+
+    #[test]
+    fn build_recall_lens_returns_none_without_focus_status() {
+        // No focus_status at all (e.g. trait default returned None or
+        // the dispatch couldn't reach the attention store): no lens.
+        let bias = thread_bias(1.0);
+        assert!(build_recall_lens(&bias, None).is_none());
+    }
+
+    #[test]
+    fn build_recall_lens_returns_none_when_status_has_no_pin() {
+        // Focus_status present but no pin → no lens. Operator hasn't
+        // declared an intent to shape ranking, so the substrate
+        // doesn't claim the response was shaped by one.
+        let bias = thread_bias(1.0);
+        let status = ostk_recall_attention::FocusStatus {
+            pinned: None,
+            history: Vec::new(),
+            transient_active: false,
+        };
+        assert!(build_recall_lens(&bias, Some(&status)).is_none());
+    }
+
+    #[test]
+    fn build_recall_lens_emits_focus_query_and_weights_when_pinned() {
+        // The substrate-level invariant: with a pin set AND a bias
+        // supplied, the lens block declares the focus query, the
+        // pinned_at timestamp, a non-negative focus_age_secs, and
+        // both axis weights so the operator can argue with the math.
+        let bias = AttentionBiasParams {
+            scope: scope(),
+            thread_weight: 0.7,
+            embedding_weight: 0.4,
+        };
+        let pin = ostk_recall_attention::PinnedFocus {
+            query: "the CLI surface".into(),
+            vec: vec![0.0_f32; 4],
+            pinned_at: chrono::Utc::now() - chrono::Duration::seconds(123),
+        };
+        let status = ostk_recall_attention::FocusStatus {
+            pinned: Some(pin),
+            history: Vec::new(),
+            transient_active: false,
+        };
+        let lens =
+            build_recall_lens(&bias, Some(&status)).expect("pin + bias must produce lens");
+        assert_eq!(lens["focus_query"].as_str(), Some("the CLI surface"));
+        // focus_age_secs should be roughly 123, allow drift for slow CI.
+        let age = lens["focus_age_secs"].as_i64().unwrap();
+        assert!((120..=130).contains(&age), "focus_age_secs ~123, got {age}");
+        assert!((lens["applied"]["thread_weight"].as_f64().unwrap() - 0.7).abs() < 1e-5);
+        assert!((lens["applied"]["embedding_weight"].as_f64().unwrap() - 0.4).abs() < 1e-5);
     }
 }

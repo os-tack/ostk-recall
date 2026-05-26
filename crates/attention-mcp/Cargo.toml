@@ -23,5 +23,6 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+ostk-recall-pipeline = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

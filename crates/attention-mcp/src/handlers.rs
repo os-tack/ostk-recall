@@ -845,6 +845,12 @@ pub async fn thread_query(
         return Err(AttentionHandlersError::CorpusUnavailable);
     };
 
+    // Scope is needed for resonance — the focus pin lives per-scope.
+    // Validates the boundary even when resonance isn't requested so
+    // a malformed scope doesn't slip through.
+    let scope = default_scope(&args)?;
+    validate_privacy_tier(&scope, d.max_privacy_tier)?;
+
     let mut params = ThreadQueryParams::default();
     if let Some(v) = args.get("since_hours").and_then(Value::as_u64) {
         if let Ok(n) = i64::try_from(v) {
@@ -884,7 +890,8 @@ pub async fn thread_query(
         let d = pick("density").unwrap_or(params.composite_weights.density);
         let a = pick("activity").unwrap_or(params.composite_weights.activity);
         let n = pick("novelty").unwrap_or(params.composite_weights.novelty);
-        params.composite_weights = CompositeWeights::new(d, a, n);
+        let r = pick("resonance").unwrap_or(params.composite_weights.resonance);
+        params.composite_weights = CompositeWeights::new_with_resonance(d, a, n, r);
     }
     #[allow(clippy::cast_possible_truncation)]
     {
@@ -896,6 +903,9 @@ pub async fn thread_query(
         }
         if let Some(v) = args.get("min_novelty").and_then(Value::as_f64) {
             params.min_novelty = v as f32;
+        }
+        if let Some(v) = args.get("min_resonance").and_then(Value::as_f64) {
+            params.min_resonance = v as f32;
         }
     }
     if let Some(v) = args.get("min_cluster_size").and_then(Value::as_u64) {
@@ -913,6 +923,23 @@ pub async fn thread_query(
             params.samples_per_cluster = n;
         }
     }
+
+    // Resonance plumbing: when the caller opts into the resonance
+    // axis, pull the scope's pinned focus and pass its vec to the
+    // query engine. No pin → resonance_score stays None per cluster
+    // and contributes 0 to the composite (decomposable). The
+    // pinned_focus is captured here so Phase F's lens block can
+    // attach to the response.
+    let resonance_requested = params.signals.contains(&Axis::Resonance);
+    let pinned_focus = if resonance_requested {
+        let status = d.attention.focus_status(&scope).await?;
+        if let Some(pin) = status.pinned.as_ref() {
+            params.resonance_focus_vec = Some(pin.vec.clone());
+        }
+        status.pinned
+    } else {
+        None
+    };
 
     let rows = run_query(corpus, &d.threads, params.clone())
         .await
@@ -949,6 +976,7 @@ pub async fn thread_query(
                 "density_score": r.density_score,
                 "activity_score": r.activity_score,
                 "novelty_score": r.novelty_score,
+                "resonance_score": r.resonance_score,
                 "composite_score": r.composite_score,
                 "samples": r.samples,
                 "attribution": {
@@ -960,7 +988,7 @@ pub async fn thread_query(
         .collect();
 
     let signals_echo: Vec<&str> = params.signals.iter().map(|a| a.as_str()).collect();
-    Ok(json!({
+    let mut response = json!({
         "clusters": clusters,
         "params": {
             "since_hours": params.since_hours,
@@ -971,15 +999,44 @@ pub async fn thread_query(
                 "density": params.composite_weights.density,
                 "activity": params.composite_weights.activity,
                 "novelty": params.composite_weights.novelty,
+                "resonance": params.composite_weights.resonance,
             },
             "min_density": params.min_density,
             "min_activity": params.min_activity,
             "min_novelty": params.min_novelty,
+            "min_resonance": params.min_resonance,
             "min_cluster_size": params.min_cluster_size,
             "limit": params.limit,
             "samples_per_cluster": params.samples_per_cluster,
         }
-    }))
+    });
+
+    // Phase F: lens declaration. The substrate never quietly applies
+    // a focus lens — if a pinned focus shaped this response (i.e.
+    // resonance was opted-in AND a pin was active when the query
+    // ran), attach a `lens` block so the caller can argue with the
+    // math, not the vibe. Absence of `lens` is the invariant: no
+    // pin in play.
+    if let Some(pin) = pinned_focus {
+        if let Some(map) = response.as_object_mut() {
+            map.insert(
+                "lens".into(),
+                json!({
+                    "focus_query": pin.query,
+                    "pinned_at": pin.pinned_at.to_rfc3339(),
+                    "applied_to_axis": "resonance",
+                    "composite_weights_echo": {
+                        "density": params.composite_weights.density,
+                        "activity": params.composite_weights.activity,
+                        "novelty": params.composite_weights.novelty,
+                        "resonance": params.composite_weights.resonance,
+                    },
+                }),
+            );
+        }
+    }
+
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------
@@ -1578,7 +1635,11 @@ mod tests {
             let axes = c["attribution"]["axes"]
                 .as_array()
                 .expect("attribution.axes");
-            assert_eq!(axes.len(), 3, "all three axes always attributed");
+            assert_eq!(
+                axes.len(),
+                4,
+                "all four axes always attributed (density, activity, novelty, resonance)"
+            );
             let composite = c["composite_score"].as_f64().unwrap();
             let attr_composite = c["attribution"]["composite"].as_f64().unwrap();
             assert!(
@@ -2171,5 +2232,242 @@ mod tests {
             .dispatch("attention_refocus", json!({"scope": scope, "query": "X"}))
             .await
             .unwrap();
+    }
+
+    // ---- Phase E + F: resonance axis on thread_query + lens block ---
+
+    /// Build a dispatch wired with a corpus and a deterministic
+    /// embedder so the focus-pin path produces a real vec that is
+    /// dim-compatible with seeded chunk embeddings.
+    async fn build_dispatch_with_resonance_corpus()
+        -> (TempDir, TempDir, Arc<AttentionDispatch>)
+    {
+        use ostk_recall_core::{Chunk, Links as CoreLinks, Source};
+        use ostk_recall_store::CorpusStore;
+
+        struct AxisZeroEmbedder {
+            dim: usize,
+        }
+        impl ostk_recall_pipeline::ChunkEmbedder for AxisZeroEmbedder {
+            fn dim(&self) -> usize { self.dim }
+            fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+                texts
+                    .iter()
+                    .map(|_| {
+                        let mut v = vec![0.0_f32; self.dim];
+                        v[0] = 1.0;
+                        v
+                    })
+                    .collect()
+            }
+        }
+        let dim = 16;
+        let embedder: Arc<dyn ostk_recall_pipeline::ChunkEmbedder> =
+            Arc::new(AxisZeroEmbedder { dim });
+
+        let tmp_threads = TempDir::new().unwrap();
+        let threads = Arc::new(ThreadsDb::open(tmp_threads.path()).unwrap());
+        let attention: Arc<dyn AttentionForwardStore> =
+            Arc::new(InMemoryAttention::with_embedder(Arc::clone(&embedder)));
+        let tmp_corpus = TempDir::new().unwrap();
+        let corpus = Arc::new(
+            CorpusStore::open_or_create(tmp_corpus.path(), dim)
+                .await
+                .unwrap(),
+        );
+
+        // Seed: two activity bursts (shared source_id per group so
+        // the activity primitive surfaces each as one cluster).
+        // Group A aligned to axis 0 (pinned focus is axis-0 → high
+        // resonance). Group B aligned to axis 4 (orthogonal → 0).
+        let now = chrono::Utc::now();
+        let mut chunks = Vec::new();
+        let mut embs: Vec<Vec<f32>> = Vec::new();
+        for i in 0..4 {
+            chunks.push(Chunk {
+                chunk_id: format!("a-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "a.md".into(),
+                chunk_index: i,
+                ts: Some(now),
+                role: None,
+                text: format!("aligned-{i}"),
+                sha256: Chunk::content_hash(&format!("a-{i}")),
+                links: CoreLinks::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[0] = 1.0;
+            v[1] = 0.001 + (i as f32) * 0.0001;
+            embs.push(v);
+        }
+        for i in 0..4 {
+            chunks.push(Chunk {
+                chunk_id: format!("b-{i}"),
+                source: Source::Markdown,
+                project: Some("p".into()),
+                source_id: "b.md".into(),
+                chunk_index: i,
+                ts: Some(now),
+                role: None,
+                text: format!("orthogonal-{i}"),
+                sha256: Chunk::content_hash(&format!("b-{i}")),
+                links: CoreLinks::default(),
+                extra: serde_json::Value::Null,
+            });
+            let mut v = vec![0.0_f32; dim];
+            v[4] = 1.0;
+            v[5] = 0.001 + (i as f32) * 0.0001;
+            embs.push(v);
+        }
+        corpus.upsert(&chunks, &embs).await.unwrap();
+
+        let d = Arc::new(
+            AttentionDispatch::new(attention, threads).with_corpus(corpus),
+        );
+        (tmp_threads, tmp_corpus, d)
+    }
+
+    #[tokio::test]
+    async fn thread_query_resonance_null_without_pin() {
+        let (_tmp_t, _tmp_c, d) = build_dispatch_with_resonance_corpus().await;
+        let out = thread_query(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "since_hours": 1,
+                "signals": ["activity", "resonance"],
+                "min_cluster_size": 3,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // No pin → no `lens` block on the response (Phase F
+        // invariant: absence of lens ⇔ no pin shaped the result).
+        assert!(out.get("lens").is_none());
+
+        // Every cluster carries resonance_score: null and a
+        // resonance row in attribution with score: null, weight: 0
+        // (Phase E default).
+        for c in out["clusters"].as_array().unwrap() {
+            assert!(
+                c["resonance_score"].is_null(),
+                "resonance_score must be null when no pin set"
+            );
+            let res_axis = c["attribution"]["axes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["axis"].as_str() == Some("resonance"))
+                .expect("resonance row in attribution");
+            assert!(res_axis["score"].is_null());
+            assert_eq!(res_axis["contribution"].as_f64(), Some(0.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_query_resonance_lifts_aligned_cluster_when_pinned() {
+        let (_tmp_t, _tmp_c, d) = build_dispatch_with_resonance_corpus().await;
+
+        // Pin a focus — the embedder writes a deterministic axis-0
+        // vector for any query, so the pinned focus aligns with
+        // cluster A's centroid and is orthogonal to cluster B.
+        attention_focus(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "query": "focused on the A topic"
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Rank by resonance directly so the lifted cluster shows up
+        // first. We keep the v0.4.x triad at uniform default (the
+        // CompositeWeights fallback kicks in when we zero them) but
+        // since rank_by="resonance", the sort uses resonance_score
+        // alone regardless of the composite weight balance.
+        let out = thread_query(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "since_hours": 1,
+                "signals": ["activity", "resonance"],
+                "rank_by": "resonance",
+                "composite_weights": { "resonance": 1.0 },
+                "min_cluster_size": 3,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Phase F invariant: a pin shaped this response, so a
+        // `lens` block must be present, declaring the focus query.
+        let lens = out.get("lens").expect("lens block must be present when pinned + resonance");
+        assert_eq!(lens["focus_query"].as_str(), Some("focused on the A topic"));
+        assert_eq!(lens["applied_to_axis"].as_str(), Some("resonance"));
+
+        let clusters = out["clusters"].as_array().unwrap();
+        assert!(!clusters.is_empty(), "should surface at least one cluster");
+
+        // Top cluster's resonance_score should be ≈ 1 (centroid
+        // aligned with pin's axis-0 vector); the orthogonal
+        // cluster should ≈ 0.
+        let top_res = clusters[0]["resonance_score"].as_f64().unwrap();
+        assert!(
+            top_res > 0.95,
+            "top cluster's resonance should be ~1 (axis-aligned), got {top_res}"
+        );
+        if clusters.len() >= 2 {
+            let other_res = clusters[1]["resonance_score"].as_f64().unwrap();
+            assert!(
+                other_res < 0.05,
+                "orthogonal cluster's resonance should be ~0, got {other_res}"
+            );
+        }
+
+        // Decomposability check on the top cluster: composite ==
+        // sum of contributions within float tolerance.
+        let composite = clusters[0]["composite_score"].as_f64().unwrap();
+        let attr_composite = clusters[0]["attribution"]["composite"].as_f64().unwrap();
+        let sum_contrib: f64 = clusters[0]["attribution"]["axes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["contribution"].as_f64().unwrap_or(0.0))
+            .sum();
+        assert!((composite - attr_composite).abs() < 1e-5);
+        assert!((sum_contrib - composite).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn thread_query_no_lens_when_resonance_not_requested() {
+        // Even with a pin set, if resonance isn't in `signals` the
+        // response is unshaped by the pin → no `lens` block.
+        // Discipline: the substrate never quietly applies a focus.
+        let (_tmp_t, _tmp_c, d) = build_dispatch_with_resonance_corpus().await;
+        attention_focus(
+            &d,
+            json!({"scope": {"project": "p"}, "query": "X"}),
+        )
+        .await
+        .unwrap();
+        let out = thread_query(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "since_hours": 1,
+                "signals": ["activity"],
+                "min_cluster_size": 3,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.get("lens").is_none(),
+            "lens must be absent when resonance axis is not requested"
+        );
     }
 }

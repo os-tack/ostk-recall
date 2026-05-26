@@ -72,6 +72,14 @@ pub enum Axis {
     Density,
     Activity,
     Novelty,
+    /// Cosine of the cluster's centroid against the scope's pinned
+    /// focus vector. Opt-in only — `Axis::all()` (the default
+    /// `signals` array) excludes it so callers that don't care
+    /// about a focus pin keep getting v0.4.x behaviour. When opted
+    /// in but no pin is set, every cluster's resonance_score stays
+    /// `None` and contributes 0 to the composite (decomposable
+    /// attribution discipline).
+    Resonance,
 }
 
 impl Axis {
@@ -81,6 +89,7 @@ impl Axis {
             Self::Density => "density",
             Self::Activity => "activity",
             Self::Novelty => "novelty",
+            Self::Resonance => "resonance",
         }
     }
 
@@ -90,50 +99,98 @@ impl Axis {
             "density" => Some(Self::Density),
             "activity" => Some(Self::Activity),
             "novelty" => Some(Self::Novelty),
+            "resonance" => Some(Self::Resonance),
             _ => None,
         }
     }
 
-    /// All three axes, in canonical order. Used to seed the default
-    /// `signals` array and the default `composite_weights`.
+    /// All three v0.4.x axes, in canonical order. Used to seed the
+    /// default `signals` array. Resonance is excluded by design —
+    /// callers opt in by listing it in `signals` so the substrate
+    /// never silently applies a focus-driven re-rank to a query
+    /// that didn't ask for one.
     #[must_use]
     pub fn all() -> [Self; 3] {
         [Self::Density, Self::Activity, Self::Novelty]
     }
+
+    /// Every known axis (including resonance). Used by
+    /// `refresh_attribution` / `finalize` to enumerate the
+    /// attribution rows so a Resonance opt-in shows up in the
+    /// per-cluster attribution even when the surfacing primitive
+    /// didn't supply it.
+    #[must_use]
+    pub fn all_known() -> [Self; 4] {
+        [
+            Self::Density,
+            Self::Activity,
+            Self::Novelty,
+            Self::Resonance,
+        ]
+    }
 }
 
-/// Weight map over the three axes. Construction enforces non-negativity
-/// and a non-zero sum so the composite formula stays sane; mismatched
-/// or all-zero inputs fall back to the uniform (1/3, 1/3, 1/3) default.
+/// Weight map over the four axes. Construction enforces non-negativity
+/// and a non-zero sum (across the v0.4.x triad — resonance defaults to
+/// 0 and doesn't participate in the fallback test); mismatched or
+/// all-zero inputs fall back to the uniform (1/3, 1/3, 1/3, 0) default
+/// so existing callers see no change.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompositeWeights {
     pub density: f32,
     pub activity: f32,
     pub novelty: f32,
+    /// Weight on the resonance axis (Phase E). Default 0.0 — opt-in
+    /// so v0.4.x callers see unchanged composite scoring.
+    pub resonance: f32,
 }
 
 impl Default for CompositeWeights {
-    /// Uniform — the only honest default for a combiner the substrate
-    /// can't form an opinion about.
+    /// Uniform over the v0.4.x triad with resonance=0. Existing
+    /// callers see no change in composite scoring; opting into
+    /// resonance requires setting both `signals` and the resonance
+    /// weight explicitly.
     fn default() -> Self {
         let third = 1.0_f32 / 3.0;
         Self {
             density: third,
             activity: third,
             novelty: third,
+            resonance: 0.0,
         }
     }
 }
 
 impl CompositeWeights {
+    /// v0.4.x constructor — resonance defaults to 0.0.
     #[must_use]
     pub fn new(density: f32, activity: f32, novelty: f32) -> Self {
+        Self::new_with_resonance(density, activity, novelty, 0.0)
+    }
+
+    /// v0.5.x constructor — caller specifies all four weights.
+    /// Used by `attention-mcp::handlers::thread_query` when the
+    /// request carries `composite_weights.resonance`.
+    #[must_use]
+    pub fn new_with_resonance(
+        density: f32,
+        activity: f32,
+        novelty: f32,
+        resonance: f32,
+    ) -> Self {
         let safe = |w: f32| if w.is_finite() && w >= 0.0 { w } else { 0.0 };
         let w = Self {
             density: safe(density),
             activity: safe(activity),
             novelty: safe(novelty),
+            resonance: safe(resonance),
         };
+        // Same fallback test as before — purely on the v0.4.x triad
+        // so a caller that explicitly zeroes them while setting
+        // resonance > 0 still falls back to uniform. That's a
+        // judgement call; the alternative ("resonance can be the
+        // sole axis") felt too far from the v0.4.x discipline of
+        // never returning silently zero composites.
         if w.density + w.activity + w.novelty <= 0.0 {
             Self::default()
         } else {
@@ -147,6 +204,7 @@ impl CompositeWeights {
             Axis::Density => self.density,
             Axis::Activity => self.activity,
             Axis::Novelty => self.novelty,
+            Axis::Resonance => self.resonance,
         }
     }
 }
@@ -216,6 +274,11 @@ pub struct ThreadQueryReport {
     pub density_score: Option<f32>,
     pub activity_score: Option<f32>,
     pub novelty_score: Option<f32>,
+    /// Resonance with the operator's pinned focus (Phase E). `None`
+    /// when the resonance axis wasn't requested OR no pin is set
+    /// OR the cluster has no usable embeddings to derive a centroid
+    /// from. Contributes 0 to the composite when `None`.
+    pub resonance_score: Option<f32>,
     pub composite_score: f32,
     pub samples: Vec<String>,
     pub attribution: ThreadQueryAttribution,
@@ -234,9 +297,16 @@ pub struct ThreadQueryParams {
     pub min_density: f32,
     pub min_activity: f32,
     pub min_novelty: f32,
+    pub min_resonance: f32,
     pub min_cluster_size: usize,
     pub limit: usize,
     pub samples_per_cluster: usize,
+    /// Focus vector for the resonance axis. `Some(vec)` when the
+    /// caller has a pinned focus (typically pulled from
+    /// `attention.focus_status(scope).pinned.vec`); `None`
+    /// otherwise. Set by the MCP handler — the query engine itself
+    /// has no opinion about where this vector comes from.
+    pub resonance_focus_vec: Option<Vec<f32>>,
 }
 
 impl Default for ThreadQueryParams {
@@ -250,9 +320,11 @@ impl Default for ThreadQueryParams {
             min_density: 0.0,
             min_activity: 0.0,
             min_novelty: 0.0,
+            min_resonance: 0.0,
             min_cluster_size: 3,
             limit: 10,
             samples_per_cluster: DEFAULT_SAMPLES_PER_BURST,
+            resonance_focus_vec: None,
         }
     }
 }
@@ -352,7 +424,10 @@ pub async fn run_query(
         let n_ok = r
             .novelty_score
             .map_or(true, |s| s >= params.min_novelty);
-        d_ok && a_ok && n_ok
+        let res_ok = r
+            .resonance_score
+            .map_or(true, |s| s >= params.min_resonance);
+        d_ok && a_ok && n_ok && res_ok
     });
 
     rows.sort_by(|a, b| {
@@ -362,6 +437,7 @@ pub async fn run_query(
                 RankBy::Axis(Axis::Density) => r.density_score.unwrap_or(0.0),
                 RankBy::Axis(Axis::Activity) => r.activity_score.unwrap_or(0.0),
                 RankBy::Axis(Axis::Novelty) => r.novelty_score.unwrap_or(0.0),
+                RankBy::Axis(Axis::Resonance) => r.resonance_score.unwrap_or(0.0),
             }
         };
         key(b)
@@ -388,11 +464,16 @@ async fn backfill_cross_axis(
 ) -> Result<(), ThreadQueryError> {
     // Collect every chunk_id we might need, deduplicated. Skip clusters
     // that already have all enabled axes populated (no work to do).
+    // Resonance always triggers a fetch when enabled + a focus vec is
+    // present, since no surfacing primitive supplies it.
+    let resonance_active = params.signals.contains(&Axis::Resonance)
+        && params.resonance_focus_vec.is_some();
     let mut all_ids: Vec<String> = Vec::new();
     for r in rows.iter() {
         let needs_any = (params.signals.contains(&Axis::Density) && r.density_score.is_none())
             || (params.signals.contains(&Axis::Activity) && r.activity_score.is_none())
-            || (params.signals.contains(&Axis::Novelty) && r.novelty_score.is_none());
+            || (params.signals.contains(&Axis::Novelty) && r.novelty_score.is_none())
+            || (resonance_active && r.resonance_score.is_none());
         if needs_any {
             all_ids.extend(r.chunk_ids.iter().cloned());
         }
@@ -484,12 +565,67 @@ async fn backfill_cross_axis(
                 }
             }
         }
+        // Resonance: cos(cluster_centroid, focus_vec). Clamped to
+        // [0, 1] so the axis composes with the others under the
+        // same `[0, 1]` contract. Skipped when the focus vec is
+        // absent (no pin) — resonance_score stays None and
+        // contributes 0 to the composite.
+        if resonance_active && r.resonance_score.is_none() {
+            if let Some(focus) = params.resonance_focus_vec.as_ref() {
+                let centroid = mean_vec(&r.chunk_ids, &embeddings);
+                if let Some(c) = centroid {
+                    r.resonance_score = Some(cosine_similarity(&c, focus).clamp(0.0, 1.0));
+                }
+            }
+        }
         // Re-finalize composite_score + attribution to reflect newly
         // populated axes. Cheap; runs once per cluster.
         refresh_attribution(r, params);
     }
 
     Ok(())
+}
+
+/// Mean vector over the embeddings present in `embeddings` for the
+/// given chunk_ids. Returns `None` when no chunk_id resolves —
+/// callers treat that as "centroid undefined, skip the axis."
+fn mean_vec(
+    chunk_ids: &[String],
+    embeddings: &HashMap<String, Vec<f32>>,
+) -> Option<Vec<f32>> {
+    let mut sum: Option<Vec<f32>> = None;
+    let mut n: u32 = 0;
+    for id in chunk_ids {
+        if let Some(v) = embeddings.get(id) {
+            if v.is_empty() {
+                continue;
+            }
+            match &mut sum {
+                Some(acc) if acc.len() == v.len() => {
+                    for (a, b) in acc.iter_mut().zip(v.iter()) {
+                        *a += b;
+                    }
+                }
+                Some(_) => {
+                    // Dim mismatch within the cluster — shouldn't
+                    // happen but better to abandon than corrupt.
+                    return None;
+                }
+                None => sum = Some(v.clone()),
+            }
+            n = n.saturating_add(1);
+        }
+    }
+    let mut acc = sum?;
+    if n == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0_f32 / n as f32;
+    for x in &mut acc {
+        *x *= inv;
+    }
+    Some(acc)
 }
 
 fn lookup_baseline<'a>(
@@ -509,13 +645,14 @@ fn lookup_baseline<'a>(
 
 fn refresh_attribution(row: &mut ThreadQueryReport, p: &ThreadQueryParams) {
     let weights = p.composite_weights;
-    let mut axes: Vec<AxisAttribution> = Vec::with_capacity(3);
+    let mut axes: Vec<AxisAttribution> = Vec::with_capacity(4);
     let mut composite = 0.0_f32;
-    for axis in Axis::all() {
+    for axis in Axis::all_known() {
         let score = match axis {
             Axis::Density => row.density_score,
             Axis::Activity => row.activity_score,
             Axis::Novelty => row.novelty_score,
+            Axis::Resonance => row.resonance_score,
         };
         let weight = weights.for_axis(axis);
         let contribution = score.map_or(0.0, |s| weight * s);
@@ -601,6 +738,7 @@ fn base_row(
         density_score: None,
         activity_score: None,
         novelty_score: None,
+        resonance_score: None,
         composite_score: 0.0,
         samples,
         attribution: ThreadQueryAttribution {
@@ -611,27 +749,7 @@ fn base_row(
 }
 
 fn finalize(mut row: ThreadQueryReport, p: &ThreadQueryParams) -> ThreadQueryReport {
-    let weights = p.composite_weights;
-    let mut axes: Vec<AxisAttribution> = Vec::with_capacity(3);
-    let mut composite = 0.0_f32;
-    for axis in Axis::all() {
-        let score = match axis {
-            Axis::Density => row.density_score,
-            Axis::Activity => row.activity_score,
-            Axis::Novelty => row.novelty_score,
-        };
-        let weight = weights.for_axis(axis);
-        let contribution = score.map_or(0.0, |s| weight * s);
-        composite += contribution;
-        axes.push(AxisAttribution {
-            axis,
-            weight,
-            score,
-            contribution,
-        });
-    }
-    row.composite_score = composite;
-    row.attribution = ThreadQueryAttribution { axes, composite };
+    refresh_attribution(&mut row, p);
     row
 }
 
