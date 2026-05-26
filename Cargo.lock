@@ -4490,6 +4490,7 @@ dependencies = [
  "chrono",
  "ostk-recall-attention",
  "ostk-recall-core",
+ "ostk-recall-pipeline",
  "ostk-recall-store",
  "serde",
  "serde_json",
@@ -4530,6 +4531,7 @@ dependencies = [
 name = "ostk-recall-mcp"
 version = "0.4.0"
 dependencies = [
+ "chrono",
  "ostk-recall-attention",
  "ostk-recall-attention-mcp",
  "ostk-recall-core",
