@@ -286,6 +286,13 @@ pub struct ThreadCreateInput {
     pub body: Option<String>,
     #[serde(default)]
     pub tension: Option<String>,
+    /// Optional corpus chunk to anchor the thread to. Without an
+    /// anchor, the thread has no embedding to contribute to recall's
+    /// `thread_score` bias axis until evidence_links accumulate. With
+    /// an anchor, every recall pass can lift chunks resonating with
+    /// the anchor's embedding via the v0.4.x thread-mediated bias.
+    #[serde(default)]
+    pub anchor_chunk_id: Option<String>,
 }
 
 pub async fn thread_create(
@@ -307,7 +314,7 @@ pub async fn thread_create(
         tension,
         familiarity: 0,
         last_touched_at: now,
-        anchor_chunk_id: None,
+        anchor_chunk_id: input.anchor_chunk_id,
         fold_override: None,
         created_at: now,
         created_scope_key: scope_key,

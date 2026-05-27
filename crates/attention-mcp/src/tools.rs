@@ -121,7 +121,8 @@ pub fn tool_thread_create() -> Value {
                 "scope": scope_schema(),
                 "handle": { "type": "string" },
                 "body": { "type": "string", "description": "Markdown body (currently informational — body persistence is the threads scanner's responsibility)." },
-                "tension": { "type": "string", "enum": ["active", "slack", "dormant"], "default": "active" }
+                "tension": { "type": "string", "enum": ["active", "slack", "dormant"], "default": "active" },
+                "anchor_chunk_id": { "type": ["string", "null"], "description": "Optional corpus chunk to anchor the thread to. Anchored threads contribute `thread_score` to recall bias for chunks that resonate with the anchor's embedding; unanchored threads only gain weight through evidence_links accumulated later." }
             },
             "required": ["handle"]
         }

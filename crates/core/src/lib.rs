@@ -19,7 +19,8 @@ pub use attention::{
 };
 pub use chunk::{Chunk, Links};
 pub use config::{
-    Config, CorpusConfig, EmbedderConfig, RerankerConfig, SourceConfig, WatchConfig, WatchMode,
+    Config, CorpusConfig, EmbedderConfig, RerankerConfig, RuntimeConfig, SourceConfig,
+    WatchConfig, WatchMode, default_worker_threads,
 };
 pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};

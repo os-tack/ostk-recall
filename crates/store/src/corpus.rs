@@ -9,7 +9,7 @@ use arrow_schema::Schema;
 use futures::TryStreamExt;
 use lancedb::Connection;
 use lancedb::index::Index;
-use lancedb::index::scalar::FtsIndexBuilder;
+use lancedb::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FtsIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::OptimizeAction;
 use ostk_recall_core::Chunk;
@@ -132,6 +132,55 @@ impl CorpusStore {
         tracing::info!("creating FTS index on corpus.text");
         table
             .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Ensure a BTree scalar index exists on `chunk_id`. Idempotent.
+    ///
+    /// `Pipeline::embed_and_persist` lands every batch through
+    /// `table.merge_insert(&["chunk_id"])`, and several recall paths
+    /// (`fetch_texts`, `fetch_embeddings`, membrane filters) emit
+    /// `chunk_id IN (…)` queries. Without a scalar index on this column
+    /// lance resolves both shapes by full-table filtered scan, so each
+    /// ingest batch reads tens of megabytes to find one row. The BTree
+    /// turns those lookups into O(log N).
+    pub async fn ensure_chunk_id_index(&self) -> Result<()> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let indices = table.list_indices().await?;
+        if indices
+            .iter()
+            .any(|ix| ix.columns.iter().any(|c| c == "chunk_id"))
+        {
+            return Ok(());
+        }
+        tracing::info!("creating BTree index on corpus.chunk_id");
+        table
+            .create_index(&["chunk_id"], Index::BTree(BTreeIndexBuilder::default()))
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Ensure a Bitmap scalar index exists on `project`. Idempotent.
+    ///
+    /// `project` is a low-cardinality column (one value per
+    /// `[[sources]]` entry, typically ~20) and is filtered on every
+    /// orphan-sweep and reingest path. Bitmap is the natural shape for
+    /// that distribution.
+    pub async fn ensure_project_index(&self) -> Result<()> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let indices = table.list_indices().await?;
+        if indices
+            .iter()
+            .any(|ix| ix.columns.iter().any(|c| c == "project"))
+        {
+            return Ok(());
+        }
+        tracing::info!("creating Bitmap index on corpus.project");
+        table
+            .create_index(&["project"], Index::Bitmap(BitmapIndexBuilder::default()))
             .execute()
             .await?;
         Ok(())
@@ -704,6 +753,73 @@ impl CorpusStore {
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         table.optimize(OptimizeAction::All).await?;
         Ok(())
+    }
+
+    /// Cheap, scan-time variant of [`Self::optimize_all`]: just fold any
+    /// fragments appended since the last index build into the existing
+    /// scalar / FTS indices. Skips `Compact` and `Prune` because both
+    /// scan with the version count, which is `O(commits)` and slow on a
+    /// long-running corpus — and the index-folding step is the only
+    /// one that affects the next scan's lookup cost.
+    pub async fn optimize_indices(&self) -> Result<()> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        table
+            .optimize(OptimizeAction::Index(Default::default()))
+            .await?;
+        Ok(())
+    }
+
+    /// Idempotently strip lance's per-commit auto-cleanup config from
+    /// the dataset manifest. Returns `true` if a write happened.
+    ///
+    /// Lance's `WriteParams::default()` enables an auto-cleanup hook
+    /// with `interval=20 / older_than=14days` and writes those values
+    /// into the manifest on first insert. Lance then fires
+    /// `cleanup_old_versions` on every 20th commit (see
+    /// `lance/src/io/commit.rs:972` → `auto_cleanup_hook`). The hook
+    /// walks every manifest file in the dataset, decoding each one's
+    /// protobuf, even when nothing meets the retention threshold —
+    /// which is the steady state for a write-heavy substrate where
+    /// most versions are fresh. Profiling showed ~67% of scan CPU
+    /// going to this walk on a 22 000-version corpus. We never query
+    /// historical versions, so cleanup belongs in the explicit
+    /// `ostk-recall optimize` path, not as a per-commit tax.
+    ///
+    /// Deletes the two keys via `delete_config_keys`. If the keys
+    /// aren't present the call is a no-op write (one tiny manifest
+    /// commit). Tracked separately so callers can suppress the noise
+    /// of a per-startup config sync when it's not needed.
+    pub async fn ensure_auto_cleanup_disabled(&self) -> Result<bool> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        // `manifest()` / `delete_config_keys()` live on `NativeTable`, not
+        // the `Table` trait. `as_native()` returns `None` only for the
+        // remote-LanceDB client; we always use the embedded path so this
+        // is infallible in practice.
+        let Some(native) = table.as_native() else {
+            return Ok(false);
+        };
+        let manifest = native.manifest().await?;
+        let has_interval = manifest
+            .config
+            .contains_key("lance.auto_cleanup.interval");
+        let has_older = manifest
+            .config
+            .contains_key("lance.auto_cleanup.older_than");
+        if !has_interval && !has_older {
+            return Ok(false);
+        }
+        tracing::info!(
+            interval = has_interval,
+            older_than = has_older,
+            "stripping lance.auto_cleanup.* from corpus manifest"
+        );
+        native
+            .delete_config_keys(&[
+                "lance.auto_cleanup.interval",
+                "lance.auto_cleanup.older_than",
+            ])
+            .await?;
+        Ok(true)
     }
 
     /// Aggregate non-stale chunks ingested since `since` into per-source

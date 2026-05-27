@@ -153,6 +153,18 @@ pub async fn init_with_options(
         .ensure_fts_index()
         .await
         .map_err(|e| anyhow!("ensure fts index: {e}"))?;
+    store
+        .ensure_auto_cleanup_disabled()
+        .await
+        .map_err(|e| anyhow!("strip auto_cleanup: {e}"))?;
+    store
+        .ensure_chunk_id_index()
+        .await
+        .map_err(|e| anyhow!("ensure chunk_id index: {e}"))?;
+    store
+        .ensure_project_index()
+        .await
+        .map_err(|e| anyhow!("ensure project index: {e}"))?;
     let _ingest = IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?;
 
     if opts.prefetch_reranker {
@@ -226,6 +238,31 @@ pub struct ServeContext {
 /// daemon) the scan shares the long-lived ledger. Otherwise it opens a
 /// fresh per-scan handle. Open failures degrade to "ambient pickup
 /// disabled" rather than failing the whole scan.
+/// Idempotently ensure the lance corpus has the scalar + FTS indexes the
+/// hot paths depend on, and that the per-commit auto-cleanup hook is
+/// disabled. `init` already runs the index ensures once at create time;
+/// we also run them at the start of every scan so corpora initialized
+/// before these indexes existed get the one-time backfill on next
+/// ingest. The auto-cleanup strip is critical — lance's defaults bake
+/// `interval=20/older_than=14days` into the manifest and run
+/// `cleanup_old_versions` (an O(versions) walk) every 20th commit, even
+/// when nothing is old enough to delete.
+async fn ensure_corpus_indexes(store: &CorpusStore) -> Result<()> {
+    store
+        .ensure_auto_cleanup_disabled()
+        .await
+        .map_err(|e| anyhow!("strip auto_cleanup: {e}"))?;
+    store
+        .ensure_chunk_id_index()
+        .await
+        .map_err(|e| anyhow!("ensure chunk_id index: {e}"))?;
+    store
+        .ensure_project_index()
+        .await
+        .map_err(|e| anyhow!("ensure project index: {e}"))?;
+    Ok(())
+}
+
 fn resolve_threads_db(ctx: Option<&ServeContext>, root: &Path) -> Option<Arc<ThreadsDb>> {
     ctx.map_or_else(
         || match ThreadsDb::open(root) {
@@ -346,6 +383,7 @@ pub async fn scan_with_context(
             .await
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
+    ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
         Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
@@ -419,7 +457,37 @@ pub async fn scan_with_context(
 
     ostk_recall_scan::fcp_rust::drain_session_cache();
 
+    // Drain ambient daemons FIRST so any synthetic ingests they fire
+    // in response to source-loop events (TurnObserver auto-promotion,
+    // AutoWeaver evidence linking, etc.) land in the corpus before we
+    // reindex. The drain is cooperative — `shutdown_ambient_daemons`
+    // cancels then awaits the join handles, so by the time it returns
+    // the daemons' last `ingest_synthetic` call has committed.
     shutdown_ambient_daemons(ambient).await;
+
+    // End-of-scan index maintenance: lance scalar indexes don't cover
+    // fragments appended after the index was built, so each ingest
+    // batch progressively shifts more work onto the unindexed-tail
+    // scan leg of `Union(MapIndex, FilteredRead)`. Folding the new
+    // fragments back into the existing indices is what restores fast
+    // dedupe lookups for the *next* scan. We deliberately skip
+    // `Compact` + `Prune` here — both scan with the version count, so
+    // running them after every scan is O(commits) and adds hours to a
+    // healthy corpus while contributing nothing to lookup latency. The
+    // standalone `ostk-recall optimize` subcommand runs the full pass
+    // when the operator wants to collapse a backlog.
+    if !dry_run {
+        let started = std::time::Instant::now();
+        tracing::info!("running OptimizeAction::Index (fold new fragments into indices)");
+        if let Err(err) = store.optimize_indices().await {
+            tracing::warn!(error = %err, "end-of-scan optimize_indices failed");
+        } else {
+            tracing::info!(
+                elapsed_s = started.elapsed().as_secs_f64(),
+                "end-of-scan optimize_indices complete"
+            );
+        }
+    }
 
     Ok(ScanOutcome {
         per_source,
@@ -465,6 +533,7 @@ pub async fn scan_paths_with_context(
             .await
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
+    ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
         Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
@@ -595,6 +664,37 @@ pub async fn inspect(
         .recall_link(chunk_id)
         .await
         .map_err(|e| anyhow!("recall_link {chunk_id}: {e}"))
+}
+
+/// Outcome of a one-shot [`optimize`] call.
+pub struct OptimizeOutcome {
+    /// Wall-clock duration of the optimize pass.
+    pub elapsed: std::time::Duration,
+}
+
+/// Run Lance's `OptimizeAction::All` against the corpus table —
+/// compact fragments, prune old versions, fold appended data into
+/// existing scalar / FTS indices. Maintenance entry point for users
+/// who want to collapse a long backlog of small commits without
+/// running a full re-scan.
+pub async fn optimize(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+) -> Result<OptimizeOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    let store = CorpusStore::open_or_create(&root, embedder.dim())
+        .await
+        .map_err(|e| anyhow!("open corpus store: {e}"))?;
+    let started = std::time::Instant::now();
+    store
+        .optimize_all()
+        .await
+        .map_err(|e| anyhow!("optimize: {e}"))?;
+    Ok(OptimizeOutcome {
+        elapsed: started.elapsed(),
+    })
 }
 
 pub async fn verify(config_path: &Path, embedder: Arc<dyn ChunkEmbedder>) -> Result<VerifyOutcome> {

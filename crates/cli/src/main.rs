@@ -3,7 +3,7 @@
 //! Handlers live in [`ostk_recall_cli::commands`]; this module parses args,
 //! constructs a real [`ostk_recall_embed::Embedder`], and delegates.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use ostk_recall_attention::{AttentionForwardStore, InMemoryAttention};
 use ostk_recall_attention_mcp::{AttentionDispatch, cli as attn_cli};
 use ostk_recall_cli::commands::{self, InitOptions, InitOutcome};
+use ostk_recall_core::{Config, default_worker_threads};
 use ostk_recall_embed::Embedder;
 use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_store::ThreadsDb;
@@ -61,6 +62,11 @@ enum Command {
     },
     /// Verify corpus integrity (counts).
     Verify,
+    /// Run Lance's `OptimizeAction::All` against the corpus — compact
+    /// small fragments, prune old versions, fold appended data into
+    /// existing scalar / FTS indices. Cheap to re-run; idempotent. Use
+    /// after a long ingest backlog to restore fast indexed lookups.
+    Optimize,
     /// Inspect a single chunk by id.
     Inspect {
         /// Chunk id to inspect.
@@ -271,20 +277,100 @@ fn resolve_embedder(config: Option<&PathBuf>) -> Result<Arc<dyn ChunkEmbedder>> 
     load_embedder(&model_id)
 }
 
-#[tokio::main]
+/// Resolve the runtime worker-thread cap.
+///
+/// Precedence: `OSTK_RECALL_WORKERS` env var > `[runtime].worker_threads`
+/// in config > [`default_worker_threads`] (4). Returns the effective
+/// value plus whether it was overridden, so we can log the source.
+///
+/// Loading the config here is a deliberate up-front cost paid before
+/// the tokio runtime is built — we need the value to construct the
+/// runtime with the right `worker_threads`, and the same value sets
+/// `DATAFUSION_TARGET_PARTITIONS` / `RAYON_NUM_THREADS` env vars
+/// which must be in place before the first lance / rayon call.
+fn resolve_worker_threads(config_path: Option<&Path>) -> usize {
+    if let Ok(v) = std::env::var("OSTK_RECALL_WORKERS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+        eprintln!(
+            "warning: OSTK_RECALL_WORKERS={v:?} could not be parsed as a positive integer; \
+             falling back to config / default"
+        );
+    }
+    if let Some(p) = config_path {
+        if let Ok(cfg) = Config::load(p) {
+            if let Some(n) = cfg.runtime.as_ref().and_then(|r| r.worker_threads) {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+    }
+    default_worker_threads()
+}
+
+fn main() -> Result<()> {
+    // CLI parsing happens before the runtime is built so we can read
+    // `--config` and use it to resolve runtime resource caps. Errors
+    // here short-circuit cleanly without spinning up tokio.
+    let cli = Cli::parse();
+    let config_path_for_runtime = cli.config.clone();
+
+    let workers = resolve_worker_threads(config_path_for_runtime.as_deref());
+
+    // Cap the global rayon pool. Lance pushes compute (protobuf
+    // decoding, percent-encoding object paths, ingest batch
+    // processing, index maintenance) onto rayon's default pool, which
+    // sizes itself to `num_cpus()` unless we override here. Calling
+    // `build_global()` is the safe, programmatic equivalent of setting
+    // `RAYON_NUM_THREADS=N` — we prefer it over `std::env::set_var`
+    // because the workspace forbids `unsafe_code`. `build_global` can
+    // only succeed once per process; doing it here, before any lance
+    // call, ensures we win the race. The `Err` arm is a no-op: it
+    // means rayon was already initialized (e.g. in a test harness),
+    // and we accept whatever sizing the prior caller chose.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build_global();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("build tokio runtime: {e}"))?;
+    rt.block_on(async_main(cli, workers))
+}
+
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
     // Stdout is reserved for tool output (and JSON-RPC frames in
     // `serve --stdio`); logs go to stderr unconditionally so MCP clients
     // never see interleaved log noise on stdout.
+    //
+    // The writer is non-blocking: a background thread drains a bounded
+    // queue and does the actual stderr writes, so the foreground tracing
+    // path can never deadlock the tokio runtime when the consumer (pipe
+    // / terminal / log forwarder) goes slow. Default policy is lossy —
+    // a saturated queue drops lines rather than back-pressuring callers.
+    // `_trace_guard` flushes pending events on drop; bind it to `main`'s
+    // stack frame so it lives until shutdown.
+    let (non_blocking_stderr, _trace_guard) =
+        tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking_stderr)
         .init();
 
-    let cli = Cli::parse();
+    tracing::info!(
+        worker_threads,
+        "runtime caps: tokio worker_threads + rayon global pool"
+    );
+
     let config_path = match cli.config.clone() {
         Some(p) => p,
         None => commands::default_config_path()?,
@@ -345,6 +431,12 @@ async fn main() -> Result<()> {
                 "  total: items={} chunks={} upserted={} dup={} errors={}",
                 t.items_seen, t.chunks_emitted, t.chunks_upserted, t.chunks_skipped_dup, t.errors
             );
+        }
+        Command::Optimize => {
+            let embedder = resolve_embedder(cli.config.as_ref())?;
+            println!("running OptimizeAction::All (compact + prune + index)…");
+            let out = commands::optimize(&config_path, embedder).await?;
+            println!("done in {:.1}s", out.elapsed.as_secs_f64());
         }
         Command::Verify => {
             let embedder = resolve_embedder(cli.config.as_ref())?;

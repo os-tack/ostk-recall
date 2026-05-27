@@ -23,6 +23,40 @@ pub struct Config {
     /// disabled, `ostk-recall watch` exits at startup.
     #[serde(default)]
     pub watch: Option<WatchConfig>,
+    /// Optional runtime resource caps. Omit to accept the polite
+    /// defaults (small thread pool sized for a background substrate).
+    /// Power users running a one-shot CLI can raise these.
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
+}
+
+/// Runtime resource caps. Each field is the upper bound on the
+/// matching subsystem's worker pool; absent fields fall back to the
+/// `OSTK_RECALL_WORKERS` env var (if set), otherwise [`default_worker_threads`].
+///
+/// All three pools (tokio runtime, DataFusion query parallelism, rayon
+/// compute) get set to the *same* effective value at process startup
+/// — no need to tune them independently in normal use, and keeping
+/// them aligned avoids over-subscription when lance internally
+/// pipelines work across all three.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Upper bound on concurrent worker threads (tokio +
+    /// DataFusion + rayon). The substrate is designed to run in the
+    /// background while a human or agent uses the same machine; the
+    /// default is intentionally low. Setting this to a value
+    /// approaching `num_cpus()` will pin the machine during scans.
+    #[serde(default)]
+    pub worker_threads: Option<usize>,
+}
+
+/// Default cap when neither env var nor config specifies one.
+/// Sized to leave plenty of cores for the human/agent on a typical
+/// laptop, while still parallelizing the substrate's own work.
+#[must_use]
+pub const fn default_worker_threads() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
