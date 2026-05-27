@@ -43,7 +43,7 @@ Works today:
   - **Recall** (5): `recall`, `recall_link`, `recall_stats`,
     `recall_audit`, `recall_fault` (synthesizes hits into virtual-memory
     pages for ostk's
-    [`mem_fault_recall`](https://github.com/os-tack/ostk)
+    [`mem_fault_recall`](https://github.com/os-tack/ostk.ai)
     driver-relay path).
   - **Attention/threads** (19): nine `attention_*` verbs (attend,
     surface, fold, familiarize, decay, focus, refocus, unfocus, status)
@@ -63,7 +63,7 @@ Works today:
   in config (default `legacy` runs a full re-scan per kick for safe
   rollout).
 - Two daemon modes that share `corpus.lance` via Lance MVCC: read-only
-  driver mode (`ostk-recall serve --stdio`, kernel-managed by ostk)
+  driver mode (`ostk-recall serve --stdio`, spawned by the ostk kernel)
   and read-write standalone mode (`ostk-recall serve`, operator-managed
   with the scan-trigger socket the watcher pokes).
 
