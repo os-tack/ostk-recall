@@ -29,6 +29,17 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
                                             # Legacy "ms-marco-MiniLM-L-6-v2" maps to JINA
                                             # Turbo English (closest equivalent in v5).
 
+# Runtime resource caps. The substrate is meant to run in the background
+# while a human or agent uses the same machine, so the default is
+# intentionally low. Omit the block to accept the default.
+#
+# Precedence: OSTK_RECALL_WORKERS env var > [runtime].worker_threads >
+# default (4). The same value pins the tokio runtime, DataFusion query
+# parallelism, and rayon compute pool — no need to tune them independently.
+#
+# [runtime]
+# worker_threads = 4    # raise toward num_cpus() for one-shot CLI runs
+
 # One [[sources]] table per logical corpus slice.
 # `project` is a free-text tag — namespace your corpora however you like.
 
@@ -49,20 +60,29 @@ paths = ["~/.gemini/tmp"]           # walks every <hash>/chats/session-*.json
 
 [[sources]]
 kind = "ostk_project"
-project = "haystack"
-paths = ["~/projects/haystack"]     # composite — expands to decisions,
-                                     # needles, audit, conversations,
-                                     # sessions, memory, specs, code
-                                     # under .ostk/
+project = "ostk"
+paths = ["~/projects/ostk"]         # composite — expands to decisions,
+                                    # needles, audit, conversations,
+                                    # sessions, memory, specs, code
+                                    # under .ostk/
+
+[[sources]]
+kind = "thread"
+project = "ostk-threads"
+paths = ["~/projects/ostk/.ostk/threads"]   # one chunk per *.md directly
+                                            # under the configured root;
+                                            # tension state lifted into
+                                            # chunk metadata.
 
 [[sources]]
 kind = "code"
 project = "experiments"
 paths = ["~/experiments"]
 extensions = ["rs", "py", "ts"]
-# Patterns merged on top of standard .gitignore behavior. Globs are
-# anchored at each path root. Underlying engine is the `ignore` crate
-# (same as ripgrep), so anything you'd write in a .gitignore works here.
+# Patterns merged on top of standard .gitignore / .ignore /
+# .ostk-recall-ignore handling. Globs are anchored at each path root.
+# Underlying engine is the `ignore` crate (same as ripgrep), so anything
+# you'd write in a .gitignore works here.
 ignore = [
     ".venv/**",        # cover venvs not always in .gitignore
     "vendor/**",
@@ -127,11 +147,10 @@ paths = ["~/Downloads/claude-data-export-*.zip"]
 #     "claude-plans",         # if you index ~/.claude/plans, watch it
 #     # NOT "claude-code-history"   — JSONL appends every LLM turn
 #     # NOT "gemini-cli-history"    — same churn pattern
-#     # NOT "haystack"               — .ostk/ self-writes on every verb
+#     # NOT "ostk"                  — .ostk/ self-writes on every verb
 # ]
 #
 # # Override the trigger socket path. Defaults to <corpus.root>/recall.sock
 # # which is the same path `serve` binds. Rare to need this — set only if
 # # you're running multiple corpora or non-default deployments.
 # # socket = "~/.local/share/ostk-recall/recall.sock"
-
