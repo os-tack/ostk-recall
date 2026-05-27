@@ -17,7 +17,7 @@ tools total — see below.
 Claude, Cursor, and ChatGPT each maintain their own siloed context — notes
 you dumped into one app are invisible to the others, and every new session
 starts cold. ostk-recall ingests your markdown trees, Claude Code session
-logs, haystack `.ostk/` directories, or arbitrary globs into a single local
+logs, ostk `.ostk/` directories, or arbitrary globs into a single local
 corpus, then exposes a hybrid (dense + BM25) recall surface plus a live
 thread/attention surface over MCP so any MCP-speaking client can recall
 context across projects without shipping your data off-box.
@@ -42,8 +42,8 @@ Works today:
 - **24 MCP tools** across two families:
   - **Recall** (5): `recall`, `recall_link`, `recall_stats`,
     `recall_audit`, `recall_fault` (synthesizes hits into virtual-memory
-    pages for haystack's
-    [`mem_fault_recall`](https://github.com/os-tack/haystack)
+    pages for ostk's
+    [`mem_fault_recall`](https://github.com/os-tack/ostk)
     driver-relay path).
   - **Attention/threads** (19): nine `attention_*` verbs (attend,
     surface, fold, familiarize, decay, focus, refocus, unfocus, status)
@@ -63,7 +63,7 @@ Works today:
   in config (default `legacy` runs a full re-scan per kick for safe
   rollout).
 - Two daemon modes that share `corpus.lance` via Lance MVCC: read-only
-  driver mode (`ostk-recall serve --stdio`, kernel-managed by haystack)
+  driver mode (`ostk-recall serve --stdio`, kernel-managed by ostk)
   and read-write standalone mode (`ostk-recall serve`, operator-managed
   with the scan-trigger socket the watcher pokes).
 
@@ -174,13 +174,13 @@ make serve
 | `gemini`       | Gemini CLI session JSON (`session-*.json`, walks recursively)    | one chunk per user/gemini exchange pair          |
 | `file_glob`    | arbitrary glob, ingested as plain text                           | paragraph split, soft-wrap at ~400 tokens        |
 | `zip_export`   | Claude.ai data-export `.zip` bundles                             | per-conversation-turn chunks                     |
-| `ostk_project` | haystack `.ostk/` dirs — decisions, needles, audit, specs, code  | composite; one chunk per record or source chunk  |
+| `ostk_project` | ostk `.ostk/` dirs — decisions, needles, audit, specs, code  | composite; one chunk per record or source chunk  |
 | `thread`       | `.ostk/threads/*.md` files; tension state captured as metadata    | one chunk per thread file                        |
 
 ## MCP tools exposed
 
 24 tools total across two families. All callable from any MCP client
-(Claude Desktop, Cursor, Claude Code, haystack kernel, etc.) via the
+(Claude Desktop, Cursor, Claude Code, ostk kernel, etc.) via the
 same `ostk-recall serve --stdio` process.
 
 ### Recall family — corpus retrieval (`crates/mcp`)
@@ -190,7 +190,7 @@ same `ostk-recall serve --stdio` process.
 | `recall`       | `{ query: string, project?: string, source?: string, since?: rfc3339, limit?: 1..100 }`                      |
 | `recall_link`  | `{ chunk_id: string }` — returns the chunk plus its parent chain                                             |
 | `recall_stats` | `{}` — total count, breakdown by source, model info, last-scan timestamp                                     |
-| `recall_fault` | `{ query: string, intent?: "symbol"\|"narrative"\|"trace"\|"general", limit?: int, max_per_source_id?: int }` — synthesizes hits into named virtual-memory pages; haystack's `mem_fault_recall` calls this |
+| `recall_fault` | `{ query: string, intent?: "symbol"\|"narrative"\|"trace"\|"general", limit?: int, max_per_source_id?: int }` — synthesizes hits into named virtual-memory pages; ostk's `mem_fault_recall` calls this |
 | `recall_audit` | `{ sql: string }` — raw SELECT over the SQLite `audit_events` table (ostk_project sources only; single statement) |
 
 ### Attention family — live thread/scope runtime (`crates/attention-mcp`)
@@ -270,14 +270,14 @@ Edit `.mcp.json` at user or project level:
 }
 ```
 
-### haystack (llmOS)
+### ostk (llmOS)
 
-**haystack v6.0.0+** ships with `fcp-recall` baked into the driver
+**ostk v6.0.0+** ships with `fcp-recall` baked into the driver
 defaults — `mem_fault_recall` and the `recall` family route through
 `ostk-recall serve --stdio` automatically. Just have `ostk-recall` on
 `$PATH`. No HUMANFILE entry needed.
 
-For pre-v6 haystack or other ostk-shaped projects, register manually
+For pre-v6 ostk or other ostk-shaped projects, register manually
 via HUMANFILE (`~/.ostk/HUMANFILE` or project-local):
 
 ```
@@ -285,7 +285,7 @@ DRIVER recall ostk-recall serve --stdio
 ```
 
 Form is `DRIVER <name> [transport] <command>`. Transport defaults to
-`fcp` when omitted; haystack's driver-relay wraps the stdio MCP
+`fcp` when omitted; ostk's driver-relay wraps the stdio MCP
 subprocess into a Unix socket at `.ostk/drivers/fcp-<name>.sock`. The
 verb shows up on next boot.
 
@@ -353,7 +353,7 @@ query on CPU, ~80 MB to the model cache. Opt out with
 ```
 
 **Read path** (clients → corpus): `serve --stdio` runs as a stdio MCP
-server. Used as the `fcp-recall` driver under haystack v6+; equally
+server. Used as the `fcp-recall` driver under ostk v6+; equally
 callable from Claude Desktop, Cursor, Claude Code, etc.
 
 **Write path** (operator edits → corpus): `serve` (no `--stdio`) binds
