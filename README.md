@@ -9,8 +9,8 @@ for the ingest manifest, the audit event log, and the threads ledger, and
 cross-encoder reranker.
 
 Two organs share one binary: **recall** (corpus retrieval, query-shaped)
-and **attention** (live thread/scope runtime, process-shaped). Eighteen
-MCP tools total — see below.
+and **attention** (live thread/scope runtime, process-shaped). 24 MCP
+tools total — see below.
 
 ## What it solves
 
@@ -37,17 +37,18 @@ Pre-alpha but functional. Used in production by the maintainer's own stack.
 Works today:
 
 - Eight source scanners (markdown, code, claude_code, gemini, file_glob,
-  zip_export, ostk_project composite, threads) plus a synthetic
-  `membrane` kind for in-process observer chunks.
-- **Eighteen MCP tools** across two families:
+  zip_export, ostk_project composite, thread) plus a synthetic `membrane`
+  kind for in-process observer chunks.
+- **24 MCP tools** across two families:
   - **Recall** (5): `recall`, `recall_link`, `recall_stats`,
     `recall_audit`, `recall_fault` (synthesizes hits into virtual-memory
     pages for haystack's
-    [`mem.fault_recall`](https://github.com/os-tack/haystack)
+    [`mem_fault_recall`](https://github.com/os-tack/haystack)
     driver-relay path).
-  - **Attention/threads** (13): five `attention_*` verbs (attend,
-    surface, fold, familiarize, decay) and eight `thread_*` verbs
-    (create, link, unlink, promote, list, emergent, attention, novelty).
+  - **Attention/threads** (19): nine `attention_*` verbs (attend,
+    surface, fold, familiarize, decay, focus, refocus, unfocus, status)
+    and ten `thread_*` verbs (create, link, unlink, promote, list,
+    emergent, attention, novelty, query, evidence).
 - Hybrid retrieval with RRF fusion over LanceDB's dense and Tantivy BM25
   indexes, plus an optional cross-encoder rerank pass (fastembed-rs;
   default `jina-reranker-v1-turbo-en`).
@@ -174,13 +175,13 @@ make serve
 | `file_glob`    | arbitrary glob, ingested as plain text                           | paragraph split, soft-wrap at ~400 tokens        |
 | `zip_export`   | Claude.ai data-export `.zip` bundles                             | per-conversation-turn chunks                     |
 | `ostk_project` | haystack `.ostk/` dirs — decisions, needles, audit, specs, code  | composite; one chunk per record or source chunk  |
-| `threads`      | `.ostk/threads/*.md` files; tension state captured as metadata    | one chunk per thread file                        |
+| `thread`       | `.ostk/threads/*.md` files; tension state captured as metadata    | one chunk per thread file                        |
 
 ## MCP tools exposed
 
-Eighteen tools total across two families. All callable from any MCP
-client (Claude Desktop, Cursor, Claude Code, haystack kernel, etc.) via
-the same `ostk-recall serve --stdio` process.
+24 tools total across two families. All callable from any MCP client
+(Claude Desktop, Cursor, Claude Code, haystack kernel, etc.) via the
+same `ostk-recall serve --stdio` process.
 
 ### Recall family — corpus retrieval (`crates/mcp`)
 
@@ -189,7 +190,7 @@ the same `ostk-recall serve --stdio` process.
 | `recall`       | `{ query: string, project?: string, source?: string, since?: rfc3339, limit?: 1..100 }`                      |
 | `recall_link`  | `{ chunk_id: string }` — returns the chunk plus its parent chain                                             |
 | `recall_stats` | `{}` — total count, breakdown by source, model info, last-scan timestamp                                     |
-| `recall_fault` | `{ query: string, intent?: "symbol"\|"narrative"\|"trace"\|"general", limit?: int, max_per_source_id?: int }` — synthesizes hits into named virtual-memory pages; haystack's `mem.fault_recall` calls this |
+| `recall_fault` | `{ query: string, intent?: "symbol"\|"narrative"\|"trace"\|"general", limit?: int, max_per_source_id?: int }` — synthesizes hits into named virtual-memory pages; haystack's `mem_fault_recall` calls this |
 | `recall_audit` | `{ sql: string }` — raw SELECT over the SQLite `audit_events` table (ostk_project sources only; single statement) |
 
 ### Attention family — live thread/scope runtime (`crates/attention-mcp`)
@@ -206,6 +207,10 @@ per the `abi-as-sovereign-boundary` doctrine.
 | `attention_fold`        | `{ scope?, handle: string, depth: folded\|half\|full }`                                |
 | `attention_familiarize` | `{ scope?, handle: string }` — increment familiarity counter                           |
 | `attention_decay`       | `{ handle: string, factor: number }` — multiplicative fade factor on the floor        |
+| `attention_focus`       | `{ scope?, query: string, surface_limit?: 0..100 }` — pin a focus query; ranking uses the pinned vector until cleared |
+| `attention_refocus`     | `{ scope?, query: string, surface_limit?: 0..100 }` — rotate pin to a query already in the scope's focus history |
+| `attention_unfocus`     | `{ scope?, surface_limit?: 0..100 }` — clear the pin; ranking returns to the conversational transient |
+| `attention_status`      | `{ scope?, surface_limit?: 0..100 }` — read-only snapshot: current pin, history, transient state |
 | `thread_create`         | `{ scope?, handle: string, body?: string, tension?: active\|slack\|dormant }`         |
 | `thread_link`           | `{ scope?, handle: string, target_path: string, category: string }`                   |
 | `thread_unlink`         | `{ evidence_id: integer }`                                                             |
@@ -214,6 +219,8 @@ per the `abi-as-sovereign-boundary` doctrine.
 | `thread_emergent`       | `{ since_hours?, limit?, min_cluster_size?, cohesion_threshold?, min_neighbours?, persist? }` — embedding-density clusters from the corpus |
 | `thread_attention`      | `{ since_hours?, limit?, samples_per_burst?, decay_hours? }` — activity-burst surface  |
 | `thread_novelty`        | `{ since_hours?, baseline_days?, limit?, min_cluster_size?, recluster_threshold?, min_mean_novelty? }` — divergence-from-baseline clusters |
+| `thread_query`          | `{ signals?: [density\|activity\|novelty], rank_by?, composite_weights?, since_hours?, ... }` — unified multi-signal query; supersedes the three legacy verbs above (kept until v1.0.0) |
+| `thread_evidence`       | `{ action: add\|list\|delete, ... }` — manage thread→thread evidence edges (cites/supersedes/etc.) |
 
 ## Hook into clients
 
@@ -266,7 +273,7 @@ Edit `.mcp.json` at user or project level:
 ### haystack (llmOS)
 
 **haystack v6.0.0+** ships with `fcp-recall` baked into the driver
-defaults — `mem.fault_recall` and the `recall` family route through
+defaults — `mem_fault_recall` and the `recall` family route through
 `ostk-recall serve --stdio` automatically. Just have `ostk-recall` on
 `$PATH`. No HUMANFILE entry needed.
 
@@ -274,11 +281,13 @@ For pre-v6 haystack or other ostk-shaped projects, register manually
 via HUMANFILE (`~/.ostk/HUMANFILE` or project-local):
 
 ```
-DRIVER mine fcp ostk-recall serve --stdio
+DRIVER recall ostk-recall serve --stdio
 ```
 
-haystack's driver-relay wraps any stdio MCP subprocess into a Unix
-socket — no kernel change needed. The verb shows up on next boot.
+Form is `DRIVER <name> [transport] <command>`. Transport defaults to
+`fcp` when omitted; haystack's driver-relay wraps the stdio MCP
+subprocess into a Unix socket at `.ostk/drivers/fcp-<name>.sock`. The
+verb shows up on next boot.
 
 ## Embedder options
 
@@ -309,7 +318,7 @@ query on CPU, ~80 MB to the model cache. Opt out with
 
 ```
                                           ┌─► MCP (stdio)  ──► clients
-  sources ──► scanners ──► pipeline ──► store    (18 tools)    ▲
+  sources ──► scanners ──► pipeline ──► store    (24 tools)    ▲
    (fs)      (8 kinds)    chunk+embed   │                       │
                           + merge_insert │                       │
                                          │  ┌──────────────┐    │
@@ -324,7 +333,7 @@ query on CPU, ~80 MB to the model cache. Opt out with
                                          │                       │
                                          │  ┌──────────────┐    │ attention_*
                                          └──┤ threads.sqlite├───┤ thread_*
-                                            │ + chain ledger│    │ (13 tools)
+                                            │ + chain ledger│    │ (19 tools)
                                             └──────┬───────┘    │
                                                    │             │
               ┌────────────────────────────────────┴─────┐       │
@@ -365,7 +374,7 @@ Stack: model2vec-rs (embedder) ▶ LanceDB vector + Tantivy BM25 (store)
 + SQLite (manifest + audit + threads ledger) ▶ pipeline (scan ▶ chunk
 ▶ embed ▶ `merge_insert`) ▶ query (dense + BM25 with RRF fusion, then
 optional fastembed-rs cross-encoder rerank) ▶ attention runtime
-(observer/weaver/curator) ▶ MCP server (18 tools).
+(observer/weaver/curator) ▶ MCP server (24 tools).
 
 See [`docs/architecture.md`](./docs/architecture.md) and
 [`docs/spec/driver-protocol.md`](./docs/spec/driver-protocol.md) for the
