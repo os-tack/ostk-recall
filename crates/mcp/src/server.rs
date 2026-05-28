@@ -94,33 +94,45 @@ impl Server {
     /// responses + server-initiated notifications to stdout. Returns
     /// when EOF is reached on stdin.
     ///
-    /// P9a-min refactor (see `p9a-mcp-resources.md`): stdout is now
-    /// owned by a single writer task that drains an mpsc channel; the
+    /// Thin wrapper over [`Self::serve`] that wires real stdin/stdout;
+    /// tests use `serve` directly against `tokio::io::duplex` pipes.
+    pub async fn run_stdio(&self) -> std::io::Result<()> {
+        self.serve(tokio::io::stdin(), tokio::io::stdout()).await
+    }
+
+    /// Transport-agnostic serve loop.
+    ///
+    /// P9a-min refactor (see `p9a-mcp-resources.md`): the writer
+    /// half is owned by a single task draining an mpsc channel; the
     /// reader loop and the resource registry both push through the
     /// same `Sender`. This is the only path that can interleave
-    /// responses with server-initiated `notifications/resources/updated`
-    /// without racing on the stdout descriptor.
-    pub async fn run_stdio(&self) -> std::io::Result<()> {
+    /// responses with server-initiated
+    /// `notifications/resources/updated` without racing on the
+    /// output descriptor.
+    ///
+    /// Shutdown is the subtle part. The registry holds a clone of
+    /// the outbound sender so background lens loops can push
+    /// notifications; on stdin EOF we must (1)
+    /// [`ResourceRegistry::clear_outbound`] to drop that clone, then
+    /// (2) drop the local sender. Only after both close does
+    /// `rx.recv().await` in the writer task return `None`. Skipping
+    /// step (1) wedges the serve task forever.
+    pub async fn serve<R, W>(&self, reader: R, writer: W) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        // Hand the sender to the registry so it can push notifications.
-        // The registry's `Arc` is shared with whoever registered the
-        // resources (typically the lens loop in P9b-min); they can
-        // continue to call `emit_resource_updated` for the life of
-        // the server.
         self.resources.set_outbound(out_tx.clone());
 
-        // Writer task — sole owner of stdout. Drains the channel
-        // until every sender drops (the reader loop's `out_tx` plus
-        // any clones held by background tasks).
-        let writer_handle = tokio::spawn(stdio_writer_task(out_rx));
+        let writer_handle = tokio::spawn(writer_task(out_rx, writer));
 
-        info!("mcp server ready on stdio");
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
+        info!("mcp server ready");
+        let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
         loop {
             line.clear();
-            let n = reader.read_line(&mut line).await?;
+            let n = buf_reader.read_line(&mut line).await?;
             if n == 0 {
                 break;
             }
@@ -137,9 +149,6 @@ impl Server {
             };
             if let Some(r) = response {
                 let payload = serialize_response(&r);
-                // Send failures only happen if the writer task has
-                // exited (channel closed). Log + continue so a flaky
-                // stdout doesn't tear down request handling mid-flight.
                 if out_tx.send(payload).is_err() {
                     error!("writer task closed; dropping response");
                     break;
@@ -147,8 +156,10 @@ impl Server {
             }
         }
         info!("mcp server shutting down");
-        // Drop our sender; once the registry's clone is the last
-        // outstanding one, the writer task exits.
+        // Order matters — see the doc comment above. clear_outbound
+        // first so the writer task's receiver sees all senders close
+        // once we also drop the local one.
+        self.resources.clear_outbound();
         drop(out_tx);
         let _ = writer_handle.await;
         Ok(())
@@ -382,24 +393,10 @@ fn serialize_response(resp: &JsonRpcResponse) -> String {
     })
 }
 
-/// Writer task: sole owner of stdout. Drains `rx` until every sender
-/// has dropped, writing each line followed by `\n`. Exposed (crate-
-/// public) so tests can drive it against an in-memory writer.
-pub(crate) async fn stdio_writer_task(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
-) -> std::io::Result<()> {
-    let mut stdout = tokio::io::stdout();
-    while let Some(line) = rx.recv().await {
-        stdout.write_all(line.as_bytes()).await?;
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
-    }
-    Ok(())
-}
-
-/// Generalized writer task used by tests. Mirrors `stdio_writer_task`
-/// but takes any `AsyncWrite` so the test can assert on the produced
-/// bytes without touching real stdout.
+/// Writer task: sole owner of the output transport. Drains `rx`
+/// until every sender has dropped, writing each line followed by
+/// `\n`. Generic over the writer so tests can drive it against an
+/// in-memory pipe; production uses `tokio::io::Stdout`.
 pub async fn writer_task<W: AsyncWriteExt + Unpin>(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     mut writer: W,

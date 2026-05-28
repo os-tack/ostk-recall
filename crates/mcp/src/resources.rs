@@ -315,6 +315,22 @@ impl ResourceRegistry {
         }
     }
 
+    /// Drop the held outbound `Sender`, if any.
+    ///
+    /// Called by [`crate::Server::serve`] during shutdown so the
+    /// writer task's receiver sees every sender close and exits
+    /// cleanly. Without this, the registry's clone keeps the
+    /// channel alive past stdin EOF and the writer task wedges on
+    /// `rx.recv().await` forever.
+    ///
+    /// After `clear_outbound`, `emit_resource_updated` becomes a
+    /// silent no-op until a new sender is installed.
+    pub fn clear_outbound(&self) {
+        if let Ok(mut guard) = self.outbound.lock() {
+            *guard = None;
+        }
+    }
+
     /// Push `notifications/resources/updated` to every subscriber of
     /// `uri`. Best-effort: if no outbound channel is wired or no
     /// subscribers exist, the call is a silent no-op (so library

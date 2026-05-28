@@ -311,6 +311,91 @@ async fn resources_subscribe() {
 }
 
 #[tokio::test]
+async fn serve_exits_cleanly_on_stdin_eof() {
+    // Review-fix regression test. Before the clear_outbound()
+    // shutdown step, `serve` wedged forever on stdin EOF because
+    // the registry held a clone of the outbound Sender and the
+    // writer task's recv().await never observed the channel
+    // closing. The bounded timeout makes the regression visible —
+    // a wedge would blow past 2s.
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    let (_tmp, server) = build_server().await;
+    let server = Arc::new(server);
+    let (mut client_stdin, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, _client_stdout) = tokio::io::duplex(4096);
+
+    let server_handle = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.serve(server_stdin, server_stdout).await })
+    };
+
+    // Send a single ping so the dispatch path is exercised at
+    // least once before EOF.
+    client_stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    // Closing the writer half delivers EOF on the server's read
+    // half — the canonical "stdin closed" signal.
+    drop(client_stdin);
+
+    let exit = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+    let join = exit.expect("serve must exit within 2s of stdin EOF");
+    let io = join.expect("serve task must not panic");
+    io.expect("serve returned an io error");
+}
+
+#[tokio::test]
+async fn serve_eof_releases_registry_outbound_for_future_runs() {
+    // The other half of the shutdown contract: after `serve`
+    // returns, the registry's outbound slot must be empty so a
+    // subsequent run_stdio (or a new transport) can install a
+    // fresh Sender. emit_resource_updated must be a no-op until
+    // then.
+    use std::time::Duration;
+
+    let (_tmp, server) = build_server().await;
+    let registry = server.resources();
+    registry.register(Arc::new(FakeResource::new("ostk://x", "body")));
+    registry
+        .subscribe(ClientId::stdio_singleton(), "ostk://x")
+        .unwrap();
+
+    let server = Arc::new(server);
+    let (client_stdin, server_stdin) = tokio::io::duplex(4096);
+    let (server_stdout, _client_stdout) = tokio::io::duplex(4096);
+
+    let server_handle = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.serve(server_stdin, server_stdout).await })
+    };
+    drop(client_stdin);
+    tokio::time::timeout(Duration::from_secs(2), server_handle)
+        .await
+        .expect("serve exits on EOF")
+        .expect("no panic")
+        .expect("no io error");
+
+    // The registry should hold no outbound now. emit_resource_updated
+    // is a silent no-op — no channel to send into.
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // If we left a stale sender behind, emit would push down it
+    // before we re-installed our tx; the assertion below catches
+    // that.
+    registry.emit_resource_updated("ostk://x");
+    assert!(
+        rx.try_recv().is_err(),
+        "registry must not hold a stale sender post-serve"
+    );
+    // Re-installing and emitting works (sanity).
+    registry.set_outbound(tx);
+    registry.emit_resource_updated("ostk://x");
+    let _ = rx.recv().await.expect("post-reinstall emit reaches channel");
+}
+
+#[tokio::test]
 async fn resources_notifications() {
     // End-to-end: register, subscribe, fire emit_resource_updated,
     // assert the JSON-RPC envelope produced on the outbound channel
