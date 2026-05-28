@@ -650,6 +650,25 @@ impl InMemoryAttention {
         Ok(())
     }
 
+    /// Snapshot the per-scope rolling vector.
+    ///
+    /// Returns the raw EMA channel — not the priority-chain
+    /// `effective_vec()`. P9b-min's lens loop reads this to feed
+    /// the drift detector (cosine distance against the prior
+    /// rolling); `scope_vector()` continues to be the ranking
+    /// channel (pin precedence applied).
+    pub async fn rolling_vec(
+        &self,
+        scope: &AttentionScope,
+    ) -> Result<Option<Vec<f32>>, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let inner = self.inner.read().await;
+        let Some(state) = inner.scopes.get(&key) else {
+            return Ok(None);
+        };
+        Ok(state.rolling_vec.clone())
+    }
+
     /// Replay-seed the per-scope rolling vector from a chain
     /// snapshot.
     ///

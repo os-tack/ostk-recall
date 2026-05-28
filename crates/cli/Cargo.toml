@@ -38,6 +38,7 @@ rayon = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 notify-debouncer-full = { workspace = true }

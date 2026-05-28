@@ -33,7 +33,6 @@ use serde::{Deserialize, Serialize};
 use ostk_recall_core::{FacetSet, facets};
 use ostk_recall_store::corpus::CorpusStore;
 
-use crate::candidate::Candidate;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
 use crate::lanes::ambient_candidates;
@@ -400,6 +399,7 @@ impl AttentionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candidate::Candidate;
     use ostk_recall_core::{Chunk, FacetSet, Links, Source};
     use std::collections::BTreeSet;
 
