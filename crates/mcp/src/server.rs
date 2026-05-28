@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};
 
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::resources::{ClientId, ResourceRegistry};
 use crate::tools::tool_list;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -26,9 +27,17 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// `attention_*` / `thread_*` tool families when the caller (typically
 /// `cli::commands::serve`) constructs a long-lived `AttentionDispatch`
 /// and threads it through.
+///
+/// The `resources` registry is always present (default empty) so the
+/// MCP `resources/*` protocol surface advertises even before P9b-min
+/// registers the `memory-lens` resource. The Arc is shared so callers
+/// can register resources from outside the server (e.g. a background
+/// lens loop) and emit update notifications without going through the
+/// server handle.
 pub struct Server {
     engine: Arc<QueryEngine>,
     attention: Option<Arc<AttentionDispatch>>,
+    resources: Arc<ResourceRegistry>,
 }
 
 impl Server {
@@ -37,14 +46,16 @@ impl Server {
         Self {
             engine: Arc::new(engine),
             attention: None,
+            resources: Arc::new(ResourceRegistry::new()),
         }
     }
 
     #[must_use]
-    pub const fn from_arc(engine: Arc<QueryEngine>) -> Self {
+    pub fn from_arc(engine: Arc<QueryEngine>) -> Self {
         Self {
             engine,
             attention: None,
+            resources: Arc::new(ResourceRegistry::new()),
         }
     }
 
@@ -57,19 +68,56 @@ impl Server {
         self
     }
 
+    /// Replace the resource registry. Callers needing to register
+    /// resources before `run_stdio` (the typical P9b-min flow) build
+    /// a registry, hand it here, and keep their own `Arc` to push
+    /// updates later.
+    #[must_use]
+    pub fn with_resources(mut self, registry: Arc<ResourceRegistry>) -> Self {
+        self.resources = registry;
+        self
+    }
+
     pub const fn engine(&self) -> &Arc<QueryEngine> {
         &self.engine
     }
 
+    /// Handle to the registry. P9b-min holds this to register the
+    /// memory-lens resource and call `emit_resource_updated` from the
+    /// background loop.
+    #[must_use]
+    pub fn resources(&self) -> Arc<ResourceRegistry> {
+        Arc::clone(&self.resources)
+    }
+
     /// Read newline-delimited JSON requests from stdin, dispatch, write
-    /// responses to stdout. Returns when EOF is reached on stdin.
+    /// responses + server-initiated notifications to stdout. Returns
+    /// when EOF is reached on stdin.
+    ///
+    /// P9a-min refactor (see `p9a-mcp-resources.md`): stdout is now
+    /// owned by a single writer task that drains an mpsc channel; the
+    /// reader loop and the resource registry both push through the
+    /// same `Sender`. This is the only path that can interleave
+    /// responses with server-initiated `notifications/resources/updated`
+    /// without racing on the stdout descriptor.
     pub async fn run_stdio(&self) -> std::io::Result<()> {
-        let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Hand the sender to the registry so it can push notifications.
+        // The registry's `Arc` is shared with whoever registered the
+        // resources (typically the lens loop in P9b-min); they can
+        // continue to call `emit_resource_updated` for the life of
+        // the server.
+        self.resources.set_outbound(out_tx.clone());
+
+        // Writer task — sole owner of stdout. Drains the channel
+        // until every sender drops (the reader loop's `out_tx` plus
+        // any clones held by background tasks).
+        let writer_handle = tokio::spawn(stdio_writer_task(out_rx));
 
         info!("mcp server ready on stdio");
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
         loop {
             line.clear();
             let n = reader.read_line(&mut line).await?;
@@ -80,23 +128,29 @@ impl Server {
             if trimmed.is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    let resp = JsonRpcResponse::err(
-                        Value::Null,
-                        JsonRpcError::parse(format!("parse error: {e}")),
-                    );
-                    write_response(&mut stdout, &resp).await?;
-                    continue;
-                }
+            let response = match serde_json::from_str::<Value>(trimmed) {
+                Ok(v) => self.handle_request(v).await,
+                Err(e) => Some(JsonRpcResponse::err(
+                    Value::Null,
+                    JsonRpcError::parse(format!("parse error: {e}")),
+                )),
             };
-            let reply = self.handle_request(value).await;
-            if let Some(r) = reply {
-                write_response(&mut stdout, &r).await?;
+            if let Some(r) = response {
+                let payload = serialize_response(&r);
+                // Send failures only happen if the writer task has
+                // exited (channel closed). Log + continue so a flaky
+                // stdout doesn't tear down request handling mid-flight.
+                if out_tx.send(payload).is_err() {
+                    error!("writer task closed; dropping response");
+                    break;
+                }
             }
         }
         info!("mcp server shutting down");
+        // Drop our sender; once the registry's clone is the last
+        // outstanding one, the writer task exits.
+        drop(out_tx);
+        let _ = writer_handle.await;
         Ok(())
     }
 
@@ -124,6 +178,21 @@ impl Server {
                 Ok(v) => Some(JsonRpcResponse::ok(id, v)),
                 Err(err) => Some(JsonRpcResponse::err(id, err)),
             },
+            "resources/list" => Some(JsonRpcResponse::ok(id, self.resources.list())),
+            "resources/read" => match resource_uri_param(&req.params) {
+                Ok(uri) => match self.resources.read(&uri) {
+                    Ok(v) => Some(JsonRpcResponse::ok(id, v)),
+                    Err(err) => Some(JsonRpcResponse::err(id, err.into_rpc())),
+                },
+                Err(err) => Some(JsonRpcResponse::err(id, err)),
+            },
+            "resources/subscribe" => match resource_uri_param(&req.params) {
+                Ok(uri) => match self.resources.subscribe(ClientId::stdio_singleton(), &uri) {
+                    Ok(()) => Some(JsonRpcResponse::ok(id, json!({}))),
+                    Err(err) => Some(JsonRpcResponse::err(id, err.into_rpc())),
+                },
+                Err(err) => Some(JsonRpcResponse::err(id, err)),
+            },
             _ => {
                 if is_notification {
                     warn!(method = %req.method, "unknown notification — ignoring");
@@ -141,7 +210,17 @@ impl Server {
     fn handle_initialize() -> Value {
         json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false } },
+            "capabilities": {
+                "tools": { "listChanged": false },
+                // P9a-min advertises `subscribe: true` so MCP clients
+                // know they can ask for `resources/subscribe`.
+                // `listChanged: false` because P9a-min doesn't push
+                // `notifications/resources/list_changed` — the
+                // resource set is established at boot. P9a-full /
+                // P9b-full revisits this when lens registration
+                // becomes dynamic.
+                "resources": { "subscribe": true, "listChanged": false }
+            },
             "serverInfo": {
                 "name": "ostk-recall",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -289,18 +368,59 @@ fn attention_error_to_rpc(err: AttentionHandlersError) -> JsonRpcError {
     }
 }
 
-async fn write_response<W: AsyncWriteExt + Unpin>(
-    w: &mut W,
-    resp: &JsonRpcResponse,
-) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(resp).map_err(|e| {
+/// Serialize a JSON-RPC response into the on-wire line form the
+/// stdio writer task consumes (no trailing newline — the writer adds
+/// one). Errors here would only happen on a programming bug in the
+/// JsonRpcResponse types, so a serde_json error is logged and a
+/// synthetic internal-error envelope returned in its place.
+fn serialize_response(resp: &JsonRpcResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|e| {
         error!(error = %e, "serialize response");
-        std::io::Error::other(e)
-    })?;
-    line.push(b'\n');
-    w.write_all(&line).await?;
-    w.flush().await?;
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {e}"}}}}"#
+        )
+    })
+}
+
+/// Writer task: sole owner of stdout. Drains `rx` until every sender
+/// has dropped, writing each line followed by `\n`. Exposed (crate-
+/// public) so tests can drive it against an in-memory writer.
+pub(crate) async fn stdio_writer_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> std::io::Result<()> {
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = rx.recv().await {
+        stdout.write_all(line.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+    }
     Ok(())
+}
+
+/// Generalized writer task used by tests. Mirrors `stdio_writer_task`
+/// but takes any `AsyncWrite` so the test can assert on the produced
+/// bytes without touching real stdout.
+pub async fn writer_task<W: AsyncWriteExt + Unpin>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut writer: W,
+) -> std::io::Result<()> {
+    while let Some(line) = rx.recv().await {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+/// Extract the `uri` parameter from a `resources/{read,subscribe}`
+/// request, mapping missing-or-non-string to a JSON-RPC invalid params
+/// error.
+fn resource_uri_param(params: &Value) -> std::result::Result<String, JsonRpcError> {
+    params
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| JsonRpcError::invalid_params("missing or non-string `uri`"))
 }
 
 /// Re-rank recall hits by what the caller is attending to right now.
