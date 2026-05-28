@@ -20,7 +20,8 @@ pub use attention::{
 pub use chunk::{Chunk, Links};
 pub use config::{
     Config, CorpusConfig, EmbedderConfig, RerankerConfig, RuntimeConfig, SourceConfig,
-    WatchConfig, WatchMode, default_worker_threads,
+    SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, WatchConfig, WatchMode, compute_source_config_id,
+    default_worker_threads,
 };
 pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};

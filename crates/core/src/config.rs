@@ -260,17 +260,108 @@ pub struct SourceConfig {
     pub ignore: Vec<String>,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Operator-supplied physical-identity discriminator. When two
+    /// `[[sources]]` blocks share the same `(kind, paths, extensions,
+    /// ignore)` shape, the default `source_config_id` would collide; set
+    /// `id = "..."` on each to disambiguate. Reserved prefix `synthetic:`
+    /// is rejected at parse (it routes to `Pipeline::ingest_synthetic`).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Computed at config parse from `(kind, paths, extensions, ignore,
+    /// optional legacy project)` via [`compute_source_config_id`]. Always
+    /// non-empty after `Config::load` / `Config::validate` returns. Never
+    /// read from the TOML.
+    #[serde(skip)]
+    pub source_config_id: String,
 }
 
+/// Reserved prefix for synthetic-ingest `source_config_id` values.
+/// User `[[sources]].id` starting with this is rejected at parse so
+/// scanner-driven and `Pipeline::ingest_synthetic` chunks never collide.
+pub const SYNTHETIC_SOURCE_CONFIG_ID_PREFIX: &str = "synthetic:";
+
 impl Config {
-    /// Load and validate config from disk.
+    /// Load and validate config from disk. Mutates each `[[sources]]` block
+    /// to populate `source_config_id` (always non-empty when this returns
+    /// Ok).
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let cfg: Self = toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))?;
-        cfg.validate()?;
+        let mut cfg: Self = toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))?;
+        cfg.validate_and_seal()?;
         Ok(cfg)
     }
 
+    /// Validate the parsed config AND finalize each source's
+    /// `source_config_id`. Use this from any caller that builds a `Config`
+    /// programmatically (tests, in-process synthesis) instead of calling
+    /// `validate` directly.
+    pub fn validate_and_seal(&mut self) -> Result<()> {
+        // First, basic per-source checks + explicit-id sanity.
+        for (i, s) in self.sources.iter().enumerate() {
+            if s.paths.is_empty() {
+                return Err(Error::Config(format!(
+                    "sources[{i}] (kind={}) has no paths",
+                    s.kind.as_str()
+                )));
+            }
+            if let Some(explicit) = &s.id {
+                if explicit.is_empty() {
+                    return Err(Error::Config(format!(
+                        "sources[{i}] (kind={}) has empty `id`",
+                        s.kind.as_str()
+                    )));
+                }
+                if explicit.starts_with(SYNTHETIC_SOURCE_CONFIG_ID_PREFIX) {
+                    return Err(Error::Config(format!(
+                        "sources[{i}] (kind={}) has reserved `id` prefix `{}` — \
+                         that prefix is reserved for `Pipeline::ingest_synthetic` chunks",
+                        s.kind.as_str(),
+                        SYNTHETIC_SOURCE_CONFIG_ID_PREFIX,
+                    )));
+                }
+            }
+        }
+
+        // Detect physical-shape duplicates BEFORE legacy-discriminator
+        // disambiguation, so the v0.5 legacy-project upgrade path is the
+        // ONLY thing that lets two same-shape blocks coexist by default.
+        // Operators wanting two blocks over the same physical scan shape
+        // (without a legacy `project`) must set `id = "..."` explicitly.
+        let has_legacy_collision = legacy_project_collision(&self.sources);
+
+        for s in &mut self.sources {
+            s.source_config_id = compute_source_config_id(s, has_legacy_collision);
+            debug_assert!(
+                !s.source_config_id.is_empty(),
+                "source_config_id must be non-empty after parse"
+            );
+        }
+
+        // After computing, refuse default-id collisions: same id from two
+        // blocks WITHOUT operator-supplied disambiguation is a bug.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, s) in self.sources.iter().enumerate() {
+            if let Some(prev) = seen.insert(s.source_config_id.clone(), i) {
+                let a = &self.sources[prev];
+                return Err(Error::Config(format!(
+                    "config error: source blocks {prev} and {i} share physical identity\n  \
+                     (kind=\"{}\", paths={:?}, extensions={:?}, ignore={:?})\n  \
+                     Either merge them, distinguish by `id = \"...\"` on each block,\n  \
+                     or move their differing facets to a single block via the facets override.",
+                    a.kind.as_str(),
+                    a.paths,
+                    a.extensions,
+                    a.ignore,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Back-compat alias retained for callers that only want syntactic
+    /// validation (no mutation). Prefer [`Config::validate_and_seal`] for
+    /// any new caller — it leaves `source_config_id` populated so the
+    /// chunk_id formula has its discriminator.
     pub fn validate(&self) -> Result<()> {
         for (i, s) in self.sources.iter().enumerate() {
             if s.paths.is_empty() {
@@ -287,6 +378,79 @@ impl Config {
     pub fn expanded_root(&self) -> Result<PathBuf> {
         expand_path(&self.corpus.root)
     }
+}
+
+/// Compute a physical-identity discriminator for a single source block.
+///
+/// `id` (when set) wins. Otherwise the formula is:
+/// `blake3-16(kind || '|' || paths || '|' || extensions || '|' || ignore || '|'
+/// || legacy_project)` where every sequence is sorted for stability.
+///
+/// The legacy project segment is empty UNLESS the operator has two blocks
+/// with identical physical shape that differ only by `[[sources]].project`
+/// (v0.5 transitional discriminator — removed at v0.7). The
+/// `has_legacy_collision` flag drives this: when true, any block carrying
+/// a legacy `project` participates with its project as the last segment.
+#[must_use]
+pub fn compute_source_config_id(cfg: &SourceConfig, has_legacy_collision: bool) -> String {
+    if let Some(explicit) = &cfg.id {
+        return explicit.clone();
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(cfg.kind.as_str().as_bytes());
+    h.update(b"|");
+    let mut paths = cfg.paths.clone();
+    paths.sort();
+    for p in &paths {
+        h.update(p.as_bytes());
+        h.update(b",");
+    }
+    h.update(b"|");
+    let mut exts = cfg.extensions.clone();
+    exts.sort();
+    for e in &exts {
+        h.update(e.as_bytes());
+        h.update(b",");
+    }
+    h.update(b"|");
+    let mut ignores = cfg.ignore.clone();
+    ignores.sort();
+    for ig in &ignores {
+        h.update(ig.as_bytes());
+        h.update(b",");
+    }
+    h.update(b"|");
+    let legacy_proj = if has_legacy_collision {
+        cfg.project.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+    h.update(legacy_proj.as_bytes());
+    let hash = h.finalize();
+    hex::encode(&hash.as_bytes()[..16])
+}
+
+/// Detect whether two or more `[[sources]]` blocks share physical shape
+/// AND differ only by their legacy `project` field. Used to opt those
+/// blocks into the v0.5 → v0.6 transitional discriminator so existing
+/// configs upgrade without forced explicit-id edits.
+fn legacy_project_collision(sources: &[SourceConfig]) -> bool {
+    // Hash each block WITHOUT the legacy project segment.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, s) in sources.iter().enumerate() {
+        if s.project.is_none() || s.id.is_some() {
+            continue;
+        }
+        // Recompute the no-project shape hash for comparison.
+        let mut tmp = s.clone();
+        tmp.project = None;
+        let shape_id = compute_source_config_id(&tmp, false);
+        if let Some(prev) = seen.insert(shape_id, i) {
+            let _ = prev;
+            return true;
+        }
+    }
+    false
 }
 
 impl SourceConfig {

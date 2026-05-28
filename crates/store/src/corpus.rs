@@ -1105,6 +1105,19 @@ fn build_record_batch(
     let source = StringArray::from_iter_values(chunks.iter().map(|c| c.source.as_str()));
     let project: StringArray = chunks.iter().map(|c| c.project.as_deref()).collect();
     let source_id = StringArray::from_iter_values(chunks.iter().map(|c| c.source_id.as_str()));
+    // source_config_id is non-empty in normal flow but the Lance column is
+    // nullable for the migration window — encode empty as NULL so v0.5
+    // rows added later round-trip identically.
+    let source_config_id: StringArray = chunks
+        .iter()
+        .map(|c| {
+            if c.source_config_id.is_empty() {
+                None
+            } else {
+                Some(c.source_config_id.as_str())
+            }
+        })
+        .collect();
     let chunk_index = UInt32Array::from_iter_values(chunks.iter().map(|c| c.chunk_index));
     let ts = TimestampMicrosecondArray::from(
         chunks
@@ -1158,6 +1171,7 @@ fn build_record_batch(
             Arc::new(source),
             Arc::new(project),
             Arc::new(source_id),
+            Arc::new(source_config_id),
             Arc::new(chunk_index),
             Arc::new(ts),
             Arc::new(role),
@@ -1184,6 +1198,7 @@ mod tests {
             source: Source::Markdown,
             project: Some("test".into()),
             source_id: "file.md".into(),
+            source_config_id: "test-cfg".into(),
             chunk_index: 0,
             ts: None,
             role: None,
@@ -1330,6 +1345,7 @@ mod tests {
             source: Source::Markdown,
             project: Some(project.to_string()),
             source_id: format!("{id}.md"),
+            source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: Some(ts),
             role: None,

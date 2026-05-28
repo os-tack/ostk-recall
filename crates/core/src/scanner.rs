@@ -16,6 +16,11 @@ pub struct SourceItem {
     /// through to scanners that do additional walks inside `parse`. Empty
     /// for scanners whose `discover` already finalized the path list.
     pub ignore: Vec<String>,
+    /// Physical-identity discriminator, copied from
+    /// [`SourceConfig::source_config_id`] by [`Pipeline::ingest_source`]
+    /// before this item reaches `parse`. Scanners thread it into emitted
+    /// [`Chunk::source_config_id`] for the chunk_id hash + Lance row.
+    pub source_config_id: String,
 }
 
 /// Scanners are synchronous producers.
@@ -83,6 +88,7 @@ mod tests {
             Box::new(std::iter::once(Ok(SourceItem {
                 source_id: self.dir.to_string_lossy().into_owned(),
                 path: Some(self.dir.clone()),
+                source_config_id: "test-cfg".into(),
                 ..SourceItem::default()
             })))
         }
@@ -102,6 +108,8 @@ mod tests {
             paths: vec![dir.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         let requested = vec![dir.join("a.txt"), dir.join("b.txt")];
@@ -128,6 +136,8 @@ mod tests {
             paths: vec![dir.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         // /tmp/Y/a.txt is unrelated; /tmp/Xtra/a.txt would byte-prefix

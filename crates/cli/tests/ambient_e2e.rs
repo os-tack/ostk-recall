@@ -90,7 +90,7 @@ async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
 
     let handle = ThreadHandle::new("three-time-scales").unwrap();
     let anchor_source_id = "anchor-fixture.md";
-    let anchor_chunk_id = Chunk::make_id(Source::Markdown, anchor_source_id, 0);
+    let anchor_chunk_id = Chunk::make_id(Source::Markdown, anchor_source_id, 0, "");
 
     // --- pre-seed the corpus with the anchor chunk -------------------
     // commands::scan does CorpusStore::open_or_create with the same dim,
@@ -106,6 +106,7 @@ async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
             source: Source::Markdown,
             project: Some("notes".into()),
             source_id: anchor_source_id.into(),
+            source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: Some(Utc::now()),
             role: None,

@@ -46,6 +46,7 @@ async fn build_server() -> (TempDir, Server) {
         source: Source::Markdown,
         project: Some("proj".into()),
         source_id: "seed.md".into(),
+        source_config_id: "test-cfg".to_string(),
         chunk_index: 0,
         ts: None,
         role: None,
@@ -64,7 +65,7 @@ async fn build_server() -> (TempDir, Server) {
             &IngestChunkRow {
                 chunk_id: chunk.chunk_id.clone(),
                 source: chunk.source.as_str().to_string(),
-                project: chunk.project.as_deref().unwrap_or("default").to_string(),
+                source_config_id: "test-cfg".to_string(),
                 source_id: chunk.source_id.clone(),
                 chunk_index: chunk.chunk_index,
                 content_sha256: chunk.sha256.clone(),

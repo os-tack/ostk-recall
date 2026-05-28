@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::source::Source;
+use crate::source::{Source, SourceKind};
 
 /// A unit of content ready to be embedded and stored.
 ///
@@ -14,6 +14,14 @@ pub struct Chunk {
     pub source: Source,
     pub project: Option<String>,
     pub source_id: String,
+    /// Physical-identity discriminator. Computed at config parse from
+    /// `[[sources]]` shape (kind, paths, extensions, ignore) for
+    /// scanner-driven chunks; reserved `synthetic:<kind>` form for
+    /// in-process `Pipeline::ingest_synthetic` chunks.
+    ///
+    /// Always non-empty.
+    #[serde(default)]
+    pub source_config_id: String,
     pub chunk_index: u32,
     pub ts: Option<DateTime<Utc>>,
     pub role: Option<String>,
@@ -37,18 +45,36 @@ pub struct Links {
 impl Chunk {
     /// Compute a deterministic chunk id.
     ///
-    /// `chunk_id = sha256(source || ':' || source_id || ':' || chunk_index)`.
-    /// Re-running a scanner with identical inputs produces identical ids, so
-    /// upsert by `chunk_id` is idempotent.
+    /// `chunk_id = sha256(source || ':' || source_id || ':' || chunk_index || source_config_id)`.
+    /// `source_config_id` distinguishes overlapping `[[sources]]` over the
+    /// same paths (P0). Re-running a scanner with identical inputs produces
+    /// identical ids, so upsert by `chunk_id` is idempotent.
     #[must_use]
-    pub fn make_id(source: Source, source_id: &str, chunk_index: u32) -> String {
+    pub fn make_id(
+        source: Source,
+        source_id: &str,
+        chunk_index: u32,
+        source_config_id: &str,
+    ) -> String {
         let mut h = Sha256::new();
         h.update(source.as_str().as_bytes());
         h.update(b":");
         h.update(source_id.as_bytes());
         h.update(b":");
         h.update(chunk_index.to_le_bytes());
+        h.update(source_config_id.as_bytes());
         hex::encode(h.finalize())
+    }
+
+    /// Reserved `source_config_id` for chunks emitted via
+    /// `Pipeline::ingest_synthetic` (no `[[sources]]` config to hash from).
+    ///
+    /// Format: `synthetic:<kind>` (e.g. `synthetic:membrane`). The prefix
+    /// `synthetic:` is reserved — user `[[sources]].id` values starting with
+    /// it are rejected at config parse.
+    #[must_use]
+    pub fn synthetic_source_config_id(kind: SourceKind) -> String {
+        format!("synthetic:{}", kind.as_str())
     }
 
     /// Content hash for the `text` field. Used by the pipeline's dedupe step:
@@ -65,23 +91,41 @@ mod tests {
 
     #[test]
     fn chunk_id_is_deterministic() {
-        let a = Chunk::make_id(Source::Markdown, "notes/foo.md", 0);
-        let b = Chunk::make_id(Source::Markdown, "notes/foo.md", 0);
+        let a = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-a");
+        let b = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-a");
         assert_eq!(a, b);
     }
 
     #[test]
     fn chunk_id_differs_by_index() {
-        let a = Chunk::make_id(Source::Markdown, "notes/foo.md", 0);
-        let b = Chunk::make_id(Source::Markdown, "notes/foo.md", 1);
+        let a = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-a");
+        let b = Chunk::make_id(Source::Markdown, "notes/foo.md", 1, "cfg-a");
         assert_ne!(a, b);
     }
 
     #[test]
     fn chunk_id_differs_by_source() {
-        let a = Chunk::make_id(Source::Markdown, "x", 0);
-        let b = Chunk::make_id(Source::Code, "x", 0);
+        let a = Chunk::make_id(Source::Markdown, "x", 0, "cfg-a");
+        let b = Chunk::make_id(Source::Code, "x", 0, "cfg-a");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn chunk_id_differs_by_source_config_id() {
+        let a = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-a");
+        let b = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-b");
+        assert_ne!(
+            a, b,
+            "chunks from different source configs must not collide"
+        );
+    }
+
+    #[test]
+    fn synthetic_source_config_id_uses_reserved_prefix() {
+        let id = Chunk::synthetic_source_config_id(SourceKind::Membrane);
+        assert_eq!(id, "synthetic:membrane");
+        let id2 = Chunk::synthetic_source_config_id(SourceKind::Thread);
+        assert_eq!(id2, "synthetic:thread");
     }
 
     #[test]

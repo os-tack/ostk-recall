@@ -711,7 +711,12 @@ fn build_membrane_chunks(
             // u32::try_from is bounded by triggers.len() in a single
             // turn — astronomically below u32::MAX, but be tidy.
             let chunk_index = u32::try_from(idx).unwrap_or(u32::MAX);
-            let chunk_id = Chunk::make_id(Source::Membrane, &source_id, chunk_index);
+            // Synthetic (membrane) chunks bypass `[[sources]]` config; use
+            // the reserved `synthetic:<kind>` discriminator per P0.
+            let source_config_id =
+                Chunk::synthetic_source_config_id(ostk_recall_core::SourceKind::Membrane);
+            let chunk_id =
+                Chunk::make_id(Source::Membrane, &source_id, chunk_index, &source_config_id);
             let sha = Chunk::content_hash(&window);
             let extra = serde_json::json!({
                 "kind": "recognition",
@@ -725,6 +730,7 @@ fn build_membrane_chunks(
                 source: Source::Membrane,
                 project: None, // pipeline ingest_synthetic carries project via meta
                 source_id,
+                source_config_id,
                 chunk_index,
                 ts: Some(Utc::now()),
                 role: Some("recognition".into()),

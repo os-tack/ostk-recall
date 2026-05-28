@@ -98,6 +98,23 @@ enum Command {
         #[command(subcommand)]
         verb: ThreadVerb,
     },
+    /// Manifest tooling (recover `ingest.sqlite` from `corpus.lance`).
+    Manifest {
+        #[command(subcommand)]
+        verb: ManifestVerb,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ManifestVerb {
+    /// Reconstruct `ingest.sqlite` from `corpus.lance` rows alone.
+    ///
+    /// Use after a partial copy or disk failure that lost the SQLite
+    /// ledger but preserved the Lance directory. The rebuild populates
+    /// `ingest_chunks` + `ingest_sources` from the embedded
+    /// `source_config_id` column (P0); `mtime/size` are stamped as 0
+    /// and refresh on the next scan.
+    Rebuild,
 }
 
 #[derive(Debug, Subcommand)]
@@ -476,8 +493,50 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             let out = run_thread(&dispatch, verb).await?;
             print_attention_output(json, &out);
         }
+        Command::Manifest { verb } => {
+            run_manifest(&config_path, verb).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// Dispatch `ostk-recall manifest <verb>`.
+async fn run_manifest(config_path: &Path, verb: ManifestVerb) -> Result<()> {
+    match verb {
+        ManifestVerb::Rebuild => {
+            let cfg = ostk_recall_core::Config::load(config_path)
+                .with_context(|| format!("loading config from {}", config_path.display()))?;
+            let root = cfg.expanded_root()?;
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating corpus root {}", root.display()))?;
+            // Open both stores; the rebuild reads from corpus.lance and
+            // writes into ingest.sqlite. If ingest.sqlite holds the
+            // legacy v0.5 schema, the open path errors loudly per P0.
+            let store = ostk_recall_store::CorpusStore::open_or_create(
+                &root,
+                // Dim is fixed at corpus-create time. We open with the
+                // embedder's nominal dim; rebuild doesn't read embeddings.
+                0,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("open corpus: {e}"))?;
+            let ingest = ostk_recall_store::IngestDb::open(&root)
+                .map_err(|e| anyhow::anyhow!("open ingest ledger: {e}"))?;
+            let run_id = format!(
+                "manifest-rebuild-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            let n = ostk_recall_store::rebuild_ingest_manifest(&store, &ingest, &run_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("rebuild_ingest_manifest: {e}"))?;
+            println!("rebuilt {n} chunks into ingest.sqlite (run_id={run_id})");
+            println!("next step: run a full `ostk-recall scan` to refresh mtime/size metadata.");
+        }
+    }
     Ok(())
 }
 

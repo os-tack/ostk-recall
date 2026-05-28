@@ -66,6 +66,7 @@ impl Scanner for ThreadScanner {
                     project: project.clone(),
                     bytes: None,
                     ignore: Vec::new(),
+                    source_config_id: "test-cfg".to_string(),
                 })
             })
         });
@@ -105,6 +106,7 @@ impl Scanner for ThreadScanner {
                 project: project.clone(),
                 bytes: None,
                 ignore: Vec::new(),
+                source_config_id: "test-cfg".to_string(),
             }))
         });
         Box::new(iter)
@@ -135,7 +137,7 @@ impl Scanner for ThreadScanner {
         }
 
         let body = std::mem::take(&mut parsed.body);
-        let chunk_id = Chunk::make_id(Source::Thread, &item.source_id, 0);
+        let chunk_id = Chunk::make_id(Source::Thread, &item.source_id, 0, &item.source_config_id);
         let sha256 = Chunk::content_hash(&body);
         let links = Links {
             file_path: Some(abs_path),
@@ -148,6 +150,7 @@ impl Scanner for ThreadScanner {
             source: Source::Thread,
             project: item.project,
             source_id,
+            source_config_id: item.source_config_id.clone(),
             chunk_index: 0,
             ts: mtime,
             role: None,
@@ -365,8 +368,10 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         }
-    }
+        }
 
     fn write_thread(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);

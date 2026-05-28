@@ -12,7 +12,7 @@ use chrono::Utc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use ostk_recall_core::{Chunk, RetentionPolicy, Scanner, SourceConfig, SourceKind};
+use ostk_recall_core::{Chunk, RetentionPolicy, Scanner, SourceConfig, SourceItem, SourceKind};
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 
@@ -182,14 +182,14 @@ impl Pipeline {
 
                     if let Ok(Some((old_mtime, old_size))) =
                         self.ingest
-                            .get_source_metadata(source_kind_str, project, &item.source_id)
+                            .get_source_metadata(source_kind_str, &cfg.source_config_id, &item.source_id)
                     {
                         if old_mtime == mtime && old_size == size {
                             if self
                                 .ingest
                                 .touch_source_chunks(
                                     source_kind_str,
-                                    project,
+                                    &cfg.source_config_id,
                                     &item.source_id,
                                     &self.run_id,
                                 )
@@ -203,7 +203,7 @@ impl Pipeline {
 
                     let _ = self.ingest.update_source_metadata(
                         source_kind_str,
-                        project,
+                        &cfg.source_config_id,
                         &item.source_id,
                         mtime,
                         size,
@@ -212,7 +212,7 @@ impl Pipeline {
                 }
             }
 
-            let chunks = match scanner.parse(item) {
+            let chunks = match scanner.parse(SourceItem { source_config_id: cfg.source_config_id.clone(), ..item }) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "parse failed");
@@ -233,7 +233,7 @@ impl Pipeline {
                         let row = IngestChunkRow {
                             chunk_id: chunk.chunk_id.clone(),
                             source: chunk.source.as_str().to_string(),
-                            project: project.to_string(),
+                            source_config_id: chunk.source_config_id.clone(),
                             source_id: chunk.source_id.clone(),
                             chunk_index: chunk.chunk_index,
                             content_sha256: chunk.sha256.clone(),
@@ -276,10 +276,10 @@ impl Pipeline {
         // scan would get swept under this run_id. That's the cross-project
         // wipe footgun. Refuse to run the sweep when project is unset; let the
         // caller fix their config.
-        if !self.dry_run && cfg.project.is_none() {
+        if !self.dry_run && cfg.source_config_id.is_empty() {
             tracing::error!(
                 source_kind = %source_kind_str,
-                "orphan sweep skipped: SourceConfig.project is None — multi-project safety contract requires an explicit project for any source whose retention policy mutates the corpus. See crates/pipeline/src/lib.rs orphan-sweep guard."
+                "orphan sweep skipped: SourceConfig.source_config_id is empty — Config::validate_and_seal must run before any scan."
             );
             stats.errors += 1;
             return stats;
@@ -292,7 +292,7 @@ impl Pipeline {
                     for s in cfg.kind.sources() {
                         match self
                             .ingest
-                            .delete_orphans(s.as_str(), project, &self.run_id)
+                            .delete_orphans(s.as_str(), &cfg.source_config_id, &self.run_id)
                         {
                             Ok(orphans) => {
                                 if !orphans.is_empty() {
@@ -313,7 +313,7 @@ impl Pipeline {
                     for s in cfg.kind.sources() {
                         match self
                             .ingest
-                            .mark_orphans_stale(s.as_str(), project, &self.run_id)
+                            .mark_orphans_stale(s.as_str(), &cfg.source_config_id, &self.run_id)
                         {
                             Ok(orphans) => {
                                 if !orphans.is_empty() {
@@ -386,7 +386,7 @@ impl Pipeline {
                     let row = IngestChunkRow {
                         chunk_id: chunk.chunk_id.clone(),
                         source: chunk.source.as_str().to_string(),
-                        project: project.to_string(),
+                        source_config_id: chunk.source_config_id.clone(),
                         source_id: chunk.source_id.clone(),
                         chunk_index: chunk.chunk_index,
                         content_sha256: chunk.sha256.clone(),
@@ -520,14 +520,14 @@ impl Pipeline {
 
                     if let Ok(Some((old_mtime, old_size))) =
                         self.ingest
-                            .get_source_metadata(source_kind_str, project, &item.source_id)
+                            .get_source_metadata(source_kind_str, &cfg.source_config_id, &item.source_id)
                     {
                         if old_mtime == mtime && old_size == size {
                             if self
                                 .ingest
                                 .touch_source_chunks(
                                     source_kind_str,
-                                    project,
+                                    &cfg.source_config_id,
                                     &item.source_id,
                                     &self.run_id,
                                 )
@@ -541,7 +541,7 @@ impl Pipeline {
 
                     let _ = self.ingest.update_source_metadata(
                         source_kind_str,
-                        project,
+                        &cfg.source_config_id,
                         &item.source_id,
                         mtime,
                         size,
@@ -550,7 +550,7 @@ impl Pipeline {
                 }
             }
 
-            let chunks = match scanner.parse(item) {
+            let chunks = match scanner.parse(SourceItem { source_config_id: cfg.source_config_id.clone(), ..item }) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "parse failed");
@@ -570,7 +570,7 @@ impl Pipeline {
                         let row = IngestChunkRow {
                             chunk_id: chunk.chunk_id.clone(),
                             source: chunk.source.as_str().to_string(),
-                            project: project.to_string(),
+                            source_config_id: chunk.source_config_id.clone(),
                             source_id: chunk.source_id.clone(),
                             chunk_index: chunk.chunk_index,
                             content_sha256: chunk.sha256.clone(),
@@ -655,7 +655,7 @@ impl Pipeline {
             for src in cfg.kind.sources() {
                 let chunk_ids = match self.ingest.tombstone_chunks_by_path(
                     src.as_str(),
-                    project,
+                    &cfg.source_config_id,
                     &source_id,
                 ) {
                     Ok(ids) => ids,
@@ -712,7 +712,7 @@ impl Pipeline {
             let row = IngestChunkRow {
                 chunk_id: chunk.chunk_id.clone(),
                 source: chunk.source.as_str().to_string(),
-                project: project.to_string(),
+                source_config_id: chunk.source_config_id.clone(),
                 source_id: chunk.source_id.clone(),
                 chunk_index: chunk.chunk_index,
                 content_sha256: chunk.sha256.clone(),
@@ -888,8 +888,10 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         }
-    }
+        }
 
     async fn make_pipeline(corpus_root: &Path, dim: usize) -> Pipeline {
         let store = Arc::new(CorpusStore::open_or_create(corpus_root, dim).await.unwrap());
@@ -988,6 +990,8 @@ mod tests {
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec!["rs".into()],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         // First run
@@ -1079,6 +1083,8 @@ mod tests {
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
         let code_cfg = SourceConfig {
             kind: SourceKind::Code,
@@ -1086,6 +1092,8 @@ mod tests {
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec!["rs".into()],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         let paths = vec![
@@ -1228,6 +1236,8 @@ mod tests {
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec!["rs".into()],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         // Initial ingest via scan_paths (single-path).
@@ -1291,6 +1301,8 @@ mod tests {
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec!["rs".into()],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         pipeline
@@ -1344,6 +1356,8 @@ mod tests {
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec!["rs".into()],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         };
 
         pipeline
@@ -1413,13 +1427,14 @@ mod tests {
     use ostk_recall_core::{Chunk, Links, Source};
 
     fn make_synthetic_chunk(source_id: &str, idx: u32, text: &str) -> Chunk {
-        let chunk_id = Chunk::make_id(Source::Gemini, source_id, idx);
+        let chunk_id = Chunk::make_id(Source::Gemini, source_id, idx, "");
         let sha = Chunk::content_hash(text);
         Chunk {
             chunk_id,
             source: Source::Gemini,
             project: Some("phase4-test".into()),
             source_id: source_id.to_string(),
+            source_config_id: "test-cfg".to_string(),
             chunk_index: idx,
             ts: None,
             role: None,

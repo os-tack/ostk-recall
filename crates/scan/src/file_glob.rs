@@ -62,6 +62,7 @@ impl Scanner for FileGlobScanner {
                         project: project.clone(),
                         bytes: None,
                         ignore: Vec::new(),
+                        source_config_id: "test-cfg".to_string(),
                     })
                 })
         });
@@ -96,6 +97,7 @@ impl Scanner for FileGlobScanner {
                 project: project.clone(),
                 bytes: None,
                 ignore: Vec::new(),
+                source_config_id: "test-cfg".to_string(),
             }))
         });
         Box::new(iter)
@@ -132,7 +134,7 @@ impl Scanner for FileGlobScanner {
                     item.source_id
                 ))
             })?;
-            let chunk_id = Chunk::make_id(Source::FileGlob, &item.source_id, chunk_index);
+            let chunk_id = Chunk::make_id(Source::FileGlob, &item.source_id, chunk_index, &item.source_config_id);
             let sha256 = Chunk::content_hash(&seg);
             let links = Links {
                 file_path: Some(abs_path.clone()),
@@ -143,6 +145,7 @@ impl Scanner for FileGlobScanner {
                 source: Source::FileGlob,
                 project: item.project.clone(),
                 source_id: item.source_id.clone(),
+                source_config_id: item.source_config_id.clone(),
                 chunk_index,
                 ts: mtime,
                 role: None,
@@ -305,8 +308,10 @@ mod tests {
             paths: vec![pat.into()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
         }
-    }
+        }
 
     #[test]
     fn split_basic_paragraphs() {

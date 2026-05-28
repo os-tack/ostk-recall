@@ -437,6 +437,7 @@ mod tests {
             source: Source::Markdown,
             project: Some("test".into()),
             source_id: format!("{id}.md"),
+            source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: None,
             role: None,

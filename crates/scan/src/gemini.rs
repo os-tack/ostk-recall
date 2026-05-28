@@ -73,6 +73,7 @@ impl Scanner for GeminiScanner {
                         project: project.clone(),
                         bytes: None,
                         ignore: Vec::new(),
+                        source_config_id: "test-cfg".to_string(),
                     })
                 })
         });
@@ -109,7 +110,12 @@ impl Scanner for GeminiScanner {
                     // Chunk index fits u32 — sessions have far fewer than 4B pairs.
                     #[allow(clippy::cast_possible_truncation)]
                     let chunk_index = chunks.len() as u32;
-                    let chunk_id = Chunk::make_id(Source::Gemini, &item.source_id, chunk_index);
+                    let chunk_id = Chunk::make_id(
+                        Source::Gemini,
+                        &item.source_id,
+                        chunk_index,
+                        &item.source_config_id,
+                    );
 
                     let mut extra = serde_json::json!({
                         "session_id": session.session_id,
@@ -130,6 +136,7 @@ impl Scanner for GeminiScanner {
                         source: Source::Gemini,
                         project: item.project.clone(),
                         source_id: item.source_id.clone(),
+                        source_config_id: item.source_config_id.clone(),
                         chunk_index,
                         ts,
                         role: Some("exchange".into()),
