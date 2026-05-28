@@ -19,23 +19,22 @@ pub use attention::{
     ThreadHandle, ThreadHandleError,
 };
 pub use chunk::{Chunk, Links};
+pub use config::{
+    Config, CorpusConfig, EmbedderConfig, RerankerConfig, RuntimeConfig,
+    SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig, WatchMode,
+    compute_source_config_id, default_worker_threads,
+};
+pub use error::{Error, Result};
 pub use facets::{
     ALLOWLIST_VERSION, Cardinality, EMBED_FACET_ALLOWLIST, FacetSet, HEADER_FORMAT_VERSION,
     cardinality_of, cfg_overlay_hash, compose_header, filter_to_allowlist, from_list,
     is_valid_facet_key, merge_override, to_list,
 };
-pub use config::{
-    Config, CorpusConfig, EmbedderConfig, RerankerConfig, RuntimeConfig, SourceConfig,
-    SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, WatchConfig, WatchMode, compute_source_config_id,
-    default_worker_threads,
-};
-pub use error::{Error, Result};
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};
 pub use types::{
-    AttentionBiasParams, AuditResult, RecallHit, RecallLinkResult, RecallParams, RecallStats,
-    RerankerStats,
-    SourceCount, SynthesizedPage,
+    AttentionBiasParams, AuditResult, MatchFeature, RankingOverrides, RecallHit, RecallLinkResult,
+    RecallParams, RecallStats, RerankerStats, SourceCount, SynthesizedPage,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

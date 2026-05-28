@@ -11,10 +11,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-};
 use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};

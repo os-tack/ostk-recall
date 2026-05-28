@@ -432,6 +432,205 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Batch-fetch full `Chunk` rows plus their dense embeddings.
+    ///
+    /// Returns `chunk_id -> (Chunk, Option<embedding>)`. Ids absent
+    /// from the corpus are simply omitted. The embedding entry is
+    /// `None` only when the row's embedding column is null (legacy /
+    /// partial-ingest case).
+    ///
+    /// Used by `crates/query/src/lanes.rs::build_candidates` after the
+    /// per-lane queries return ids only. One query per call regardless
+    /// of K — the `chunk_id IN (...)` filter lets Lance push the lookup
+    /// down.
+    pub async fn fetch_chunks_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (Chunk, Option<Vec<f32>>)>> {
+        use std::collections::HashMap;
+
+        use arrow_array::{Array, ListArray};
+        use chrono::TimeZone;
+        use ostk_recall_core::Links;
+
+        let mut out: HashMap<String, (Chunk, Option<Vec<f32>>)> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let ids_joined = ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({ids_joined})");
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "source".into(),
+                "project".into(),
+                "source_id".into(),
+                "source_config_id".into(),
+                "facets".into(),
+                "embedding_input_sha256".into(),
+                "chunk_index".into(),
+                "ts".into(),
+                "role".into(),
+                "text".into(),
+                "sha256".into(),
+                "links_json".into(),
+                "extra_json".into(),
+                "embedding".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        for batch in &batches {
+            let n = batch.num_rows();
+            if n == 0 {
+                continue;
+            }
+            let chunk_id = downcast_str(batch, "chunk_id")?;
+            let source = downcast_str(batch, "source")?;
+            let project = downcast_str_opt(batch, "project");
+            let source_id = downcast_str(batch, "source_id")?;
+            let source_config_id = downcast_str_opt(batch, "source_config_id");
+            let embedding_input_sha256 = downcast_str_opt(batch, "embedding_input_sha256");
+            let chunk_index = downcast_u32(batch, "chunk_index")?;
+            let ts = batch
+                .column_by_name("ts")
+                .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>());
+            let role = downcast_str_opt(batch, "role");
+            let text = downcast_str(batch, "text")?;
+            let sha256 = downcast_str(batch, "sha256")?;
+            let links_json = downcast_str(batch, "links_json")?;
+            let extra_json = downcast_str(batch, "extra_json")?;
+            let facets = batch
+                .column_by_name("facets")
+                .and_then(|c| c.as_any().downcast_ref::<ListArray>());
+            let emb = batch
+                .column_by_name("embedding")
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
+            let emb_dim = emb.map(|a| usize::try_from(a.value_length()).unwrap_or(0));
+            let emb_values = emb.and_then(|a| {
+                a.values()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .cloned()
+            });
+
+            for i in 0..n {
+                let id = chunk_id.value(i).to_string();
+                let parsed_source = match parse_source(source.value(i)) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let links: Links = if links_json.is_null(i) {
+                    Links::default()
+                } else {
+                    serde_json::from_str(links_json.value(i)).unwrap_or_default()
+                };
+                let extra: serde_json::Value = if extra_json.is_null(i) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(extra_json.value(i)).unwrap_or(serde_json::Value::Null)
+                };
+
+                let facet_list: Vec<String> = if let Some(arr) = facets {
+                    if arr.is_null(i) {
+                        Vec::new()
+                    } else {
+                        let inner = arr.value(i);
+                        let inner_str =
+                            inner
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .ok_or_else(|| {
+                                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                                        "facets inner expected Utf8".into(),
+                                    ))
+                                })?;
+                        let mut v = Vec::with_capacity(inner_str.len());
+                        for j in 0..inner_str.len() {
+                            if !inner_str.is_null(j) {
+                                v.push(inner_str.value(j).to_string());
+                            }
+                        }
+                        v
+                    }
+                } else {
+                    Vec::new()
+                };
+                let facets_set = ostk_recall_core::from_list(&facet_list);
+
+                let ts_val = ts.and_then(|a| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        chrono::Utc.timestamp_micros(a.value(i)).single()
+                    }
+                });
+
+                let chunk = Chunk {
+                    chunk_id: id.clone(),
+                    source: parsed_source,
+                    project: project.and_then(|a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i).to_string())
+                        }
+                    }),
+                    source_id: source_id.value(i).to_string(),
+                    source_config_id: source_config_id.map_or(String::new(), |a| {
+                        if a.is_null(i) {
+                            String::new()
+                        } else {
+                            a.value(i).to_string()
+                        }
+                    }),
+                    chunk_index: chunk_index.value(i),
+                    ts: ts_val,
+                    role: role.and_then(|a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i).to_string())
+                        }
+                    }),
+                    text: text.value(i).to_string(),
+                    sha256: sha256.value(i).to_string(),
+                    links,
+                    facets: facets_set,
+                    embedding_input_sha256: embedding_input_sha256.map_or(String::new(), |a| {
+                        if a.is_null(i) {
+                            String::new()
+                        } else {
+                            a.value(i).to_string()
+                        }
+                    }),
+                    extra,
+                };
+
+                let embedding = match (emb, emb_values.as_ref(), emb_dim) {
+                    (Some(arr), Some(values), Some(dim)) if dim > 0 && !arr.is_null(i) => {
+                        let start = i * dim;
+                        Some(values.values()[start..start + dim].to_vec())
+                    }
+                    _ => None,
+                };
+
+                out.insert(id, (chunk, embedding));
+            }
+        }
+        Ok(out)
+    }
+
     /// Sample non-stale chunks ingested since `since`, up to `limit` rows.
     /// Returns `(chunk_id, embedding)` pairs for use with emergent
     /// clustering. Ordering is whatever Lance returns — callers that
@@ -459,10 +658,7 @@ impl CorpusStore {
             .query()
             .only_if(filter)
             .limit(limit)
-            .select(Select::Columns(vec![
-                "chunk_id".into(),
-                "embedding".into(),
-            ]))
+            .select(Select::Columns(vec!["chunk_id".into(), "embedding".into()]))
             .execute()
             .await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -799,9 +995,7 @@ impl CorpusStore {
             return Ok(false);
         };
         let manifest = native.manifest().await?;
-        let has_interval = manifest
-            .config
-            .contains_key("lance.auto_cleanup.interval");
+        let has_interval = manifest.config.contains_key("lance.auto_cleanup.interval");
         let has_older = manifest
             .config
             .contains_key("lance.auto_cleanup.older_than");
@@ -930,9 +1124,7 @@ impl CorpusStore {
         // are reproducible across runs.
         let mut out: Vec<ActivityBurst> = groups.into_values().collect();
         for burst in &mut out {
-            burst
-                .samples
-                .sort_by(|a, b| b.1.cmp(&a.1));
+            burst.samples.sort_by(|a, b| b.1.cmp(&a.1));
             burst.samples.truncate(samples_per_group);
             burst.chunk_ids.sort();
         }
@@ -1091,6 +1283,65 @@ fn column_as_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArr
 /// Duplicates `'` -> `''`; `LanceDB`'s filter parser is SQL-like.
 fn escape_sql(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// Required Utf8 column — error if missing or wrong type.
+fn downcast_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+            "{name} column missing in projection"
+        )))
+    })?;
+    col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::CastError(format!(
+            "{name} expected to be Utf8"
+        )))
+    })
+}
+
+/// Optional Utf8 column — returns `None` if absent or the wrong type.
+fn downcast_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+}
+
+/// Inverse of `Source::as_str`. Returns `None` for unknown strings —
+/// callers skip such rows rather than fail.
+fn parse_source(s: &str) -> Option<ostk_recall_core::Source> {
+    use ostk_recall_core::Source;
+    Some(match s {
+        "markdown" => Source::Markdown,
+        "code" => Source::Code,
+        "claude_code" => Source::ClaudeCode,
+        "ostk_decision" => Source::OstkDecision,
+        "ostk_needle" => Source::OstkNeedle,
+        "ostk_audit_significant" => Source::OstkAuditSignificant,
+        "ostk_conversation" => Source::OstkConversation,
+        "ostk_session" => Source::OstkSession,
+        "ostk_memory" => Source::OstkMemory,
+        "ostk_spec" => Source::OstkSpec,
+        "file_glob" => Source::FileGlob,
+        "zip_export" => Source::ZipExport,
+        "gemini" => Source::Gemini,
+        "thread" => Source::Thread,
+        "membrane" => Source::Membrane,
+        _ => return None,
+    })
+}
+
+/// Required UInt32 column.
+fn downcast_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+            "{name} column missing in projection"
+        )))
+    })?;
+    col.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::CastError(format!(
+            "{name} expected to be UInt32"
+        )))
+    })
 }
 
 fn build_record_batch(
@@ -1493,10 +1744,7 @@ mod tests {
         let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
 
         let now = chrono::Utc::now();
-        let chunks = vec![
-            chunk_with("a", "alpha", now),
-            chunk_with("b", "beta", now),
-        ];
+        let chunks = vec![chunk_with("a", "alpha", now), chunk_with("b", "beta", now)];
         let embs = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
         store.upsert(&chunks, &embs).await.unwrap();
 

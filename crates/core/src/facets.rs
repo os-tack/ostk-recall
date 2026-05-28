@@ -40,13 +40,7 @@ pub enum Cardinality {
 /// non-allowlisted facet (e.g. `session_id`, `era`) MUST NOT trigger
 /// re-embed. `era` is intentionally excluded so weekly bucket rollover
 /// doesn't churn the whole corpus.
-pub const EMBED_FACET_ALLOWLIST: &[&str] = &[
-    "project",
-    "lang",
-    "agent",
-    "status",
-    "record_kind",
-];
+pub const EMBED_FACET_ALLOWLIST: &[&str] = &["project", "lang", "agent", "status", "record_kind"];
 
 /// Schema-versioning constants for the embedding-input hash. Bumping
 /// either invalidates every `embedding_input_sha256` and forces a
@@ -218,7 +212,10 @@ mod tests {
     #[test]
     fn multi_override_unions() {
         let mut f: FacetSet = BTreeMap::new();
-        f.insert("project".into(), [String::from("auth")].into_iter().collect());
+        f.insert(
+            "project".into(),
+            [String::from("auth")].into_iter().collect(),
+        );
         merge_override(&mut f, "project", vec!["billing".into()]);
         assert_eq!(
             f["project"],
@@ -231,7 +228,10 @@ mod tests {
     #[test]
     fn multi_empty_list_clears() {
         let mut f: FacetSet = BTreeMap::new();
-        f.insert("project".into(), [String::from("auth")].into_iter().collect());
+        f.insert(
+            "project".into(),
+            [String::from("auth")].into_iter().collect(),
+        );
         merge_override(&mut f, "project", vec![]);
         assert!(f.get("project").is_none(), "empty-list sentinel clears");
     }
@@ -263,9 +263,18 @@ mod tests {
     #[test]
     fn header_only_includes_allowlist() {
         let mut f: FacetSet = BTreeMap::new();
-        f.insert("project".into(), [String::from("auth")].into_iter().collect());
-        f.insert("era".into(), [String::from("2026-W22-Q2")].into_iter().collect());
-        f.insert("session_id".into(), [String::from("abc")].into_iter().collect());
+        f.insert(
+            "project".into(),
+            [String::from("auth")].into_iter().collect(),
+        );
+        f.insert(
+            "era".into(),
+            [String::from("2026-W22-Q2")].into_iter().collect(),
+        );
+        f.insert(
+            "session_id".into(),
+            [String::from("abc")].into_iter().collect(),
+        );
         let allow = filter_to_allowlist(&f);
         let header = compose_header(&allow);
         assert!(header.contains("project:auth"));
@@ -292,7 +301,10 @@ mod tests {
     fn from_list_handles_colon_in_value() {
         let list = vec!["agent:claude-3:opus".to_string()];
         let f = from_list(&list);
-        assert_eq!(f["agent"], [String::from("claude-3:opus")].into_iter().collect());
+        assert_eq!(
+            f["agent"],
+            [String::from("claude-3:opus")].into_iter().collect()
+        );
     }
 
     #[test]

@@ -58,11 +58,9 @@ pub async fn rebuild_ingest_manifest(
     for batch in &batches {
         let chunk_ids = batch
             .column_by_name("chunk_id")
-            .ok_or_else(|| {
-                StoreError::InvalidEnumValue {
-                    field: "chunk_id".into(),
-                    value: "missing column".into(),
-                }
+            .ok_or_else(|| StoreError::InvalidEnumValue {
+                field: "chunk_id".into(),
+                value: "missing column".into(),
             })?
             .as_any()
             .downcast_ref::<StringArray>()

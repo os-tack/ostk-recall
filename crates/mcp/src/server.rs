@@ -246,9 +246,8 @@ impl Server {
                             .dispatch(other, args)
                             .await
                             .map_err(attention_error_to_rpc)?;
-                        let text = serde_json::to_string(&out).map_err(|e| {
-                            JsonRpcError::internal(format!("serialize: {e}"))
-                        })?;
+                        let text = serde_json::to_string(&out)
+                            .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
                         return Ok(json!({
                             "content": [{ "type": "text", "text": text }],
                             "isError": false,
@@ -373,25 +372,23 @@ async fn apply_attention_bias(
     // Batch-fetch all hit embeddings up front when we'll need them.
     // Skip when no scope vector is available (every cosine would be
     // 0 anyway) or no corpus is wired into the dispatch.
-    let hit_embeddings: std::collections::HashMap<String, Vec<f32>> = match (
-        scope_vec.as_ref(),
-        dispatch.corpus.as_ref(),
-    ) {
-        (Some(_), Some(corpus)) => {
-            let ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
-            match corpus.fetch_embeddings(&ids).await {
-                Ok(map) => map,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "attention-bias: fetch_embeddings failed; embedding axis contributes 0"
-                    );
-                    std::collections::HashMap::new()
+    let hit_embeddings: std::collections::HashMap<String, Vec<f32>> =
+        match (scope_vec.as_ref(), dispatch.corpus.as_ref()) {
+            (Some(_), Some(corpus)) => {
+                let ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+                match corpus.fetch_embeddings(&ids).await {
+                    Ok(map) => map,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "attention-bias: fetch_embeddings failed; embedding axis contributes 0"
+                        );
+                        std::collections::HashMap::new()
+                    }
                 }
             }
-        }
-        _ => std::collections::HashMap::new(),
-    };
+            _ => std::collections::HashMap::new(),
+        };
 
     for hit in hits.iter_mut() {
         let base = hit.score;
@@ -443,12 +440,36 @@ async fn apply_attention_bias(
         hit.attention_score = Some(thread_score);
         hit.attention_weight = Some(thread_w);
         hit.score = base + thread_w * thread_score + embed_w * embedding_score;
+        // P3A invariant: `score = Σ match_features.contribution` must
+        // hold on the MCP wire (see `core::types::MatchFeature`).
+        // attention_bias mutates `score` here; emit the corresponding
+        // contributions so the sum still matches. The existing
+        // entries (rrf / rerank / identifier_boost) summed to `base`
+        // before this stage — adding these two keeps that sum equal
+        // to the new score.
+        hit.match_features.insert(
+            "attention_thread".to_string(),
+            ostk_recall_core::MatchFeature {
+                raw: thread_score,
+                weight: thread_w,
+                contribution: thread_w * thread_score,
+            },
+        );
+        hit.match_features.insert(
+            "attention_embedding".to_string(),
+            ostk_recall_core::MatchFeature {
+                raw: embedding_score,
+                weight: embed_w,
+                contribution: embed_w * embedding_score,
+            },
+        );
     }
 
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 }
 
@@ -469,9 +490,7 @@ fn build_recall_lens(
     status: Option<&ostk_recall_attention::FocusStatus>,
 ) -> Option<Value> {
     let pin = status?.pinned.as_ref()?;
-    let age_secs = (chrono::Utc::now() - pin.pinned_at)
-        .num_seconds()
-        .max(0);
+    let age_secs = (chrono::Utc::now() - pin.pinned_at).num_seconds().max(0);
     Some(json!({
         "focus_query": pin.query,
         "pinned_at": pin.pinned_at.to_rfc3339(),
@@ -547,6 +566,7 @@ mod attention_bias_tests {
             embedding_weight: None,
             attention_score: None,
             attention_weight: None,
+            match_features: Default::default(),
         }
     }
 
@@ -562,10 +582,7 @@ mod attention_bias_tests {
         let tmp = TempDir::new().unwrap();
         let threads = Arc::new(ThreadsDb::open(tmp.path()).unwrap());
         let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
-        (
-            tmp,
-            Arc::new(AttentionDispatch::new(attention, threads)),
-        )
+        (tmp, Arc::new(AttentionDispatch::new(attention, threads)))
     }
 
     /// Seed a thread anchored to a chunk + light up its in-memory score.
@@ -592,7 +609,10 @@ mod attention_bias_tests {
         // attend + familiarize so the InMemoryAttention has a non-zero
         // score for the handle. Bump familiarity multiple times so the
         // floor stays above ARCHIVE_THRESHOLD.
-        d.attention.attend(&scope(), "active context").await.unwrap();
+        d.attention
+            .attend(&scope(), "active context")
+            .await
+            .unwrap();
         for _ in 0..5 {
             d.attention.familiarize(&scope(), &handle).await.unwrap();
         }
@@ -624,8 +644,8 @@ mod attention_bias_tests {
         assert!(a.attention_score.unwrap() > 0.0);
         assert_eq!(a.attention_weight, Some(1.0));
         // Math is decomposable: score == base_score + weight * attention_score
-        let expected = a.base_score.unwrap()
-            + a.attention_weight.unwrap() * a.attention_score.unwrap();
+        let expected =
+            a.base_score.unwrap() + a.attention_weight.unwrap() * a.attention_score.unwrap();
         assert!(
             (a.score - expected).abs() < 1e-5,
             "score must equal base + weight*attention (got {} vs expected {expected})",
@@ -637,6 +657,55 @@ mod attention_bias_tests {
         assert_eq!(u.base_score, Some(0.5));
         assert_eq!(u.attention_score, Some(0.0));
         assert_eq!(u.score, 0.5);
+    }
+
+    /// P3A invariant guard for MCP wire output: `score = Σ
+    /// match_features.contribution` must hold even after the
+    /// attention-bias post-stage mutates `score`. Bias emits
+    /// `attention_thread` / `attention_embedding` contributions so
+    /// the sum still matches.
+    #[tokio::test]
+    async fn bias_preserves_score_equals_sum_match_features() {
+        let (_tmp, d) = build_dispatch().await;
+        seed_anchored_thread(&d, "fade-is-concentration", "anchored").await;
+
+        // Seed match_features as the rank engine would (sum equals
+        // pre-bias score — that's the post-rank state hybrid::recall
+        // produces).
+        let mut hits = vec![hit("anchored", 0.5), hit("unrelated", 0.5)];
+        for h in &mut hits {
+            h.match_features.insert(
+                "rrf".to_string(),
+                ostk_recall_core::MatchFeature::new(h.score, 1.0),
+            );
+        }
+        let bias = thread_bias(1.0);
+        apply_attention_bias(&mut hits, &bias, &d).await;
+
+        for h in &hits {
+            let sum: f32 = h.match_features.values().map(|m| m.contribution).sum();
+            assert!(
+                (h.score - sum).abs() < 1e-5,
+                "score {} != Σ contribution {} for {} (features: {:?})",
+                h.score,
+                sum,
+                h.chunk_id,
+                h.match_features
+            );
+            // Bias always emits the two attention entries (the
+            // contribution may be 0 when the chunk isn't anchored,
+            // but the entry exists so debug UIs see the axis).
+            assert!(
+                h.match_features.contains_key("attention_thread"),
+                "missing attention_thread row on {}",
+                h.chunk_id
+            );
+            assert!(
+                h.match_features.contains_key("attention_embedding"),
+                "missing attention_embedding row on {}",
+                h.chunk_id
+            );
+        }
     }
 
     #[tokio::test]
@@ -1001,8 +1070,7 @@ mod attention_bias_tests {
             history: Vec::new(),
             transient_active: false,
         };
-        let lens =
-            build_recall_lens(&bias, Some(&status)).expect("pin + bias must produce lens");
+        let lens = build_recall_lens(&bias, Some(&status)).expect("pin + bias must produce lens");
         assert_eq!(lens["focus_query"].as_str(), Some("the CLI surface"));
         // focus_age_secs should be roughly 123, allow drift for slow CI.
         let age = lens["focus_age_secs"].as_i64().unwrap();

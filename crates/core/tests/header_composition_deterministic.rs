@@ -8,9 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ostk_recall_core::{
-    Chunk, FacetSet, compose_header, filter_to_allowlist,
-};
+use ostk_recall_core::{Chunk, FacetSet, compose_header, filter_to_allowlist};
 
 fn fset(items: &[(&str, &[&str])]) -> FacetSet {
     let mut out: FacetSet = BTreeMap::new();
@@ -45,8 +43,16 @@ fn header_stable_across_key_insertion_order() {
 fn embedding_input_hash_stable_across_orders() {
     let f1 = fset(&[("project", &["auth", "billing"]), ("lang", &["rust"])]);
     let f2 = fset(&[("lang", &["rust"]), ("project", &["billing", "auth"])]);
-    let h1 = Chunk::embedding_input_hash("model-x", &compose_header(&filter_to_allowlist(&f1)), "body");
-    let h2 = Chunk::embedding_input_hash("model-x", &compose_header(&filter_to_allowlist(&f2)), "body");
+    let h1 = Chunk::embedding_input_hash(
+        "model-x",
+        &compose_header(&filter_to_allowlist(&f1)),
+        "body",
+    );
+    let h2 = Chunk::embedding_input_hash(
+        "model-x",
+        &compose_header(&filter_to_allowlist(&f2)),
+        "body",
+    );
     assert_eq!(h1, h2, "deterministic header → deterministic hash");
 }
 
@@ -54,15 +60,23 @@ fn embedding_input_hash_stable_across_orders() {
 fn non_allowlisted_facets_dont_change_hash() {
     let mut f1 = fset(&[("project", &["auth"])]);
     let mut f2 = f1.clone();
-    f2.insert("session_id".into(), ["abc123".to_string()].into_iter().collect());
-    f2.insert("era".into(), ["2026-W22-Q2".to_string()].into_iter().collect());
+    f2.insert(
+        "session_id".into(),
+        ["abc123".to_string()].into_iter().collect(),
+    );
+    f2.insert(
+        "era".into(),
+        ["2026-W22-Q2".to_string()].into_iter().collect(),
+    );
 
     let h1 = Chunk::embedding_input_hash("m", &compose_header(&filter_to_allowlist(&f1)), "body");
     let h2 = Chunk::embedding_input_hash("m", &compose_header(&filter_to_allowlist(&f2)), "body");
     assert_eq!(h1, h2, "non-allowlisted facets must not affect the hash");
 
     // Sanity: an allowlisted change DOES affect it.
-    f1.entry("project".into()).or_default().insert("billing".into());
+    f1.entry("project".into())
+        .or_default()
+        .insert("billing".into());
     let h3 = Chunk::embedding_input_hash("m", &compose_header(&filter_to_allowlist(&f1)), "body");
     assert_ne!(h1, h3, "allowlisted change must change the hash");
 }

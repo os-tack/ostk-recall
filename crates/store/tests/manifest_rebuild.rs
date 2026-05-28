@@ -3,9 +3,7 @@
 //! when an ingest ledger is lost or corrupt.
 
 use ostk_recall_core::{Chunk, Links, Source};
-use ostk_recall_store::{
-    CorpusStore, IngestDb, manifest::rebuild_ingest_manifest,
-};
+use ostk_recall_store::{CorpusStore, IngestDb, manifest::rebuild_ingest_manifest};
 use tempfile::TempDir;
 
 #[tokio::test]

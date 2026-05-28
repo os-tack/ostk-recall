@@ -17,7 +17,10 @@ fn deterministic_for_fixed_inputs() {
 fn differs_by_source_config_id() {
     let a = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-x");
     let b = Chunk::make_id(Source::Markdown, "notes/foo.md", 0, "cfg-y");
-    assert_ne!(a, b, "same chunk under a different source config yields a different id");
+    assert_ne!(
+        a, b,
+        "same chunk under a different source config yields a different id"
+    );
 }
 
 #[test]

@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
-use arrow_array::{Array, FixedSizeListArray, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_array::{
+    Array, FixedSizeListArray, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
@@ -152,16 +155,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             decoded.insert(chunk_id, tvs);
         }
     }
-    println!("PASS: decoded into HashMap<chunk_id, Vec<Vec<f32>>> with {} entries", decoded.len());
+    println!(
+        "PASS: decoded into HashMap<chunk_id, Vec<Vec<f32>>> with {} entries",
+        decoded.len()
+    );
 
     // Reference MaxSim: pick one known chunk + a fixed query token set;
     // hand-compute the score and compare.
     let target_id = sample_ids[0].to_string();
     let target_tokens = decoded.get(&target_id).expect("target present");
-    let query_tokens: Vec<Vec<f32>> = vec![
-        vec![1.0; DIM],
-        vec![0.5; DIM],
-    ];
+    let query_tokens: Vec<Vec<f32>> = vec![vec![1.0; DIM], vec![0.5; DIM]];
     let max_sim = maxsim(&query_tokens, target_tokens);
     let reference = maxsim_reference(&query_tokens, target_tokens);
     let delta = (max_sim - reference).abs();
@@ -170,7 +173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     println!("PASS: in-memory MaxSim ({max_sim:.6}) matches reference ({reference:.6})");
-    println!("RESULT: Lance 0.29.0 supports List<FixedSizeList<F32,D>> side-table + bulk-fetch + decode for MaxSim");
+    println!(
+        "RESULT: Lance 0.29.0 supports List<FixedSizeList<F32,D>> side-table + bulk-fetch + decode for MaxSim"
+    );
     Ok(())
 }
 

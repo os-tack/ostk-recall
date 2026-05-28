@@ -74,7 +74,10 @@ mod tests {
     fn source_config_id_is_nullable() {
         let s = corpus_schema(128);
         let f = s.field_with_name("source_config_id").unwrap();
-        assert!(f.is_nullable(), "source_config_id is nullable for migration");
+        assert!(
+            f.is_nullable(),
+            "source_config_id is nullable for migration"
+        );
     }
 
     #[test]

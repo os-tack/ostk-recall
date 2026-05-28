@@ -415,7 +415,9 @@ impl ChainEvent {
                 "note": note,
             }),
             Self::ThreadLinkRemove { id, .. } => serde_json::json!({ "id": id }),
-            Self::FocusSet { scope, query, vec, .. } => serde_json::json!({
+            Self::FocusSet {
+                scope, query, vec, ..
+            } => serde_json::json!({
                 "scope": scope,
                 "query": query,
                 "vec": vec,
@@ -443,17 +445,21 @@ impl ChainEvent {
             v.get(k)
                 .and_then(|x| x.as_str())
                 .map(ToString::to_string)
-                .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                    message: format!("chain payload missing `{k}` for kind={kind}"),
-                    source: None,
-                }))
+                .ok_or_else(|| {
+                    StoreError::Lance(lancedb::Error::Other {
+                        message: format!("chain payload missing `{k}` for kind={kind}"),
+                        source: None,
+                    })
+                })
         };
         let handle_field = |k: &str| -> Result<ThreadHandle> {
             let s = s_field(k)?;
-            ThreadHandle::new(s).map_err(|e| StoreError::Lance(lancedb::Error::Other {
-                message: format!("chain payload bad handle: {e}"),
-                source: None,
-            }))
+            ThreadHandle::new(s).map_err(|e| {
+                StoreError::Lance(lancedb::Error::Other {
+                    message: format!("chain payload bad handle: {e}"),
+                    source: None,
+                })
+            })
         };
         let ev = match kind {
             "thread_create" => Self::ThreadCreate {
@@ -479,10 +485,12 @@ impl ChainEvent {
                 let eid = v
                     .get("evidence_id")
                     .and_then(serde_json::Value::as_i64)
-                    .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                        message: "chain payload missing evidence_id".into(),
-                        source: None,
-                    }))?;
+                    .ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "chain payload missing evidence_id".into(),
+                            source: None,
+                        })
+                    })?;
                 Self::EvidenceRemove {
                     thread: handle_field("thread")?,
                     evidence_id: eid,
@@ -493,10 +501,12 @@ impl ChainEvent {
                 let eid = v
                     .get("evidence_id")
                     .and_then(serde_json::Value::as_i64)
-                    .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                        message: "chain payload missing evidence_id".into(),
-                        source: None,
-                    }))?;
+                    .ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "chain payload missing evidence_id".into(),
+                            source: None,
+                        })
+                    })?;
                 Self::EvidenceStateChange {
                     evidence_id: eid,
                     from: RelationState::parse(&s_field("from")?)?,
@@ -508,38 +518,50 @@ impl ChainEvent {
                 let entries_raw = v
                     .get("entries")
                     .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                        message: "chain payload missing entries".into(),
-                        source: None,
-                    }))?;
+                    .ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "chain payload missing entries".into(),
+                            source: None,
+                        })
+                    })?;
                 let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(entries_raw.len());
                 for row in entries_raw {
-                    let pair = row.as_array().ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                        message: "familiarity entry not array".into(),
-                        source: None,
-                    }))?;
+                    let pair = row.as_array().ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "familiarity entry not array".into(),
+                            source: None,
+                        })
+                    })?;
                     let h_s = pair
                         .first()
                         .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                            message: "familiarity entry missing handle".into(),
-                            source: None,
-                        }))?;
+                        .ok_or_else(|| {
+                            StoreError::Lance(lancedb::Error::Other {
+                                message: "familiarity entry missing handle".into(),
+                                source: None,
+                            })
+                        })?;
                     let fam = pair
                         .get(1)
                         .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
-                            message: "familiarity entry missing count".into(),
+                        .ok_or_else(|| {
+                            StoreError::Lance(lancedb::Error::Other {
+                                message: "familiarity entry missing count".into(),
+                                source: None,
+                            })
+                        })?;
+                    let h = ThreadHandle::new(h_s).map_err(|e| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("familiarity entry bad handle: {e}"),
                             source: None,
-                        }))?;
-                    let h = ThreadHandle::new(h_s).map_err(|e| StoreError::Lance(lancedb::Error::Other {
-                        message: format!("familiarity entry bad handle: {e}"),
-                        source: None,
-                    }))?;
-                    let fam_u32 = u32::try_from(fam).map_err(|_| StoreError::Lance(lancedb::Error::Other {
-                        message: format!("familiarity count overflow: {fam}"),
-                        source: None,
-                    }))?;
+                        })
+                    })?;
+                    let fam_u32 = u32::try_from(fam).map_err(|_| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("familiarity count overflow: {fam}"),
+                            source: None,
+                        })
+                    })?;
                     entries.push((h, fam_u32));
                 }
                 let turn_seq = v
@@ -581,36 +603,36 @@ impl ChainEvent {
                 Self::ThreadLinkRemove { id, ts }
             }
             "focus_set" => {
-                let scope: AttentionScope = serde_json::from_value(
-                    v.get("scope")
-                        .cloned()
-                        .ok_or_else(|| StoreError::Lance(lancedb::Error::Other {
+                let scope: AttentionScope =
+                    serde_json::from_value(v.get("scope").cloned().ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
                             message: "focus_set payload missing scope".into(),
                             source: None,
-                        }))?,
-                )
-                .map_err(|e| StoreError::Lance(lancedb::Error::Other {
-                    message: format!("focus_set scope decode: {e}"),
-                    source: None,
-                }))?;
-                let query = v
-                    .get("query")
-                    .and_then(|x| {
-                        if x.is_null() {
-                            None
-                        } else {
-                            x.as_str().map(ToString::to_string)
-                        }
-                    });
+                        })
+                    })?)
+                    .map_err(|e| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("focus_set scope decode: {e}"),
+                            source: None,
+                        })
+                    })?;
+                let query = v.get("query").and_then(|x| {
+                    if x.is_null() {
+                        None
+                    } else {
+                        x.as_str().map(ToString::to_string)
+                    }
+                });
                 let vec = match v.get("vec") {
                     Some(serde_json::Value::Null) | None => None,
                     Some(arr) => {
-                        let parsed: Vec<f32> = serde_json::from_value(arr.clone()).map_err(|e| {
-                            StoreError::Lance(lancedb::Error::Other {
-                                message: format!("focus_set vec decode: {e}"),
-                                source: None,
-                            })
-                        })?;
+                        let parsed: Vec<f32> =
+                            serde_json::from_value(arr.clone()).map_err(|e| {
+                                StoreError::Lance(lancedb::Error::Other {
+                                    message: format!("focus_set vec decode: {e}"),
+                                    source: None,
+                                })
+                            })?;
                         Some(parsed)
                     }
                 };
@@ -871,8 +893,7 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     /// should not wedge boot.
     pub fn iter_chain(&self) -> Result<Vec<ChainEvent>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT kind, payload FROM chain_log ORDER BY seq ASC")?;
+        let mut stmt = conn.prepare("SELECT kind, payload FROM chain_log ORDER BY seq ASC")?;
         let rows: Vec<(String, String)> = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
@@ -937,8 +958,7 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         let conn = self.lock();
         let mut handles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         {
-            let mut stmt =
-                conn.prepare("SELECT handle FROM threads WHERE anchor_chunk_id = ?")?;
+            let mut stmt = conn.prepare("SELECT handle FROM threads WHERE anchor_chunk_id = ?")?;
             let rows = stmt.query_map(params![chunk_id], |r| r.get::<_, String>(0))?;
             for h in rows {
                 handles.insert(h?);
@@ -1435,13 +1455,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         let mut guard = self.lock();
         let tx = guard.transaction()?;
         tx.execute("DELETE FROM thread_thread_links WHERE id = ?", params![id])?;
-        self.sink.append_within(
-            &ChainEvent::ThreadLinkRemove {
-                id,
-                ts: Utc::now(),
-            },
-            &tx,
-        )?;
+        self.sink
+            .append_within(&ChainEvent::ThreadLinkRemove { id, ts: Utc::now() }, &tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -1507,8 +1522,7 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
 
     pub fn proposed_thread_count(&self) -> Result<u64> {
         let conn = self.lock();
-        let n: i64 =
-            conn.query_row("SELECT COUNT(*) FROM threads_proposed", [], |r| r.get(0))?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM threads_proposed", [], |r| r.get(0))?;
         u64::try_from(n).map_err(|_| {
             StoreError::Lance(lancedb::Error::Other {
                 message: format!("proposed_thread_count returned negative value: {n}"),
@@ -1681,9 +1695,7 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
     })
 }
 
-fn row_to_thread_thread_link(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<ThreadThreadLink> {
+fn row_to_thread_thread_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadThreadLink> {
     let id: i64 = r.get(0)?;
     let from_s: String = r.get(1)?;
     let to_s: String = r.get(2)?;
@@ -2149,15 +2161,13 @@ mod tests {
         db.upsert_thread(&sample_thread("abi-as-sovereign-boundary"))
             .unwrap();
 
-        let link = sample_thread_thread_link(
-            "post-release",
-            "abi-as-sovereign-boundary",
-            "cites",
-        );
+        let link = sample_thread_thread_link("post-release", "abi-as-sovereign-boundary", "cites");
         let id = db.add_thread_thread_link(&link).unwrap();
         assert!(id > 0);
 
-        let from_rows = db.list_thread_thread_links_from(&handle("post-release")).unwrap();
+        let from_rows = db
+            .list_thread_thread_links_from(&handle("post-release"))
+            .unwrap();
         assert_eq!(from_rows.len(), 1);
         assert_eq!(from_rows[0].to_thread.as_str(), "abi-as-sovereign-boundary");
         assert_eq!(from_rows[0].category, "cites");
@@ -2338,11 +2348,8 @@ mod tests {
         // INSERT must roll back so the link never lands in the table.
         let tmp = TempDir::new().unwrap();
         let sink = Arc::new(AtomicErrorSink::default());
-        let db = ThreadsDb::open_with_sink(
-            tmp.path(),
-            Arc::clone(&sink) as Arc<dyn ChainSink>,
-        )
-        .unwrap();
+        let db =
+            ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink) as Arc<dyn ChainSink>).unwrap();
         db.upsert_thread(&sample_thread("a")).unwrap();
         db.upsert_thread(&sample_thread("b")).unwrap();
         let baseline = db.thread_thread_link_count().unwrap();
@@ -2362,11 +2369,9 @@ mod tests {
         // DELETE is rolled back and the row survives.
         let tmp = TempDir::new().unwrap();
         let recording = Arc::new(RecordingSink::default());
-        let db = ThreadsDb::open_with_sink(
-            tmp.path(),
-            Arc::clone(&recording) as Arc<dyn ChainSink>,
-        )
-        .unwrap();
+        let db =
+            ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&recording) as Arc<dyn ChainSink>)
+                .unwrap();
         db.upsert_thread(&sample_thread("a")).unwrap();
         db.upsert_thread(&sample_thread("b")).unwrap();
         let id = db
@@ -2375,11 +2380,8 @@ mod tests {
         drop(db);
 
         let sink = Arc::new(AtomicErrorSink::default());
-        let db = ThreadsDb::open_with_sink(
-            tmp.path(),
-            Arc::clone(&sink) as Arc<dyn ChainSink>,
-        )
-        .unwrap();
+        let db =
+            ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink) as Arc<dyn ChainSink>).unwrap();
         assert_eq!(db.thread_thread_link_count().unwrap(), 1, "precondition");
 
         let result = db.delete_thread_thread_link(id);
@@ -2463,8 +2465,8 @@ mod tests {
 
     #[test]
     fn chain_event_focus_set_payload_round_trip() {
-        use ostk_recall_core::attention::AttentionScope;
         use ostk_recall_core::PrivacyTier;
+        use ostk_recall_core::attention::AttentionScope;
 
         let scope = AttentionScope {
             project: Some("p".into()),
@@ -2516,8 +2518,8 @@ mod tests {
         // a row that iter_chain reads back as the same FocusSet
         // payload, including the vec — proves the wire format
         // survives a disk round-trip.
-        use ostk_recall_core::attention::AttentionScope;
         use ostk_recall_core::PrivacyTier;
+        use ostk_recall_core::attention::AttentionScope;
 
         let tmp = TempDir::new().unwrap();
         let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());

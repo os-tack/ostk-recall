@@ -114,5 +114,8 @@ paths = ["~/notes"]
     write!(f, "{body}").unwrap();
     let cfg = Config::load(f.path()).unwrap();
     // Both ids set: each block is uniquely identified.
-    assert_ne!(cfg.sources[0].source_config_id, cfg.sources[1].source_config_id);
+    assert_ne!(
+        cfg.sources[0].source_config_id,
+        cfg.sources[1].source_config_id
+    );
 }

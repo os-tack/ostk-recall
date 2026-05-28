@@ -8,14 +8,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ostk_recall_core::{FacetSet, cardinality_of, from_list, merge_override, to_list, Cardinality};
+use ostk_recall_core::{Cardinality, FacetSet, cardinality_of, from_list, merge_override, to_list};
 
 #[test]
 fn single_override_replaces_scanner_value() {
     let mut f: FacetSet = BTreeMap::new();
     f.insert("lang".into(), ["rust".to_string()].into_iter().collect());
     merge_override(&mut f, "lang", vec!["python".into()]);
-    assert_eq!(f["lang"], ["python".to_string()].into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(
+        f["lang"],
+        ["python".to_string()].into_iter().collect::<BTreeSet<_>>()
+    );
 }
 
 #[test]
@@ -56,7 +59,12 @@ fn facet_values_with_colon_round_trip() {
     let list = to_list(&f);
     assert!(list.iter().any(|s| s == "agent:claude-3:opus"));
     let parsed = from_list(&list);
-    assert_eq!(parsed["agent"], ["claude-3:opus".to_string()].into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(
+        parsed["agent"],
+        ["claude-3:opus".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
 }
 
 #[test]
@@ -66,7 +74,10 @@ fn facet_values_with_spaces_paths_tilde_round_trip() {
         "path_prefix".into(),
         ["~/projects/ostk recall".to_string()].into_iter().collect(),
     );
-    f.insert("project".into(), ["foo / bar".to_string()].into_iter().collect());
+    f.insert(
+        "project".into(),
+        ["foo / bar".to_string()].into_iter().collect(),
+    );
     let list = to_list(&f);
     let parsed = from_list(&list);
     assert_eq!(parsed, f);

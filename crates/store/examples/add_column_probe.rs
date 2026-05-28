@@ -9,9 +9,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
-};
+use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::query::ExecutableQuery;

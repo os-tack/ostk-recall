@@ -1,21 +1,48 @@
 //! Hybrid dense + BM25 retrieval over the corpus table.
+//!
+//! P3A: this module now drives per-lane candidate generation via
+//! `crates/query/src/lanes.rs` and explicit RRF fusion via the new
+//! `RankEngine`. Lance's internal `RRFReranker` is no longer called
+//! from this path — per-lane rank + score is captured on each
+//! `Candidate` so downstream features (P9b lens portfolio, P3B/P4/P7
+//! enrichment) can score with full attribution.
+//!
+//! Backward-compat output: `recall` still returns `Vec<RecallHit>`.
+//! Internally, the pipeline is:
+//!
+//! ```text
+//! lane_bm25 ╮
+//!           ├── build_candidates → Vec<Candidate>
+//! lane_dense ╯           ↓
+//!                  RankEngine{Rrf=1.0}.rank → Vec<RankedHit>
+//!                                          ↓
+//!                                Convert → Vec<RecallHit>
+//!                                          ↓
+//!                  cross-encoder rerank → identifier boost
+//!                                       → source-id diversify → truncate
+//! ```
+//!
+//! The four existing v0.5 heuristics are preserved:
+//! - Stratified code prefetch: an additional `lane_dense` filtered to
+//!   `source = 'code'` when the caller hasn't bound `source` itself.
+//! - Cross-encoder rerank (jina-turbo) via `RerankerLike`.
+//! - Identifier code boost (additive +3.0 on snippet-matching code rows).
+//! - Per-`source_id` diversification.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
-use lancedb::Connection;
-use lancedb::index::scalar::FullTextSearchQuery;
-use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::rerankers::rrf::RRFReranker;
-use ostk_recall_core::Source;
+use ostk_recall_core::{Chunk, ContextRole, Source};
 use ostk_recall_pipeline::ChunkEmbedder;
-use ostk_recall_store::CORPUS_TABLE;
+use ostk_recall_store::{CORPUS_TABLE, CorpusStore};
 
+use crate::candidate::Candidate;
+use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
+use crate::lanes::{LaneEntry, build_candidates, lane_bm25, lane_dense, rrf_score_normalized};
+use crate::rank::{Feature, RankEngine, RankedHit};
 use crate::rerank::RerankerLike;
-use crate::row::{batch_to_hits, sql_escape};
+use crate::row::{snippet_of, sql_escape};
 use crate::types::{RecallHit, RecallParams};
 
 /// Default cap on hits per `source_id` after RRF rerank. One chatty session
@@ -54,6 +81,16 @@ pub const STRATIFIED_CODE_PREFETCH: usize = 12;
 /// Set to `0.0` to disable the heuristic without removing the call site.
 pub const IDENTIFIER_CODE_BOOST: f32 = 3.0;
 
+/// Soft-sigmoid normalization constant for the `Bm25` rank feature
+/// (`raw_bm25 / (raw_bm25 + K_BM25)` → bounded `(0, 1)`).
+///
+/// **Inert in alpha.1**: the `Bm25` feature ships at weight `0.0`,
+/// so this constant has no effect on retrieval ordering today. P5
+/// sweeps the weight + this constant together. Exposed as a public
+/// constant + per-call override on `RankingOverrides::k_bm25` so
+/// the eventual tuner can vary it without code edits.
+pub const K_BM25: f32 = 10.0;
+
 /// Execute a hybrid recall against the corpus table.
 ///
 /// Pipeline:
@@ -69,7 +106,7 @@ pub const IDENTIFIER_CODE_BOOST: f32 = 3.0;
 ///    Without a reranker, the RRF-fused order is preserved.
 /// 4. Per-`source_id` diversity filter, truncated to `limit`.
 pub async fn recall(
-    conn: &Connection,
+    store: &CorpusStore,
     embedder: &dyn ChunkEmbedder,
     reranker: Option<&dyn RerankerLike>,
     params: &RecallParams,
@@ -87,12 +124,25 @@ pub async fn recall(
     // the cross-encoder rerank both have room to operate.
     let fetch_limit = limit.saturating_mul(PREFETCH_MULTIPLIER).max(limit);
 
+    // Resolve P3A per-call overrides. `None` field → compiled-in default.
+    // P5 / file-config will populate `ranking_overrides` from
+    // `[ranking.stages]` / `[ranking.weights]` and pass through unchanged.
+    let overrides = params.ranking_overrides.clone().unwrap_or_default();
+    let stratified_prefetch = overrides
+        .stratified_code_prefetch
+        .unwrap_or(STRATIFIED_CODE_PREFETCH);
+    let identifier_boost = overrides
+        .identifier_code_boost
+        .unwrap_or(IDENTIFIER_CODE_BOOST);
+    let _k_bm25 = overrides.k_bm25.unwrap_or(K_BM25); // wired when Bm25 feature lands
+
     let vec = embedder
         .encode_batch(&[query_text])
         .into_iter()
         .next()
         .unwrap_or_default();
 
+    let conn = store.connection();
     let table = conn.open_table(CORPUS_TABLE).execute().await?;
 
     let primary_filter = build_filter(
@@ -102,66 +152,215 @@ pub async fn recall(
         params.before,
     );
 
-    let mut candidates = run_hybrid_query(
-        &table,
-        &vec,
-        query_text,
-        fetch_limit,
-        primary_filter.as_deref(),
-    )
-    .await?;
+    // Per-lane queries. Lance executes these sequentially against the
+    // same table; running them via join_all gives a small win on cold
+    // index pages but adds complexity — keep sequential for P3A.
+    let bm25 = lane_bm25(&table, query_text, primary_filter.as_deref(), fetch_limit).await?;
+    let dense = lane_dense(&table, &vec, primary_filter.as_deref(), fetch_limit).await?;
 
-    // Soft-stratified augmentation: when the caller hasn't filtered by
-    // source, top up with a code-only prefetch so the reranker always
-    // sees code candidates.
-    if params.source.is_none() {
+    // Stratified code prefetch: when the caller hasn't filtered by
+    // source, top up the dense lane with a code-only dense pass so the
+    // reranker always sees code candidates. Mirrors v0.5 behavior
+    // (`STRATIFIED_CODE_PREFETCH = 12`). On failure we log and proceed
+    // with primary lanes only.
+    let dense = if params.source.is_none() {
         let code_filter = build_filter(
             params.project.as_deref(),
             Some(Source::Code.as_str()),
             params.since,
             params.before,
         );
-        match run_hybrid_query(
-            &table,
-            &vec,
-            query_text,
-            STRATIFIED_CODE_PREFETCH,
-            code_filter.as_deref(),
-        )
-        .await
-        {
+        match lane_dense(&table, &vec, code_filter.as_deref(), stratified_prefetch).await {
             Ok(extras) => {
                 tracing::debug!(
-                    primary = candidates.len(),
+                    primary = dense.len(),
                     code_extras = extras.len(),
                     "stratified prefetch"
                 );
-                merge_dedup(&mut candidates, extras);
+                merge_dense_lanes(dense, extras)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "stratified code prefetch failed; continuing with primary candidates");
+                tracing::warn!(error = %e, "stratified code prefetch failed; continuing with primary lanes");
+                dense
             }
+        }
+    } else {
+        dense
+    };
+
+    // Union ids → batch-fetch full chunks + dense embeddings → build
+    // Candidates with lane evidence + RRF.
+    let mut union_ids: Vec<String> = Vec::with_capacity(bm25.len() + dense.len());
+    union_ids.extend(bm25.iter().map(|(id, _, _)| id.clone()));
+    union_ids.extend(dense.iter().map(|(id, _, _)| id.clone()));
+    union_ids.sort();
+    union_ids.dedup();
+    let fetched = store.fetch_chunks_by_ids(&union_ids).await?;
+    let mut chunks: HashMap<String, Chunk> = HashMap::with_capacity(fetched.len());
+    let mut embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+    for (id, (chunk, emb)) in fetched {
+        if let Some(e) = emb {
+            embeddings.insert(id.clone(), e);
+        }
+        chunks.insert(id, chunk);
+    }
+    let mut candidates = build_candidates(&bm25, &dense, chunks);
+    // Stamp dense embeddings onto candidates for downstream P9b /
+    // AttentionAffinity scoring. Cheap — clone of Vec<f32>.
+    for c in &mut candidates {
+        if let Some(e) = embeddings.remove(&c.chunk.chunk_id) {
+            c.dense_embedding = Some(e);
         }
     }
 
-    // Cross-encoder pass. The candidate text we score is the snippet that
-    // already shipped through `batch_to_hits` (≤400 chars) — short, dense,
-    // and what the user would see in the answer anyway. Doing this in a
-    // `spawn_blocking` keeps the async runtime healthy even though the
-    // ONNX call is CPU-bound.
-    let candidates = if let Some(reranker) = reranker {
-        rerank_candidates(reranker, query_text, candidates)?
-    } else {
-        candidates
-    };
+    // Rank with Rrf=1.0 (alpha.1 default). Other features ship at
+    // weight 0.0 until P5 measures (and per-phase as P6/P7/P7b/P8
+    // land). Engine takes &self → no lock; an Arc<RankEngine> here
+    // would be needed once the lens loop shares one with explicit
+    // recall, but the explicit path can keep building per-call.
+    let engine = RankEngine::new().with_feature(Feature {
+        name: "rrf",
+        weight: 1.0,
+        score_fn: Box::new(|c, _q, _a| c.rrf_score.map_or(0.0, rrf_score_normalized)),
+    });
+    let query_ctx = QueryContext::explicit(query_text, vec.clone());
+    let ranked: Vec<RankedHit> = engine.rank(candidates, &query_ctx, &AttentionContext::empty());
 
-    // Identifier-mode boost: when the query reads like a symbol name
-    // (snake_case, CamelCase, or a single short token), bias actual code
-    // definitions above conversation transcripts that merely mention the
-    // identifier. Bumps post-rerank scores in place, then re-sorts.
-    let candidates = boost_code_for_identifier_queries(query_text, candidates);
+    // Convert to RecallHit for the existing post-rank stages. The
+    // top-N for rerank is `fetch_limit`; rerank truncates further.
+    let mut hits: Vec<RecallHit> = ranked
+        .into_iter()
+        .take(fetch_limit)
+        .map(ranked_to_recall_hit)
+        .collect();
 
-    Ok(diversify_by_source_id(candidates, limit, max_per_source_id))
+    // Cross-encoder pass. The candidate text we score is the snippet
+    // already capped at `SNIPPET_CHARS` — same shape as v0.5.
+    if let Some(reranker) = reranker {
+        hits = rerank_candidates(reranker, query_text, hits)?;
+    }
+
+    // Identifier-mode boost: when the query reads like a symbol name,
+    // bias actual code definitions above conversation transcripts.
+    // Bumps post-rerank scores in place and re-sorts. Future work
+    // (P3B AC): emit a `FeatureAttribution { name: "identifier_boost",
+    // raw: 1.0, weight: IDENTIFIER_CODE_BOOST, contribution: 3.0 }`
+    // row on the MCP response so the boost is auditable.
+    let hits = boost_code_for_identifier_queries(query_text, hits, identifier_boost);
+
+    Ok(diversify_by_source_id(hits, limit, max_per_source_id))
+}
+
+/// Convert a `RankedHit` to the public `RecallHit` shape.
+///
+/// `score` is filled from `total` (sum of weighted feature
+/// contributions); after the cross-encoder rerank stage runs, this
+/// score is overwritten with the cross-encoder score, matching v0.5.
+fn ranked_to_recall_hit(ranked: RankedHit) -> RecallHit {
+    let Candidate { chunk, .. } = ranked.candidate;
+    let Chunk {
+        chunk_id,
+        source,
+        project,
+        source_id,
+        ts,
+        role,
+        text,
+        links,
+        extra,
+        ..
+    } = chunk;
+
+    let snippet = snippet_of(&text);
+    // Chunk stores `role: Option<String>` (wire form); RecallHit
+    // surfaces the typed `Option<ContextRole>`. Unknown strings are
+    // simply dropped — UI clients that care can re-derive from
+    // `extra` if needed.
+    let role = role.as_deref().and_then(parse_context_role);
+
+    // Carry rank-engine attribution forward to the wire. Per P3A:
+    // `total_score = Σ contribution`. Post-rank stages
+    // (identifier_boost) may add their own entries downstream so the
+    // boost is auditable.
+    let match_features: std::collections::BTreeMap<String, ostk_recall_core::MatchFeature> = ranked
+        .features
+        .into_iter()
+        .map(|(name, attr)| {
+            (
+                name.to_string(),
+                ostk_recall_core::MatchFeature {
+                    raw: attr.raw,
+                    weight: attr.weight,
+                    contribution: attr.contribution,
+                },
+            )
+        })
+        .collect();
+
+    RecallHit {
+        chunk_id,
+        project,
+        source: source.as_str().to_string(),
+        source_id,
+        ts,
+        snippet,
+        score: ranked.total,
+        links,
+        extra,
+        stale: false,
+        role,
+        base_score: None,
+        thread_score: None,
+        embedding_score: None,
+        thread_weight: None,
+        embedding_weight: None,
+        attention_score: None,
+        attention_weight: None,
+        match_features,
+    }
+}
+
+/// Parse the snake_case wire form of `ContextRole`. Returns `None` for
+/// unknown strings; mirrors the serde rename used on the enum itself.
+fn parse_context_role(s: &str) -> Option<ContextRole> {
+    match s {
+        "primary" => Some(ContextRole::Primary),
+        "evolution" => Some(ContextRole::Evolution),
+        "usage" => Some(ContextRole::Usage),
+        _ => None,
+    }
+}
+
+/// Merge two dense lane outputs by chunk_id, keeping the BEST (lowest)
+/// rank seen for each id. The `extras` lane's ranks are kept as-is —
+/// they're scored within their own subset (code-only) and may legitimately
+/// be rank 0 inside the subset while the primary dense lane has them at
+/// rank 50; we keep the better evidence either way.
+fn merge_dense_lanes(primary: Vec<LaneEntry>, extras: Vec<LaneEntry>) -> Vec<LaneEntry> {
+    if extras.is_empty() {
+        return primary;
+    }
+    let mut by_id: HashMap<String, (f32, u32)> =
+        HashMap::with_capacity(primary.len() + extras.len());
+    for (id, score, rank) in primary.into_iter().chain(extras.into_iter()) {
+        by_id
+            .entry(id)
+            .and_modify(|cur| {
+                if rank < cur.1 {
+                    *cur = (score, rank);
+                }
+            })
+            .or_insert((score, rank));
+    }
+    let mut out: Vec<LaneEntry> = by_id
+        .into_iter()
+        .map(|(id, (score, rank))| (id, score, rank))
+        .collect();
+    // Restore rank order; tie-break on chunk_id so equal-rank rows
+    // appear in a deterministic sequence (HashMap iteration above is
+    // unordered).
+    out.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// Returns true when the query reads like a code identifier.
@@ -226,66 +425,32 @@ pub fn is_identifier_query(q: &str) -> bool {
 fn boost_code_for_identifier_queries(
     query: &str,
     mut candidates: Vec<RecallHit>,
+    boost: f32,
 ) -> Vec<RecallHit> {
-    if !is_identifier_query(query) || IDENTIFIER_CODE_BOOST == 0.0 {
+    if !is_identifier_query(query) || boost == 0.0 {
         return candidates;
     }
     let needle = query.trim().to_lowercase();
     for hit in &mut candidates {
         if hit.source == Source::Code.as_str() && hit.snippet.to_lowercase().contains(&needle) {
-            hit.score += IDENTIFIER_CODE_BOOST;
+            hit.score += boost;
+            // P3A AC: post-rank boost stages emit a match_features
+            // entry so the boost is auditable in the MCP response and
+            // the `score = Σ contribution` invariant on
+            // `core::types::MatchFeature` is preserved.
+            hit.match_features.insert(
+                "identifier_boost".to_string(),
+                ostk_recall_core::MatchFeature::new(1.0, boost),
+            );
         }
     }
     candidates.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
     candidates
-}
-
-/// Issue one hybrid (dense + BM25 + RRF) query against `table`.
-async fn run_hybrid_query(
-    table: &lancedb::Table,
-    vec: &[f32],
-    query_text: &str,
-    fetch_limit: usize,
-    filter: Option<&str>,
-) -> Result<Vec<RecallHit>> {
-    let mut q = table
-        .query()
-        .nearest_to(vec.to_vec())?
-        .full_text_search(FullTextSearchQuery::new(query_text.to_string()))
-        .rerank(Arc::new(RRFReranker::default()))
-        .limit(fetch_limit);
-    if let Some(f) = filter {
-        q = q.only_if(f);
-    }
-    let stream = q.execute().await?;
-    let batches: Vec<_> = stream.try_collect().await?;
-    let mut out = Vec::new();
-    for b in &batches {
-        out.extend(batch_to_hits(b)?);
-    }
-    Ok(out)
-}
-
-/// Merge `extras` into `dest`, skipping any whose `chunk_id` is already
-/// present. Preserves `dest` order; appends new rows at the tail. The
-/// reranker reorders everything, so insertion position only matters when
-/// no reranker is attached — code rows correctly land *after* the primary
-/// candidates in that fallback path.
-fn merge_dedup(dest: &mut Vec<RecallHit>, extras: Vec<RecallHit>) {
-    if extras.is_empty() {
-        return;
-    }
-    let seen: std::collections::HashSet<String> = dest.iter().map(|h| h.chunk_id.clone()).collect();
-    for hit in extras {
-        if seen.contains(&hit.chunk_id) {
-            continue;
-        }
-        dest.push(hit);
-    }
 }
 
 /// Apply the cross-encoder reranker to a candidate pool. Drops candidates
@@ -317,14 +482,30 @@ fn rerank_candidates(
         .rerank(query, &docs, take)
         .map_err(|e| crate::error::QueryError::Decode(format!("rerank: {e}")))?;
 
-    // Reassemble candidates in the new order; replace the score with the
-    // cross-encoder score so downstream callers see the post-rerank rank.
+    // Reassemble candidates in the new order. The cross-encoder REPLACES
+    // the engine score (it isn't an additive feature — see
+    // p3-rank-evidence.md "Reranker is a post-rank stage, not a
+    // feature"), so to keep the `score = Σ contribution` invariant on
+    // the MatchFeature doc honest, we reset `match_features` to a
+    // single `rerank` entry whose contribution equals the new score.
+    // The rank-engine attribution (rrf, etc.) is dropped — operators
+    // who want pre-rerank attribution should use the explicit
+    // `recall_audit` path or run with the reranker disabled.
     let mut by_idx: Vec<Option<RecallHit>> = candidates.into_iter().map(Some).collect();
     let mut out = Vec::with_capacity(ranked.len());
     for r in ranked {
         if let Some(slot) = by_idx.get_mut(r.idx).and_then(Option::take) {
             let mut hit = slot;
             hit.score = r.score;
+            hit.match_features.clear();
+            hit.match_features.insert(
+                "rerank".to_string(),
+                ostk_recall_core::MatchFeature {
+                    raw: r.score,
+                    weight: 1.0,
+                    contribution: r.score,
+                },
+            );
             out.push(hit);
         }
     }
@@ -449,6 +630,7 @@ mod tests {
             embedding_weight: None,
             attention_score: None,
             attention_weight: None,
+            match_features: Default::default(),
         }
     }
 
@@ -547,6 +729,7 @@ mod tests {
             embedding_weight: None,
             attention_score: None,
             attention_weight: None,
+            match_features: Default::default(),
         }
     }
 
@@ -581,19 +764,45 @@ mod tests {
     }
 
     #[test]
-    fn merge_dedup_appends_new_skips_existing() {
-        let mut dest = vec![fake_hit("a", "S"), fake_hit("b", "S")];
-        let extras = vec![fake_hit("a", "S"), fake_hit("c", "S")];
-        merge_dedup(&mut dest, extras);
-        let ids: Vec<_> = dest.iter().map(|h| h.chunk_id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "c"]);
+    fn merge_dense_lanes_keeps_better_rank_on_duplicate() {
+        // Chunk "a" ranks 5 in the primary dense lane but rank 0 in the
+        // stratified code prefetch — keep the rank-0 evidence so RRF
+        // reflects the better signal.
+        let primary = vec![("a".into(), 0.5, 5), ("b".into(), 0.4, 1)];
+        let extras = vec![("a".into(), 0.1, 0), ("c".into(), 0.2, 2)];
+        let merged = merge_dense_lanes(primary, extras);
+        let by_id: std::collections::HashMap<_, _> = merged
+            .iter()
+            .map(|(id, score, rank)| (id.as_str(), (*score, *rank)))
+            .collect();
+        assert_eq!(by_id["a"].1, 0);
+        assert!(by_id.contains_key("b"));
+        assert!(by_id.contains_key("c"));
+        // Output is sorted by rank ascending.
+        let ranks: Vec<u32> = merged.iter().map(|(_, _, r)| *r).collect();
+        assert!(ranks.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]
-    fn merge_dedup_empty_extras_noop() {
-        let mut dest = vec![fake_hit("a", "S")];
-        merge_dedup(&mut dest, Vec::new());
-        assert_eq!(dest.len(), 1);
+    fn merge_dense_lanes_empty_extras_returns_primary() {
+        let primary = vec![("a".into(), 0.5, 0), ("b".into(), 0.4, 1)];
+        let merged = merge_dense_lanes(primary.clone(), Vec::new());
+        assert_eq!(merged.len(), 2);
+        // identity on (id, rank) is enough; merge sorts by rank.
+        let ids: Vec<_> = merged.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_context_role_known_values() {
+        assert_eq!(parse_context_role("primary"), Some(ContextRole::Primary));
+        assert_eq!(
+            parse_context_role("evolution"),
+            Some(ContextRole::Evolution)
+        );
+        assert_eq!(parse_context_role("usage"), Some(ContextRole::Usage));
+        assert_eq!(parse_context_role("nonsense"), None);
+        assert_eq!(parse_context_role(""), None);
     }
 
     #[test]
@@ -644,6 +853,7 @@ mod tests {
                 embedding_weight: None,
                 attention_score: None,
                 attention_weight: None,
+                match_features: Default::default(),
             },
             RecallHit {
                 chunk_id: "code1".into(),
@@ -664,9 +874,11 @@ mod tests {
                 embedding_weight: None,
                 attention_score: None,
                 attention_weight: None,
+                match_features: Default::default(),
             },
         ];
-        let out = boost_code_for_identifier_queries("alloc_page", candidates);
+        let out =
+            boost_code_for_identifier_queries("alloc_page", candidates, IDENTIFIER_CODE_BOOST);
         assert_eq!(out[0].chunk_id, "code1", "code hit should win after boost");
         // Boost lifted 4.0 by IDENTIFIER_CODE_BOOST (3.0) → 7.0, comfortably
         // above the 5.0 conversation row.
@@ -695,6 +907,7 @@ mod tests {
                 embedding_weight: None,
                 attention_score: None,
                 attention_weight: None,
+                match_features: Default::default(),
             },
             RecallHit {
                 chunk_id: "code1".into(),
@@ -715,9 +928,14 @@ mod tests {
                 embedding_weight: None,
                 attention_score: None,
                 attention_weight: None,
+                match_features: Default::default(),
             },
         ];
-        let out = boost_code_for_identifier_queries("how do we wire the reranker", candidates);
+        let out = boost_code_for_identifier_queries(
+            "how do we wire the reranker",
+            candidates,
+            IDENTIFIER_CODE_BOOST,
+        );
         // Order untouched, scores untouched.
         assert_eq!(out[0].chunk_id, "conv1");
         assert!((out[0].score - 5.0).abs() < f32::EPSILON);
