@@ -857,66 +857,23 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_content_advances_rolling_baseline_so_next_drift_compares_to_current_tick() {
-        // Regression test for the review fix. Before the fix,
-        // `try_refresh_lens` built an updated `new_state` but
-        // returned `UnchangedContent` without it; `apply_decision`
-        // only touched `last_lens_ts`. Result: drift checks kept
-        // comparing against the original baseline. A second tick
-        // with the same drifted vector would still register drift
-        // — but the rendered markdown's minute-resolution timestamp
-        // means the content fingerprint can diverge, firing a
-        // spurious notification for semantically unchanged content.
+        // Regression for the review fix. Before it, the
+        // UnchangedContent arm of apply_decision only touched
+        // last_lens_ts — the rolling baseline stayed anchored to
+        // the original snapshot. Drift accumulated against the
+        // stale baseline could eventually cross threshold for
+        // byte-identical content and fire a spurious notification.
         //
-        // Post-fix: the unchanged-content path adopts the new
-        // baseline. A second tick with the same drifted vector
-        // reports `NoTrigger`.
+        // Post-fix: UnchangedContent carries the advanced LensState
+        // and apply_decision adopts it. The test asserts every
+        // field the loop relies on for the next tick's gating
+        // decision is copied forward.
         let tmp = TempDir::new().unwrap();
-        let corpus = CorpusStore::open_or_create(tmp.path(), 3).await.unwrap();
-
-        // First tick: drift triggers from None → Some, content
-        // fingerprint becomes set. Empty corpus → empty lens →
-        // Refresh path. We'll use this to seed `last_content_fp`.
-        let drifted = vec![1.0_f32, 0.0, 0.0];
-        let snap1 = LensTickSnapshot {
-            rolling_vec: Some(drifted.clone()),
-            scope_vector: Some(drifted.clone()),
-            pin_fingerprint: None,
-        };
-        let state0 = LensState::default();
-        let cfg = LensConfig::default();
-        let d1 = try_refresh_lens(&snap1, &state0, &corpus, &cfg).await;
-        let state1 = match d1 {
-            LensRefreshDecision::Refresh { new_state, .. } => new_state,
-            other => panic!("expected Refresh on first tick, got {other:?}"),
-        };
-
-        // Second tick: drift past threshold (orthogonal vector), but
-        // the rendered content is byte-identical because the
-        // (empty) corpus still produces an empty lens whose
-        // markdown only varies on the minute timestamp. Force the
-        // content fingerprint to match by using the same state's
-        // content_fp.
-        let drifted2 = vec![0.0_f32, 1.0, 0.0];
-        let snap2 = LensTickSnapshot {
-            rolling_vec: Some(drifted2.clone()),
-            scope_vector: Some(drifted2.clone()),
-            pin_fingerprint: None,
-        };
-        // Patch state1 so its content_fp matches what the next
-        // empty-lens render will produce — we know the markdown
-        // will differ on the timestamp, so the unchanged-content
-        // branch can't fire naturally in this fixture. Instead we
-        // assert via apply_decision that the carried new_state's
-        // rolling baseline advances.
-        let _ = state1; // suppress unused
-
-        // Construct a synthetic UnchangedContent decision and verify
-        // apply_decision adopts its new_state.
-        let lens_state_in = LensState {
-            last_rolling_vec: Some(drifted2.clone()),
+        let advanced = LensState {
+            last_rolling_vec: Some(vec![0.0_f32, 1.0, 0.0]),
             last_pin_fingerprint: None,
             last_portfolio_chunk_ids: vec!["x".into()],
-            last_content_fp: Some(vec![3; 32]),
+            last_content_fp: Some(vec![3_u8; 32]),
             last_lens_ts: Some(Utc::now()),
         };
         let resource = MemoryLensResource::new("body".into());
@@ -926,7 +883,7 @@ mod tests {
         let mut state = LensState::default();
         apply_decision(
             LensRefreshDecision::UnchangedContent {
-                new_state: lens_state_in.clone(),
+                new_state: advanced.clone(),
             },
             &mut state,
             &resource,
@@ -934,11 +891,11 @@ mod tests {
             &sink,
             tmp.path(),
         );
-        assert_eq!(state.last_rolling_vec, lens_state_in.last_rolling_vec);
-        assert_eq!(state.last_content_fp, lens_state_in.last_content_fp);
+        assert_eq!(state.last_rolling_vec, advanced.last_rolling_vec);
+        assert_eq!(state.last_content_fp, advanced.last_content_fp);
         assert_eq!(
             state.last_portfolio_chunk_ids,
-            lens_state_in.last_portfolio_chunk_ids
+            advanced.last_portfolio_chunk_ids
         );
     }
 }
