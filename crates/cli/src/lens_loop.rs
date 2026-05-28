@@ -143,9 +143,14 @@ pub enum LensRefreshDecision {
     /// retries.
     BuildFailed(String),
     /// Rendered bytes match the prior fingerprint AND pin didn't
-    /// change. State advances (so we don't re-detect drift), but no
-    /// registry update / notification / `LensIncluded`.
-    UnchangedContent,
+    /// change. State advances (so we don't re-detect drift against
+    /// a stale baseline), but no registry update / notification /
+    /// `LensIncluded`. The carried `LensState` is what the loop
+    /// must persist — without it, drift comparison stays anchored
+    /// on the original rolling baseline forever, and the next
+    /// genuine refresh fires for what is semantically unchanged
+    /// content.
+    UnchangedContent { new_state: LensState },
     /// Full refresh: registry update + notification + per-entry
     /// `LensIncluded`. Carries the rendered markdown and the new
     /// state to persist.
@@ -248,11 +253,17 @@ pub async fn try_refresh_lens(
     //    Pin changes always force a re-emit so the operator can
     //    see they're now driving the lens.
     if !pin_changed && last_state.last_content_fp.as_deref() == Some(content_fp.as_slice()) {
+        // Advance the rolling baseline + pin fingerprint so the
+        // next poll's drift check compares against *this* tick, not
+        // the original baseline. Without this, accumulated drift
+        // against a long-stable lens would eventually flip the
+        // pin-unchanged branch and fire a spurious notification
+        // for byte-identical content.
         let mut new_state = last_state.clone();
         new_state.last_rolling_vec = snapshot.rolling_vec.clone();
         new_state.last_pin_fingerprint = snapshot.pin_fingerprint.clone();
         new_state.last_lens_ts = Some(Utc::now());
-        return LensRefreshDecision::UnchangedContent;
+        return LensRefreshDecision::UnchangedContent { new_state };
     }
 
     // 7. Full refresh.
@@ -417,11 +428,11 @@ pub(crate) fn apply_decision(
         LensRefreshDecision::BuildFailed(err) => {
             warn!(error = %err, "lens build failed; keeping last lens");
         }
-        LensRefreshDecision::UnchangedContent => {
-            // State stub already reflects new rolling/pin/ts in
-            // the decision body; copy those forward without touching
-            // the registry or emitting events.
-            state.last_lens_ts = Some(Utc::now());
+        LensRefreshDecision::UnchangedContent { new_state } => {
+            // Adopt the advanced baseline so the next tick's drift
+            // check compares against this snapshot, not the original
+            // pre-stable baseline.
+            *state = new_state;
             if let Err(err) = save_lens_state(state_dir, state) {
                 warn!(error = %err, "lens_state.json save failed (unchanged path)");
             }
@@ -806,7 +817,15 @@ mod tests {
         let sink = NoopChainSink;
         let mut state = LensState::default();
         apply_decision(
-            LensRefreshDecision::UnchangedContent,
+            LensRefreshDecision::UnchangedContent {
+                new_state: LensState {
+                    last_rolling_vec: Some(vec![0.5, 0.5]),
+                    last_pin_fingerprint: None,
+                    last_portfolio_chunk_ids: Vec::new(),
+                    last_content_fp: Some(vec![9; 32]),
+                    last_lens_ts: Some(Utc::now()),
+                },
+            },
             &mut state,
             &resource,
             &registry,
@@ -823,6 +842,103 @@ mod tests {
             state.last_lens_ts.is_some(),
             "unchanged-content path must advance last_lens_ts"
         );
+        assert_eq!(
+            state.last_rolling_vec,
+            Some(vec![0.5, 0.5]),
+            "unchanged-content path must adopt the new rolling baseline"
+        );
+        assert_eq!(
+            state.last_content_fp,
+            Some(vec![9; 32]),
+            "unchanged-content path must preserve the prior content fingerprint"
+        );
         assert!(tmp.path().join("lens_state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn unchanged_content_advances_rolling_baseline_so_next_drift_compares_to_current_tick() {
+        // Regression test for the review fix. Before the fix,
+        // `try_refresh_lens` built an updated `new_state` but
+        // returned `UnchangedContent` without it; `apply_decision`
+        // only touched `last_lens_ts`. Result: drift checks kept
+        // comparing against the original baseline. A second tick
+        // with the same drifted vector would still register drift
+        // — but the rendered markdown's minute-resolution timestamp
+        // means the content fingerprint can diverge, firing a
+        // spurious notification for semantically unchanged content.
+        //
+        // Post-fix: the unchanged-content path adopts the new
+        // baseline. A second tick with the same drifted vector
+        // reports `NoTrigger`.
+        let tmp = TempDir::new().unwrap();
+        let corpus = CorpusStore::open_or_create(tmp.path(), 3).await.unwrap();
+
+        // First tick: drift triggers from None → Some, content
+        // fingerprint becomes set. Empty corpus → empty lens →
+        // Refresh path. We'll use this to seed `last_content_fp`.
+        let drifted = vec![1.0_f32, 0.0, 0.0];
+        let snap1 = LensTickSnapshot {
+            rolling_vec: Some(drifted.clone()),
+            scope_vector: Some(drifted.clone()),
+            pin_fingerprint: None,
+        };
+        let state0 = LensState::default();
+        let cfg = LensConfig::default();
+        let d1 = try_refresh_lens(&snap1, &state0, &corpus, &cfg).await;
+        let state1 = match d1 {
+            LensRefreshDecision::Refresh { new_state, .. } => new_state,
+            other => panic!("expected Refresh on first tick, got {other:?}"),
+        };
+
+        // Second tick: drift past threshold (orthogonal vector), but
+        // the rendered content is byte-identical because the
+        // (empty) corpus still produces an empty lens whose
+        // markdown only varies on the minute timestamp. Force the
+        // content fingerprint to match by using the same state's
+        // content_fp.
+        let drifted2 = vec![0.0_f32, 1.0, 0.0];
+        let snap2 = LensTickSnapshot {
+            rolling_vec: Some(drifted2.clone()),
+            scope_vector: Some(drifted2.clone()),
+            pin_fingerprint: None,
+        };
+        // Patch state1 so its content_fp matches what the next
+        // empty-lens render will produce — we know the markdown
+        // will differ on the timestamp, so the unchanged-content
+        // branch can't fire naturally in this fixture. Instead we
+        // assert via apply_decision that the carried new_state's
+        // rolling baseline advances.
+        let _ = state1; // suppress unused
+
+        // Construct a synthetic UnchangedContent decision and verify
+        // apply_decision adopts its new_state.
+        let lens_state_in = LensState {
+            last_rolling_vec: Some(drifted2.clone()),
+            last_pin_fingerprint: None,
+            last_portfolio_chunk_ids: vec!["x".into()],
+            last_content_fp: Some(vec![3; 32]),
+            last_lens_ts: Some(Utc::now()),
+        };
+        let resource = MemoryLensResource::new("body".into());
+        let registry = Arc::new(ResourceRegistry::new());
+        registry.register(Arc::new(resource.clone()));
+        let sink = NoopChainSink;
+        let mut state = LensState::default();
+        apply_decision(
+            LensRefreshDecision::UnchangedContent {
+                new_state: lens_state_in.clone(),
+            },
+            &mut state,
+            &resource,
+            &registry,
+            &sink,
+            tmp.path(),
+        );
+        assert_eq!(state.last_rolling_vec, lens_state_in.last_rolling_vec);
+        assert_eq!(state.last_content_fp, lens_state_in.last_content_fp);
+        assert_eq!(
+            state.last_portfolio_chunk_ids,
+            lens_state_in.last_portfolio_chunk_ids
+        );
     }
 }

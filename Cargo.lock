@@ -4705,6 +4705,7 @@ name = "ostk-recall"
 version = "0.5.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "chrono",
  "clap",
  "dirs",
@@ -4721,6 +4722,7 @@ dependencies = [
  "ostk-recall-scan",
  "ostk-recall-store",
  "rayon",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
