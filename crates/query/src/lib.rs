@@ -18,6 +18,7 @@ pub mod context;
 pub mod error;
 pub mod hybrid;
 pub mod lanes;
+pub mod lens;
 pub mod link;
 pub mod rank;
 pub mod rerank;
