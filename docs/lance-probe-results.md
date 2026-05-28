@@ -39,9 +39,10 @@ in-memory MaxSim against a hand-computed reference.
 - Decode round-trips into `Vec<Vec<f32>>` with correct cardinalities.
 - MaxSim score (6.346154) matches reference implementation (6.346154).
 
-**Decision**: P4 ships the rerank-only MaxSim feature with side-table
-storage + bulk fetch + in-memory MaxSim. The design committed to in
-P4 holds against Lance 0.29.0.
+**Decision**: the Lance storage/retrieval half of P4 is viable:
+side-table storage + bulk fetch + in-memory MaxSim work against Lance
+0.29.0. Shipping the full rerank-only MaxSim feature still depends on
+the ColBERT encoder decision in `docs/fastembed-colbert-probe.md`.
 
 ## Probe 3: online `add_column` schema evolution
 
