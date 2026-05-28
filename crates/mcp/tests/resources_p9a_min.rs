@@ -13,7 +13,10 @@
 //! - `resources_notifications` — `notifications/resources/updated`
 //!   JSON-RPC envelope reaches the wire.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use ostk_recall_core::{Chunk, Links, Source};
 use ostk_recall_mcp::{
@@ -24,6 +27,7 @@ use ostk_recall_query::QueryEngine;
 use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
 // ---- shared fixtures --------------------------------------------------
@@ -308,6 +312,140 @@ async fn resources_subscribe() {
     let req = jsonrpc_req(2, "resources/subscribe", json!({ "uri": "ostk://missing" }));
     let resp = server.handle_request(req).await.expect("subscribe replies");
     assert!(resp.error.is_some());
+}
+
+/// AsyncRead that always returns an `io::Error`. Used to drive
+/// `serve` through the reader-error cleanup path.
+struct ErrReader;
+
+impl AsyncRead for ErrReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::other("synthetic reader error")))
+    }
+}
+
+/// AsyncWrite that always errors on `poll_write`. The flush/shutdown
+/// paths succeed so the writer task gets the error on the first
+/// payload rather than during teardown.
+#[derive(Default)]
+struct ErrWriter {
+    writes: AtomicUsize,
+}
+
+impl AsyncWrite for ErrWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Err(std::io::Error::other("synthetic writer error")))
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn serve_propagates_reader_error_after_cleanup() {
+    // Review-fix regression test: a reader I/O error must NOT skip
+    // the cleanup phase. Before the fix, `read_line(...).await?`
+    // short-circuited the function, leaving the registry's outbound
+    // sender alive and the writer task waiting on rx.recv().
+    use std::time::Duration;
+
+    let (_tmp, server) = build_server().await;
+    let registry = server.resources();
+    registry.register(Arc::new(FakeResource::new("ostk://x", "body")));
+
+    let buf: Vec<u8> = Vec::new();
+    let server = Arc::new(server);
+    let handle = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.serve(ErrReader, buf).await })
+    };
+
+    // The reader errors on first read → cleanup runs → serve
+    // returns Err inside the 2s budget. A wedge would blow past
+    // this timeout.
+    let result = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("serve must return within 2s on reader I/O error")
+        .expect("serve task must not panic");
+    let err = result.expect_err("reader I/O error must propagate");
+    assert!(
+        err.to_string().contains("synthetic reader error"),
+        "reader error must propagate verbatim, got: {err}"
+    );
+
+    // Cleanup contract: post-shutdown the registry must hold no
+    // outbound sender, so a fresh transport can install one.
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    registry
+        .subscribe(ClientId::stdio_singleton(), "ostk://x")
+        .unwrap();
+    registry.emit_resource_updated("ostk://x");
+    assert!(
+        rx.try_recv().is_err(),
+        "registry must not hold a stale sender after reader-error shutdown"
+    );
+    registry.set_outbound(tx);
+    registry.emit_resource_updated("ostk://x");
+    let _ = rx.recv().await.expect("re-installed sender works");
+}
+
+#[tokio::test]
+async fn serve_propagates_writer_error_after_cleanup() {
+    // The companion path: a writer I/O error must also surface,
+    // and cleanup must still run. We need a reader that yields one
+    // valid request (so the writer task actually tries a write)
+    // and then EOFs (so the reader loop completes Ok and lets the
+    // writer error become the surfaced error).
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    let (_tmp, server) = build_server().await;
+    let server = Arc::new(server);
+
+    let (mut client_stdin, server_stdin) = tokio::io::duplex(4096);
+    let server_stdout = ErrWriter::default();
+
+    let handle = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.serve(server_stdin, server_stdout).await })
+    };
+
+    // One valid request the writer will try to ship downstream,
+    // then close stdin so the reader loop exits cleanly. The
+    // writer's error becomes the function's return value.
+    client_stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    drop(client_stdin);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("serve must return within 2s on writer I/O error")
+        .expect("serve task must not panic");
+    let err = result.expect_err("writer I/O error must propagate");
+    assert!(
+        err.to_string().contains("synthetic writer error"),
+        "writer error must propagate verbatim, got: {err}"
+    );
 }
 
 #[tokio::test]

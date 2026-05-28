@@ -110,13 +110,24 @@ impl Server {
     /// `notifications/resources/updated` without racing on the
     /// output descriptor.
     ///
-    /// Shutdown is the subtle part. The registry holds a clone of
-    /// the outbound sender so background lens loops can push
-    /// notifications; on stdin EOF we must (1)
-    /// [`ResourceRegistry::clear_outbound`] to drop that clone, then
-    /// (2) drop the local sender. Only after both close does
-    /// `rx.recv().await` in the writer task return `None`. Skipping
-    /// step (1) wedges the serve task forever.
+    /// Shutdown contract — the cleanup phase runs unconditionally,
+    /// so an I/O error on either the read or the write half cannot
+    /// leak a half-open channel:
+    ///
+    /// 1. The reader loop runs inside an inner async block whose
+    ///    result is captured rather than `?`-propagated. EOF →
+    ///    `Ok(())`; reader I/O error → `Err(_)`; same for an early
+    ///    break when the writer task closed.
+    /// 2. After the inner block resolves either way, the registry's
+    ///    outbound sender is cleared and the local sender dropped.
+    ///    Only then does the writer task's `rx.recv().await`
+    ///    observe all senders closed and exit.
+    /// 3. `writer_handle.await` joins the writer; its I/O result is
+    ///    consulted alongside the reader's.
+    /// 4. Error propagation prefers the reader error (the proximate
+    ///    cause when the underlying I/O breaks) and falls through to
+    ///    the writer error only on a clean reader completion. A
+    ///    writer-task panic surfaces as `io::Error::other`.
     pub async fn serve<R, W>(&self, reader: R, writer: W) -> std::io::Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
@@ -130,39 +141,56 @@ impl Server {
         info!("mcp server ready");
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
-        loop {
-            line.clear();
-            let n = buf_reader.read_line(&mut line).await?;
-            if n == 0 {
-                break;
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let response = match serde_json::from_str::<Value>(trimmed) {
-                Ok(v) => self.handle_request(v).await,
-                Err(e) => Some(JsonRpcResponse::err(
-                    Value::Null,
-                    JsonRpcError::parse(format!("parse error: {e}")),
-                )),
-            };
-            if let Some(r) = response {
-                let payload = serialize_response(&r);
-                if out_tx.send(payload).is_err() {
-                    error!("writer task closed; dropping response");
+
+        // Capture the loop result rather than `?`-propagating. The
+        // cleanup phase below must run on every path (EOF, reader
+        // error, writer-task-closed) so the registry never holds a
+        // dangling outbound Sender.
+        let read_result: std::io::Result<()> = async {
+            loop {
+                line.clear();
+                let n = buf_reader.read_line(&mut line).await?;
+                if n == 0 {
                     break;
                 }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let response = match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) => self.handle_request(v).await,
+                    Err(e) => Some(JsonRpcResponse::err(
+                        Value::Null,
+                        JsonRpcError::parse(format!("parse error: {e}")),
+                    )),
+                };
+                if let Some(r) = response {
+                    let payload = serialize_response(&r);
+                    if out_tx.send(payload).is_err() {
+                        error!("writer task closed; dropping response");
+                        break;
+                    }
+                }
             }
+            Ok(())
         }
+        .await;
+
         info!("mcp server shutting down");
-        // Order matters — see the doc comment above. clear_outbound
-        // first so the writer task's receiver sees all senders close
-        // once we also drop the local one.
         self.resources.clear_outbound();
         drop(out_tx);
-        let _ = writer_handle.await;
-        Ok(())
+        let writer_result = writer_handle.await;
+
+        // Reader error wins — it's the proximate cause when the
+        // underlying transport breaks. Writer errors propagate only
+        // when the reader completed cleanly.
+        read_result?;
+        match writer_result {
+            Ok(io_result) => io_result,
+            Err(join_err) => Err(std::io::Error::other(format!(
+                "writer task panicked: {join_err}"
+            ))),
+        }
     }
 
     /// Dispatch one JSON-RPC message. Returns None for notifications (no id).
