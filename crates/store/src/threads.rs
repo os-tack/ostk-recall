@@ -295,6 +295,17 @@ pub enum ChainEvent {
         reason: AttentionSkipReason,
         ts: DateTime<Utc>,
     },
+    /// P9b-min — one chunk was just included in the rendered
+    /// memory-lens resource. Audit-only: replay does not restore
+    /// any in-memory state; the loop reads recent `LensIncluded`
+    /// events directly when the P9b-full refractory penalty lands.
+    /// Logged ONLY after the registry update + notification
+    /// succeed (`p9b-lens-portfolio.md`, "Background loop" step 4).
+    LensIncluded {
+        chunk_id: String,
+        slot: String,
+        ts: DateTime<Utc>,
+    },
 }
 
 /// Sink for substrate chain rows.
@@ -347,6 +358,7 @@ impl ChainEvent {
             Self::FocusSet { .. } => "focus_set",
             Self::RollingVectorSnapshot { .. } => "rolling_vector_snapshot",
             Self::AttentionTurnSkipped { .. } => "attention_turn_skipped",
+            Self::LensIncluded { .. } => "lens_included",
         }
     }
 
@@ -365,7 +377,8 @@ impl ChainEvent {
             | Self::ThreadLinkRemove { ts, .. }
             | Self::FocusSet { ts, .. }
             | Self::RollingVectorSnapshot { ts, .. }
-            | Self::AttentionTurnSkipped { ts, .. } => ts,
+            | Self::AttentionTurnSkipped { ts, .. }
+            | Self::LensIncluded { ts, .. } => ts,
         }
     }
 
@@ -458,6 +471,12 @@ impl ChainEvent {
             Self::AttentionTurnSkipped { scope, reason, .. } => serde_json::json!({
                 "scope": scope,
                 "reason": reason.as_str(),
+            }),
+            Self::LensIncluded {
+                chunk_id, slot, ..
+            } => serde_json::json!({
+                "chunk_id": chunk_id,
+                "slot": slot,
             }),
         };
         serde_json::to_string(&v)
@@ -760,6 +779,11 @@ impl ChainEvent {
                 })?;
                 Self::AttentionTurnSkipped { scope, reason, ts }
             }
+            "lens_included" => Self::LensIncluded {
+                chunk_id: s_field("chunk_id")?,
+                slot: s_field("slot")?,
+                ts,
+            },
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
                     message: format!("unknown chain kind: {other}"),

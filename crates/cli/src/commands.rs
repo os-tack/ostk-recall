@@ -1133,7 +1133,13 @@ async fn replay_chain_into_attention(
             | ChainEvent::ThreadLinkRemove { .. }
             // P6A: AttentionTurnSkipped is audit-only — no in-memory
             // state to restore for a turn that was rejected.
-            | ChainEvent::AttentionTurnSkipped { .. } => {}
+            | ChainEvent::AttentionTurnSkipped { .. }
+            // P9b-min: LensIncluded is audit-only — the lens loop
+            // reads recent events for the refractory penalty in
+            // P9b-full but replay does not restore any in-memory
+            // state. last_portfolio_chunk_ids is carried in
+            // lens_state.json instead.
+            | ChainEvent::LensIncluded { .. } => {}
         }
     }
 

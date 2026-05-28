@@ -37,6 +37,8 @@ tracing-appender = { workspace = true }
 rayon = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 notify-debouncer-full = { workspace = true }
 fs4 = { workspace = true }
