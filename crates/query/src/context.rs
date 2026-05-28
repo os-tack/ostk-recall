@@ -101,19 +101,25 @@ impl AttentionContext {
         }
     }
 
-    /// Set both the effective scope vector and the rolling channel
-    /// in one call. Used by P9b-min's enrich step (snapshot before
-    /// the attention lock drops); also handy in tests.
+    /// Populate the rolling channel and, when no effective scope
+    /// vector is set yet, seed `scope_vector` from the same vec.
     ///
-    /// `scope_vector` is populated alongside `rolling_vec` so callers
-    /// that scored on the affinity path see a non-zero value. A
-    /// rolling-only setter would have surprised
-    /// [`crate::rank::attention_affinity_score`], which reads
-    /// `scope_vector` exclusively (that's where pin precedence still
-    /// applies upstream).
+    /// The two-field behaviour exists so callers using a bare
+    /// `AttentionContext::default().with_rolling(v)` get a non-zero
+    /// affinity score — [`crate::rank::attention_affinity_score`]
+    /// reads `scope_vector` exclusively. But when `scope_vector`
+    /// has already been set (typically by an operator pin via
+    /// [`Self::with_scope_vector`]), pin precedence must win:
+    /// `with_rolling` is purely additive in that case, and the pin
+    /// stays authoritative for ranking. The runtime-side priority
+    /// chain (`pinned → rolling → transient`) already resolved which
+    /// vec belongs in `scope_vector`; the builder here must not
+    /// rewrite that decision.
     #[must_use]
     pub fn with_rolling(mut self, rolling: Vec<f32>) -> Self {
-        self.scope_vector = Some(rolling.clone());
+        if self.scope_vector.is_none() {
+            self.scope_vector = Some(rolling.clone());
+        }
         self.rolling_vec = Some(rolling);
         self
     }

@@ -111,6 +111,49 @@ fn with_rolling_builder_drives_affinity_score() {
 }
 
 #[test]
+fn with_rolling_preserves_existing_scope_vector() {
+    // Review-fix regression test: pin precedence must survive a
+    // `.with_rolling()` chained on after `with_scope_vector`. P9b's
+    // enrich step composes contexts as
+    // `with_scope_vector(pinned).with_rolling(rolling_snapshot)`;
+    // a naive setter that always overwrites `scope_vector` would
+    // silently demote the pin to the rolling channel.
+    let pin = vec![1.0, 0.0, 0.0];
+    let rolling = vec![0.0, 1.0, 0.0];
+    let ctx = AttentionContext::with_scope_vector(pin.clone()).with_rolling(rolling.clone());
+    assert_eq!(
+        ctx.scope_vector.as_deref(),
+        Some(pin.as_slice()),
+        "pin must survive a subsequent with_rolling"
+    );
+    assert_eq!(
+        ctx.rolling_vec.as_deref(),
+        Some(rolling.as_slice()),
+        "rolling channel must still be populated"
+    );
+}
+
+#[test]
+fn affinity_scores_against_pin_when_both_set() {
+    // The behavioural counterpart to the field-level test above:
+    // when `with_scope_vector` and `with_rolling` are both used,
+    // affinity scoring follows the pin (which is what
+    // `attention_affinity_score` reads).
+    let cand = make_candidate("c1", Some(vec![1.0, 0.0, 0.0]));
+    // Pin aligns with the candidate; rolling is orthogonal — the
+    // delta is large enough that misreading one for the other can't
+    // be hidden by float fuzz.
+    let pin = vec![1.0, 0.0, 0.0];
+    let rolling = vec![0.0, 1.0, 0.0];
+    let ctx = AttentionContext::with_scope_vector(pin).with_rolling(rolling);
+    let score = attention_affinity_score(&cand, &ctx);
+    assert!(
+        (score - 1.0).abs() < 1e-6,
+        "affinity must score against the pinned scope_vector, not rolling (got {score})"
+    );
+}
+
+#[test]
 fn score_is_in_unit_interval() {
     // Random-ish vectors — verify the score is always in [0, 1].
     let cand = make_candidate("c1", Some(vec![0.6, 0.8, 0.0]));
