@@ -12,7 +12,10 @@ use chrono::Utc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use ostk_recall_core::{Chunk, RetentionPolicy, Scanner, SourceConfig, SourceItem, SourceKind};
+use ostk_recall_core::{
+    Chunk, RetentionPolicy, Scanner, SourceConfig, SourceItem, SourceKind, cfg_overlay_hash,
+    compose_header, filter_to_allowlist, merge_override,
+};
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 
@@ -143,6 +146,68 @@ impl Pipeline {
         self.events.subscribe()
     }
 
+    /// P1: apply the per-chunk facet overlay and compute the embedding
+    /// input hash in-place.
+    ///
+    /// Merges `cfg.facets` (operator override) into `chunk.facets`
+    /// (scanner-emitted) per per-key cardinality. Legacy
+    /// `[[sources]].project = "x"` is desugared to a `project` facet
+    /// here too — the scalar field is in flight for v0.7 deprecation
+    /// but the override-merge path is the canonical home.
+    ///
+    /// Then composes the deterministic header from the allowlisted
+    /// subset and stamps `embedding_input_sha256` on the chunk.
+    fn apply_p1_overlay(&self, chunk: &mut Chunk, cfg: &SourceConfig) {
+        // Legacy `project` desugar: prepend the scalar value before the
+        // operator override runs so an operator-supplied `facets.project`
+        // unions on top.
+        if let Some(legacy_project) = cfg.project.as_deref() {
+            if !legacy_project.is_empty() {
+                merge_override(
+                    &mut chunk.facets,
+                    "project",
+                    vec![legacy_project.to_string()],
+                );
+            }
+        }
+        for (key, values) in &cfg.facets {
+            merge_override(&mut chunk.facets, key, values.clone());
+        }
+        self.stamp_embedding_input_sha256(chunk);
+    }
+
+    /// Compute and stamp `embedding_input_sha256` from `chunk.facets` +
+    /// `chunk.text`. Used by both the scanner-driven path (after the
+    /// override merge) and the synthetic path (no override).
+    fn stamp_embedding_input_sha256(&self, chunk: &mut Chunk) {
+        let allow = filter_to_allowlist(&chunk.facets);
+        let header = compose_header(&allow);
+        chunk.embedding_input_sha256 =
+            Chunk::embedding_input_hash(self.embedder_model_id(), &header, &chunk.text);
+    }
+
+    /// Returns the embedder's model identifier used to scope the
+    /// `embedding_input_sha256`. The pipeline doesn't itself carry the
+    /// model id (the [`ChunkEmbedder`] trait is dim-only), so for now
+    /// we use a placeholder — bumping this is equivalent to bumping
+    /// `ALLOWLIST_VERSION`: it forces a corpus-wide re-embed.
+    fn embedder_model_id(&self) -> &'static str {
+        // TODO(P5): pipe through the actual embedder model id from
+        // ChunkEmbedder once we add `fn model_id(&self) -> &str`.
+        // Until then, every re-tag/text-change hashes against a fixed
+        // version; bumping this constant (or ALLOWLIST_VERSION /
+        // HEADER_FORMAT_VERSION) forces a re-embed.
+        "default"
+    }
+
+    /// P1: hash the per-source overlay state — legacy `project` + the
+    /// operator `facets` override — so Tier-1 (mtime/size) can detect
+    /// "operator changed facets without touching the file" and force a
+    /// re-parse. Delegates to `core::cfg_overlay_hash`.
+    fn cfg_overlay_hash(&self, cfg: &SourceConfig) -> String {
+        cfg_overlay_hash(cfg.project.as_deref(), &cfg.facets)
+    }
+
     // Casts: `d.as_micros() as i64` and `meta.len() as i64` are intentional —
     // micros within i64 range until year 294247; file lengths under 8 EiB.
     // Length and nested-if shape track the parallel `ingest_paths_for_source`.
@@ -170,7 +235,10 @@ impl Pipeline {
             };
             stats.items_seen += 1;
 
-            // Tier 1: File-level metadata check
+            // Tier 1: File-level metadata check, gated by cfg-overlay
+            // hash so operator facet edits force re-parse even when the
+            // file mtime/size are unchanged (P1).
+            let overlay_hash = self.cfg_overlay_hash(cfg);
             if let Some(path) = &item.path {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mtime = meta
@@ -180,11 +248,11 @@ impl Pipeline {
                         .map_or(0, |d| d.as_micros() as i64);
                     let size = meta.len() as i64;
 
-                    if let Ok(Some((old_mtime, old_size))) =
+                    if let Ok(Some((old_mtime, old_size, old_overlay))) =
                         self.ingest
                             .get_source_metadata(source_kind_str, &cfg.source_config_id, &item.source_id)
                     {
-                        if old_mtime == mtime && old_size == size {
+                        if old_mtime == mtime && old_size == size && old_overlay == overlay_hash {
                             if self
                                 .ingest
                                 .touch_source_chunks(
@@ -207,6 +275,7 @@ impl Pipeline {
                         &item.source_id,
                         mtime,
                         size,
+                        &overlay_hash,
                         &self.run_id,
                     );
                 }
@@ -222,11 +291,16 @@ impl Pipeline {
             };
             stats.chunks_emitted += chunks.len();
 
-            for chunk in chunks {
-                // Tier 2: Chunk-level dedupe
+            for mut chunk in chunks {
+                // P1: stamp facets + embedding_input_sha256 BEFORE dedupe
+                // so the Tier-2 check observes facet edits.
+                self.apply_p1_overlay(&mut chunk, cfg);
+
+                // Tier 2: skip when both chunk_id AND embedding input
+                // are unchanged (text + allowlisted facets identical).
                 match self
                     .ingest
-                    .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
+                    .content_already_embedded(&chunk.chunk_id, &chunk.embedding_input_sha256)
                 {
                     Ok(true) => {
                         stats.chunks_skipped_dup += 1;
@@ -237,6 +311,7 @@ impl Pipeline {
                             source_id: chunk.source_id.clone(),
                             chunk_index: chunk.chunk_index,
                             content_sha256: chunk.sha256.clone(),
+                            embedding_input_sha256: chunk.embedding_input_sha256.clone(),
                         };
                         let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
                     }
@@ -375,11 +450,15 @@ impl Pipeline {
         let mut to_embed: Vec<Chunk> = Vec::with_capacity(chunks.len());
         let mut event_source_ids: HashSet<String> = HashSet::new();
 
-        for chunk in chunks {
+        for mut chunk in chunks {
             event_source_ids.insert(chunk.source_id.clone());
+            // P1: synthetic chunks bypass `[[sources]]` override but
+            // still need an `embedding_input_sha256` for the new dedupe
+            // path. Whatever facets the synthetic producer set survive.
+            self.stamp_embedding_input_sha256(&mut chunk);
             match self
                 .ingest
-                .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
+                .content_already_embedded(&chunk.chunk_id, &chunk.embedding_input_sha256)
             {
                 Ok(true) => {
                     stats.chunks_skipped_dup += 1;
@@ -390,6 +469,7 @@ impl Pipeline {
                         source_id: chunk.source_id.clone(),
                         chunk_index: chunk.chunk_index,
                         content_sha256: chunk.sha256.clone(),
+                        embedding_input_sha256: chunk.embedding_input_sha256.clone(),
                     };
                     let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
                 }
@@ -509,6 +589,7 @@ impl Pipeline {
             stats.items_seen += 1;
 
             // Tier 1: file-level metadata short-circuit (same as ingest_source).
+            let overlay_hash = self.cfg_overlay_hash(cfg);
             if let Some(path) = &item.path {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mtime = meta
@@ -518,11 +599,11 @@ impl Pipeline {
                         .map_or(0, |d| d.as_micros() as i64);
                     let size = meta.len() as i64;
 
-                    if let Ok(Some((old_mtime, old_size))) =
+                    if let Ok(Some((old_mtime, old_size, old_overlay))) =
                         self.ingest
                             .get_source_metadata(source_kind_str, &cfg.source_config_id, &item.source_id)
                     {
-                        if old_mtime == mtime && old_size == size {
+                        if old_mtime == mtime && old_size == size && old_overlay == overlay_hash {
                             if self
                                 .ingest
                                 .touch_source_chunks(
@@ -545,6 +626,7 @@ impl Pipeline {
                         &item.source_id,
                         mtime,
                         size,
+                        &overlay_hash,
                         &self.run_id,
                     );
                 }
@@ -560,10 +642,11 @@ impl Pipeline {
             };
             stats.chunks_emitted += chunks.len();
 
-            for chunk in chunks {
+            for mut chunk in chunks {
+                self.apply_p1_overlay(&mut chunk, cfg);
                 match self
                     .ingest
-                    .content_already_ingested(&chunk.chunk_id, &chunk.sha256)
+                    .content_already_embedded(&chunk.chunk_id, &chunk.embedding_input_sha256)
                 {
                     Ok(true) => {
                         stats.chunks_skipped_dup += 1;
@@ -574,6 +657,7 @@ impl Pipeline {
                             source_id: chunk.source_id.clone(),
                             chunk_index: chunk.chunk_index,
                             content_sha256: chunk.sha256.clone(),
+                            embedding_input_sha256: chunk.embedding_input_sha256.clone(),
                         };
                         let _ = self.ingest.record_chunk(&row, Some(&self.run_id));
                     }
@@ -716,6 +800,7 @@ impl Pipeline {
                 source_id: chunk.source_id.clone(),
                 chunk_index: chunk.chunk_index,
                 content_sha256: chunk.sha256.clone(),
+                embedding_input_sha256: chunk.embedding_input_sha256.clone(),
             };
             self.ingest
                 .record_chunk(&row, Some(&self.run_id))
@@ -890,6 +975,7 @@ mod tests {
             extensions: vec![],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
         }
 
@@ -992,6 +1078,7 @@ mod tests {
             extensions: vec!["rs".into()],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         // First run
@@ -1085,6 +1172,7 @@ mod tests {
             extensions: vec![],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
         let code_cfg = SourceConfig {
             kind: SourceKind::Code,
@@ -1094,6 +1182,7 @@ mod tests {
             extensions: vec!["rs".into()],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         let paths = vec![
@@ -1238,6 +1327,7 @@ mod tests {
             extensions: vec!["rs".into()],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         // Initial ingest via scan_paths (single-path).
@@ -1303,6 +1393,7 @@ mod tests {
             extensions: vec!["rs".into()],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         pipeline
@@ -1358,6 +1449,7 @@ mod tests {
             extensions: vec!["rs".into()],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         pipeline
@@ -1434,6 +1526,8 @@ mod tests {
             source: Source::Gemini,
             project: Some("phase4-test".into()),
             source_id: source_id.to_string(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
             source_config_id: "test-cfg".to_string(),
             chunk_index: idx,
             ts: None,

@@ -110,6 +110,11 @@ pub async fn rebuild_ingest_manifest(
                 source_config_id: source_cfg_ids.value(i).to_string(),
                 chunk_index: chunk_indices.value(i),
                 content_sha256: shas.value(i).to_string(),
+                // Rebuild can't reconstruct the embedding-input hash from
+                // corpus.lance alone (the header version + model id aren't
+                // stored). Leave empty so the next scan force-recomputes
+                // it; users who never re-tag won't notice.
+                embedding_input_sha256: String::new(),
             };
             ingest.record_chunk(&row, Some(run_id))?;
             // Reconstruct an ingest_sources row keyed on
@@ -122,6 +127,7 @@ pub async fn rebuild_ingest_manifest(
                 &row.source_id,
                 0,
                 0,
+                "",
                 run_id,
             )?;
             written += 1;

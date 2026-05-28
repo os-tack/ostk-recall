@@ -106,6 +106,8 @@ async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
             source: Source::Markdown,
             project: Some("notes".into()),
             source_id: anchor_source_id.into(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
             source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: Some(Utc::now()),

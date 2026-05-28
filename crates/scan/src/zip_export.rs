@@ -174,6 +174,8 @@ impl Scanner for ZipExportScanner {
                     project: item.project.clone(),
                     source_id,
                     source_config_id: item.source_config_id.clone(),
+                    facets: Default::default(),
+                    embedding_input_sha256: String::new(),
                     chunk_index,
                     ts: msg.created_at,
                     role: Some(role.into()),
@@ -328,6 +330,7 @@ mod tests {
             extensions: vec![],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
         }
 

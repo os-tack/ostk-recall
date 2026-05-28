@@ -74,6 +74,10 @@ pub struct RecallParams {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// Half-open upper bound (`ts < before`). Combined with `since` this
+    /// yields a `[since, before)` interval. P1 addition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     /// Cap on hits sharing the same `source_id` after RRF reranking.

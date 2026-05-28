@@ -437,6 +437,8 @@ mod tests {
             source: Source::Markdown,
             project: Some("test".into()),
             source_id: format!("{id}.md"),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
             source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: None,

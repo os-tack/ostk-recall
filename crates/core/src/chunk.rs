@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::facets::{ALLOWLIST_VERSION, FacetSet, HEADER_FORMAT_VERSION};
 use crate::source::{Source, SourceKind};
 
 /// A unit of content ready to be embedded and stored.
@@ -28,6 +29,19 @@ pub struct Chunk {
     pub text: String,
     pub sha256: String,
     pub links: Links,
+    /// Interpretive overlay (P1). Scanner-emitted + operator-override,
+    /// merged per per-key cardinality. Identity is NOT a function of
+    /// facets; the embedding input IS (via the allowlisted subset →
+    /// `embedding_input_sha256`).
+    #[serde(default)]
+    pub facets: FacetSet,
+    /// SHA-256 over `(header_format_version || allowlist_version ||
+    /// embedder_model_id || allowlisted_facet_header || text)`.
+    /// Drives the Tier-2 dedupe check — changing an allowlisted facet
+    /// triggers re-embed; changing a non-allowlisted facet does not.
+    /// Always non-empty after pipeline ingest.
+    #[serde(default)]
+    pub embedding_input_sha256: String,
     #[serde(default)]
     pub extra: serde_json::Value,
 }
@@ -82,6 +96,32 @@ impl Chunk {
     #[must_use]
     pub fn content_hash(text: &str) -> String {
         hex::encode(Sha256::digest(text.as_bytes()))
+    }
+
+    /// Compute the embedding-input hash (P1).
+    ///
+    /// Includes versioning bytes so a header-format bump or allowlist
+    /// change forces a corpus-wide re-embed on next scan:
+    /// `sha256(HEADER_FORMAT_VERSION || ALLOWLIST_VERSION ||
+    /// embedder_model_id || allowlisted_header || text)`.
+    ///
+    /// `allowlisted_header` is the deterministic header from
+    /// `compose_header(filter_to_allowlist(facets))`.
+    #[must_use]
+    pub fn embedding_input_hash(
+        embedder_model_id: &str,
+        allowlisted_header: &str,
+        text: &str,
+    ) -> String {
+        let mut h = Sha256::new();
+        h.update(HEADER_FORMAT_VERSION.to_le_bytes());
+        h.update(ALLOWLIST_VERSION.to_le_bytes());
+        h.update(embedder_model_id.as_bytes());
+        h.update(b"|");
+        h.update(allowlisted_header.as_bytes());
+        h.update(b"\n\n");
+        h.update(text.as_bytes());
+        hex::encode(h.finalize())
     }
 }
 

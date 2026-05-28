@@ -18,6 +18,19 @@ pub fn corpus_schema(dim: usize) -> Arc<Schema> {
         Field::new("project", DataType::Utf8, true),
         Field::new("source_id", DataType::Utf8, false),
         Field::new("source_config_id", DataType::Utf8, true),
+        // P1: per-chunk facets, serialized as `key:value` strings. Sorted
+        // for stable round-trip. `array_contains(facets, 'project:auth')`
+        // is the single-value filter primitive; OR-of-contains expresses
+        // multi-value filters.
+        Field::new(
+            "facets",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        // P1: drives Tier-2 dedupe. Changing an allowlisted facet flips
+        // this hash and forces a re-embed; other-facet edits leave it
+        // alone.
+        Field::new("embedding_input_sha256", DataType::Utf8, true),
         Field::new("chunk_index", DataType::UInt32, false),
         Field::new(
             "ts",

@@ -374,6 +374,8 @@ fn build_chunks(
             source,
             project: project.map(str::to_string),
             source_id: source_id_base.to_string(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
             source_config_id: source_config_id.to_string(),
             chunk_index,
             ts: block.ts.or(first_ts),

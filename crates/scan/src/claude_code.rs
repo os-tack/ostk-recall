@@ -133,6 +133,7 @@ mod tests {
             extensions: vec![],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
         }
 

@@ -260,6 +260,16 @@ pub struct SourceConfig {
     pub ignore: Vec<String>,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Operator-supplied facet overrides (P1). Merged into each emitted
+    /// chunk's `facets` via per-key cardinality (single replaces, multi
+    /// unions). Empty-list sentinel `key = []` clears a multi-cardinality
+    /// scanner-emitted set.
+    ///
+    /// Facet keys participate in `embedding_input_sha256` only if they
+    /// are in `EMBED_FACET_ALLOWLIST` — other keys are filter-only and
+    /// don't trigger re-embed.
+    #[serde(default)]
+    pub facets: std::collections::BTreeMap<String, Vec<String>>,
     /// Operator-supplied physical-identity discriminator. When two
     /// `[[sources]]` blocks share the same `(kind, paths, extensions,
     /// ignore)` shape, the default `source_config_id` would collide; set

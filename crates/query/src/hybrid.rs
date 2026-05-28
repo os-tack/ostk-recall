@@ -99,6 +99,7 @@ pub async fn recall(
         params.project.as_deref(),
         params.source.as_deref(),
         params.since,
+        params.before,
     );
 
     let mut candidates = run_hybrid_query(
@@ -118,6 +119,7 @@ pub async fn recall(
             params.project.as_deref(),
             Some(Source::Code.as_str()),
             params.since,
+            params.before,
         );
         match run_hybrid_query(
             &table,
@@ -370,6 +372,7 @@ fn build_filter(
     project: Option<&str>,
     source: Option<&str>,
     since: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
 ) -> Option<String> {
     let mut clauses: Vec<String> = Vec::new();
     if let Some(p) = project {
@@ -380,6 +383,10 @@ fn build_filter(
     }
     if let Some(t) = since {
         clauses.push(format!("ts >= TIMESTAMP '{}'", t.to_rfc3339()));
+    }
+    if let Some(t) = before {
+        // Half-open: combined with `since`, this yields [since, before).
+        clauses.push(format!("ts < TIMESTAMP '{}'", t.to_rfc3339()));
     }
     if clauses.is_empty() {
         None
@@ -396,12 +403,12 @@ mod tests {
 
     #[test]
     fn build_filter_empty() {
-        assert!(build_filter(None, None, None).is_none());
+        assert!(build_filter(None, None, None, None).is_none());
     }
 
     #[test]
     fn build_filter_project_and_source() {
-        let f = build_filter(Some("foo"), Some("markdown"), None).unwrap();
+        let f = build_filter(Some("foo"), Some("markdown"), None, None).unwrap();
         assert!(f.contains("project = 'foo'"));
         assert!(f.contains("source = 'markdown'"));
         assert!(f.contains("AND"));
@@ -409,7 +416,7 @@ mod tests {
 
     #[test]
     fn build_filter_escapes_quotes() {
-        let f = build_filter(Some("a'b"), None, None).unwrap();
+        let f = build_filter(Some("a'b"), None, None, None).unwrap();
         assert_eq!(f, "project = 'a''b'");
     }
 
@@ -418,7 +425,7 @@ mod tests {
         let t = DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let f = build_filter(None, None, Some(t)).unwrap();
+        let f = build_filter(None, None, Some(t), None).unwrap();
         assert!(f.contains("TIMESTAMP '2026-04-17T10:00:00+00:00'"));
     }
 

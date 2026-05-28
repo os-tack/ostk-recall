@@ -93,7 +93,8 @@ async fn two_configs_same_dir_do_not_collide() {
             ignore: vec![],
             extensions: vec![],
             id: Some("notes-alpha".into()),
-            source_config_id: String::new(), // sealed by validate_and_seal
+            source_config_id: String::new(), // sealed by validate_and_seal,
+            facets: Default::default(),
         },
         SourceConfig {
             kind: SourceKind::Markdown,
@@ -103,6 +104,7 @@ async fn two_configs_same_dir_do_not_collide() {
             extensions: vec![],
             id: Some("notes-beta".into()),
             source_config_id: String::new(),
+            facets: Default::default(),
         },
     ];
     let cfg = build_config(fixtures.path(), blocks);
@@ -140,6 +142,7 @@ async fn dropping_one_block_sweeps_only_its_chunks() {
             extensions: vec![],
             id: Some("notes-alpha".into()),
             source_config_id: String::new(),
+            facets: Default::default(),
         },
         SourceConfig {
             kind: SourceKind::Markdown,
@@ -149,6 +152,7 @@ async fn dropping_one_block_sweeps_only_its_chunks() {
             extensions: vec![],
             id: Some("notes-beta".into()),
             source_config_id: String::new(),
+            facets: Default::default(),
         },
     ];
     let cfg = build_config(fixtures.path(), blocks);

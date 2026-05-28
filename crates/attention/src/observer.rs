@@ -731,6 +731,8 @@ fn build_membrane_chunks(
                 project: None, // pipeline ingest_synthetic carries project via meta
                 source_id,
                 source_config_id,
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
                 chunk_index,
                 ts: Some(Utc::now()),
                 role: Some("recognition".into()),

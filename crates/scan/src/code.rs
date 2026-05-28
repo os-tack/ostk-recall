@@ -201,6 +201,8 @@ impl Scanner for CodeScanner {
                 source: Source::Code,
                 project: item.project.clone(),
                 source_id: item.source_id.clone(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
                 source_config_id: item.source_config_id.clone(),
                 chunk_index,
                 ts: mtime,
@@ -308,6 +310,7 @@ mod tests {
             extensions: exts.iter().map(|s| (*s).to_string()).collect(),
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
         }
 

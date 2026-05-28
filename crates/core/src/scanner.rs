@@ -110,6 +110,7 @@ mod tests {
             extensions: vec![],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         let requested = vec![dir.join("a.txt"), dir.join("b.txt")];
@@ -138,6 +139,7 @@ mod tests {
             extensions: vec![],
             id: None,
             source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         };
 
         // /tmp/Y/a.txt is unrelated; /tmp/Xtra/a.txt would byte-prefix

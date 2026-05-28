@@ -34,6 +34,11 @@ pub struct IngestChunkRow {
     pub source_config_id: String,
     pub chunk_index: u32,
     pub content_sha256: String,
+    /// P1: embedding-input hash. Empty string means "unknown" (pre-P1
+    /// ledger row); the pipeline treats empty as "force re-embed" via
+    /// the new `content_already_embedded` dedupe path.
+    #[serde(default)]
+    pub embedding_input_sha256: String,
 }
 
 // Connection is the lock: every method must hold the guard across `prepare`
@@ -109,25 +114,39 @@ CREATE TABLE IF NOT EXISTS ingest_sources (
     source_config_id  TEXT NOT NULL,
     mtime_micros      INTEGER NOT NULL,
     size_bytes        INTEGER NOT NULL,
+    cfg_overlay_hash  TEXT NOT NULL DEFAULT '',
     last_run_id       TEXT,
     PRIMARY KEY (source, source_id, source_config_id)
 );
 
 CREATE TABLE IF NOT EXISTS ingest_chunks (
-    chunk_id          TEXT PRIMARY KEY,
-    source            TEXT NOT NULL,
-    source_id         TEXT NOT NULL,
-    source_config_id  TEXT NOT NULL,
-    chunk_index       INTEGER NOT NULL,
-    content_sha256    TEXT NOT NULL,
-    upserted_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_run_id       TEXT
+    chunk_id                TEXT PRIMARY KEY,
+    source                  TEXT NOT NULL,
+    source_id               TEXT NOT NULL,
+    source_config_id        TEXT NOT NULL,
+    chunk_index             INTEGER NOT NULL,
+    content_sha256          TEXT NOT NULL,
+    embedding_input_sha256  TEXT NOT NULL DEFAULT '',
+    upserted_at             TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_run_id             TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
     ON ingest_chunks(source, source_config_id, source_id);
 ",
         )?;
+
+        // P1: additive columns for v0.6 ledgers that pre-date the
+        // embedding-input hash and the cfg-overlay hash. Tolerates
+        // "already exists" errors so re-open is idempotent.
+        let _ = conn.execute(
+            "ALTER TABLE ingest_chunks ADD COLUMN embedding_input_sha256 TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE ingest_sources ADD COLUMN cfg_overlay_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         Ok(())
     }
@@ -141,12 +160,35 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
         Ok(exists)
     }
 
+    /// P1: Tier-2 dedupe. Skip embedding when an existing row already
+    /// has this exact `(chunk_id, embedding_input_sha256)` — that means
+    /// neither text nor any allowlisted facet changed.
+    ///
+    /// Empty `embedding_input_sha256` is treated as "unknown" and never
+    /// matches (forces re-embed on first P1 ingest after upgrade).
+    pub fn content_already_embedded(
+        &self,
+        chunk_id: &str,
+        embedding_input_sha256: &str,
+    ) -> Result<bool> {
+        if embedding_input_sha256.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM ingest_chunks
+             WHERE chunk_id = ? AND embedding_input_sha256 = ? LIMIT 1",
+        )?;
+        let exists = stmt.exists(params![chunk_id, embedding_input_sha256])?;
+        Ok(exists)
+    }
+
     pub fn record_chunk(&self, row: &IngestChunkRow, run_id: Option<&str>) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "INSERT OR REPLACE INTO ingest_chunks
-             (chunk_id, source, source_id, source_config_id, chunk_index, content_sha256, last_run_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (chunk_id, source, source_id, source_config_id, chunk_index, content_sha256, embedding_input_sha256, last_run_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 row.chunk_id,
                 row.source,
@@ -154,26 +196,32 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
                 row.source_config_id,
                 row.chunk_index,
                 row.content_sha256,
+                row.embedding_input_sha256,
                 run_id
             ],
         )?;
         Ok(())
     }
 
+    /// Returns `(mtime_micros, size_bytes, cfg_overlay_hash)` if a row
+    /// exists. `cfg_overlay_hash` is empty for v0.5 rows (`ALTER TABLE`
+    /// migration default); the pipeline treats empty as "always re-parse"
+    /// for the first scan after upgrade.
     pub fn get_source_metadata(
         &self,
         source: &str,
         source_config_id: &str,
         source_id: &str,
-    ) -> Result<Option<(i64, i64)>> {
+    ) -> Result<Option<(i64, i64, String)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT mtime_micros, size_bytes FROM ingest_sources WHERE source = ? AND source_config_id = ? AND source_id = ?"
+            "SELECT mtime_micros, size_bytes, cfg_overlay_hash FROM ingest_sources WHERE source = ? AND source_config_id = ? AND source_id = ?"
         )?;
         let res = stmt.query_row(params![source, source_config_id, source_id], |r| {
             let m: i64 = r.get(0)?;
             let s: i64 = r.get(1)?;
-            Ok((m, s))
+            let h: String = r.get(2)?;
+            Ok((m, s, h))
         });
         match res {
             Ok(v) => Ok(Some(v)),
@@ -208,13 +256,14 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
         source_id: &str,
         mtime: i64,
         size: i64,
+        cfg_overlay_hash: &str,
         run_id: &str,
     ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO ingest_sources (source, source_id, source_config_id, mtime_micros, size_bytes, last_run_id)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![source, source_id, source_config_id, mtime, size, run_id],
+            "INSERT OR REPLACE INTO ingest_sources (source, source_id, source_config_id, mtime_micros, size_bytes, cfg_overlay_hash, last_run_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![source, source_id, source_config_id, mtime, size, cfg_overlay_hash, run_id],
         )?;
         Ok(())
     }
@@ -384,6 +433,7 @@ mod tests {
             source_config_id: "cfg-test".into(),
             chunk_index: 0,
             content_sha256: "deadbeef".into(),
+            embedding_input_sha256: String::new(),
         };
         db.record_chunk(&row, Some("run-1")).unwrap();
         assert!(db.content_already_ingested("abc", "deadbeef").unwrap());
@@ -406,6 +456,7 @@ mod tests {
                     source_config_id: cfg.into(),
                     chunk_index: i,
                     content_sha256: format!("sha-{i}"),
+                    embedding_input_sha256: String::new(),
                 },
                 Some("run-1"),
             )
@@ -420,13 +471,14 @@ mod tests {
                 source_config_id: cfg.into(),
                 chunk_index: 0,
                 content_sha256: "sha-keep".into(),
+                embedding_input_sha256: String::new(),
             },
             Some("run-1"),
         )
         .unwrap();
-        db.update_source_metadata("markdown", cfg, "doomed.md", 0, 0, "run-1")
+        db.update_source_metadata("markdown", cfg, "doomed.md", 0, 0, "", "run-1")
             .unwrap();
-        db.update_source_metadata("markdown", cfg, "keep.md", 0, 0, "run-1")
+        db.update_source_metadata("markdown", cfg, "keep.md", 0, 0, "", "run-1")
             .unwrap();
 
         let purged = db

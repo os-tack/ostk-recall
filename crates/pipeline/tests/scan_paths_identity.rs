@@ -60,6 +60,7 @@ fn make_cfg(fixtures_dir: &Path) -> SourceConfig {
             extensions: vec![],
             id: None,
             source_config_id: String::new(),
+            facets: Default::default(),
         }],
         reranker: None,
         watch: None,

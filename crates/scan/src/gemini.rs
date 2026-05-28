@@ -136,6 +136,8 @@ impl Scanner for GeminiScanner {
                         source: Source::Gemini,
                         project: item.project.clone(),
                         source_id: item.source_id.clone(),
+                        facets: Default::default(),
+                        embedding_input_sha256: String::new(),
                         source_config_id: item.source_config_id.clone(),
                         chunk_index,
                         ts,

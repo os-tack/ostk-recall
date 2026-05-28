@@ -1118,6 +1118,35 @@ fn build_record_batch(
             }
         })
         .collect();
+    // P1: facets serialized as `key:value` strings via to_list (sorted
+    // for stable round-trip). Column is List<Utf8>.
+    let facets_lists: Vec<Vec<String>> = chunks
+        .iter()
+        .map(|c| ostk_recall_core::to_list(&c.facets))
+        .collect();
+    let facets_col = {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        let mut b = ListBuilder::new(StringBuilder::new());
+        for list in &facets_lists {
+            for v in list {
+                b.values().append_value(v);
+            }
+            b.append(true);
+        }
+        b.finish()
+    };
+    // P1: embedding_input_sha256 — nullable; empty string maps to NULL
+    // for migration symmetry.
+    let embedding_input_sha256: StringArray = chunks
+        .iter()
+        .map(|c| {
+            if c.embedding_input_sha256.is_empty() {
+                None
+            } else {
+                Some(c.embedding_input_sha256.as_str())
+            }
+        })
+        .collect();
     let chunk_index = UInt32Array::from_iter_values(chunks.iter().map(|c| c.chunk_index));
     let ts = TimestampMicrosecondArray::from(
         chunks
@@ -1172,6 +1201,8 @@ fn build_record_batch(
             Arc::new(project),
             Arc::new(source_id),
             Arc::new(source_config_id),
+            Arc::new(facets_col),
+            Arc::new(embedding_input_sha256),
             Arc::new(chunk_index),
             Arc::new(ts),
             Arc::new(role),
@@ -1198,6 +1229,8 @@ mod tests {
             source: Source::Markdown,
             project: Some("test".into()),
             source_id: "file.md".into(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
             source_config_id: "test-cfg".into(),
             chunk_index: 0,
             ts: None,
@@ -1345,6 +1378,8 @@ mod tests {
             source: Source::Markdown,
             project: Some(project.to_string()),
             source_id: format!("{id}.md"),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
             source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: Some(ts),
