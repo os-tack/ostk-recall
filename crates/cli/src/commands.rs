@@ -307,6 +307,13 @@ fn spawn_ambient_daemons(
     if let Some(attn) = attention {
         observer = observer.with_attention(attn);
     }
+    // P6A — share the ledger's chain sink with the observer so every
+    // observe()-mediated `attend()` persists
+    // `RollingVectorSnapshot` (or `AttentionTurnSkipped` once the
+    // P6-full noise gate ships). Without this the rolling channel
+    // lives only in memory and a restart erases it. The sink is
+    // already `Arc`-shared, so this is a clone of a pointer.
+    observer = observer.with_chain_sink(threads.chain_sink());
     let observer = Arc::new(observer);
     let weaver = Arc::new(AutoWeaver::new(
         Arc::clone(threads),
@@ -1075,6 +1082,16 @@ async fn replay_chain_into_attention(
     // by Familiarize). Type inferred from the ChainEvent::FocusSet
     // pattern below.
     let mut focus_events = Vec::new();
+    // P6A — RollingVectorSnapshot is idempotent per scope (each
+    // event supersedes the previous), so we keep only the latest
+    // per `(project, session_id, agent)` triple. Chain rows arrive
+    // in chronological order, so HashMap::insert with the same key
+    // naturally drops older entries. The vec is replayed verbatim
+    // (no re-embed) so stochastic embedders don't drift on boot.
+    let mut latest_rolling: std::collections::HashMap<
+        (Option<String>, Option<String>, Option<String>),
+        (AttentionScope, Vec<f32>),
+    > = std::collections::HashMap::new();
     for ev in events {
         match ev {
             ChainEvent::FamiliarityBatch { entries, .. } => {
@@ -1093,6 +1110,18 @@ async fn replay_chain_into_attention(
             } => {
                 focus_events.push((ev_scope, query, vec, ts));
             }
+            ChainEvent::RollingVectorSnapshot {
+                scope: ev_scope,
+                vec,
+                ..
+            } => {
+                let key = (
+                    ev_scope.project.clone(),
+                    ev_scope.session_id.clone(),
+                    ev_scope.agent.clone(),
+                );
+                latest_rolling.insert(key, (ev_scope, vec));
+            }
             ChainEvent::ThreadCreate { .. }
             | ChainEvent::ThreadRename { .. }
             | ChainEvent::ThreadDelete { .. }
@@ -1102,11 +1131,8 @@ async fn replay_chain_into_attention(
             | ChainEvent::TensionTransition { .. }
             | ChainEvent::ThreadLinkAdd { .. }
             | ChainEvent::ThreadLinkRemove { .. }
-            // P6A: rolling-vector / turn-skipped rows are wire-only
-            // during replay — `rolling_vec` reseeds on the first
-            // post-boot `attend()`. P6-full will restore the
-            // most-recent snapshot per scope verbatim.
-            | ChainEvent::RollingVectorSnapshot { .. }
+            // P6A: AttentionTurnSkipped is audit-only — no in-memory
+            // state to restore for a turn that was rejected.
             | ChainEvent::AttentionTurnSkipped { .. } => {}
         }
     }
@@ -1125,9 +1151,16 @@ async fn replay_chain_into_attention(
             tracing::warn!(error = %err, "focus_set replay skipped");
         }
     }
+    let rolling_n = latest_rolling.len();
+    for (_key, (ev_scope, vec)) in latest_rolling {
+        if let Err(err) = attention.seed_rolling_vec(&ev_scope, vec).await {
+            tracing::warn!(error = %err, "rolling_vector_snapshot replay skipped");
+        }
+    }
     tracing::info!(
         events = n,
         focus_events = focus_n,
+        rolling_snapshots = rolling_n,
         "chain replay applied to in-memory attention"
     );
     Ok(())

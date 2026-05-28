@@ -130,6 +130,67 @@ async fn observer_mediated_attend_emits_rolling_vector_snapshot() {
 }
 
 #[tokio::test]
+async fn rolling_vec_snapshot_round_trips_through_replay() {
+    // Review-fix regression test: a RollingVectorSnapshot captured
+    // from one InMemoryAttention must, after seed_rolling_vec, drive
+    // the same scope_vector on a fresh InMemoryAttention. This is
+    // the restart-safety contract that P9a/P9b depend on.
+    use ostk_recall_attention::InMemoryAttention;
+
+    let (pipeline, _corpus_tmp) = build_pipeline(16).await;
+    let store_tmp = TempDir::new().unwrap();
+    let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
+    let chain: Arc<dyn ChainSink> = sink.clone();
+    let db = Arc::new(ThreadsDb::open_with_sink(store_tmp.path(), chain.clone()).unwrap());
+
+    // Original session: build attention, attend twice so rolling_vec
+    // has actually advanced via EMA blend (not just seeded).
+    let original: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
+    let observer = TurnObserver::new(pipeline, db)
+        .with_attention(Arc::clone(&original))
+        .with_chain_sink(chain);
+    observer
+        .observe(&scope(), "first observed turn", 0, "sess-1", None)
+        .await
+        .unwrap();
+    observer
+        .observe(&scope(), "second observed turn diverges", 1, "sess-1", None)
+        .await
+        .unwrap();
+
+    let pre_restart = original.scope_vector(&scope()).await.unwrap().unwrap();
+
+    // Find the latest snapshot for this scope (mirrors the cli
+    // replay's "keep latest per scope" rule).
+    let events = sink.take();
+    let snapshot = events
+        .iter()
+        .filter_map(|e| match e {
+            ChainEvent::RollingVectorSnapshot { vec, .. } => Some(vec.clone()),
+            _ => None,
+        })
+        .last()
+        .expect("at least one RollingVectorSnapshot must have been emitted");
+    assert_eq!(
+        snapshot, pre_restart,
+        "the snapshot vec must equal the live rolling channel"
+    );
+
+    // Fresh session: seed the rolling channel from the snapshot,
+    // exactly as cli::replay_chain_into_attention does.
+    let fresh = InMemoryAttention::new();
+    fresh
+        .seed_rolling_vec(&scope(), snapshot.clone())
+        .await
+        .unwrap();
+    let post_restart = fresh.scope_vector(&scope()).await.unwrap().unwrap();
+    assert_eq!(
+        post_restart, snapshot,
+        "after replay seed, scope_vector must return the snapshot verbatim"
+    );
+}
+
+#[tokio::test]
 async fn observer_without_chain_sink_emits_no_attention_events() {
     // `with_chain_sink` is optional: observers wired only to a
     // ledger (legacy / test fixtures) still call `attend()` for

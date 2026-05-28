@@ -104,8 +104,16 @@ impl AttentionContext {
     /// Set both the effective scope vector and the rolling channel
     /// in one call. Used by P9b-min's enrich step (snapshot before
     /// the attention lock drops); also handy in tests.
+    ///
+    /// `scope_vector` is populated alongside `rolling_vec` so callers
+    /// that scored on the affinity path see a non-zero value. A
+    /// rolling-only setter would have surprised
+    /// [`crate::rank::attention_affinity_score`], which reads
+    /// `scope_vector` exclusively (that's where pin precedence still
+    /// applies upstream).
     #[must_use]
     pub fn with_rolling(mut self, rolling: Vec<f32>) -> Self {
+        self.scope_vector = Some(rolling.clone());
         self.rolling_vec = Some(rolling);
         self
     }

@@ -95,6 +95,22 @@ fn dim_mismatch_returns_zero() {
 }
 
 #[test]
+fn with_rolling_builder_drives_affinity_score() {
+    // Review-fix regression test: `AttentionContext::with_rolling`
+    // must populate `scope_vector` so callers using the builder see
+    // non-zero affinity. A rolling-only setter would silently make
+    // every candidate score 0 — exactly the failure mode P9b-min's
+    // enrich step is most likely to trip into.
+    let cand = make_candidate("c1", Some(vec![1.0, 0.0, 0.0]));
+    let ctx = AttentionContext::default().with_rolling(vec![1.0, 0.0, 0.0]);
+    let score = attention_affinity_score(&cand, &ctx);
+    assert!(
+        (score - 1.0).abs() < 1e-6,
+        "with_rolling must propagate to scope_vector for affinity scoring, got {score}"
+    );
+}
+
+#[test]
 fn score_is_in_unit_interval() {
     // Random-ish vectors — verify the score is always in [0, 1].
     let cand = make_candidate("c1", Some(vec![0.6, 0.8, 0.0]));

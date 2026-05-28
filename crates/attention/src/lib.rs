@@ -650,6 +650,33 @@ impl InMemoryAttention {
         Ok(())
     }
 
+    /// Replay-seed the per-scope rolling vector from a chain
+    /// snapshot.
+    ///
+    /// Used by `cli::commands::replay_chain_into_attention` to
+    /// restore `rolling_vec` on boot from the most-recent
+    /// `ChainEvent::RollingVectorSnapshot` per scope. The vec is
+    /// carried verbatim from the chain row — no re-embedding — so
+    /// stochastic embedders don't drift across restarts.
+    ///
+    /// Only `rolling_vec` is touched; `transient_vec` stays empty
+    /// until the first post-boot `attend()`. `effective_vec()`'s
+    /// priority chain (`pinned → rolling → transient`) then returns
+    /// the seeded value as the scope vector until either a pin lands
+    /// or the EMA blend advances it.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn seed_rolling_vec(
+        &self,
+        scope: &AttentionScope,
+        rolling: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        let key = ScopeKey::from(scope);
+        let mut inner = self.inner.write().await;
+        let entry = inner.scopes.entry(key).or_default();
+        entry.rolling_vec = Some(rolling);
+        Ok(())
+    }
+
     /// Pin a focus query to a scope. If `query` is already in
     /// `focus_history`, the existing entry is **promoted** to the
     /// pin slot — its original `vec` and `pinned_at` are preserved

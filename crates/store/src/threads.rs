@@ -882,6 +882,18 @@ impl ThreadsDb {
         std::mem::replace(&mut self.sink, sink)
     }
 
+    /// Clone of the active chain sink. Used by ambient wiring
+    /// (`cli::commands::spawn_ambient_daemons`) so the
+    /// [`crate::attention::observer::TurnObserver`] shares the same
+    /// sink as the ledger — `RollingVectorSnapshot` /
+    /// `AttentionTurnSkipped` events land in the same `chain_log`
+    /// table as `ThreadCreate` / `FamiliarityBatch`, and replay can
+    /// rebuild rolling state on boot.
+    #[must_use]
+    pub fn chain_sink(&self) -> Arc<dyn ChainSink> {
+        Arc::clone(&self.sink)
+    }
+
     pub(crate) fn setup_connection(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
