@@ -34,6 +34,57 @@ pub enum FoldDepth {
     Full,
 }
 
+/// Reason an attention-update call was skipped by the noise gate.
+///
+/// Stable wire enum: codes do not change across versions. The P6A
+/// scope wires the variant + chain event but does not exercise any
+/// reason path yet — the multi-signal noise gate that produces these
+/// values lands in P6-full (see `p6-attention-ema.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSkipReason {
+    /// Turn was below the minimum token threshold and carried no
+    /// entity / handle bypass signal.
+    TooShort,
+    /// Trivial acknowledgement (e.g. "ok", "thanks", "hmm").
+    Trivial,
+    /// Bash command or shell-noise prefix.
+    ShellCommand,
+    /// Semantic delta against the existing rolling vector was too
+    /// small to count as a real shift.
+    NearDuplicate,
+    /// Edit/typo correction that should not displace prior focus.
+    TypoCorrection,
+}
+
+impl AttentionSkipReason {
+    /// Stable string discriminator used in the chain payload.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::TooShort => "too_short",
+            Self::Trivial => "trivial",
+            Self::ShellCommand => "shell_command",
+            Self::NearDuplicate => "near_duplicate",
+            Self::TypoCorrection => "typo_correction",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; returns `None` for unrecognized
+    /// strings so callers can decide whether to reject or fall through.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "too_short" => Self::TooShort,
+            "trivial" => Self::Trivial,
+            "shell_command" => Self::ShellCommand,
+            "near_duplicate" => Self::NearDuplicate,
+            "typo_correction" => Self::TypoCorrection,
+            _ => return None,
+        })
+    }
+}
+
 /// Privacy tier on an `AttentionScope`. Mirrors the T0/T1/T2/T3
 /// sovereign-OS theme.
 ///

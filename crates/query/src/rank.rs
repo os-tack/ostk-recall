@@ -171,6 +171,64 @@ impl Default for RankEngine {
     }
 }
 
+// ---- attention features ------------------------------------------------
+
+/// Direct attention-affinity score, used by P9b-min and as a future
+/// `RankFeature` instance (P3B will wrap it behind the
+/// `RankFeatureFactory` shape once `prepare()`-needing features ship).
+///
+/// Returns cosine similarity between the attention scope vector and
+/// the candidate's dense embedding, clamped to `[0, 1]`. Cosine on
+/// normalized vectors actually lives in `[-1, 1]`, but anti-resonant
+/// candidates should contribute zero — they are not "attended to" in
+/// any meaningful sense, just orthogonal in the embedding space.
+///
+/// Inputs `None` ⇒ score 0:
+/// - `attn.scope_vector == None`: empty-mind boot (no pin, no
+///   rolling, no transient). P9b-min skips lens injection in this
+///   case; we still need the rank path to be a no-op rather than
+///   bias toward the all-zeros vector.
+/// - `candidate.dense_embedding == None`: candidate row had no
+///   embedding column (legacy or non-projected). The other lanes
+///   still drove it into the candidate set, but attention-axis
+///   cannot contribute without an embedding.
+#[must_use]
+pub fn attention_affinity_score(candidate: &Candidate, attn: &AttentionContext) -> f32 {
+    let Some(scope_vec) = attn.scope_vector.as_deref() else {
+        return 0.0;
+    };
+    let Some(emb) = candidate.dense_embedding.as_deref() else {
+        return 0.0;
+    };
+    cosine_similarity(scope_vec, emb).max(0.0)
+}
+
+/// Cosine similarity over `[-1, 1]`. Returns 0 on empty vectors or
+/// dimension mismatch — the safe choice so an upstream embedder swap
+/// can't produce a spurious score.
+///
+/// Inlined here rather than depending on `ostk-recall-attention` for
+/// the helper: the query crate sits below attention in the crate
+/// graph and must stay independent of it.
+#[must_use]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
 #[cfg(test)]
 mod tests {
     use ostk_recall_core::{Chunk, FacetSet, Links, Source};

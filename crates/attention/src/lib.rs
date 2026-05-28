@@ -25,12 +25,14 @@ pub mod query;
 pub mod weaver;
 
 pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
+pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
+pub use observer::{
+    ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default,
+};
 pub use query::{
     Axis, AxisAttribution, CompositeWeights, RankBy, ThreadQueryAttribution, ThreadQueryError,
     ThreadQueryParams, ThreadQueryReport, run_query,
 };
-pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
-pub use observer::{ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default};
 pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};
 
 use std::collections::HashMap;
@@ -38,10 +40,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_core::attention::{
-    AttentionPage, AttentionScope, FoldDepth, PrivacyTier, ScoreAttribution, ThreadHandle,
+    AttentionPage, AttentionScope, AttentionSkipReason, FoldDepth, PrivacyTier, ScoreAttribution,
+    ThreadHandle,
 };
+use ostk_recall_pipeline::ChunkEmbedder;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -58,6 +61,13 @@ pub const ALPHA: f32 = 1.0;
 pub const BETA: f32 = 0.5;
 /// Surfacer skips pages with score < this threshold.
 pub const ARCHIVE_THRESHOLD: f32 = 0.1;
+
+/// Default EMA update rate for the per-scope `rolling_vec`. `0.3` is
+/// the tuning baseline documented in `p6-attention-ema.md`; a future
+/// phase exposes it via config. λ ∈ (0, 1]: smaller values make the
+/// rolling vector slower to drift; larger values track the latest
+/// embedding more eagerly.
+pub const DEFAULT_ATTENTION_LAMBDA: f32 = 0.3;
 
 /// Familiarity at which decay flattens to `DECAY_RATE_FAMILIAR`.
 pub const FAMILIARITY_SATURATION: u32 = 20;
@@ -128,6 +138,26 @@ pub fn off_diagonal_lift_gate(tension: f32, resonance: f32) -> f32 {
 
 // --- errors ------------------------------------------------------------
 
+/// Outcome of an `attend()` call. The observer-mediated path
+/// translates these into chain events; direct test callers may
+/// ignore the value.
+///
+/// P6A only ever returns `Updated`; the multi-signal noise gate
+/// that produces `Skipped` lands in P6-full (see
+/// `p6-attention-ema.md`).
+#[derive(Debug, Clone)]
+pub enum AttendOutcome {
+    /// The scope's rolling attention vector advanced. `rolling_vec`
+    /// is the post-EMA value (L2-normalized); `lambda` is the
+    /// runtime's update rate at the time of the call, so chain
+    /// replay can reproduce the math even if the default changes.
+    Updated { rolling_vec: Vec<f32>, lambda: f32 },
+    /// The noise gate (P6-full) rejected the turn. The variant
+    /// exists in P6A so the `ChainEvent::AttentionTurnSkipped` wire
+    /// shape is stable from day one.
+    Skipped { reason: AttentionSkipReason },
+}
+
 #[derive(Debug, Error)]
 pub enum AttentionError {
     #[error("scope not found: {0:?}")]
@@ -174,9 +204,18 @@ impl From<&AttentionScope> for ScopeKey {
 /// scoped and privacy-filtered.
 #[async_trait]
 pub trait AttentionForwardStore: Send + Sync {
-    /// Ingest current conversational / tool context; update the rolling
-    /// attention vector for the given scope.
-    async fn attend(&self, scope: &AttentionScope, context: &str) -> Result<(), AttentionError>;
+    /// Ingest current conversational / tool context; update the
+    /// rolling attention vector for the given scope.
+    ///
+    /// Returns an [`AttendOutcome`] so the observer-mediated path
+    /// can persist [`crate::observer::TurnObserver`]'s chain events
+    /// (`RollingVectorSnapshot` on update, `AttentionTurnSkipped` on
+    /// noise-gate rejection). Direct callers may discard the value.
+    async fn attend(
+        &self,
+        scope: &AttentionScope,
+        context: &str,
+    ) -> Result<AttendOutcome, AttentionError>;
 
     /// Surface pages above `ARCHIVE_THRESHOLD` for the given scope,
     /// honouring `PrivacyTier` rules.
@@ -258,10 +297,7 @@ pub trait AttentionForwardStore: Send + Sync {
         Err(AttentionError::FocusHistoryMiss(query))
     }
 
-    async fn unfocus(
-        &self,
-        _scope: &AttentionScope,
-    ) -> Result<FocusOutcome, AttentionError> {
+    async fn unfocus(&self, _scope: &AttentionScope) -> Result<FocusOutcome, AttentionError> {
         Ok(FocusOutcome {
             previous: None,
             pinned: None,
@@ -269,10 +305,7 @@ pub trait AttentionForwardStore: Send + Sync {
         })
     }
 
-    async fn focus_status(
-        &self,
-        _scope: &AttentionScope,
-    ) -> Result<FocusStatus, AttentionError> {
+    async fn focus_status(&self, _scope: &AttentionScope) -> Result<FocusStatus, AttentionError> {
         Ok(FocusStatus {
             pinned: None,
             history: Vec::new(),
@@ -355,12 +388,21 @@ pub struct FocusStatus {
 
 #[derive(Debug, Default)]
 struct ScopeState {
-    /// Continuously updated by `attend()` — the running per-turn
-    /// embedding of conversational context. Drives ranking only when
-    /// no pin is set. Never overwrites the pin.
+    /// Last-turn embedding. `attend()` overwrites this verbatim on
+    /// every successful call. Drives no ranking when a pin or a
+    /// rolling vector exists; serves as the fallback signal for very
+    /// young scopes before the rolling channel is seeded.
     transient_vec: Vec<f32>,
-    /// Operator-controlled focus. When `Some`, `effective_vec` returns
-    /// this vector instead of `transient_vec`.
+    /// EMA-blended attention vector. `None` until the first
+    /// successful `attend()` seeds it; subsequent updates run
+    /// `rolling = normalize((1 - lambda) * rolling + lambda * new)`
+    /// per `p6-attention-ema.md`. Sits between `pinned_focus` and
+    /// `transient_vec` in the [`Self::effective_vec`] priority chain
+    /// — the operator's pin always wins, but rolling beats last-turn
+    /// once it exists.
+    rolling_vec: Option<Vec<f32>>,
+    /// Operator-controlled focus. When `Some`, `effective_vec`
+    /// returns this vector instead of rolling / transient.
     pinned_focus: Option<PinnedFocus>,
     /// Bounded ring of previously-pinned foci. Front is most-recent;
     /// LRU eviction pops the back when capacity is hit.
@@ -369,17 +411,68 @@ struct ScopeState {
 }
 
 impl ScopeState {
-    /// The vector ranking should use right now: pinned focus if the
-    /// operator has set one, otherwise the conversational transient.
-    /// Returns an empty slice when neither has been populated — every
-    /// cosine downstream treats an empty slice as 0 so the result is
-    /// "no contribution", same as the pre-pin behavior.
+    /// Priority chain used by every ranking caller:
+    /// `pinned_focus → rolling_vec → transient_vec`.
+    ///
+    /// - Pinned wins absolutely: the operator's stated lens is
+    ///   authoritative.
+    /// - When no pin is set, the rolling EMA drives ranking — it
+    ///   smooths out one-turn jitter and is the input the first
+    ///   active memory lens (P9b-min) reads.
+    /// - Transient is the cold-start fallback: before the rolling
+    ///   channel has been seeded, the latest embed is the best
+    ///   signal available.
+    ///
+    /// Returns an empty slice when nothing is populated; every
+    /// cosine downstream treats an empty slice as 0, so the result
+    /// is "no contribution" — same as the pre-rolling behaviour.
     fn effective_vec(&self) -> &[f32] {
-        match &self.pinned_focus {
-            Some(pin) => &pin.vec,
-            None => &self.transient_vec,
+        if let Some(pin) = &self.pinned_focus {
+            return &pin.vec;
+        }
+        if let Some(rv) = &self.rolling_vec {
+            if !rv.is_empty() {
+                return rv;
+            }
+        }
+        &self.transient_vec
+    }
+
+    /// Last-turn vector, bypassing the priority chain.
+    ///
+    /// Reserved for callers that explicitly want "what was the most
+    /// recent turn about" rather than "what is the scope's current
+    /// stance." No P6A caller uses it; exposed for the eventual
+    /// P6-full noise-gate audit case in
+    /// `final-corrections-addendum.md` B1.
+    #[allow(dead_code)]
+    fn transient_vec(&self) -> &[f32] {
+        &self.transient_vec
+    }
+}
+
+/// Compute `normalize((1 - lambda) * prev + lambda * next)`.
+///
+/// Falls back to `next.to_vec()` when the two vectors disagree on
+/// dimension — that case can only arise if the embedder dimension
+/// changed mid-run, and the safer move is to reset rolling state
+/// rather than blend two incompatible spaces.
+fn ema_blend_normalized(prev: &[f32], next: &[f32], lambda: f32) -> Vec<f32> {
+    if prev.is_empty() || prev.len() != next.len() {
+        return next.to_vec();
+    }
+    let mut out: Vec<f32> = prev
+        .iter()
+        .zip(next.iter())
+        .map(|(p, n)| (1.0 - lambda).mul_add(*p, lambda * *n))
+        .collect();
+    let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in &mut out {
+            *x /= norm;
         }
     }
+    out
 }
 
 #[derive(Debug, Default)]
@@ -423,7 +516,7 @@ fn compute_score_parts(
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InMemoryAttention {
     inner: Arc<RwLock<Inner>>,
     /// Optional real embedder. When `Some`, `attend()` and the
@@ -434,6 +527,19 @@ pub struct InMemoryAttention {
     /// `cli::commands::serve` does not have to put the embedder
     /// first.
     embedder: Option<Arc<dyn ChunkEmbedder>>,
+    /// EMA update rate for the per-scope rolling vector. See
+    /// [`DEFAULT_ATTENTION_LAMBDA`].
+    lambda: f32,
+}
+
+impl Default for InMemoryAttention {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            embedder: None,
+            lambda: DEFAULT_ATTENTION_LAMBDA,
+        }
+    }
 }
 
 impl InMemoryAttention {
@@ -454,7 +560,27 @@ impl InMemoryAttention {
         Self {
             inner: Arc::new(RwLock::new(Inner::default())),
             embedder: Some(embedder),
+            lambda: DEFAULT_ATTENTION_LAMBDA,
         }
+    }
+
+    /// Override the EMA update rate λ. Builder-style so production
+    /// wiring stays a single chained expression. Clamped to
+    /// `(0.0, 1.0]` so callers can't disable the rolling channel
+    /// (λ=0 would freeze it) or overshoot (λ>1 would amplify noise).
+    #[must_use]
+    pub fn with_lambda(mut self, lambda: f32) -> Self {
+        let clamped = lambda.clamp(f32::EPSILON, 1.0);
+        self.lambda = clamped;
+        self
+    }
+
+    /// Current EMA update rate λ. Returned by `AttendOutcome::Updated`
+    /// alongside the rolling vector so observers and chain replay see
+    /// the same value.
+    #[must_use]
+    pub const fn lambda(&self) -> f32 {
+        self.lambda
     }
 
     /// Embed `text` through the configured embedder, or fall back
@@ -550,7 +676,12 @@ impl InMemoryAttention {
             .focus_history
             .iter()
             .position(|p| p.query == query)
-            .map(|i| scope_state.focus_history.remove(i).expect("position is valid"));
+            .map(|i| {
+                scope_state
+                    .focus_history
+                    .remove(i)
+                    .expect("position is valid")
+            });
 
         // Construct the new pin: either the existing history entry,
         // or a fresh one with current timestamp and a freshly-embedded
@@ -633,10 +764,7 @@ impl InMemoryAttention {
     /// unfocusing an already-unfocused scope is a no-op and returns
     /// a `FocusOutcome` with `previous = pinned = None`.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn unfocus(
-        &self,
-        scope: &AttentionScope,
-    ) -> Result<FocusOutcome, AttentionError> {
+    pub async fn unfocus(&self, scope: &AttentionScope) -> Result<FocusOutcome, AttentionError> {
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let scope_state = inner.scopes.entry(key).or_default();
@@ -688,9 +816,7 @@ impl InMemoryAttention {
                 // Merge-on-dedupe: if this query was already in
                 // history, take it out first so we don't double up
                 // after we install the new pin.
-                if let Some(pos) =
-                    scope_state.focus_history.iter().position(|p| p.query == q)
-                {
+                if let Some(pos) = scope_state.focus_history.iter().position(|p| p.query == q) {
                     let _ = scope_state.focus_history.remove(pos);
                 }
                 // Demote current pin to history front.
@@ -739,8 +865,7 @@ impl InMemoryAttention {
         Ok(FocusStatus {
             pinned: state.pinned_focus.clone(),
             history: state.focus_history.iter().cloned().collect(),
-            transient_active: state.pinned_focus.is_none()
-                && !state.transient_vec.is_empty(),
+            transient_active: state.pinned_focus.is_none() && !state.transient_vec.is_empty(),
         })
     }
 
@@ -827,15 +952,31 @@ pub fn stub_embed(context: &str) -> Vec<f32> {
 #[allow(clippy::significant_drop_tightening)]
 #[async_trait]
 impl AttentionForwardStore for InMemoryAttention {
-    async fn attend(&self, scope: &AttentionScope, context: &str) -> Result<(), AttentionError> {
+    async fn attend(
+        &self,
+        scope: &AttentionScope,
+        context: &str,
+    ) -> Result<AttendOutcome, AttentionError> {
         let vec = self.embed(context);
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let entry = inner.scopes.entry(key).or_default();
-        // attend() only ever writes the transient channel — it must
-        // never clobber the operator's pinned focus.
-        entry.transient_vec = vec;
-        Ok(())
+        // attend() writes the transient + rolling channels but never
+        // touches the pin: `effective_vec()` makes pinned win at
+        // read time, so the operator's stated lens stays
+        // authoritative even while the conversational stream keeps
+        // updating attention.
+        entry.transient_vec = vec.clone();
+        let updated = match entry.rolling_vec.as_deref() {
+            None => vec,
+            Some(prev) if prev.is_empty() => vec,
+            Some(prev) => ema_blend_normalized(prev, &vec, self.lambda),
+        };
+        entry.rolling_vec = Some(updated.clone());
+        Ok(AttendOutcome::Updated {
+            rolling_vec: updated,
+            lambda: self.lambda,
+        })
     }
 
     async fn surface(
@@ -1027,17 +1168,11 @@ impl AttentionForwardStore for InMemoryAttention {
         Self::refocus(self, scope, query).await
     }
 
-    async fn unfocus(
-        &self,
-        scope: &AttentionScope,
-    ) -> Result<FocusOutcome, AttentionError> {
+    async fn unfocus(&self, scope: &AttentionScope) -> Result<FocusOutcome, AttentionError> {
         Self::unfocus(self, scope).await
     }
 
-    async fn focus_status(
-        &self,
-        scope: &AttentionScope,
-    ) -> Result<FocusStatus, AttentionError> {
+    async fn focus_status(&self, scope: &AttentionScope) -> Result<FocusStatus, AttentionError> {
         Self::focus_status(self, scope).await
     }
 }
@@ -1655,9 +1790,15 @@ mod tests {
 
         // attend() must NOT replace the pin's vector — it writes to
         // the transient channel, which is shadowed by the pin at read.
-        store.attend(&scope, "something else entirely").await.unwrap();
+        store
+            .attend(&scope, "something else entirely")
+            .await
+            .unwrap();
         let v = store.scope_vector(&scope).await.unwrap().unwrap();
-        assert_eq!(v, pinned_vec, "scope_vector must return pinned vec, not transient");
+        assert_eq!(
+            v, pinned_vec,
+            "scope_vector must return pinned vec, not transient"
+        );
     }
 
     #[tokio::test]
@@ -1755,10 +1896,7 @@ mod tests {
         // MAX + 2 focuses.
         let total = FOCUS_HISTORY_MAX + 2;
         for i in 0..total {
-            store
-                .focus(&scope, format!("pin-{i}"))
-                .await
-                .unwrap();
+            store.focus(&scope, format!("pin-{i}")).await.unwrap();
         }
         let status = store.focus_status(&scope).await.unwrap();
         assert_eq!(

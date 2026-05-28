@@ -392,9 +392,9 @@ pub async fn scan_with_context(
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db.as_ref().map(|threads| {
-        spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone())
-    });
+    let ambient = threads_db
+        .as_ref()
+        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -542,9 +542,9 @@ pub async fn scan_paths_with_context(
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db.as_ref().map(|threads| {
-        spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone())
-    });
+    let ambient = threads_db
+        .as_ref()
+        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -985,13 +985,12 @@ pub async fn serve(
 
     let dispatch: Option<Arc<AttentionDispatch>> = serve_ctx.as_ref().map(|c| {
         let attention_dyn: Arc<dyn AttentionForwardStore> = c.attention.clone();
-        let dispatch =
-            AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)).with_corpus(
-                // Reuse the engine's CorpusStore so the emergent
-                // surface reads the same lance corpus the MCP recall
-                // verbs query.
-                Arc::clone(engine.store()),
-            );
+        let dispatch = AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)).with_corpus(
+            // Reuse the engine's CorpusStore so the emergent
+            // surface reads the same lance corpus the MCP recall
+            // verbs query.
+            Arc::clone(engine.store()),
+        );
         Arc::new(dispatch)
     });
 
@@ -1000,13 +999,8 @@ pub async fn serve(
     let embedder_for_bg = Arc::clone(&embedder);
     let ctx_for_bg = serve_ctx.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_socket_listener(
-            &sock_path,
-            config_path_for_bg,
-            embedder_for_bg,
-            ctx_for_bg,
-        )
-        .await
+        if let Err(e) =
+            run_socket_listener(&sock_path, config_path_for_bg, embedder_for_bg, ctx_for_bg).await
         {
             tracing::error!(error = %e, "background socket listener failed");
         }
@@ -1039,9 +1033,8 @@ pub async fn serve(
 /// the chain — boot reads chain rows back via `iter_chain` to rebuild
 /// the in-memory score tier.
 fn open_threads_db_with_chain(root: &Path) -> Result<ThreadsDb> {
-    let sink: Arc<dyn ChainSink> = Arc::new(
-        SqliteChainSink::open(root).map_err(|e| anyhow!("open chain sink: {e}"))?,
-    );
+    let sink: Arc<dyn ChainSink> =
+        Arc::new(SqliteChainSink::open(root).map_err(|e| anyhow!("open chain sink: {e}"))?);
     ThreadsDb::open_with_sink(root, sink).map_err(|e| anyhow!("open threads db: {e}"))
 }
 
@@ -1108,7 +1101,13 @@ async fn replay_chain_into_attention(
             | ChainEvent::EvidenceStateChange { .. }
             | ChainEvent::TensionTransition { .. }
             | ChainEvent::ThreadLinkAdd { .. }
-            | ChainEvent::ThreadLinkRemove { .. } => {}
+            | ChainEvent::ThreadLinkRemove { .. }
+            // P6A: rolling-vector / turn-skipped rows are wire-only
+            // during replay — `rolling_vec` reseeds on the first
+            // post-boot `attend()`. P6-full will restore the
+            // most-recent snapshot per scope verbatim.
+            | ChainEvent::RollingVectorSnapshot { .. }
+            | ChainEvent::AttentionTurnSkipped { .. } => {}
         }
     }
 

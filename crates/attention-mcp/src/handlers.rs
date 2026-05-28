@@ -217,7 +217,9 @@ pub async fn attend(d: &AttentionDispatch, args: Value) -> Result<Value, Attenti
     let scope = default_scope(&args)?;
     validate_privacy_tier(&scope, d.max_privacy_tier)?;
     let context = require_str(&args, "context")?;
-    d.attention.attend(&scope, &context).await?;
+    // P6A returns `AttendOutcome` so the observer-mediated path can
+    // emit chain events; this MCP handler does not consume the outcome.
+    let _outcome = d.attention.attend(&scope, &context).await?;
     Ok(json!({}))
 }
 

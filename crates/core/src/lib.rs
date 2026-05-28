@@ -15,8 +15,8 @@ pub mod source;
 pub mod types;
 
 pub use attention::{
-    AttentionPage, AttentionScope, FoldDepth, IngestEvent, PrivacyTier, ScoreAttribution,
-    ThreadHandle, ThreadHandleError,
+    AttentionPage, AttentionScope, AttentionSkipReason, FoldDepth, IngestEvent, PrivacyTier,
+    ScoreAttribution, ThreadHandle, ThreadHandleError,
 };
 pub use chunk::{Chunk, Links};
 pub use config::{

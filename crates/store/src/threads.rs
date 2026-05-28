@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::attention::AttentionScope;
-use ostk_recall_core::{FoldDepth, PrivacyTier, ThreadHandle};
+use ostk_recall_core::{AttentionSkipReason, FoldDepth, PrivacyTier, ThreadHandle};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::corpus::{Result, StoreError};
@@ -273,6 +273,28 @@ pub enum ChainEvent {
         vec: Option<Vec<f32>>,
         ts: DateTime<Utc>,
     },
+    /// A successful `attend()` updated the scope's rolling attention
+    /// vector. Persisted so chain replay can re-derive `rolling_vec`
+    /// on boot without re-running the embedder over historical turns.
+    /// `vec` is the post-EMA value (already normalized); `lambda` is
+    /// the runtime's update rate at the time of writing so replay can
+    /// reproduce the math even if defaults change.
+    RollingVectorSnapshot {
+        scope: AttentionScope,
+        vec: Vec<f32>,
+        lambda: f32,
+        ts: DateTime<Utc>,
+    },
+    /// An attempt to update attention was rejected by the noise gate.
+    /// `reason` is a stable enum so observers can argue with the
+    /// gate's decisions across releases (see
+    /// `p6-attention-ema.md` "Noise gate reason codes"). P6A wires
+    /// the variant; the gate that produces it ships in P6-full.
+    AttentionTurnSkipped {
+        scope: AttentionScope,
+        reason: AttentionSkipReason,
+        ts: DateTime<Utc>,
+    },
 }
 
 /// Sink for substrate chain rows.
@@ -323,6 +345,8 @@ impl ChainEvent {
             Self::ThreadLinkAdd { .. } => "thread_link_add",
             Self::ThreadLinkRemove { .. } => "thread_link_remove",
             Self::FocusSet { .. } => "focus_set",
+            Self::RollingVectorSnapshot { .. } => "rolling_vector_snapshot",
+            Self::AttentionTurnSkipped { .. } => "attention_turn_skipped",
         }
     }
 
@@ -339,7 +363,9 @@ impl ChainEvent {
             | Self::TensionTransition { ts, .. }
             | Self::ThreadLinkAdd { ts, .. }
             | Self::ThreadLinkRemove { ts, .. }
-            | Self::FocusSet { ts, .. } => ts,
+            | Self::FocusSet { ts, .. }
+            | Self::RollingVectorSnapshot { ts, .. }
+            | Self::AttentionTurnSkipped { ts, .. } => ts,
         }
     }
 
@@ -421,6 +447,17 @@ impl ChainEvent {
                 "scope": scope,
                 "query": query,
                 "vec": vec,
+            }),
+            Self::RollingVectorSnapshot {
+                scope, vec, lambda, ..
+            } => serde_json::json!({
+                "scope": scope,
+                "vec": vec,
+                "lambda": lambda,
+            }),
+            Self::AttentionTurnSkipped { scope, reason, .. } => serde_json::json!({
+                "scope": scope,
+                "reason": reason.as_str(),
             }),
         };
         serde_json::to_string(&v)
@@ -655,6 +692,73 @@ impl ChainEvent {
                     vec,
                     ts,
                 }
+            }
+            "rolling_vector_snapshot" => {
+                let scope: AttentionScope =
+                    serde_json::from_value(v.get("scope").cloned().ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "rolling_vector_snapshot payload missing scope".into(),
+                            source: None,
+                        })
+                    })?)
+                    .map_err(|e| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("rolling_vector_snapshot scope decode: {e}"),
+                            source: None,
+                        })
+                    })?;
+                let vec: Vec<f32> =
+                    serde_json::from_value(v.get("vec").cloned().ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "rolling_vector_snapshot payload missing vec".into(),
+                            source: None,
+                        })
+                    })?)
+                    .map_err(|e| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("rolling_vector_snapshot vec decode: {e}"),
+                            source: None,
+                        })
+                    })?;
+                #[allow(clippy::cast_possible_truncation)]
+                let lambda = v
+                    .get("lambda")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "rolling_vector_snapshot payload missing lambda".into(),
+                            source: None,
+                        })
+                    })? as f32;
+                Self::RollingVectorSnapshot {
+                    scope,
+                    vec,
+                    lambda,
+                    ts,
+                }
+            }
+            "attention_turn_skipped" => {
+                let scope: AttentionScope =
+                    serde_json::from_value(v.get("scope").cloned().ok_or_else(|| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: "attention_turn_skipped payload missing scope".into(),
+                            source: None,
+                        })
+                    })?)
+                    .map_err(|e| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("attention_turn_skipped scope decode: {e}"),
+                            source: None,
+                        })
+                    })?;
+                let reason_s = s_field("reason")?;
+                let reason = AttentionSkipReason::parse(&reason_s).ok_or_else(|| {
+                    StoreError::Lance(lancedb::Error::Other {
+                        message: format!("attention_turn_skipped unknown reason: {reason_s}"),
+                        source: None,
+                    })
+                })?;
+                Self::AttentionTurnSkipped { scope, reason, ts }
             }
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
