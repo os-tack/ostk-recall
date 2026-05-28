@@ -103,6 +103,28 @@ enum Command {
         #[command(subcommand)]
         verb: ManifestVerb,
     },
+    /// Memory-lens controls (P9b-min). The lens is the daemon's
+    /// background-injected MCP resource; these verbs read its state
+    /// from the local recall directory without spawning a client.
+    Lens {
+        #[command(subcommand)]
+        verb: LensVerb,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LensVerb {
+    /// Dump the most recently rendered lens markdown. Reads
+    /// `{root}/lens.md`, the side-of-disk copy the loop writes
+    /// alongside each registry update. Prints an empty-state hint
+    /// when the file is absent (daemon hasn't refreshed yet, or
+    /// the daemon was started with OSTK_RECALL_LENS_DISABLED).
+    Show,
+    /// Print the env-var incantation that disables the lens for
+    /// the next `serve` invocation. The disable is per-session by
+    /// design — bake-in opt-out behaviour requires touching
+    /// config.toml directly.
+    Disable,
 }
 
 #[derive(Debug, Subcommand)]
@@ -496,8 +518,49 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
         Command::Manifest { verb } => {
             run_manifest(&config_path, verb).await?;
         }
+        Command::Lens { verb } => {
+            run_lens(&config_path, verb)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Dispatch `ostk-recall lens <verb>`.
+fn run_lens(config_path: &Path, verb: LensVerb) -> Result<()> {
+    match verb {
+        LensVerb::Show => {
+            let cfg = ostk_recall_core::Config::load(config_path)
+                .with_context(|| format!("loading config from {}", config_path.display()))?;
+            let root = cfg.expanded_root()?;
+            let lens_md = root.join(ostk_recall_cli::lens_loop::LENS_MARKDOWN_FILE);
+            if !lens_md.exists() {
+                println!(
+                    "_No lens rendered yet._ Start `ostk-recall serve --stdio` and wait for the first refresh.\n\
+                     (Empty-mind boot, OSTK_RECALL_LENS_DISABLED, or simply no attention drift since the daemon started.)"
+                );
+                return Ok(());
+            }
+            let body = std::fs::read_to_string(&lens_md)
+                .with_context(|| format!("reading {}", lens_md.display()))?;
+            print!("{body}");
+            if !body.ends_with('\n') {
+                println!();
+            }
+        }
+        LensVerb::Disable => {
+            // Per-session opt-out. Documented in p9b-lens-portfolio.md
+            // "Privacy + control". Baking-in disabled state requires
+            // editing config.toml; we deliberately don't muck with the
+            // user's config from a CLI verb.
+            println!(
+                "Set OSTK_RECALL_LENS_DISABLED=1 in the environment before launching\n\
+                 `ostk-recall serve --stdio` to disable the memory-lens daemon for the\n\
+                 lifetime of that serve invocation. For a persistent opt-out edit the\n\
+                 [lens] section of your config.toml (planned for v0.6.0-rc.1)."
+            );
+        }
+    }
     Ok(())
 }
 

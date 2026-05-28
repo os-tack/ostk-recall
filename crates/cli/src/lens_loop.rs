@@ -41,6 +41,13 @@ use crate::lens_state::{LensState, save_lens_state};
 /// exactly this URI.
 pub const MEMORY_LENS_URI: &str = "ostk://memory-lens";
 pub const MEMORY_LENS_NAME: &str = "ostk-recall memory lens";
+
+/// Filename within the state directory where the loop writes a
+/// copy of the most-recent rendered markdown. The MCP transport is
+/// the authoritative wire, but a side-of-disk copy lets
+/// `ostk-recall lens show` dump the current lens without spawning
+/// an MCP client.
+pub const LENS_MARKDOWN_FILE: &str = "lens.md";
 pub const MEMORY_LENS_DESCRIPTION: &str =
     "Ambient memory lens — automatically surfaces chunks aligned with current attention. \
      Re-rendered when attention drifts or the pinned focus changes. \
@@ -426,7 +433,15 @@ pub(crate) fn apply_decision(
         } => {
             // Steps 1-4 from try_refresh_lens's doc:
             //   1. Write rendered into the resource body.
-            resource.set(rendered);
+            resource.set(rendered.clone());
+            //   1b. Side copy on disk so `lens show` (a separate
+            //       process) can read the current lens without
+            //       spawning an MCP client.
+            if let Err(err) =
+                std::fs::write(state_dir.join(LENS_MARKDOWN_FILE), rendered.as_bytes())
+            {
+                warn!(error = %err, "lens.md write failed");
+            }
             //   2. Tell subscribed clients to re-read. Must happen
             //      AFTER the body write so the next resources/read
             //      sees the new content.

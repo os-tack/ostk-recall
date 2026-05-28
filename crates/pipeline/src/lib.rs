@@ -133,6 +133,19 @@ impl Pipeline {
         &self.ingest
     }
 
+    /// P9b-min cold-start warmup. Encode a tiny dummy input through
+    /// the embedder so the model weights are resident before the
+    /// lens loop's first poll lands. The `cold_start_budget_ms`
+    /// default (500ms) in `p9b-lens-portfolio.md` is a target on
+    /// the first lens latency; this call is the lever.
+    ///
+    /// Best-effort: `encode_batch` already absorbs and logs its own
+    /// errors, and the lens loop tolerates a slow first refresh —
+    /// so we don't propagate a result.
+    pub async fn warmup_models(&self) {
+        let _ = self.embedder.encode_batch(&["warmup"]);
+    }
+
     /// Subscribe to post-`merge_insert` events. Multiple subscribers are
     /// supported via [`tokio::sync::broadcast`]; lagged receivers see an
     /// explicit `RecvError::Lagged(n)` on their next `recv()` and

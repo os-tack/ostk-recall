@@ -17,9 +17,13 @@ use ostk_recall_attention::{
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode};
-use ostk_recall_mcp::Server;
+use ostk_recall_mcp::{ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
+use ostk_recall_query::lens::LensConfig;
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
+
+use crate::lens_loop::{MemoryLensResource, run_lens_loop};
+use crate::lens_state::load_lens_state;
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
 use ostk_recall_scan::code::CodeScanner;
 use ostk_recall_scan::file_glob::FileGlobScanner;
@@ -1013,6 +1017,63 @@ pub async fn serve(
         }
     });
 
+    // P9b-min — construct the memory-lens registry + resource and,
+    // when the attention substrate is online, spawn the background
+    // refresh loop. The registry is always handed to Server::
+    // with_resources so `resources/list` advertises the memory-lens
+    // URI even before any refresh has rendered content.
+    let lens_registry = Arc::new(ResourceRegistry::new());
+    let lens_resource = Arc::new(MemoryLensResource::new(String::new()));
+    lens_registry.register(Arc::clone(&lens_resource) as Arc<dyn ostk_recall_mcp::Resource>);
+
+    let lens_disabled = std::env::var_os("OSTK_RECALL_LENS_DISABLED").is_some();
+    if let (Some(ctx), false) = (serve_ctx.as_ref(), lens_disabled) {
+        // P9b "Cold-start warmup C1" — encode a single token to
+        // force model weights resident before the lens loop's first
+        // poll. Best-effort: the embedder swallows internal errors,
+        // and a slow first lens isn't fatal.
+        let _ = embedder.encode_batch(&["warmup"]);
+
+        let lens_state_dir = root.to_path_buf();
+        let initial_state = match load_lens_state(&lens_state_dir) {
+            Ok(state) => state.unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "lens_state.json load failed; starting from default state"
+                );
+                Default::default()
+            }
+        };
+
+        let attention = Arc::clone(&ctx.attention);
+        let corpus = Arc::clone(engine.store());
+        let chain_sink_clone: Arc<dyn ChainSink> = ctx.threads.chain_sink();
+        let registry = Arc::clone(&lens_registry);
+        let resource = Arc::clone(&lens_resource);
+        let cancel = serve_cancel.clone();
+        let scope = ambient_scope_default();
+        let state_dir = lens_state_dir.clone();
+        tokio::spawn(async move {
+            run_lens_loop(
+                attention,
+                corpus,
+                registry,
+                resource,
+                chain_sink_clone,
+                LensConfig::default(),
+                scope,
+                state_dir,
+                initial_state,
+                cancel,
+            )
+            .await;
+        });
+        tracing::info!("memory-lens daemon spawned");
+    } else if lens_disabled {
+        tracing::info!("memory-lens daemon disabled via OSTK_RECALL_LENS_DISABLED");
+    }
+
     tracing::info!(
         model = %engine.model(),
         dim = engine.store().dim(),
@@ -1020,10 +1081,11 @@ pub async fn serve(
         attention = dispatch.is_some(),
         "mcp serve --stdio starting"
     );
-    let server = match dispatch {
+    let server_base = match dispatch {
         Some(d) => Server::new(engine).with_attention(d),
         None => Server::new(engine),
     };
+    let server = server_base.with_resources(lens_registry);
     server
         .run_stdio()
         .await
