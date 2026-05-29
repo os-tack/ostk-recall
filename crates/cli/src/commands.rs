@@ -101,6 +101,7 @@ pub struct VerifyOutcome {
 }
 
 pub type WeaveOutcome = ostk_recall_attention::WeaveWindowOutcome;
+pub type ConsolidateOutcome = ostk_recall_attention::ConsolidateOutcome;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
@@ -544,6 +545,36 @@ pub async fn weave(
         .weave_window(since, epoch_size.max(1))
         .await
         .map_err(|e| anyhow!("weave_window: {e}"))
+}
+
+/// Run a coarse consolidation cycle (`weave --consolidate`). Same setup as
+/// [`weave`], but invokes [`AutoWeaver::consolidate`]: deep re-weave + anchor
+/// bridging + proposal promotion + idle fade. Offline operator policy.
+pub async fn consolidate(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    since: Option<Duration>,
+    epoch_size: usize,
+) -> Result<ConsolidateOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    std::fs::create_dir_all(&root)?;
+    let store = Arc::new(
+        CorpusStore::open_or_create(&root, embedder.dim())
+            .await
+            .map_err(|e| anyhow!("open corpus store: {e}"))?,
+    );
+    let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default());
+    let since = since
+        .map(chrono::Duration::from_std)
+        .transpose()
+        .map_err(|_| anyhow!("--since duration is too large for chrono"))?;
+    weaver
+        .consolidate(since, epoch_size.max(1))
+        .await
+        .map_err(|e| anyhow!("consolidate: {e}"))
 }
 
 /// Path-aware sibling of [`scan`].

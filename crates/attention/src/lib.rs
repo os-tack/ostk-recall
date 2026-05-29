@@ -34,7 +34,8 @@ pub use query::{
     ThreadQueryParams, ThreadQueryReport, run_query,
 };
 pub use weaver::{
-    AutoWeaver, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome, WeaverThresholds,
+    AutoWeaver, ConsolidateOutcome, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome,
+    WeaverThresholds,
 };
 
 use std::collections::HashMap;

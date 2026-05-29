@@ -82,12 +82,20 @@ enum Command {
     /// it does not make bulk scans look like watched conversation turns.
     Weave {
         /// Only weave chunks newer than this duration, e.g. 1h, 24h, 7d.
-        /// Omit for the whole active corpus.
+        /// Omit for the whole active corpus. With `--consolidate` this is
+        /// the horizon of the consolidation layer (the cron tier picks it).
         #[arg(long)]
         since: Option<String>,
         /// Number of chunk ids per synthesized source-kind batch.
         #[arg(long, default_value_t = 256)]
         epoch_size: usize,
+        /// Run a coarse **consolidation** cycle, not just capture: after the
+        /// windowed re-weave, bridge consolidated threads across canyons,
+        /// promote recurring high-cohesion proposals to durable threads, and
+        /// fade idle threads. Offline policy — schedule under cron/launchd at
+        /// the cadences in `config.example.toml`, never inside `serve`.
+        #[arg(long)]
+        consolidate: bool,
     },
     /// Inspect a single chunk by id.
     Inspect {
@@ -555,19 +563,43 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                 None => println!("done in {:.1}s", out.elapsed.as_secs_f64()),
             }
         }
-        Command::Weave { since, epoch_size } => {
+        Command::Weave {
+            since,
+            epoch_size,
+            consolidate,
+        } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
             let since = since.as_deref().map(parse_since_duration).transpose()?;
-            let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
-            println!(
-                "weave summary: batches={} chunks={} evidence_links={} proposed_weaves={} proposed_threads={} proposals_pruned={}",
-                out.batches_processed,
-                out.chunks_seen,
-                out.evidence_links_written,
-                out.proposed_weaves,
-                out.proposed_threads_written,
-                out.proposals_pruned
-            );
+            if consolidate {
+                let out =
+                    commands::consolidate(&config_path, embedder, since, epoch_size).await?;
+                let w = &out.window;
+                println!(
+                    "consolidate summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_threads={} proposals_pruned={} | bridges_written={} bridges_touched={} proposals_promoted={} threads_faded={}",
+                    w.batches_processed,
+                    w.chunks_seen,
+                    w.evidence_links_written,
+                    w.evidence_links_touched,
+                    w.proposed_threads_written,
+                    w.proposals_pruned,
+                    out.anchor_bridges_written,
+                    out.anchor_bridges_touched,
+                    out.proposals_promoted,
+                    out.threads_faded,
+                );
+            } else {
+                let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
+                println!(
+                    "weave summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_weaves={} proposed_threads={} proposals_pruned={}",
+                    out.batches_processed,
+                    out.chunks_seen,
+                    out.evidence_links_written,
+                    out.evidence_links_touched,
+                    out.proposed_weaves,
+                    out.proposed_threads_written,
+                    out.proposals_pruned
+                );
+            }
         }
         Command::Verify => {
             let embedder = resolve_embedder(cli.config.as_ref())?;

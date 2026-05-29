@@ -17,10 +17,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use ostk_recall_core::attention::PrivacyTier;
 use ostk_recall_core::{IngestOrigin, SourceKind, ThreadHandle};
 use ostk_recall_pipeline::{IngestEvent, Pipeline};
 use ostk_recall_store::{
-    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, ThreadRecord, ThreadsDb,
+    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, TensionState,
+    ThreadRecord, ThreadsDb,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -126,11 +128,67 @@ pub struct WeaveWindowOutcome {
     pub proposals_pruned: usize,
 }
 
+/// Aggregate result from a coarse `consolidate` pass — the P11b-full
+/// consolidation cycle layered on top of `weave_window`.
+#[derive(Debug, Default)]
+pub struct ConsolidateOutcome {
+    /// The deep re-weave of the window (binds recent arrivals, re-touches
+    /// edges, prunes stale proposals).
+    pub window: WeaveWindowOutcome,
+    /// New anchor↔thread bridge edges written by the anchor re-weave.
+    pub anchor_bridges_written: usize,
+    /// Existing anchor↔thread bridges re-touched (strengthened) this pass.
+    pub anchor_bridges_touched: usize,
+    /// Recurring, high-cohesion proposals promoted to durable threads.
+    pub proposals_promoted: usize,
+    /// Threads down-transitioned (Active→Slack→Dormant) by the idle fade.
+    pub threads_faded: usize,
+}
+
 /// Unpromoted emergent proposals older than this are pruned at the end of a
 /// `weave_window` pass. Generous enough to leave recent proposals for
 /// operator review; the content-based handle prevents re-accumulation, so
 /// this only clears the genuinely stale tail.
 const PROPOSED_PRUNE_AGE_DAYS: i64 = 14;
+
+// --- consolidation tunables (P11b-full) -----------------------------------
+
+/// Cosine cut-off for the anchor↔anchor bridge re-weave in a consolidation
+/// pass. High on purpose: a consolidated thread only bridges to another
+/// when their anchors genuinely resonate (a canyon-spanning link, not
+/// same-day adjacency).
+const ANCHOR_BRIDGE_THRESHOLD: f32 = 0.85;
+/// A proposal is auto-promoted to a real thread only when its
+/// distinct-content cluster is at least this large …
+const PROMOTE_MIN_DISTINCT_SIZE: usize = 5;
+/// … and at least this cohesive. Auto-promotion writes a durable thread,
+/// so the bar is "clearly a real, recurring unit," not a passing cluster.
+const PROMOTE_MIN_COHESION: f32 = 0.9;
+/// Base idle days after which an `Active` thread fades to `Slack`. Scaled
+/// up by familiarity (see `idle_fade_multiplier`) so deeply-familiar threads
+/// persist longer — the present curates which past stays load-bearing.
+const FADE_SLACK_IDLE_DAYS: f64 = 14.0;
+/// Base idle days after which a thread fades to `Dormant`.
+const FADE_DORMANT_IDLE_DAYS: f64 = 60.0;
+
+/// Familiarity stretches the idle-fade windows: a saturated thread tolerates
+/// up to ~2× the idle before fading. Mirrors the `familiarity_floor` curve.
+#[allow(clippy::cast_precision_loss)]
+fn idle_fade_multiplier(familiarity: u32) -> f64 {
+    1.0 + f64::from(familiarity.min(crate::FAMILIARITY_SATURATION))
+        / f64::from(crate::FAMILIARITY_SATURATION)
+}
+
+/// Coarseness ranking for tension, so the offline fade only ever
+/// *down*-transitions (Active → Slack → Dormant); reanimation is the live
+/// curator's job (it has the resonance signal the offline pass lacks).
+const fn tension_rank(t: TensionState) -> u8 {
+    match t {
+        TensionState::Active => 2,
+        TensionState::Slack => 1,
+        TensionState::Dormant => 0,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WeaverError {
@@ -218,6 +276,125 @@ impl AutoWeaver {
             .threads
             .prune_proposed_threads_older_than(chrono::Duration::days(PROPOSED_PRUNE_AGE_DAYS))?;
         Ok(aggregate)
+    }
+
+    /// Run a coarse **consolidation cycle** over a temporal window — the
+    /// P11b-full layer that goes beyond capture. Where `weave_window` only
+    /// binds and proposes, `consolidate` also: deep-re-weaves recent arrivals,
+    /// bridges consolidated threads across canyons, promotes recurring
+    /// high-quality proposals into durable threads, and fades idle threads so
+    /// the surfaced past stays load-bearing without drowning the present.
+    ///
+    /// Offline by design: the operator schedules it via `weave --consolidate`
+    /// under cron/launchd, never `serve`. It does not make bulk content look
+    /// like live TurnEnds — it invokes the processing primitives directly.
+    pub async fn consolidate(
+        &self,
+        since: Option<chrono::Duration>,
+        epoch_size: usize,
+    ) -> Result<ConsolidateOutcome, WeaverError> {
+        let mut out = ConsolidateOutcome::default();
+
+        // 1. Deep re-weave: bind recent arrivals to the anchor set, re-touch
+        //    edges that re-resonate, prune the stale proposal tail.
+        out.window = self.weave_window(since, epoch_size).await?;
+
+        // 2. Anchor↔anchor re-weave: cross-link consolidated threads whose
+        //    anchors genuinely resonate (canyon-spanning bridges). Feeding the
+        //    anchor set as both candidates and anchors reuses the matched-
+        //    anchor pass; self-links are skipped (anchor_id == chunk_id guard).
+        let snap = self.load_anchor_snapshot().await?;
+        if !snap.anchor_embeds.is_empty() {
+            let pass = self.match_against_anchors(
+                &snap.anchor_embeds,
+                &snap.threads,
+                &snap.anchor_embeds,
+                ANCHOR_BRIDGE_THRESHOLD,
+                "bridge",
+            )?;
+            out.anchor_bridges_written = pass.links_written;
+            out.anchor_bridges_touched = pass.links_touched;
+        }
+
+        // 3. Promote recurring, high-cohesion proposals to durable threads.
+        out.proposals_promoted = self.promote_recurring_proposals()?;
+
+        // 4. Fade idle threads (the present curates the past). Down-only; the
+        //    live curator owns reanimation (it has the resonance signal this
+        //    offline pass lacks).
+        out.threads_faded = self.fade_idle_threads()?;
+
+        Ok(out)
+    }
+
+    /// Promote proposals whose distinct-content cluster is large and cohesive
+    /// enough to be a real, recurring unit. A *surviving* proposal is recurring
+    /// by construction: the date-free handle (RT-5) means the weaver re-proposes
+    /// a still-live cluster idempotently rather than re-creating it, and stale
+    /// proposals are pruned — so a proposal that is still present and clears the
+    /// size/cohesion bar has recurred across passes. The new thread anchors on
+    /// the cluster's first chunk. Idempotent: already-promoted rows are skipped.
+    fn promote_recurring_proposals(&self) -> Result<usize, WeaverError> {
+        let proposals = self.threads.list_proposed_threads()?;
+        let mut promoted = 0usize;
+        for p in proposals {
+            if p.promoted_to.is_some()
+                || p.chunk_ids.len() < PROMOTE_MIN_DISTINCT_SIZE
+                || p.cohesion < PROMOTE_MIN_COHESION
+            {
+                continue;
+            }
+            let Some(anchor) = p.chunk_ids.first() else {
+                continue;
+            };
+            // The proposed handle is already a content-derived `proposed-<hex>`
+            // string; reuse it as the thread handle so the lineage is explicit.
+            let Ok(handle) = ThreadHandle::new(&p.proposed_handle) else {
+                continue;
+            };
+            let now = Utc::now();
+            let rec = ThreadRecord {
+                handle: handle.clone(),
+                tension: TensionState::Active,
+                familiarity: 0,
+                last_touched_at: now,
+                anchor_chunk_id: Some(anchor.clone()),
+                fold_override: None,
+                created_at: now,
+                created_scope_key: None,
+                privacy_tier: PrivacyTier::T1Project,
+            };
+            self.threads.upsert_thread(&rec)?;
+            self.threads
+                .mark_proposed_thread_promoted(&p.proposed_handle, &handle)?;
+            promoted += 1;
+        }
+        Ok(promoted)
+    }
+
+    /// Fade threads that have gone idle, down-transitioning tension by time
+    /// since `last_touched_at`. Familiarity stretches the windows so deeply-
+    /// familiar threads persist longer. Down-only — never reanimates.
+    #[allow(clippy::cast_precision_loss)]
+    fn fade_idle_threads(&self) -> Result<usize, WeaverError> {
+        let now = Utc::now();
+        let mut faded = 0usize;
+        for t in self.threads.list_threads(None)? {
+            let idle_days = (now - t.last_touched_at).num_seconds().max(0) as f64 / 86_400.0;
+            let mult = idle_fade_multiplier(t.familiarity);
+            let target = if idle_days >= FADE_DORMANT_IDLE_DAYS * mult {
+                TensionState::Dormant
+            } else if idle_days >= FADE_SLACK_IDLE_DAYS * mult {
+                TensionState::Slack
+            } else {
+                continue;
+            };
+            if tension_rank(target) < tension_rank(t.tension) {
+                self.threads.set_tension(&t.handle, target)?;
+                faded += 1;
+            }
+        }
+        Ok(faded)
     }
 
     /// Subscribe to `pipeline` and drive the weaver until `cancel`
@@ -554,7 +731,9 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use ostk_recall_core::{Chunk, Links, PrivacyTier, Source};
-    use ostk_recall_store::{CorpusStore, ThreadRecord, ThreadsDb};
+    use ostk_recall_store::{
+        CorpusStore, ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb,
+    };
     use tempfile::TempDir;
 
     const DIM: usize = 4;
@@ -980,5 +1159,132 @@ mod tests {
         assert!((t.for_source(SourceKind::Gemini) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::ZipExport) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::FileGlob) - 0.80).abs() < 1e-6);
+    }
+
+    fn proposal(handle: &str, n_chunks: usize, cohesion: f32) -> ProposedThreadRecord {
+        ProposedThreadRecord {
+            id: 0,
+            proposed_handle: handle.to_string(),
+            chunk_ids: (0..n_chunks).map(|i| format!("{handle}-c{i}")).collect(),
+            centroid_vec: vec![1.0, 0.0, 0.0, 0.0],
+            cohesion,
+            created_at: Utc::now(),
+            promoted_to: None,
+        }
+    }
+
+    fn thread_touched(handle: &str, tension: TensionState, days_idle: i64, fam: u32) -> ThreadRecord {
+        let touched = Utc::now() - chrono::Duration::days(days_idle);
+        ThreadRecord {
+            handle: ThreadHandle::new(handle).unwrap(),
+            tension,
+            familiarity: fam,
+            last_touched_at: touched,
+            anchor_chunk_id: None,
+            fold_override: None,
+            created_at: touched,
+            created_scope_key: None,
+            privacy_tier: PrivacyTier::T1Project,
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_recurring_proposals_gates_on_size_and_cohesion() {
+        let fx = fixture().await;
+        // Passing: large + cohesive.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-bigcohesive", 6, 0.95))
+            .unwrap();
+        // Failing: too small.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-small", 2, 0.99))
+            .unwrap();
+        // Failing: too loose.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-loose", 8, 0.5))
+            .unwrap();
+
+        let promoted = weaver(&fx).promote_recurring_proposals().unwrap();
+        assert_eq!(promoted, 1, "only the large+cohesive proposal promotes");
+
+        // The promoted proposal became a real, anchored thread …
+        let t = fx
+            .threads
+            .get_thread(&ThreadHandle::new("proposed-bigcohesive").unwrap())
+            .unwrap()
+            .expect("promoted thread exists");
+        assert_eq!(t.anchor_chunk_id.as_deref(), Some("proposed-bigcohesive-c0"));
+        // … and the proposal row is marked promoted (won't re-promote).
+        let again = weaver(&fx).promote_recurring_proposals().unwrap();
+        assert_eq!(again, 0, "already-promoted proposals are skipped");
+
+        // The rejected ones did not become threads.
+        assert!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("proposed-loose").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fade_idle_threads_down_transitions_by_idle_time() {
+        let fx = fixture().await;
+        // Fresh → stays Active (idle below the slack window).
+        fx.threads
+            .upsert_thread(&thread_touched("fresh", TensionState::Active, 1, 0))
+            .unwrap();
+        // 20 days idle, familiarity 0 → past the 14d slack window → Slack.
+        fx.threads
+            .upsert_thread(&thread_touched("idle-slack", TensionState::Active, 20, 0))
+            .unwrap();
+        // 90 days idle → past the 60d dormant window → Dormant.
+        fx.threads
+            .upsert_thread(&thread_touched("idle-dormant", TensionState::Active, 90, 0))
+            .unwrap();
+        // 20 days idle but saturated familiarity (×2 window = 28d slack) →
+        // still within tolerance → stays Active.
+        fx.threads
+            .upsert_thread(&thread_touched("familiar", TensionState::Active, 20, 20))
+            .unwrap();
+
+        let faded = weaver(&fx).fade_idle_threads().unwrap();
+        assert_eq!(faded, 2, "idle-slack and idle-dormant fade; others hold");
+
+        let get = |h: &str| {
+            fx.threads
+                .get_thread(&ThreadHandle::new(h).unwrap())
+                .unwrap()
+                .unwrap()
+                .tension
+        };
+        assert_eq!(get("fresh"), TensionState::Active);
+        assert_eq!(get("idle-slack"), TensionState::Slack);
+        assert_eq!(get("idle-dormant"), TensionState::Dormant);
+        assert_eq!(
+            get("familiar"),
+            TensionState::Active,
+            "familiarity stretches the idle window"
+        );
+    }
+
+    #[tokio::test]
+    async fn fade_idle_threads_never_up_transitions() {
+        let fx = fixture().await;
+        // A Dormant thread that is fresh must NOT be reanimated by the
+        // offline fade — that's the live curator's job.
+        fx.threads
+            .upsert_thread(&thread_touched("dormant-fresh", TensionState::Dormant, 0, 0))
+            .unwrap();
+        let faded = weaver(&fx).fade_idle_threads().unwrap();
+        assert_eq!(faded, 0);
+        assert_eq!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("dormant-fresh").unwrap())
+                .unwrap()
+                .unwrap()
+                .tension,
+            TensionState::Dormant
+        );
     }
 }
