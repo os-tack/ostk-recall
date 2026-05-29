@@ -52,9 +52,17 @@ Works today:
 - Hybrid retrieval with RRF fusion over LanceDB's dense and Tantivy BM25
   indexes, plus an optional cross-encoder rerank pass (fastembed-rs;
   default `jina-reranker-v1-turbo-en`).
-- Live attention runtime: TurnObserver (per turn), AutoWeaver (per
-  ingest event), IdleCurator (timer). `InMemoryAttention` score tier
-  rebuilt on boot via chain replay from `threads.sqlite`.
+- Live attention runtime: TurnObserver + AutoWeaver fire on watched
+  conversation-transcript **TurnEnds** (the v0.6 gate — bulk scans no
+  longer replay as live cognition); IdleCurator on a timer.
+  `InMemoryAttention` score tier rebuilt on boot via chain replay from
+  `threads.sqlite`.
+- **Ambient memory lens**: `serve` maintains the `ostk://memory-lens` MCP
+  *resource* — a query-less portfolio of corpus excerpts aligned to the
+  current attention vector and refreshed as focus drifts, so subscribing
+  clients get proactive context without asking. Bulk-scanned content is
+  woven into the thread graph by `ostk-recall weave`. Tune via `[lens]`;
+  `ostk-recall lens show` / `lens disable` to inspect or stop the loop.
 - Idempotent re-ingest via `chunk_id = sha256(source:source_id:chunk_index)`
   and LanceDB `merge_insert`.
 - File-watcher (`ostk-recall watch`) that pokes a running `serve` whenever
@@ -130,10 +138,13 @@ and all tunables.
 ```
 ostk-recall init                # create corpus root, download model
 ostk-recall scan                # ingest configured sources
+ostk-recall weave               # weave bulk-scanned content into the thread graph
 ostk-recall verify              # reconcile counts across store + manifest
+ostk-recall optimize            # compact + fold indexes (--aggressive to collapse old versions)
 ostk-recall serve --stdio       # MCP server on stdio (driver mode, RO)
-ostk-recall serve               # standalone w/ scan-trigger socket (RW)
+ostk-recall serve               # standalone w/ scan-trigger socket (RW) + ambient lens
 ostk-recall watch               # file-watcher → poke standalone serve
+ostk-recall lens show           # print the current ambient memory lens
 ```
 
 ### Live updates
@@ -182,6 +193,12 @@ make serve
 24 tools total across two families. All callable from any MCP client
 (Claude Desktop, Cursor, Claude Code, ostk kernel, etc.) via the
 same `ostk-recall serve --stdio` process.
+
+Alongside the tools, `serve` exposes an MCP **resources** surface —
+`resources/list`, `resources/read`, `resources/subscribe` — currently
+serving the ambient `ostk://memory-lens` (see the memory lens under
+[Status](#status)). Clients that subscribe receive change notifications as
+the lens refreshes.
 
 ### Recall family — corpus retrieval (`crates/mcp`)
 
@@ -340,7 +357,7 @@ query on CPU, ~80 MB to the model cache. Opt out with
               ▼                                          ▼       │
        ┌────────────────┐  ┌────────────────┐  ┌──────────────┐  │
        │ TurnObserver   │  │ AutoWeaver     │  │ IdleCurator  │──┘
-       │ per turn       │  │ per ingest     │  │ timer-driven │
+       │ on TurnEnd     │  │ on TurnEnd     │  │ timer-driven │
        │ → membrane     │  │ → evidence     │  │ → fade +     │
        │   chunks +     │  │   links        │  │   tension    │
        │   stubs        │  │                │  │   transitions│
@@ -360,11 +377,12 @@ callable from Claude Desktop, Cursor, Claude Code, etc.
 `recall.sock`; `watch` debounces filesystem events and pokes the socket
 with the changed paths; `Pipeline::scan_paths` does per-path ingest.
 
-**Attention loop** (conversational stream → live state): TurnObserver
-emits membrane chunks via `Pipeline::ingest_synthetic`; AutoWeaver
-subscribes to `Pipeline::subscribe_ingest` and writes derived evidence
-links; IdleCurator scores fade on a timer and transitions tension
-states.
+**Attention loop** (conversational stream → live state): on a watched
+transcript **TurnEnd**, TurnObserver emits membrane chunks via
+`Pipeline::ingest_synthetic` and AutoWeaver writes derived evidence links
+— both gate on `IngestEvent::is_turn_end()`, so bulk ingest is skipped.
+`ostk-recall weave` runs the same weaver over bulk content on demand.
+IdleCurator scores fade on a timer and transitions tension states.
 
 Read and write daemons share `corpus.lance` via Lance MVCC. The
 `InMemoryAttention` score tier is per-process; it rebuilds from the
