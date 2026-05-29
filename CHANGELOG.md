@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **P11b-full — temporal consolidation: the past weaves the future.** The
+  weaver previously only *captured* (wrote evidence, proposed clusters);
+  this adds the reverse direction — recency re-strengthens which past stays
+  load-bearing, and the unreferenced fades.
+  - **Edge activation.** `evidence_links` gains `touch_count` +
+    `last_touched_at` (idempotent migration + backfill). `edge_activation(
+    similarity, age_days, idle_days, touch_count)` is a derived, componentized
+    score: a recency gate (decays toward zero if never re-touched — so the
+    lens cannot become a hairball) times a similarity bridge (time-distance
+    upweights high-similarity long-range edges; weak matches are not rescued).
+    The weaver re-touches an edge on each re-resonance instead of dropping the
+    signal. Durable rows are never deleted as activation fades.
+  - **`ostk-recall weave --consolidate`.** A coarse consolidation cycle over a
+    `--since` window: deep re-weave → anchor↔anchor bridging across canyons →
+    near-duplicate thread merge → promotion of recurring high-cohesion
+    proposals to durable threads → structural abstraction of deeply-familiar
+    stable threads (fold) → idle-time thread fade. Offline operator policy
+    (cron/launchd), never coupled to `serve`. See the README "Consolidation
+    cadence" section for the scheduling shape.
+
 ## [0.6.0-alpha.4] - 2026-05-29
 
 Daemon transport milestone: `serve` becomes a real standalone daemon

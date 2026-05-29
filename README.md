@@ -145,6 +145,7 @@ and all tunables.
 ostk-recall init                # create corpus root, download model
 ostk-recall scan                # ingest configured sources
 ostk-recall weave               # weave bulk-scanned content into the thread graph
+ostk-recall weave --consolidate # coarse consolidation cycle (bridge/promote/merge/fade)
 ostk-recall verify              # reconcile counts across store + manifest
 ostk-recall optimize            # compact + fold indexes (--aggressive to collapse old versions)
 ostk-recall serve               # standalone daemon: MCP over socket/pipe + ambient lens
@@ -173,6 +174,42 @@ enabled = true
 mode = "incremental"             # opt-in path-aware ingest (~250 ms save → corpus).
                                  # default "legacy" runs a full re-scan per kick.
 ```
+
+### Consolidation cadence (scheduling)
+
+`serve` owns *live* cognition (a watched transcript turn → observer +
+weaver). Offline **consolidation** is separate and operator-scheduled — it
+must not run inside `serve` or compete with lens responsiveness. The
+maintenance shape is explicit and one-directional; nothing is implicitly
+coupled:
+
+```
+ostk-recall scan                          # ingest (prints a `weave` hint on new chunks)
+ostk-recall weave --since 24h             # capture: bind recent arrivals to anchors
+ostk-recall weave --consolidate --since 1w  # coarse cycle (see below)
+ostk-recall optimize                      # compact fragments when you want it
+```
+
+`weave --consolidate` runs the full cycle over its `--since` window:
+deep re-weave → anchor↔anchor bridge → near-duplicate thread merge →
+promote recurring high-cohesion proposals → fold deeply-familiar stable
+threads → idle-fade. The `--since` value *is* the consolidation horizon;
+pick it per cron tier. A sketch (`p11-temporal-consolidation.md` horizons):
+
+```cron
+# crontab — offline consolidation tiers (single-writer; runs beside serve via WAL,
+# or stop serve first for a clean measurement window).
+17 * * * *   ostk-recall weave --since 90m                       # hourly capture
+37 */6 * * * ostk-recall weave --consolidate --since 24h         # 6h: cohere day-threads
+53 4 * * *   ostk-recall weave --consolidate --since 7d          # daily: 1-week consolidate
+23 5 * * 0   ostk-recall weave --consolidate --since 30d && ostk-recall optimize  # weekly: month + compact
+```
+
+On macOS, wrap the same commands in a `launchd` `StartCalendarInterval`
+agent (`~/Library/LaunchAgents/ai.ostk.recall.consolidate.plist`); on
+Linux a systemd timer. The scheduler is policy — the CLI is the only
+contract. Prefix offline runs with `HF_HUB_OFFLINE=1` once the model is
+cached.
 
 The Makefile wraps the same loop:
 
