@@ -701,6 +701,7 @@ pub fn chunk_rust_file(
     source: Source,
     source_id: &str,
     project: Option<&str>,
+    source_config_id: &str,
     mtime: Option<DateTime<Utc>>,
     abs_path: &str,
 ) -> Option<Vec<Chunk>> {
@@ -770,7 +771,7 @@ pub fn chunk_rust_file(
     let first_symbol_line = symbols.iter().map(|s| s.line_start).min().unwrap_or(1);
     if let Some(header_body) = slice_module_header(&file_lines, first_symbol_line) {
         let chunk_index = u32::try_from(chunks.len()).ok()?;
-        let chunk_id = Chunk::make_id(source, source_id, chunk_index);
+        let chunk_id = Chunk::make_id(source, source_id, chunk_index, source_config_id);
         let sha256 = Chunk::content_hash(&header_body);
         let extra = serde_json::json!({
             "kind": "module_header",
@@ -784,6 +785,9 @@ pub fn chunk_rust_file(
             source,
             project: project.map(str::to_string),
             source_id: source_id.to_string(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
+            source_config_id: source_config_id.to_string(),
             chunk_index,
             ts: mtime,
             role: None,
@@ -804,7 +808,7 @@ pub fn chunk_rust_file(
         }
         let body = format!("// {} {}\n{}", sym.kind, sym.name, chunk_text);
         let chunk_index = u32::try_from(chunks.len()).ok()?;
-        let chunk_id = Chunk::make_id(source, source_id, chunk_index);
+        let chunk_id = Chunk::make_id(source, source_id, chunk_index, source_config_id);
         let sha256 = Chunk::content_hash(&body);
         let extra = serde_json::json!({
             "kind": sym.kind,
@@ -822,6 +826,9 @@ pub fn chunk_rust_file(
             source,
             project: project.map(str::to_string),
             source_id: source_id.to_string(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
+            source_config_id: source_config_id.to_string(),
             chunk_index,
             ts: mtime,
             role: None,

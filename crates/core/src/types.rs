@@ -9,10 +9,40 @@
 //! in v0.1.5 (cut #3 prep, →1848). The query crate keeps `pub use` re-exports
 //! for backward compatibility with existing consumers.
 
+use std::collections::BTreeMap;
+
 use crate::attention::AttentionScope;
 use crate::{ContextRole, Links, RecallIntent};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// One feature's contribution to a hit's total score, surfaced on the
+/// MCP wire as the recall response's `match_features` map. Mirrors
+/// `ostk_recall_query::rank::FeatureAttribution` but lives in `core`
+/// so the serialized shape stays in the wire-types crate.
+///
+/// Per P3A: `total_score = Σ contribution` over the map's entries.
+/// `weight` is the engine-configured multiplier; `raw` is the
+/// feature's `[0, 1]` output. P9b portfolio slot dominance reads
+/// `contribution` (raw with a zero weight is misleadingly large);
+/// debug UIs surface both.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct MatchFeature {
+    pub raw: f32,
+    pub weight: f32,
+    pub contribution: f32,
+}
+
+impl MatchFeature {
+    #[must_use]
+    pub fn new(raw: f32, weight: f32) -> Self {
+        Self {
+            raw,
+            weight,
+            contribution: raw * weight,
+        }
+    }
+}
 
 /// Optional attention-bias rider for [`RecallParams`].
 ///
@@ -74,6 +104,10 @@ pub struct RecallParams {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// Half-open upper bound (`ts < before`). Combined with `since` this
+    /// yields a `[since, before)` interval. P1 addition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     /// Cap on hits sharing the same `source_id` after RRF reranking.
@@ -89,6 +123,41 @@ pub struct RecallParams {
     /// hybrid score alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_bias: Option<AttentionBiasParams>,
+    /// Optional per-call overrides for tunable rank constants
+    /// (P3A). `None` falls back to the hardcoded defaults in
+    /// `crates/query/src/hybrid.rs` for everything; populating a
+    /// field overrides just that knob. P5 / `[ranking.stages]` /
+    /// `[ranking.weights]` configuration will plumb through this
+    /// same struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking_overrides: Option<RankingOverrides>,
+}
+
+/// Per-call overrides for tunable rank constants.
+///
+/// Each field defaults to `None` → the implementation's compiled-in
+/// constant is used. Operators set the few knobs they care about.
+/// File-config (`[ranking.stages]`, `[ranking.weights]`) lands later
+/// and populates this same struct before passing through to recall.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RankingOverrides {
+    /// Override `STRATIFIED_CODE_PREFETCH` (default 12). Number of
+    /// code-only dense candidates appended to the primary lane when
+    /// the caller hasn't filtered by `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stratified_code_prefetch: Option<usize>,
+    /// Override `IDENTIFIER_CODE_BOOST` (default 3.0). Additive
+    /// score the post-rank identifier-boost stage applies to code
+    /// rows whose snippet contains the identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_code_boost: Option<f32>,
+    /// Override `K_BM25` (default 10.0). Soft-sigmoid constant in
+    /// the `Bm25` rank-feature normalizer `s / (s + K_BM25)`. The
+    /// `Bm25` feature ships at weight 0.0 in alpha.1 (numerically
+    /// inert) and gets tuned in P5; this override lets P5 sweep
+    /// without code changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k_bm25: Option<f32>,
 }
 
 /// One retrieval row, shaped for MCP consumers.
@@ -150,6 +219,16 @@ pub struct RecallHit {
     /// shape). Populated identically; remove at v1.0.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_weight: Option<f32>,
+    /// Per-feature score attribution from the P3A rank engine.
+    ///
+    /// `total_score = Σ entry.contribution`. Keyed by feature name
+    /// (e.g. `"rrf"`, `"identifier_boost"`); ordered by name for
+    /// stable debug output. Empty when no rank engine ran (e.g.
+    /// legacy decoder paths, fake hits in tests). Additive on the
+    /// wire — older MCP clients that don't know about this field
+    /// will ignore it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub match_features: BTreeMap<String, MatchFeature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

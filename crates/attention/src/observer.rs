@@ -28,7 +28,9 @@ use ostk_recall_core::attention::{AttentionScope, PrivacyTier, ThreadHandle, Thr
 use ostk_recall_core::{Chunk, Links, Source};
 use ostk_recall_pipeline::{Pipeline, PipelineError, SyntheticSourceMeta};
 use ostk_recall_store::corpus::{CorpusStore, StoreError};
-use ostk_recall_store::{ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb};
+use ostk_recall_store::{
+    ChainEvent, ChainSink, ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb,
+};
 use regex::Regex;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -140,6 +142,14 @@ pub struct TurnObserver {
     /// Optional so test fixtures and library callers without a live
     /// score tier work unchanged.
     attention: Option<Arc<dyn crate::AttentionForwardStore>>,
+    /// Optional chain sink for attention-side events. When set, every
+    /// successful `attend()` emits `ChainEvent::RollingVectorSnapshot`
+    /// and every noise-gate rejection emits
+    /// `ChainEvent::AttentionTurnSkipped`. The Skipped path is wired
+    /// in P6A but only fired in P6-full once the noise gate ships.
+    /// Independent from the `ThreadsDb` sink so the observer can
+    /// participate in chain emission without owning ledger writes.
+    chain_sink: Option<Arc<dyn ChainSink>>,
 }
 
 impl TurnObserver {
@@ -159,6 +169,7 @@ impl TurnObserver {
             known_handles: Arc::new(RwLock::new(HashSet::new())),
             promotions_this_session: Arc::new(AtomicUsize::new(0)),
             attention: None,
+            chain_sink: None,
         }
     }
 
@@ -168,6 +179,18 @@ impl TurnObserver {
     #[must_use]
     pub fn with_attention(mut self, attention: Arc<dyn crate::AttentionForwardStore>) -> Self {
         self.attention = Some(attention);
+        self
+    }
+
+    /// Attach a [`ChainSink`] so the observer-mediated attend path
+    /// persists `RollingVectorSnapshot` / `AttentionTurnSkipped`
+    /// events. Direct calls into `InMemoryAttention::attend()`
+    /// (test-only) bypass this and emit no chain rows — the observer
+    /// is the only path that persists, per the design split in
+    /// `p6-attention-ema.md` ("Chain event ownership").
+    #[must_use]
+    pub fn with_chain_sink(mut self, sink: Arc<dyn ChainSink>) -> Self {
+        self.chain_sink = Some(sink);
         self
     }
 
@@ -232,11 +255,47 @@ impl TurnObserver {
         // Best-effort — a failing in-memory store must never abort the
         // durable observation.
         if let Some(attn) = &self.attention {
-            if let Err(err) = attn.attend(scope, turn_text).await {
-                tracing::warn!(
-                    error = %err,
-                    "persistent-attention: attend failed at observe entry"
-                );
+            match attn.attend(scope, turn_text).await {
+                Ok(outcome) => {
+                    // P6A — observer owns chain emission. Direct
+                    // `attend()` calls (tests) bypass this path and
+                    // emit no chain rows; only the observer-mediated
+                    // route persists rolling-vector / turn-skipped
+                    // events. See `p6-attention-ema.md` "Chain event
+                    // ownership".
+                    if let Some(sink) = &self.chain_sink {
+                        let event = match outcome {
+                            crate::AttendOutcome::Updated {
+                                rolling_vec,
+                                lambda,
+                            } => ChainEvent::RollingVectorSnapshot {
+                                scope: scope.clone(),
+                                vec: rolling_vec,
+                                lambda,
+                                ts: Utc::now(),
+                            },
+                            crate::AttendOutcome::Skipped { reason } => {
+                                ChainEvent::AttentionTurnSkipped {
+                                    scope: scope.clone(),
+                                    reason,
+                                    ts: Utc::now(),
+                                }
+                            }
+                        };
+                        if let Err(err) = sink.append(&event) {
+                            tracing::warn!(
+                                error = %err,
+                                "persistent-attention: chain append failed"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "persistent-attention: attend failed at observe entry"
+                    );
+                }
             }
         }
 
@@ -283,7 +342,8 @@ impl TurnObserver {
                 }
             }
             if !entries.is_empty() {
-                self.store.record_familiarity_batch(entries.clone(), turn_seq)?;
+                self.store
+                    .record_familiarity_batch(entries.clone(), turn_seq)?;
                 // Mirror the durable familiarity bumps into the in-memory
                 // score tier so `surface()` / `score_thread()` see them
                 // without waiting for chain replay on next boot. Matches
@@ -334,8 +394,7 @@ impl TurnObserver {
             };
 
             let qualifies_for_promotion = count >= PROMOTE_MIN_OCCURRENCES
-                && self.promotions_this_session.load(Ordering::Relaxed)
-                    < PROMOTION_CAP_PER_SESSION;
+                && self.promotions_this_session.load(Ordering::Relaxed) < PROMOTION_CAP_PER_SESSION;
             let promoted_to_handle = if qualifies_for_promotion {
                 ThreadHandle::new(phrase.clone()).ok()
             } else {
@@ -463,6 +522,14 @@ impl TurnObserver {
                 res = rx.recv() => {
                     match res {
                         Ok(event) => {
+                            // Live cognition fires ONLY on a TurnEnd: a
+                            // watched conversation-transcript ingest. Bulk
+                            // scans (replaying history through the live
+                            // pipeline) and synthetic self-writes (membrane
+                            // feedback) are skipped.
+                            if !event.is_turn_end() {
+                                continue;
+                            }
                             let scope = AttentionScope {
                                 project: event
                                     .project
@@ -514,6 +581,9 @@ impl TurnObserver {
                     // handshake doesn't race the broadcast. Best-effort
                     // observe; per-event errors stay non-fatal.
                     while let Ok(event) = rx.try_recv() {
+                        if !event.is_turn_end() {
+                            continue;
+                        }
                         let scope = AttentionScope {
                             project: event
                                 .project
@@ -711,7 +781,12 @@ fn build_membrane_chunks(
             // u32::try_from is bounded by triggers.len() in a single
             // turn — astronomically below u32::MAX, but be tidy.
             let chunk_index = u32::try_from(idx).unwrap_or(u32::MAX);
-            let chunk_id = Chunk::make_id(Source::Membrane, &source_id, chunk_index);
+            // Synthetic (membrane) chunks bypass `[[sources]]` config; use
+            // the reserved `synthetic:<kind>` discriminator per P0.
+            let source_config_id =
+                Chunk::synthetic_source_config_id(ostk_recall_core::SourceKind::Membrane);
+            let chunk_id =
+                Chunk::make_id(Source::Membrane, &source_id, chunk_index, &source_config_id);
             let sha = Chunk::content_hash(&window);
             let extra = serde_json::json!({
                 "kind": "recognition",
@@ -725,6 +800,9 @@ fn build_membrane_chunks(
                 source: Source::Membrane,
                 project: None, // pipeline ingest_synthetic carries project via meta
                 source_id,
+                source_config_id,
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
                 chunk_index,
                 ts: Some(Utc::now()),
                 role: Some("recognition".into()),
@@ -1007,7 +1085,10 @@ mod tests {
         let turn = "We keep returning to hoberman-thread-primitive, \
             and hoberman-thread-primitive shows up again in this turn, \
             because hoberman-thread-primitive is everywhere.";
-        let res = obs.observe(&scope(), turn, 5, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), turn, 5, "sess-1", None)
+            .await
+            .unwrap();
         assert_eq!(
             res.familiarity_increments.len(),
             1,
@@ -1045,7 +1126,10 @@ mod tests {
         let _ = sink.take();
 
         let turn = "We talked about not-a-real-handle and never mentioned it again.";
-        let res = obs.observe(&scope(), turn, 1, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), turn, 1, "sess-1", None)
+            .await
+            .unwrap();
         assert!(
             res.familiarity_increments.is_empty(),
             "unknown handle must not increment familiarity"
@@ -1067,7 +1151,10 @@ mod tests {
 
         // Single mention => no stub.
         let single = "I keep thinking about idle-curator-fade in passing.";
-        let res = obs.observe(&scope(), single, 1, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), single, 1, "sess-1", None)
+            .await
+            .unwrap();
         assert!(
             !res.proposed_stubs
                 .iter()
@@ -1078,7 +1165,10 @@ mod tests {
         // Double mention => stub.
         let double = "We saw idle-curator-fade come up twice. \
             Then idle-curator-fade again, in the second sentence.";
-        let res = obs.observe(&scope(), double, 2, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), double, 2, "sess-1", None)
+            .await
+            .unwrap();
         assert!(
             res.proposed_stubs
                 .iter()
@@ -1098,7 +1188,10 @@ mod tests {
 
         let turn = "Look at hoberman-thread-primitive and \
             hoberman-thread-primitive once more — it keeps showing up.";
-        let res = obs.observe(&scope(), turn, 3, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), turn, 3, "sess-1", None)
+            .await
+            .unwrap();
         assert!(
             !res.proposed_stubs
                 .iter()
@@ -1174,7 +1267,10 @@ mod tests {
             That also points at attention-substrate-mvp, \
             and attention-substrate-mvp is worth a thread.";
 
-        let res = obs.observe(&scope(), turn, 11, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), turn, 11, "sess-1", None)
+            .await
+            .unwrap();
 
         assert!(
             res.membrane_chunks_ingested >= 1,
@@ -1342,8 +1438,8 @@ mod tests {
             "test assumes <=12 phrases; expand suffixes if cap grows"
         );
         let suffixes = [
-            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
-            "theta", "iota", "kappa", "lambda", "mu",
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+            "lambda", "mu",
         ];
         let mut turn = String::new();
         for suffix in suffixes.iter().take(n) {
@@ -1396,7 +1492,10 @@ mod tests {
         let turn = "anchor-less-phrase came up. \
             anchor-less-phrase showed up. \
             anchor-less-phrase one more.";
-        let res = obs.observe(&scope(), turn, 1, "sess-1", None).await.unwrap();
+        let res = obs
+            .observe(&scope(), turn, 1, "sess-1", None)
+            .await
+            .unwrap();
 
         // 3 mentions but no anchor → no row written; falls through to
         // the proposed-stubs return path (legacy behavior for tests).
@@ -1427,8 +1526,7 @@ mod tests {
         let db = ThreadsDb::open_with_sink(store_tmp.path(), sink).unwrap();
         let attention: Arc<dyn crate::AttentionForwardStore> =
             Arc::new(crate::InMemoryAttention::new());
-        let obs = TurnObserver::new(pipeline, Arc::new(db))
-            .with_attention(Arc::clone(&attention));
+        let obs = TurnObserver::new(pipeline, Arc::new(db)).with_attention(Arc::clone(&attention));
 
         let chunk_id = "membrane:sess-1:42:0";
         let turn = "we keep returning to fade-is-concentration, \
@@ -1456,10 +1554,7 @@ mod tests {
         );
 
         // And surface(...) sees the thread (score above ARCHIVE_THRESHOLD).
-        let pages = attention
-            .surface(&scope(), 10)
-            .await
-            .unwrap();
+        let pages = attention.surface(&scope(), 10).await.unwrap();
         assert!(
             pages.iter().any(|p| p.handle == h.as_str()),
             "surface() must include the promoted thread"
@@ -1502,8 +1597,7 @@ mod tests {
         })
         .unwrap();
 
-        let obs = TurnObserver::new(pipeline, Arc::new(db))
-            .with_attention(Arc::clone(&attention));
+        let obs = TurnObserver::new(pipeline, Arc::new(db)).with_attention(Arc::clone(&attention));
         obs.refresh_known_handles().await.unwrap();
 
         // Pre-condition: no in-memory score yet.

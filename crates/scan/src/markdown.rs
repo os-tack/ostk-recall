@@ -67,6 +67,7 @@ impl Scanner for MarkdownScanner {
                         project: project.clone(),
                         bytes: None,
                         ignore: Vec::new(),
+                        source_config_id: "test-cfg".to_string(),
                     })
                 })
         });
@@ -104,6 +105,7 @@ impl Scanner for MarkdownScanner {
                 project: project.clone(),
                 bytes: None,
                 ignore: Vec::new(),
+                source_config_id: "test-cfg".to_string(),
             }))
         });
         Box::new(iter)
@@ -132,7 +134,12 @@ impl Scanner for MarkdownScanner {
                     item.source_id
                 ))
             })?;
-            let chunk_id = Chunk::make_id(Source::Markdown, &item.source_id, chunk_index);
+            let chunk_id = Chunk::make_id(
+                Source::Markdown,
+                &item.source_id,
+                chunk_index,
+                &item.source_config_id,
+            );
             let sha256 = Chunk::content_hash(&seg);
             let links = Links {
                 file_path: Some(abs_path.clone()),
@@ -143,6 +150,9 @@ impl Scanner for MarkdownScanner {
                 source: Source::Markdown,
                 project: item.project.clone(),
                 source_id: item.source_id.clone(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
+                source_config_id: item.source_config_id.clone(),
                 chunk_index,
                 ts: mtime,
                 role: None,
@@ -326,6 +336,9 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
     }
 

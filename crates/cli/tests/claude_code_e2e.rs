@@ -101,13 +101,15 @@ async fn claude_code_end_to_end() {
         .await
         .unwrap();
     assert_eq!(out.totals.errors, 0);
-    // Per-message chunking (Phase H):
-    //   session-a: user "hi there" + assistant text "let me check" + tool_use + assistant text "done" = 4
+    // Per-message chunking (Phase H) + ingest-side drop_tool_blocks:
+    //   session-a: user "hi there" + assistant text "let me check" + assistant text "done" = 3
+    //     (the tool_use block is dropped at the scanner — see
+    //      claude_code.rs::parse_two_sessions_with_tool_use)
     //   session-b: user "q" + assistant text "a" = 2
-    //   total = 6
+    //   total = 5
     assert_eq!(
-        out.totals.chunks_upserted, 6,
-        "expected 6 per-block chunks, got {:?}",
+        out.totals.chunks_upserted, 5,
+        "expected 5 per-block chunks (tool_use dropped), got {:?}",
         out.totals
     );
 

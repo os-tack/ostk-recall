@@ -120,8 +120,8 @@ pub struct NoveltyReport {
 /// permissive output (the v0.3.1 discipline default) should pass `0.0`
 /// explicitly — see `crates/attention-mcp/src/handlers.rs::thread_novelty`.
 #[allow(clippy::too_many_lines)] // baseline computation + per-chunk scoring + recluster
-                                 // + filter is one logical pipeline; splitting hurts more
-                                 // than it helps. v0.4.0 `thread_query` consolidates this.
+// + filter is one logical pipeline; splitting hurts more
+// than it helps. v0.4.0 `thread_query` consolidates this.
 pub async fn surface_novelty(
     corpus: &Arc<CorpusStore>,
     since: DateTime<Utc>,
@@ -187,10 +187,8 @@ pub async fn surface_novelty(
         .iter()
         .map(|c| (c.chunk_id.clone(), c.embedding.clone()))
         .collect();
-    let by_id: HashMap<&str, &ScoredChunk> = scored
-        .iter()
-        .map(|c| (c.chunk_id.as_str(), c))
-        .collect();
+    let by_id: HashMap<&str, &ScoredChunk> =
+        scored.iter().map(|c| (c.chunk_id.as_str(), c)).collect();
 
     let clusters = find_clusters_with(&cluster_input, recluster_threshold, min_cluster, 2);
     if clusters.is_empty() {
@@ -357,6 +355,9 @@ mod tests {
             source: Source::Markdown,
             project: Some("p".into()),
             source_id: format!("{id}.md"),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
+            source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: Some(ts),
             role: None,
@@ -403,9 +404,17 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
-            .await
-            .unwrap();
+        let reports = surface_novelty(
+            &store,
+            since,
+            7,
+            10,
+            3,
+            DEFAULT_RECLUSTER_THRESHOLD,
+            MIN_MEAN_NOVELTY,
+        )
+        .await
+        .unwrap();
         assert_eq!(reports.len(), 1, "got {reports:#?}");
         let r = &reports[0];
         assert_eq!(r.members, 3);
@@ -436,9 +445,17 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
-            .await
-            .unwrap();
+        let reports = surface_novelty(
+            &store,
+            since,
+            7,
+            10,
+            3,
+            DEFAULT_RECLUSTER_THRESHOLD,
+            MIN_MEAN_NOVELTY,
+        )
+        .await
+        .unwrap();
         assert!(reports.is_empty(), "got {reports:#?}");
     }
 
@@ -460,9 +477,17 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
-            .await
-            .unwrap();
+        let reports = surface_novelty(
+            &store,
+            since,
+            7,
+            10,
+            3,
+            DEFAULT_RECLUSTER_THRESHOLD,
+            MIN_MEAN_NOVELTY,
+        )
+        .await
+        .unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].members, 4);
         // Same caveat as `surface_novelty_scores_orthogonal_higher_than_aligned`:
@@ -534,9 +559,17 @@ mod tests {
         store.upsert(&chunks, &embs).await.unwrap();
 
         let since = now - chrono::Duration::hours(1);
-        let reports = surface_novelty(&store, since, 7, 10, 3, DEFAULT_RECLUSTER_THRESHOLD, MIN_MEAN_NOVELTY)
-            .await
-            .unwrap();
+        let reports = surface_novelty(
+            &store,
+            since,
+            7,
+            10,
+            3,
+            DEFAULT_RECLUSTER_THRESHOLD,
+            MIN_MEAN_NOVELTY,
+        )
+        .await
+        .unwrap();
         assert!(reports.is_empty());
     }
 }

@@ -25,6 +25,9 @@ fn dumps_extra_for_haystack_thread() {
         paths: vec![root.to_string_lossy().into_owned()],
         ignore: vec![],
         extensions: vec![],
+        id: None,
+        source_config_id: "test-cfg".to_string(),
+        facets: Default::default(),
     };
     let scanner = ThreadScanner;
     let items: Vec<_> = scanner.discover(&cfg).filter_map(Result::ok).collect();

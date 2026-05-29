@@ -265,20 +265,25 @@ mod tests {
         let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
         assert_eq!(clusters.len(), 1, "expected exactly one emergent cluster");
         let c = &clusters[0];
-        assert_eq!(c.chunk_ids.len(), 4, "cluster should contain all 4 hot chunks");
+        assert_eq!(
+            c.chunk_ids.len(),
+            4,
+            "cluster should contain all 4 hot chunks"
+        );
         for id in &c.chunk_ids {
             assert!(id.starts_with("hot-"), "unexpected cluster member: {id}");
         }
-        assert!(c.cohesion > 0.99, "cohesion should be near-1 for tight cluster, got {}", c.cohesion);
+        assert!(
+            c.cohesion > 0.99,
+            "cohesion should be near-1 for tight cluster, got {}",
+            c.cohesion
+        );
         assert_eq!(c.centroid.len(), dim);
     }
 
     #[test]
     fn no_clusters_when_batch_below_min_size() {
-        let chunks = vec![
-            v("a", near_axis(0, 4, 0.01)),
-            v("b", near_axis(0, 4, 0.01)),
-        ];
+        let chunks = vec![v("a", near_axis(0, 4, 0.01)), v("b", near_axis(0, 4, 0.01))];
         let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
         assert!(clusters.is_empty());
     }

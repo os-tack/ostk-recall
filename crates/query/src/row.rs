@@ -107,6 +107,7 @@ pub fn batch_to_hits(batch: &RecordBatch) -> Result<Vec<RecallHit>> {
             embedding_weight: None,
             attention_score: None,
             attention_weight: None,
+            match_features: Default::default(),
         });
     }
 

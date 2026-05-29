@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0-alpha.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -57,10 +57,10 @@ ostk-recall-cli = { path = "crates/cli" }
 
 # external
 model2vec-rs = "0.1.4"
-lancedb = "0.27.2"
-arrow = "57"
-arrow-array = "57"
-arrow-schema = "57"
+lancedb = "0.29.0"
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
 rusqlite = { version = "0.33", features = ["bundled"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync", "net"] }
 tokio-util = "0.7"
@@ -76,10 +76,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 sha2 = "0.10"
+blake3 = "1"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"
+rlimit = "0.10"
 walkdir = "2.5"
 ignore = "0.4"
 globset = "0.4"

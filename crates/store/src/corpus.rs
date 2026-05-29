@@ -12,7 +12,7 @@ use lancedb::index::Index;
 use lancedb::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FtsIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::OptimizeAction;
-use ostk_recall_core::Chunk;
+use ostk_recall_core::{Chunk, SourceKind};
 use thiserror::Error;
 
 use crate::schema::{CORPUS_TABLE, corpus_schema};
@@ -71,6 +71,13 @@ pub struct CorpusStore {
     root: PathBuf,
 }
 
+/// One source-kind batch selected for a windowed corpus pass.
+#[derive(Debug, Clone)]
+pub struct CorpusWindowBatch {
+    pub source: SourceKind,
+    pub chunk_ids: Vec<String>,
+}
+
 impl CorpusStore {
     /// Open (or create) the `LanceDB` connection at `<root>/corpus.lance`. The
     /// corpus table is created with the given embedding dim if absent.
@@ -116,6 +123,15 @@ impl CorpusStore {
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         let n = table.count_rows(None).await?;
         Ok(n)
+    }
+
+    /// Current Lance dataset version of the corpus table. Each commit
+    /// (`merge_insert`, delete, optimize) bumps this. Opening the table
+    /// fresh returns the latest version, so callers see commits made by
+    /// other handles. Used to verify commit batching and prune passes.
+    pub async fn version(&self) -> Result<u64> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        Ok(table.version().await?)
     }
 
     /// Ensure the Tantivy FTS index exists on the `text` column. Idempotent —
@@ -432,6 +448,205 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Batch-fetch full `Chunk` rows plus their dense embeddings.
+    ///
+    /// Returns `chunk_id -> (Chunk, Option<embedding>)`. Ids absent
+    /// from the corpus are simply omitted. The embedding entry is
+    /// `None` only when the row's embedding column is null (legacy /
+    /// partial-ingest case).
+    ///
+    /// Used by `crates/query/src/lanes.rs::build_candidates` after the
+    /// per-lane queries return ids only. One query per call regardless
+    /// of K — the `chunk_id IN (...)` filter lets Lance push the lookup
+    /// down.
+    pub async fn fetch_chunks_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (Chunk, Option<Vec<f32>>)>> {
+        use std::collections::HashMap;
+
+        use arrow_array::{Array, ListArray};
+        use chrono::TimeZone;
+        use ostk_recall_core::Links;
+
+        let mut out: HashMap<String, (Chunk, Option<Vec<f32>>)> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let ids_joined = ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({ids_joined})");
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "source".into(),
+                "project".into(),
+                "source_id".into(),
+                "source_config_id".into(),
+                "facets".into(),
+                "embedding_input_sha256".into(),
+                "chunk_index".into(),
+                "ts".into(),
+                "role".into(),
+                "text".into(),
+                "sha256".into(),
+                "links_json".into(),
+                "extra_json".into(),
+                "embedding".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        for batch in &batches {
+            let n = batch.num_rows();
+            if n == 0 {
+                continue;
+            }
+            let chunk_id = downcast_str(batch, "chunk_id")?;
+            let source = downcast_str(batch, "source")?;
+            let project = downcast_str_opt(batch, "project");
+            let source_id = downcast_str(batch, "source_id")?;
+            let source_config_id = downcast_str_opt(batch, "source_config_id");
+            let embedding_input_sha256 = downcast_str_opt(batch, "embedding_input_sha256");
+            let chunk_index = downcast_u32(batch, "chunk_index")?;
+            let ts = batch
+                .column_by_name("ts")
+                .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>());
+            let role = downcast_str_opt(batch, "role");
+            let text = downcast_str(batch, "text")?;
+            let sha256 = downcast_str(batch, "sha256")?;
+            let links_json = downcast_str(batch, "links_json")?;
+            let extra_json = downcast_str(batch, "extra_json")?;
+            let facets = batch
+                .column_by_name("facets")
+                .and_then(|c| c.as_any().downcast_ref::<ListArray>());
+            let emb = batch
+                .column_by_name("embedding")
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
+            let emb_dim = emb.map(|a| usize::try_from(a.value_length()).unwrap_or(0));
+            let emb_values = emb.and_then(|a| {
+                a.values()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .cloned()
+            });
+
+            for i in 0..n {
+                let id = chunk_id.value(i).to_string();
+                let parsed_source = match parse_source(source.value(i)) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let links: Links = if links_json.is_null(i) {
+                    Links::default()
+                } else {
+                    serde_json::from_str(links_json.value(i)).unwrap_or_default()
+                };
+                let extra: serde_json::Value = if extra_json.is_null(i) {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(extra_json.value(i)).unwrap_or(serde_json::Value::Null)
+                };
+
+                let facet_list: Vec<String> = if let Some(arr) = facets {
+                    if arr.is_null(i) {
+                        Vec::new()
+                    } else {
+                        let inner = arr.value(i);
+                        let inner_str =
+                            inner
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .ok_or_else(|| {
+                                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                                        "facets inner expected Utf8".into(),
+                                    ))
+                                })?;
+                        let mut v = Vec::with_capacity(inner_str.len());
+                        for j in 0..inner_str.len() {
+                            if !inner_str.is_null(j) {
+                                v.push(inner_str.value(j).to_string());
+                            }
+                        }
+                        v
+                    }
+                } else {
+                    Vec::new()
+                };
+                let facets_set = ostk_recall_core::from_list(&facet_list);
+
+                let ts_val = ts.and_then(|a| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        chrono::Utc.timestamp_micros(a.value(i)).single()
+                    }
+                });
+
+                let chunk = Chunk {
+                    chunk_id: id.clone(),
+                    source: parsed_source,
+                    project: project.and_then(|a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i).to_string())
+                        }
+                    }),
+                    source_id: source_id.value(i).to_string(),
+                    source_config_id: source_config_id.map_or(String::new(), |a| {
+                        if a.is_null(i) {
+                            String::new()
+                        } else {
+                            a.value(i).to_string()
+                        }
+                    }),
+                    chunk_index: chunk_index.value(i),
+                    ts: ts_val,
+                    role: role.and_then(|a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i).to_string())
+                        }
+                    }),
+                    text: text.value(i).to_string(),
+                    sha256: sha256.value(i).to_string(),
+                    links,
+                    facets: facets_set,
+                    embedding_input_sha256: embedding_input_sha256.map_or(String::new(), |a| {
+                        if a.is_null(i) {
+                            String::new()
+                        } else {
+                            a.value(i).to_string()
+                        }
+                    }),
+                    extra,
+                };
+
+                let embedding = match (emb, emb_values.as_ref(), emb_dim) {
+                    (Some(arr), Some(values), Some(dim)) if dim > 0 && !arr.is_null(i) => {
+                        let start = i * dim;
+                        Some(values.values()[start..start + dim].to_vec())
+                    }
+                    _ => None,
+                };
+
+                out.insert(id, (chunk, embedding));
+            }
+        }
+        Ok(out)
+    }
+
     /// Sample non-stale chunks ingested since `since`, up to `limit` rows.
     /// Returns `(chunk_id, embedding)` pairs for use with emergent
     /// clustering. Ordering is whatever Lance returns — callers that
@@ -459,10 +674,7 @@ impl CorpusStore {
             .query()
             .only_if(filter)
             .limit(limit)
-            .select(Select::Columns(vec![
-                "chunk_id".into(),
-                "embedding".into(),
-            ]))
+            .select(Select::Columns(vec!["chunk_id".into(), "embedding".into()]))
             .execute()
             .await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -755,6 +967,33 @@ impl CorpusStore {
         Ok(())
     }
 
+    /// Aggressive optimize: compact + reindex (via [`OptimizeAction::All`]),
+    /// then prune **all** historical versions, collapsing the table to its
+    /// latest version. Returns the number of old versions removed.
+    ///
+    /// Unlike [`Self::optimize_all`], this overrides Lance's default
+    /// retention: `delete_unverified = true` bypasses the 7-day
+    /// in-progress-transaction guard so versions created *today* are
+    /// actually removed. That is the only way to undo a version explosion
+    /// from a heavy scan without waiting two weeks — but it is **only safe
+    /// when no other process is writing this corpus**. Callers must
+    /// guarantee exclusivity (the `optimize --aggressive` CLI path makes
+    /// the operator responsible).
+    pub async fn optimize_compact_and_prune(&self) -> Result<u64> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        // 1. Compact small fragments + fold new data into indices.
+        table.optimize(OptimizeAction::All).await?;
+        // 2. Prune every version older than "now" (keep only the latest).
+        let stats = table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(chrono::Duration::zero()),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await?;
+        Ok(stats.prune.map_or(0, |p| p.old_versions))
+    }
+
     /// Cheap, scan-time variant of [`Self::optimize_all`]: just fold any
     /// fragments appended since the last index build into the existing
     /// scalar / FTS indices. Skips `Compact` and `Prune` because both
@@ -799,9 +1038,7 @@ impl CorpusStore {
             return Ok(false);
         };
         let manifest = native.manifest().await?;
-        let has_interval = manifest
-            .config
-            .contains_key("lance.auto_cleanup.interval");
+        let has_interval = manifest.config.contains_key("lance.auto_cleanup.interval");
         let has_older = manifest
             .config
             .contains_key("lance.auto_cleanup.older_than");
@@ -930,9 +1167,7 @@ impl CorpusStore {
         // are reproducible across runs.
         let mut out: Vec<ActivityBurst> = groups.into_values().collect();
         for burst in &mut out {
-            burst
-                .samples
-                .sort_by(|a, b| b.1.cmp(&a.1));
+            burst.samples.sort_by(|a, b| b.1.cmp(&a.1));
             burst.samples.truncate(samples_per_group);
             burst.chunk_ids.sort();
         }
@@ -995,6 +1230,70 @@ impl CorpusStore {
                 out.insert(id_arr.value(i).to_string(), ts);
             }
         }
+        Ok(out)
+    }
+
+    /// Return non-stale chunk ids in a time window, grouped by source kind
+    /// and split into fixed-size batches.
+    ///
+    /// `since = None` means the whole active corpus. `since = Some(ts)`
+    /// excludes rows with NULL timestamps, which is the only defensible
+    /// interpretation for a lower-bound time filter.
+    pub async fn chunk_id_batches_by_source_window(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        epoch_size: usize,
+    ) -> Result<Vec<CorpusWindowBatch>> {
+        use std::collections::HashMap;
+
+        let epoch_size = epoch_size.max(1);
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let filter = match since {
+            Some(ts) => format!(
+                "stale = false AND ts >= TIMESTAMP '{}'",
+                ts.format("%Y-%m-%d %H:%M:%S")
+            ),
+            None => "stale = false".to_string(),
+        };
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "source".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        let mut grouped: HashMap<SourceKind, Vec<String>> = HashMap::new();
+        for batch in &batches {
+            let id_arr = column_as_str(batch, "chunk_id")?;
+            let source_arr = column_as_str(batch, "source")?;
+            for i in 0..batch.num_rows() {
+                let Some(source) = parse_source_kind(source_arr.value(i)) else {
+                    continue;
+                };
+                grouped
+                    .entry(source)
+                    .or_default()
+                    .push(id_arr.value(i).to_string());
+            }
+        }
+
+        let mut out = Vec::new();
+        for (source, mut ids) in grouped {
+            ids.sort();
+            for chunk in ids.chunks(epoch_size) {
+                out.push(CorpusWindowBatch {
+                    source,
+                    chunk_ids: chunk.to_vec(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.source
+                .as_str()
+                .cmp(b.source.as_str())
+                .then_with(|| a.chunk_ids.first().cmp(&b.chunk_ids.first()))
+        });
         Ok(out)
     }
 
@@ -1093,6 +1392,87 @@ fn escape_sql(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Required Utf8 column — error if missing or wrong type.
+fn downcast_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+            "{name} column missing in projection"
+        )))
+    })?;
+    col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::CastError(format!(
+            "{name} expected to be Utf8"
+        )))
+    })
+}
+
+/// Optional Utf8 column — returns `None` if absent or the wrong type.
+fn downcast_str_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+}
+
+/// Inverse of `Source::as_str`. Returns `None` for unknown strings —
+/// callers skip such rows rather than fail.
+fn parse_source(s: &str) -> Option<ostk_recall_core::Source> {
+    use ostk_recall_core::Source;
+    Some(match s {
+        "markdown" => Source::Markdown,
+        "code" => Source::Code,
+        "claude_code" => Source::ClaudeCode,
+        "ostk_decision" => Source::OstkDecision,
+        "ostk_needle" => Source::OstkNeedle,
+        "ostk_audit_significant" => Source::OstkAuditSignificant,
+        "ostk_conversation" => Source::OstkConversation,
+        "ostk_session" => Source::OstkSession,
+        "ostk_memory" => Source::OstkMemory,
+        "ostk_spec" => Source::OstkSpec,
+        "file_glob" => Source::FileGlob,
+        "zip_export" => Source::ZipExport,
+        "gemini" => Source::Gemini,
+        "thread" => Source::Thread,
+        "membrane" => Source::Membrane,
+        _ => return None,
+    })
+}
+
+/// Map concrete stored source rows back to their scanner/source kind.
+fn parse_source_kind(s: &str) -> Option<SourceKind> {
+    Some(match s {
+        "markdown" => SourceKind::Markdown,
+        "code" => SourceKind::Code,
+        "claude_code" => SourceKind::ClaudeCode,
+        "ostk_decision"
+        | "ostk_needle"
+        | "ostk_audit_significant"
+        | "ostk_conversation"
+        | "ostk_session"
+        | "ostk_memory"
+        | "ostk_spec" => SourceKind::OstkProject,
+        "file_glob" => SourceKind::FileGlob,
+        "zip_export" => SourceKind::ZipExport,
+        "gemini" => SourceKind::Gemini,
+        "thread" => SourceKind::Thread,
+        "membrane" => SourceKind::Membrane,
+        _ => return None,
+    })
+}
+
+/// Required UInt32 column.
+fn downcast_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+            "{name} column missing in projection"
+        )))
+    })?;
+    col.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
+        StoreError::Arrow(arrow::error::ArrowError::CastError(format!(
+            "{name} expected to be UInt32"
+        )))
+    })
+}
+
 fn build_record_batch(
     schema: &Arc<Schema>,
     chunks: &[Chunk],
@@ -1105,6 +1485,48 @@ fn build_record_batch(
     let source = StringArray::from_iter_values(chunks.iter().map(|c| c.source.as_str()));
     let project: StringArray = chunks.iter().map(|c| c.project.as_deref()).collect();
     let source_id = StringArray::from_iter_values(chunks.iter().map(|c| c.source_id.as_str()));
+    // source_config_id is non-empty in normal flow but the Lance column is
+    // nullable for the migration window — encode empty as NULL so v0.5
+    // rows added later round-trip identically.
+    let source_config_id: StringArray = chunks
+        .iter()
+        .map(|c| {
+            if c.source_config_id.is_empty() {
+                None
+            } else {
+                Some(c.source_config_id.as_str())
+            }
+        })
+        .collect();
+    // P1: facets serialized as `key:value` strings via to_list (sorted
+    // for stable round-trip). Column is List<Utf8>.
+    let facets_lists: Vec<Vec<String>> = chunks
+        .iter()
+        .map(|c| ostk_recall_core::to_list(&c.facets))
+        .collect();
+    let facets_col = {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        let mut b = ListBuilder::new(StringBuilder::new());
+        for list in &facets_lists {
+            for v in list {
+                b.values().append_value(v);
+            }
+            b.append(true);
+        }
+        b.finish()
+    };
+    // P1: embedding_input_sha256 — nullable; empty string maps to NULL
+    // for migration symmetry.
+    let embedding_input_sha256: StringArray = chunks
+        .iter()
+        .map(|c| {
+            if c.embedding_input_sha256.is_empty() {
+                None
+            } else {
+                Some(c.embedding_input_sha256.as_str())
+            }
+        })
+        .collect();
     let chunk_index = UInt32Array::from_iter_values(chunks.iter().map(|c| c.chunk_index));
     let ts = TimestampMicrosecondArray::from(
         chunks
@@ -1158,6 +1580,9 @@ fn build_record_batch(
             Arc::new(source),
             Arc::new(project),
             Arc::new(source_id),
+            Arc::new(source_config_id),
+            Arc::new(facets_col),
+            Arc::new(embedding_input_sha256),
             Arc::new(chunk_index),
             Arc::new(ts),
             Arc::new(role),
@@ -1184,6 +1609,9 @@ mod tests {
             source: Source::Markdown,
             project: Some("test".into()),
             source_id: "file.md".into(),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
+            source_config_id: "test-cfg".into(),
             chunk_index: 0,
             ts: None,
             role: None,
@@ -1290,6 +1718,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optimize_compact_and_prune_removes_old_versions_keeps_data() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+        // Many separate upserts → many versions (mimics per-batch commits).
+        for i in 0..8 {
+            store
+                .upsert(
+                    &[sample_chunk(&format!("c{i}"), "text")],
+                    &[vec![1.0, 0.0, 0.0, 0.0]],
+                )
+                .await
+                .unwrap();
+        }
+        let before = store.version().await.unwrap();
+        assert!(
+            before >= 8,
+            "expected many versions before prune, got {before}"
+        );
+
+        let pruned = store.optimize_compact_and_prune().await.unwrap();
+        assert!(
+            pruned > 0,
+            "aggressive prune should remove historical versions, removed {pruned}"
+        );
+        // Prune drops history, never live rows.
+        assert_eq!(store.row_count().await.unwrap(), 8);
+    }
+
+    #[tokio::test]
     async fn mark_chunks_stale() {
         let tmp = TempDir::new().unwrap();
         let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
@@ -1330,6 +1787,9 @@ mod tests {
             source: Source::Markdown,
             project: Some(project.to_string()),
             source_id: format!("{id}.md"),
+            facets: Default::default(),
+            embedding_input_sha256: String::new(),
+            source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
             ts: Some(ts),
             role: None,
@@ -1442,10 +1902,7 @@ mod tests {
         let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
 
         let now = chrono::Utc::now();
-        let chunks = vec![
-            chunk_with("a", "alpha", now),
-            chunk_with("b", "beta", now),
-        ];
+        let chunks = vec![chunk_with("a", "alpha", now), chunk_with("b", "beta", now)];
         let embs = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
         store.upsert(&chunks, &embs).await.unwrap();
 

@@ -90,6 +90,7 @@ impl Scanner for CodeScanner {
                         project: project.clone(),
                         bytes: None,
                         ignore: Vec::new(),
+                        source_config_id: "test-cfg".to_string(),
                     })
                 })
         });
@@ -132,6 +133,7 @@ impl Scanner for CodeScanner {
                 project: project.clone(),
                 bytes: None,
                 ignore: Vec::new(),
+                source_config_id: "test-cfg".to_string(),
             }))
         });
         Box::new(iter)
@@ -164,6 +166,7 @@ impl Scanner for CodeScanner {
                 Source::Code,
                 &item.source_id,
                 item.project.as_deref(),
+                &item.source_config_id,
                 mtime,
                 &abs_path,
             ) {
@@ -182,7 +185,12 @@ impl Scanner for CodeScanner {
                     item.source_id
                 ))
             })?;
-            let chunk_id = Chunk::make_id(Source::Code, &item.source_id, chunk_index);
+            let chunk_id = Chunk::make_id(
+                Source::Code,
+                &item.source_id,
+                chunk_index,
+                &item.source_config_id,
+            );
             let sha256 = Chunk::content_hash(&window);
             let links = Links {
                 file_path: Some(abs_path.clone()),
@@ -193,6 +201,9 @@ impl Scanner for CodeScanner {
                 source: Source::Code,
                 project: item.project.clone(),
                 source_id: item.source_id.clone(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
+                source_config_id: item.source_config_id.clone(),
                 chunk_index,
                 ts: mtime,
                 role: None,
@@ -297,6 +308,9 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: exts.iter().map(|s| (*s).to_string()).collect(),
+            id: None,
+            source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
     }
 
@@ -514,6 +528,7 @@ mod tests {
             project: Some("test".into()),
             bytes: None,
             ignore: Vec::new(),
+            source_config_id: "test-cfg".into(),
         };
         let chunks = scanner.parse(item).expect("parse failed");
         assert!(

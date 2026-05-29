@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};
 
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::resources::{ClientId, ResourceRegistry};
 use crate::tools::tool_list;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -26,9 +27,17 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// `attention_*` / `thread_*` tool families when the caller (typically
 /// `cli::commands::serve`) constructs a long-lived `AttentionDispatch`
 /// and threads it through.
+///
+/// The `resources` registry is always present (default empty) so the
+/// MCP `resources/*` protocol surface advertises even before P9b-min
+/// registers the `memory-lens` resource. The Arc is shared so callers
+/// can register resources from outside the server (e.g. a background
+/// lens loop) and emit update notifications without going through the
+/// server handle.
 pub struct Server {
     engine: Arc<QueryEngine>,
     attention: Option<Arc<AttentionDispatch>>,
+    resources: Arc<ResourceRegistry>,
 }
 
 impl Server {
@@ -37,14 +46,16 @@ impl Server {
         Self {
             engine: Arc::new(engine),
             attention: None,
+            resources: Arc::new(ResourceRegistry::new()),
         }
     }
 
     #[must_use]
-    pub const fn from_arc(engine: Arc<QueryEngine>) -> Self {
+    pub fn from_arc(engine: Arc<QueryEngine>) -> Self {
         Self {
             engine,
             attention: None,
+            resources: Arc::new(ResourceRegistry::new()),
         }
     }
 
@@ -57,47 +68,129 @@ impl Server {
         self
     }
 
+    /// Replace the resource registry. Callers needing to register
+    /// resources before `run_stdio` (the typical P9b-min flow) build
+    /// a registry, hand it here, and keep their own `Arc` to push
+    /// updates later.
+    #[must_use]
+    pub fn with_resources(mut self, registry: Arc<ResourceRegistry>) -> Self {
+        self.resources = registry;
+        self
+    }
+
     pub const fn engine(&self) -> &Arc<QueryEngine> {
         &self.engine
     }
 
+    /// Handle to the registry. P9b-min holds this to register the
+    /// memory-lens resource and call `emit_resource_updated` from the
+    /// background loop.
+    #[must_use]
+    pub fn resources(&self) -> Arc<ResourceRegistry> {
+        Arc::clone(&self.resources)
+    }
+
     /// Read newline-delimited JSON requests from stdin, dispatch, write
-    /// responses to stdout. Returns when EOF is reached on stdin.
+    /// responses + server-initiated notifications to stdout. Returns
+    /// when EOF is reached on stdin.
+    ///
+    /// Thin wrapper over [`Self::serve`] that wires real stdin/stdout;
+    /// tests use `serve` directly against `tokio::io::duplex` pipes.
     pub async fn run_stdio(&self) -> std::io::Result<()> {
-        let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        self.serve(tokio::io::stdin(), tokio::io::stdout()).await
+    }
+
+    /// Transport-agnostic serve loop.
+    ///
+    /// P9a-min refactor (see `p9a-mcp-resources.md`): the writer
+    /// half is owned by a single task draining an mpsc channel; the
+    /// reader loop and the resource registry both push through the
+    /// same `Sender`. This is the only path that can interleave
+    /// responses with server-initiated
+    /// `notifications/resources/updated` without racing on the
+    /// output descriptor.
+    ///
+    /// Shutdown contract — the cleanup phase runs unconditionally,
+    /// so an I/O error on either the read or the write half cannot
+    /// leak a half-open channel:
+    ///
+    /// 1. The reader loop runs inside an inner async block whose
+    ///    result is captured rather than `?`-propagated. EOF →
+    ///    `Ok(())`; reader I/O error → `Err(_)`; same for an early
+    ///    break when the writer task closed.
+    /// 2. After the inner block resolves either way, the registry's
+    ///    outbound sender is cleared and the local sender dropped.
+    ///    Only then does the writer task's `rx.recv().await`
+    ///    observe all senders closed and exit.
+    /// 3. `writer_handle.await` joins the writer; its I/O result is
+    ///    consulted alongside the reader's.
+    /// 4. Error propagation prefers the reader error (the proximate
+    ///    cause when the underlying I/O breaks) and falls through to
+    ///    the writer error only on a clean reader completion. A
+    ///    writer-task panic surfaces as `io::Error::other`.
+    pub async fn serve<R, W>(&self, reader: R, writer: W) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        self.resources.set_outbound(out_tx.clone());
+
+        let writer_handle = tokio::spawn(writer_task(out_rx, writer));
+
+        info!("mcp server ready");
+        let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
 
-        info!("mcp server ready on stdio");
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                break;
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let value: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    let resp = JsonRpcResponse::err(
-                        Value::Null,
-                        JsonRpcError::parse(format!("parse error: {e}")),
-                    );
-                    write_response(&mut stdout, &resp).await?;
+        // Capture the loop result rather than `?`-propagating. The
+        // cleanup phase below must run on every path (EOF, reader
+        // error, writer-task-closed) so the registry never holds a
+        // dangling outbound Sender.
+        let read_result: std::io::Result<()> = async {
+            loop {
+                line.clear();
+                let n = buf_reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-            };
-            let reply = self.handle_request(value).await;
-            if let Some(r) = reply {
-                write_response(&mut stdout, &r).await?;
+                let response = match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) => self.handle_request(v).await,
+                    Err(e) => Some(JsonRpcResponse::err(
+                        Value::Null,
+                        JsonRpcError::parse(format!("parse error: {e}")),
+                    )),
+                };
+                if let Some(r) = response {
+                    let payload = serialize_response(&r);
+                    if out_tx.send(payload).is_err() {
+                        error!("writer task closed; dropping response");
+                        break;
+                    }
+                }
             }
+            Ok(())
         }
+        .await;
+
         info!("mcp server shutting down");
-        Ok(())
+        self.resources.clear_outbound();
+        drop(out_tx);
+        let writer_result = writer_handle.await;
+
+        // Reader error wins — it's the proximate cause when the
+        // underlying transport breaks. Writer errors propagate only
+        // when the reader completed cleanly.
+        read_result?;
+        match writer_result {
+            Ok(io_result) => io_result,
+            Err(join_err) => Err(std::io::Error::other(format!(
+                "writer task panicked: {join_err}"
+            ))),
+        }
     }
 
     /// Dispatch one JSON-RPC message. Returns None for notifications (no id).
@@ -124,6 +217,21 @@ impl Server {
                 Ok(v) => Some(JsonRpcResponse::ok(id, v)),
                 Err(err) => Some(JsonRpcResponse::err(id, err)),
             },
+            "resources/list" => Some(JsonRpcResponse::ok(id, self.resources.list())),
+            "resources/read" => match resource_uri_param(&req.params) {
+                Ok(uri) => match self.resources.read(&uri) {
+                    Ok(v) => Some(JsonRpcResponse::ok(id, v)),
+                    Err(err) => Some(JsonRpcResponse::err(id, err.into_rpc())),
+                },
+                Err(err) => Some(JsonRpcResponse::err(id, err)),
+            },
+            "resources/subscribe" => match resource_uri_param(&req.params) {
+                Ok(uri) => match self.resources.subscribe(ClientId::stdio_singleton(), &uri) {
+                    Ok(()) => Some(JsonRpcResponse::ok(id, json!({}))),
+                    Err(err) => Some(JsonRpcResponse::err(id, err.into_rpc())),
+                },
+                Err(err) => Some(JsonRpcResponse::err(id, err)),
+            },
             _ => {
                 if is_notification {
                     warn!(method = %req.method, "unknown notification — ignoring");
@@ -141,7 +249,17 @@ impl Server {
     fn handle_initialize() -> Value {
         json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false } },
+            "capabilities": {
+                "tools": { "listChanged": false },
+                // P9a-min advertises `subscribe: true` so MCP clients
+                // know they can ask for `resources/subscribe`.
+                // `listChanged: false` because P9a-min doesn't push
+                // `notifications/resources/list_changed` — the
+                // resource set is established at boot. P9a-full /
+                // P9b-full revisits this when lens registration
+                // becomes dynamic.
+                "resources": { "subscribe": true, "listChanged": false }
+            },
             "serverInfo": {
                 "name": "ostk-recall",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -246,9 +364,8 @@ impl Server {
                             .dispatch(other, args)
                             .await
                             .map_err(attention_error_to_rpc)?;
-                        let text = serde_json::to_string(&out).map_err(|e| {
-                            JsonRpcError::internal(format!("serialize: {e}"))
-                        })?;
+                        let text = serde_json::to_string(&out)
+                            .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
                         return Ok(json!({
                             "content": [{ "type": "text", "text": text }],
                             "isError": false,
@@ -290,18 +407,45 @@ fn attention_error_to_rpc(err: AttentionHandlersError) -> JsonRpcError {
     }
 }
 
-async fn write_response<W: AsyncWriteExt + Unpin>(
-    w: &mut W,
-    resp: &JsonRpcResponse,
-) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(resp).map_err(|e| {
+/// Serialize a JSON-RPC response into the on-wire line form the
+/// stdio writer task consumes (no trailing newline — the writer adds
+/// one). Errors here would only happen on a programming bug in the
+/// JsonRpcResponse types, so a serde_json error is logged and a
+/// synthetic internal-error envelope returned in its place.
+fn serialize_response(resp: &JsonRpcResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_else(|e| {
         error!(error = %e, "serialize response");
-        std::io::Error::other(e)
-    })?;
-    line.push(b'\n');
-    w.write_all(&line).await?;
-    w.flush().await?;
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {e}"}}}}"#
+        )
+    })
+}
+
+/// Writer task: sole owner of the output transport. Drains `rx`
+/// until every sender has dropped, writing each line followed by
+/// `\n`. Generic over the writer so tests can drive it against an
+/// in-memory pipe; production uses `tokio::io::Stdout`.
+pub async fn writer_task<W: AsyncWriteExt + Unpin>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut writer: W,
+) -> std::io::Result<()> {
+    while let Some(line) = rx.recv().await {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
     Ok(())
+}
+
+/// Extract the `uri` parameter from a `resources/{read,subscribe}`
+/// request, mapping missing-or-non-string to a JSON-RPC invalid params
+/// error.
+fn resource_uri_param(params: &Value) -> std::result::Result<String, JsonRpcError> {
+    params
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| JsonRpcError::invalid_params("missing or non-string `uri`"))
 }
 
 /// Re-rank recall hits by what the caller is attending to right now.
@@ -373,25 +517,23 @@ async fn apply_attention_bias(
     // Batch-fetch all hit embeddings up front when we'll need them.
     // Skip when no scope vector is available (every cosine would be
     // 0 anyway) or no corpus is wired into the dispatch.
-    let hit_embeddings: std::collections::HashMap<String, Vec<f32>> = match (
-        scope_vec.as_ref(),
-        dispatch.corpus.as_ref(),
-    ) {
-        (Some(_), Some(corpus)) => {
-            let ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
-            match corpus.fetch_embeddings(&ids).await {
-                Ok(map) => map,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "attention-bias: fetch_embeddings failed; embedding axis contributes 0"
-                    );
-                    std::collections::HashMap::new()
+    let hit_embeddings: std::collections::HashMap<String, Vec<f32>> =
+        match (scope_vec.as_ref(), dispatch.corpus.as_ref()) {
+            (Some(_), Some(corpus)) => {
+                let ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+                match corpus.fetch_embeddings(&ids).await {
+                    Ok(map) => map,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "attention-bias: fetch_embeddings failed; embedding axis contributes 0"
+                        );
+                        std::collections::HashMap::new()
+                    }
                 }
             }
-        }
-        _ => std::collections::HashMap::new(),
-    };
+            _ => std::collections::HashMap::new(),
+        };
 
     for hit in hits.iter_mut() {
         let base = hit.score;
@@ -443,12 +585,36 @@ async fn apply_attention_bias(
         hit.attention_score = Some(thread_score);
         hit.attention_weight = Some(thread_w);
         hit.score = base + thread_w * thread_score + embed_w * embedding_score;
+        // P3A invariant: `score = Σ match_features.contribution` must
+        // hold on the MCP wire (see `core::types::MatchFeature`).
+        // attention_bias mutates `score` here; emit the corresponding
+        // contributions so the sum still matches. The existing
+        // entries (rrf / rerank / identifier_boost) summed to `base`
+        // before this stage — adding these two keeps that sum equal
+        // to the new score.
+        hit.match_features.insert(
+            "attention_thread".to_string(),
+            ostk_recall_core::MatchFeature {
+                raw: thread_score,
+                weight: thread_w,
+                contribution: thread_w * thread_score,
+            },
+        );
+        hit.match_features.insert(
+            "attention_embedding".to_string(),
+            ostk_recall_core::MatchFeature {
+                raw: embedding_score,
+                weight: embed_w,
+                contribution: embed_w * embedding_score,
+            },
+        );
     }
 
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 }
 
@@ -469,9 +635,7 @@ fn build_recall_lens(
     status: Option<&ostk_recall_attention::FocusStatus>,
 ) -> Option<Value> {
     let pin = status?.pinned.as_ref()?;
-    let age_secs = (chrono::Utc::now() - pin.pinned_at)
-        .num_seconds()
-        .max(0);
+    let age_secs = (chrono::Utc::now() - pin.pinned_at).num_seconds().max(0);
     Some(json!({
         "focus_query": pin.query,
         "pinned_at": pin.pinned_at.to_rfc3339(),
@@ -547,6 +711,7 @@ mod attention_bias_tests {
             embedding_weight: None,
             attention_score: None,
             attention_weight: None,
+            match_features: Default::default(),
         }
     }
 
@@ -562,10 +727,7 @@ mod attention_bias_tests {
         let tmp = TempDir::new().unwrap();
         let threads = Arc::new(ThreadsDb::open(tmp.path()).unwrap());
         let attention: Arc<dyn AttentionForwardStore> = Arc::new(InMemoryAttention::new());
-        (
-            tmp,
-            Arc::new(AttentionDispatch::new(attention, threads)),
-        )
+        (tmp, Arc::new(AttentionDispatch::new(attention, threads)))
     }
 
     /// Seed a thread anchored to a chunk + light up its in-memory score.
@@ -592,7 +754,10 @@ mod attention_bias_tests {
         // attend + familiarize so the InMemoryAttention has a non-zero
         // score for the handle. Bump familiarity multiple times so the
         // floor stays above ARCHIVE_THRESHOLD.
-        d.attention.attend(&scope(), "active context").await.unwrap();
+        d.attention
+            .attend(&scope(), "active context")
+            .await
+            .unwrap();
         for _ in 0..5 {
             d.attention.familiarize(&scope(), &handle).await.unwrap();
         }
@@ -624,8 +789,8 @@ mod attention_bias_tests {
         assert!(a.attention_score.unwrap() > 0.0);
         assert_eq!(a.attention_weight, Some(1.0));
         // Math is decomposable: score == base_score + weight * attention_score
-        let expected = a.base_score.unwrap()
-            + a.attention_weight.unwrap() * a.attention_score.unwrap();
+        let expected =
+            a.base_score.unwrap() + a.attention_weight.unwrap() * a.attention_score.unwrap();
         assert!(
             (a.score - expected).abs() < 1e-5,
             "score must equal base + weight*attention (got {} vs expected {expected})",
@@ -637,6 +802,55 @@ mod attention_bias_tests {
         assert_eq!(u.base_score, Some(0.5));
         assert_eq!(u.attention_score, Some(0.0));
         assert_eq!(u.score, 0.5);
+    }
+
+    /// P3A invariant guard for MCP wire output: `score = Σ
+    /// match_features.contribution` must hold even after the
+    /// attention-bias post-stage mutates `score`. Bias emits
+    /// `attention_thread` / `attention_embedding` contributions so
+    /// the sum still matches.
+    #[tokio::test]
+    async fn bias_preserves_score_equals_sum_match_features() {
+        let (_tmp, d) = build_dispatch().await;
+        seed_anchored_thread(&d, "fade-is-concentration", "anchored").await;
+
+        // Seed match_features as the rank engine would (sum equals
+        // pre-bias score — that's the post-rank state hybrid::recall
+        // produces).
+        let mut hits = vec![hit("anchored", 0.5), hit("unrelated", 0.5)];
+        for h in &mut hits {
+            h.match_features.insert(
+                "rrf".to_string(),
+                ostk_recall_core::MatchFeature::new(h.score, 1.0),
+            );
+        }
+        let bias = thread_bias(1.0);
+        apply_attention_bias(&mut hits, &bias, &d).await;
+
+        for h in &hits {
+            let sum: f32 = h.match_features.values().map(|m| m.contribution).sum();
+            assert!(
+                (h.score - sum).abs() < 1e-5,
+                "score {} != Σ contribution {} for {} (features: {:?})",
+                h.score,
+                sum,
+                h.chunk_id,
+                h.match_features
+            );
+            // Bias always emits the two attention entries (the
+            // contribution may be 0 when the chunk isn't anchored,
+            // but the entry exists so debug UIs see the axis).
+            assert!(
+                h.match_features.contains_key("attention_thread"),
+                "missing attention_thread row on {}",
+                h.chunk_id
+            );
+            assert!(
+                h.match_features.contains_key("attention_embedding"),
+                "missing attention_embedding row on {}",
+                h.chunk_id
+            );
+        }
     }
 
     #[tokio::test]
@@ -744,6 +958,9 @@ mod attention_bias_tests {
                 source: Source::Markdown,
                 project: Some("p".into()),
                 source_id: "a.md".into(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
+                source_config_id: "test-cfg".to_string(),
                 chunk_index: 0,
                 ts: Some(now),
                 role: None,
@@ -757,6 +974,9 @@ mod attention_bias_tests {
                 source: Source::Markdown,
                 project: Some("p".into()),
                 source_id: "b.md".into(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
+                source_config_id: "test-cfg".to_string(),
                 chunk_index: 0,
                 ts: Some(now),
                 role: None,
@@ -866,6 +1086,9 @@ mod attention_bias_tests {
                 source: Source::Markdown,
                 project: Some("p".into()),
                 source_id: "a.md".into(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
+                source_config_id: "test-cfg".to_string(),
                 chunk_index: 0,
                 ts: Some(now),
                 role: None,
@@ -879,6 +1102,9 @@ mod attention_bias_tests {
                 source: Source::Markdown,
                 project: Some("p".into()),
                 source_id: "b.md".into(),
+                facets: Default::default(),
+                embedding_input_sha256: String::new(),
+                source_config_id: "test-cfg".to_string(),
                 chunk_index: 0,
                 ts: Some(now),
                 role: None,
@@ -989,8 +1215,7 @@ mod attention_bias_tests {
             history: Vec::new(),
             transient_active: false,
         };
-        let lens =
-            build_recall_lens(&bias, Some(&status)).expect("pin + bias must produce lens");
+        let lens = build_recall_lens(&bias, Some(&status)).expect("pin + bias must produce lens");
         assert_eq!(lens["focus_query"].as_str(), Some("the CLI surface"));
         // focus_age_secs should be roughly 123, allow drift for slow CI.
         let age = lens["focus_age_secs"].as_i64().unwrap();

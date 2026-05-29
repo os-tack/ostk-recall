@@ -71,6 +71,7 @@ impl Scanner for ClaudeCodeScanner {
                         project,
                         bytes: None,
                         ignore: Vec::new(),
+                        source_config_id: "test-cfg".to_string(),
                     })
                 })
         });
@@ -88,6 +89,7 @@ impl Scanner for ClaudeCodeScanner {
             Source::ClaudeCode,
             &item.source_id,
             item.project.as_deref(),
+            &item.source_config_id,
             mtime,
         )
         .map(drop_tool_blocks)
@@ -129,6 +131,9 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
     }
 
@@ -227,7 +232,9 @@ mod tests {
         assert!(all_chunks.iter().any(|c| c.text == "start"));
         assert!(all_chunks.iter().any(|c| c.text == "end"));
         assert!(
-            all_chunks.iter().any(|c| c.project.as_deref() == Some("foo")),
+            all_chunks
+                .iter()
+                .any(|c| c.project.as_deref() == Some("foo")),
             "project carried through"
         );
     }

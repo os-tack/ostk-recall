@@ -13,23 +13,32 @@ use std::sync::Arc;
 use ostk_recall_store::{EventsDb, IngestDb};
 
 pub mod audit;
+pub mod candidate;
+pub mod context;
 pub mod error;
 pub mod hybrid;
+pub mod lanes;
+pub mod lens;
 pub mod link;
+pub mod rank;
 pub mod rerank;
 mod row;
 pub mod stats;
 pub mod synthesis;
 pub mod types;
 
+pub use candidate::Candidate;
+pub use context::{AttentionContext, QueryContext};
 pub use error::{QueryError, Result};
 pub use hybrid::recall;
+pub use lanes::{ambient_candidates, explicit_candidates};
 pub use ostk_recall_core::{
     AuditResult, Chunk, Links, RecallHit, RecallIntent, RecallLinkResult, RecallParams,
     RecallStats, RerankerStats, Source, SourceCount, SynthesizedPage,
 };
 pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
+pub use rank::{Feature, FeatureAttribution, RankEngine, RankedHit, ScoreFn};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
 pub use rerank::{RerankerError, RerankerLike};
@@ -109,7 +118,7 @@ impl QueryEngine {
     /// function so engine-bound and free callers share one code path.
     pub async fn recall(&self, params: RecallParams) -> Result<Vec<RecallHit>> {
         hybrid::recall(
-            self.store.connection(),
+            self.store.as_ref(),
             self.embedder.as_ref(),
             self.reranker.as_deref(),
             &params,

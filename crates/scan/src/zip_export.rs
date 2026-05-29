@@ -72,6 +72,7 @@ impl Scanner for ZipExportScanner {
                         project: project.clone(),
                         bytes: None,
                         ignore: Vec::new(),
+                        source_config_id: "test-cfg".to_string(),
                     })
                 })
         });
@@ -111,6 +112,7 @@ impl Scanner for ZipExportScanner {
                 project: project.clone(),
                 bytes: None,
                 ignore: Vec::new(),
+                source_config_id: "test-cfg".to_string(),
             }))
         });
         Box::new(iter)
@@ -156,7 +158,12 @@ impl Scanner for ZipExportScanner {
                     continue;
                 }
                 let source_id = format!("{zip_name}:{conv_uuid}:{}", msg.uuid);
-                let chunk_id = Chunk::make_id(Source::ZipExport, &source_id, chunk_index);
+                let chunk_id = Chunk::make_id(
+                    Source::ZipExport,
+                    &source_id,
+                    chunk_index,
+                    &item.source_config_id,
+                );
                 let sha256 = Chunk::content_hash(&text);
                 let links = Links {
                     file_path: Some(abs_path.clone()),
@@ -171,6 +178,9 @@ impl Scanner for ZipExportScanner {
                     source: Source::ZipExport,
                     project: item.project.clone(),
                     source_id,
+                    source_config_id: item.source_config_id.clone(),
+                    facets: Default::default(),
+                    embedding_input_sha256: String::new(),
                     chunk_index,
                     ts: msg.created_at,
                     role: Some(role.into()),
@@ -323,6 +333,9 @@ mod tests {
             paths: vec![pat.into()],
             ignore: vec![],
             extensions: vec![],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
         }
     }
 

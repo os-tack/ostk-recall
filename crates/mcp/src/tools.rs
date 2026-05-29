@@ -14,6 +14,7 @@ pub fn tool_recall() -> Value {
                 "project": { "type": "string" },
                 "source": { "type": "string" },
                 "since": { "type": "string", "format": "date-time" },
+                "before": { "type": "string", "format": "date-time" },
                 "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": 100 },
                 "max_per_source_id": {
                     "type": "integer",

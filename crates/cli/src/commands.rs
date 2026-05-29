@@ -16,10 +16,16 @@ use ostk_recall_attention::{
 };
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
-use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode};
-use ostk_recall_mcp::Server;
+use ostk_recall_core::{
+    Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode,
+};
+use ostk_recall_mcp::{ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
+use ostk_recall_query::lens::LensConfig;
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
+
+use crate::lens_loop::{MemoryLensResource, run_lens_loop};
+use crate::lens_state::load_lens_state;
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
 use ostk_recall_scan::code::CodeScanner;
 use ostk_recall_scan::file_glob::FileGlobScanner;
@@ -93,6 +99,8 @@ pub struct ScanOutcome {
 pub struct VerifyOutcome {
     pub report: VerifyReport,
 }
+
+pub type WeaveOutcome = ostk_recall_attention::WeaveWindowOutcome;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
@@ -209,11 +217,19 @@ fn force_wipe_corpus(root: &Path) -> Result<()> {
         eprintln!("forcing re-init: removing {}", lance.display());
         std::fs::remove_dir_all(&lance).with_context(|| format!("removing {}", lance.display()))?;
     }
+    // Remove each SQLite DB *and* its WAL-mode sidecars. Deleting only the
+    // main `.sqlite` while leaving an orphaned `-wal`/`-shm` behind puts
+    // SQLite in a broken state: a later read-only open fails with "unable
+    // to open database file" (which crashes `serve` → MCP `-32000`) and a
+    // read-write open can abort the scan, silently stranding the corpus
+    // empty. So wipe the sidecars in the same pass.
     for db_name in ["ingest.sqlite", "events.sqlite"] {
-        let p = root.join(db_name);
-        if p.exists() {
-            eprintln!("forcing re-init: removing {}", p.display());
-            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let p = root.join(format!("{db_name}{suffix}"));
+            if p.exists() {
+                eprintln!("forcing re-init: removing {}", p.display());
+                std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+            }
         }
     }
     Ok(())
@@ -307,6 +323,13 @@ fn spawn_ambient_daemons(
     if let Some(attn) = attention {
         observer = observer.with_attention(attn);
     }
+    // P6A — share the ledger's chain sink with the observer so every
+    // observe()-mediated `attend()` persists
+    // `RollingVectorSnapshot` (or `AttentionTurnSkipped` once the
+    // P6-full noise gate ships). Without this the rolling channel
+    // lives only in memory and a restart erases it. The sink is
+    // already `Arc`-shared, so this is a clone of a pointer.
+    observer = observer.with_chain_sink(threads.chain_sink());
     let observer = Arc::new(observer);
     let weaver = Arc::new(AutoWeaver::new(
         Arc::clone(threads),
@@ -392,9 +415,9 @@ pub async fn scan_with_context(
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db.as_ref().map(|threads| {
-        spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone())
-    });
+    let ambient = threads_db
+        .as_ref()
+        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -496,6 +519,33 @@ pub async fn scan_with_context(
     })
 }
 
+pub async fn weave(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    since: Option<Duration>,
+    epoch_size: usize,
+) -> Result<WeaveOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    std::fs::create_dir_all(&root)?;
+    let store = Arc::new(
+        CorpusStore::open_or_create(&root, embedder.dim())
+            .await
+            .map_err(|e| anyhow!("open corpus store: {e}"))?,
+    );
+    let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default());
+    let since = since
+        .map(chrono::Duration::from_std)
+        .transpose()
+        .map_err(|_| anyhow!("--since duration is too large for chrono"))?;
+    weaver
+        .weave_window(since, epoch_size.max(1))
+        .await
+        .map_err(|e| anyhow!("weave_window: {e}"))
+}
+
 /// Path-aware sibling of [`scan`].
 ///
 /// Loads the same config + scanners, then dispatches each input path to the
@@ -542,9 +592,9 @@ pub async fn scan_paths_with_context(
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db.as_ref().map(|threads| {
-        spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone())
-    });
+    let ambient = threads_db
+        .as_ref()
+        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -670,6 +720,9 @@ pub async fn inspect(
 pub struct OptimizeOutcome {
     /// Wall-clock duration of the optimize pass.
     pub elapsed: std::time::Duration,
+    /// Number of historical versions pruned. `Some` only on the
+    /// `--aggressive` path; `None` for the conservative default pass.
+    pub versions_pruned: Option<u64>,
 }
 
 /// Run Lance's `OptimizeAction::All` against the corpus table —
@@ -680,6 +733,7 @@ pub struct OptimizeOutcome {
 pub async fn optimize(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
+    aggressive: bool,
 ) -> Result<OptimizeOutcome> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
@@ -688,12 +742,22 @@ pub async fn optimize(
         .await
         .map_err(|e| anyhow!("open corpus store: {e}"))?;
     let started = std::time::Instant::now();
-    store
-        .optimize_all()
-        .await
-        .map_err(|e| anyhow!("optimize: {e}"))?;
+    let versions_pruned = if aggressive {
+        let n = store
+            .optimize_compact_and_prune()
+            .await
+            .map_err(|e| anyhow!("optimize: {e}"))?;
+        Some(n)
+    } else {
+        store
+            .optimize_all()
+            .await
+            .map_err(|e| anyhow!("optimize: {e}"))?;
+        None
+    };
     Ok(OptimizeOutcome {
         elapsed: started.elapsed(),
+        versions_pruned,
     })
 }
 
@@ -806,6 +870,22 @@ fn events_db_if_wanted(
     } else {
         Ok(None)
     }
+}
+
+/// Map the optional `[lens]` config block onto the daemon's runtime
+/// `LensConfig`. `None` (no `[lens]` block) yields the daemon
+/// defaults. Kept as a free function so the mapping is unit-testable
+/// without spinning up `serve`.
+fn resolve_lens_config(settings: Option<&LensSettings>) -> LensConfig {
+    settings.map_or_else(LensConfig::default, |l| LensConfig {
+        token_budget: l.token_budget,
+        min_excerpt_tokens: l.min_excerpt_tokens,
+        drift_threshold: l.drift_threshold,
+        poll_interval_secs: l.poll_interval_secs,
+        exclude_facets: l.exclude_facets.clone(),
+        candidate_k_per_lane: l.candidate_k_per_lane,
+        dominance_threshold: l.dominance_threshold,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -985,13 +1065,12 @@ pub async fn serve(
 
     let dispatch: Option<Arc<AttentionDispatch>> = serve_ctx.as_ref().map(|c| {
         let attention_dyn: Arc<dyn AttentionForwardStore> = c.attention.clone();
-        let dispatch =
-            AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)).with_corpus(
-                // Reuse the engine's CorpusStore so the emergent
-                // surface reads the same lance corpus the MCP recall
-                // verbs query.
-                Arc::clone(engine.store()),
-            );
+        let dispatch = AttentionDispatch::new(attention_dyn, Arc::clone(&c.threads)).with_corpus(
+            // Reuse the engine's CorpusStore so the emergent
+            // surface reads the same lance corpus the MCP recall
+            // verbs query.
+            Arc::clone(engine.store()),
+        );
         Arc::new(dispatch)
     });
 
@@ -1000,17 +1079,72 @@ pub async fn serve(
     let embedder_for_bg = Arc::clone(&embedder);
     let ctx_for_bg = serve_ctx.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_socket_listener(
-            &sock_path,
-            config_path_for_bg,
-            embedder_for_bg,
-            ctx_for_bg,
-        )
-        .await
+        if let Err(e) =
+            run_socket_listener(&sock_path, config_path_for_bg, embedder_for_bg, ctx_for_bg).await
         {
             tracing::error!(error = %e, "background socket listener failed");
         }
     });
+
+    // P9b-min — construct the memory-lens registry + resource and,
+    // when the attention substrate is online, spawn the background
+    // refresh loop. The registry is always handed to Server::
+    // with_resources so `resources/list` advertises the memory-lens
+    // URI even before any refresh has rendered content.
+    let lens_registry = Arc::new(ResourceRegistry::new());
+    let lens_resource = Arc::new(MemoryLensResource::new(String::new()));
+    lens_registry.register(Arc::clone(&lens_resource) as Arc<dyn ostk_recall_mcp::Resource>);
+
+    let lens_disabled = std::env::var_os("OSTK_RECALL_LENS_DISABLED").is_some();
+    if let (Some(ctx), false) = (serve_ctx.as_ref(), lens_disabled) {
+        // P9b "Cold-start warmup C1" — encode a single token to
+        // force model weights resident before the lens loop's first
+        // poll. Best-effort: the embedder swallows internal errors,
+        // and a slow first lens isn't fatal.
+        let _ = embedder.encode_batch(&["warmup"]);
+
+        let lens_state_dir = root.to_path_buf();
+        let initial_state = match load_lens_state(&lens_state_dir) {
+            Ok(state) => state.unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "lens_state.json load failed; starting from default state"
+                );
+                Default::default()
+            }
+        };
+
+        let attention = Arc::clone(&ctx.attention);
+        let corpus = Arc::clone(engine.store());
+        let chain_sink_clone: Arc<dyn ChainSink> = ctx.threads.chain_sink();
+        let registry = Arc::clone(&lens_registry);
+        let resource = Arc::clone(&lens_resource);
+        let cancel = serve_cancel.clone();
+        let scope = ambient_scope_default();
+        let state_dir = lens_state_dir.clone();
+        // Map the optional `[lens]` config block onto the daemon's
+        // runtime LensConfig; absent block → defaults.
+        let lens_config = resolve_lens_config(cfg.lens.as_ref());
+        tokio::spawn(async move {
+            run_lens_loop(
+                attention,
+                corpus,
+                registry,
+                resource,
+                chain_sink_clone,
+                lens_config,
+                scope,
+                state_dir,
+                initial_state,
+                cancel,
+            )
+            .await;
+        });
+        tracing::info!("memory-lens daemon spawned");
+    } else if lens_disabled {
+        tracing::info!("memory-lens daemon disabled via OSTK_RECALL_LENS_DISABLED");
+    }
 
     tracing::info!(
         model = %engine.model(),
@@ -1019,10 +1153,11 @@ pub async fn serve(
         attention = dispatch.is_some(),
         "mcp serve --stdio starting"
     );
-    let server = match dispatch {
+    let server_base = match dispatch {
         Some(d) => Server::new(engine).with_attention(d),
         None => Server::new(engine),
     };
+    let server = server_base.with_resources(lens_registry);
     server
         .run_stdio()
         .await
@@ -1039,9 +1174,8 @@ pub async fn serve(
 /// the chain — boot reads chain rows back via `iter_chain` to rebuild
 /// the in-memory score tier.
 fn open_threads_db_with_chain(root: &Path) -> Result<ThreadsDb> {
-    let sink: Arc<dyn ChainSink> = Arc::new(
-        SqliteChainSink::open(root).map_err(|e| anyhow!("open chain sink: {e}"))?,
-    );
+    let sink: Arc<dyn ChainSink> =
+        Arc::new(SqliteChainSink::open(root).map_err(|e| anyhow!("open chain sink: {e}"))?);
     ThreadsDb::open_with_sink(root, sink).map_err(|e| anyhow!("open threads db: {e}"))
 }
 
@@ -1082,6 +1216,16 @@ async fn replay_chain_into_attention(
     // by Familiarize). Type inferred from the ChainEvent::FocusSet
     // pattern below.
     let mut focus_events = Vec::new();
+    // P6A — RollingVectorSnapshot is idempotent per scope (each
+    // event supersedes the previous), so we keep only the latest
+    // per `(project, session_id, agent)` triple. Chain rows arrive
+    // in chronological order, so HashMap::insert with the same key
+    // naturally drops older entries. The vec is replayed verbatim
+    // (no re-embed) so stochastic embedders don't drift on boot.
+    let mut latest_rolling: std::collections::HashMap<
+        (Option<String>, Option<String>, Option<String>),
+        (AttentionScope, Vec<f32>),
+    > = std::collections::HashMap::new();
     for ev in events {
         match ev {
             ChainEvent::FamiliarityBatch { entries, .. } => {
@@ -1100,6 +1244,18 @@ async fn replay_chain_into_attention(
             } => {
                 focus_events.push((ev_scope, query, vec, ts));
             }
+            ChainEvent::RollingVectorSnapshot {
+                scope: ev_scope,
+                vec,
+                ..
+            } => {
+                let key = (
+                    ev_scope.project.clone(),
+                    ev_scope.session_id.clone(),
+                    ev_scope.agent.clone(),
+                );
+                latest_rolling.insert(key, (ev_scope, vec));
+            }
             ChainEvent::ThreadCreate { .. }
             | ChainEvent::ThreadRename { .. }
             | ChainEvent::ThreadDelete { .. }
@@ -1108,7 +1264,16 @@ async fn replay_chain_into_attention(
             | ChainEvent::EvidenceStateChange { .. }
             | ChainEvent::TensionTransition { .. }
             | ChainEvent::ThreadLinkAdd { .. }
-            | ChainEvent::ThreadLinkRemove { .. } => {}
+            | ChainEvent::ThreadLinkRemove { .. }
+            // P6A: AttentionTurnSkipped is audit-only — no in-memory
+            // state to restore for a turn that was rejected.
+            | ChainEvent::AttentionTurnSkipped { .. }
+            // P9b-min: LensIncluded is audit-only — the lens loop
+            // reads recent events for the refractory penalty in
+            // P9b-full but replay does not restore any in-memory
+            // state. last_portfolio_chunk_ids is carried in
+            // lens_state.json instead.
+            | ChainEvent::LensIncluded { .. } => {}
         }
     }
 
@@ -1126,9 +1291,16 @@ async fn replay_chain_into_attention(
             tracing::warn!(error = %err, "focus_set replay skipped");
         }
     }
+    let rolling_n = latest_rolling.len();
+    for (_key, (ev_scope, vec)) in latest_rolling {
+        if let Err(err) = attention.seed_rolling_vec(&ev_scope, vec).await {
+            tracing::warn!(error = %err, "rolling_vector_snapshot replay skipped");
+        }
+    }
     tracing::info!(
         events = n,
         focus_events = focus_n,
+        rolling_snapshots = rolling_n,
         "chain replay applied to in-memory attention"
     );
     Ok(())
@@ -2071,5 +2243,83 @@ mod watch_mode_tests {
     fn watch_mode_default_is_legacy() {
         let w = WatchConfig::default();
         assert_eq!(w.mode, WatchMode::Legacy);
+    }
+}
+
+#[cfg(test)]
+mod lens_config_tests {
+    use super::{LensSettings, resolve_lens_config};
+
+    /// The `[lens]` config defaults are duplicated in `core` (serde
+    /// can't reach across to `query`). This guard fails loudly if the
+    /// two ever drift, which would silently change daemon behavior for
+    /// users who omit the block.
+    #[test]
+    fn lens_settings_default_matches_query_default() {
+        let mapped = resolve_lens_config(Some(&LensSettings::default()));
+        let dflt = ostk_recall_query::lens::LensConfig::default();
+        assert_eq!(mapped.token_budget, dflt.token_budget);
+        assert_eq!(mapped.min_excerpt_tokens, dflt.min_excerpt_tokens);
+        assert!((mapped.drift_threshold - dflt.drift_threshold).abs() < f32::EPSILON);
+        assert_eq!(mapped.poll_interval_secs, dflt.poll_interval_secs);
+        assert_eq!(mapped.exclude_facets, dflt.exclude_facets);
+        assert_eq!(mapped.candidate_k_per_lane, dflt.candidate_k_per_lane);
+        assert!((mapped.dominance_threshold - dflt.dominance_threshold).abs() < f32::EPSILON);
+    }
+
+    /// Absent `[lens]` block resolves to the daemon default verbatim.
+    #[test]
+    fn resolve_lens_config_none_is_default() {
+        let mapped = resolve_lens_config(None);
+        let dflt = ostk_recall_query::lens::LensConfig::default();
+        assert_eq!(mapped.token_budget, dflt.token_budget);
+        assert_eq!(mapped.poll_interval_secs, dflt.poll_interval_secs);
+    }
+
+    /// Explicit overrides flow through.
+    #[test]
+    fn resolve_lens_config_applies_overrides() {
+        let settings = LensSettings {
+            token_budget: 1234,
+            poll_interval_secs: 9,
+            exclude_facets: vec!["status:archived".into()],
+            ..LensSettings::default()
+        };
+        let mapped = resolve_lens_config(Some(&settings));
+        assert_eq!(mapped.token_budget, 1234);
+        assert_eq!(mapped.poll_interval_secs, 9);
+        assert_eq!(mapped.exclude_facets, vec!["status:archived".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod force_wipe_tests {
+    use super::force_wipe_corpus;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Regression: `init --force` must remove SQLite WAL/SHM sidecars,
+    /// not just the main `.sqlite`. An orphaned `-wal` (main file gone)
+    /// breaks the next open — read-only fails outright (crashing `serve`
+    /// → MCP `-32000`), read-write can abort mid-scan.
+    #[test]
+    fn force_wipe_removes_sqlite_wal_shm_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let files = [
+            "events.sqlite",
+            "events.sqlite-wal",
+            "events.sqlite-shm",
+            "ingest.sqlite",
+            "ingest.sqlite-wal",
+            "ingest.sqlite-shm",
+        ];
+        for f in files {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        force_wipe_corpus(root).unwrap();
+        for f in files {
+            assert!(!root.join(f).exists(), "{f} should have been removed");
+        }
     }
 }

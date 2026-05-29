@@ -66,7 +66,29 @@ enum Command {
     /// small fragments, prune old versions, fold appended data into
     /// existing scalar / FTS indices. Cheap to re-run; idempotent. Use
     /// after a long ingest backlog to restore fast indexed lookups.
-    Optimize,
+    Optimize {
+        /// Also prune ALL historical versions, collapsing the corpus to
+        /// its latest version. Overrides Lance's default ~14-day
+        /// retention (the normal pass leaves recent versions in place),
+        /// so this is how you undo a version explosion from a heavy scan.
+        /// ONLY safe when nothing else is writing the corpus — stop
+        /// `serve`/`watch` and any running `scan` first.
+        #[arg(long)]
+        aggressive: bool,
+    },
+    /// Run the explicit windowed auto-weaver pass over indexed content.
+    ///
+    /// This is the bulk/library counterpart to live TurnEnd weaving:
+    /// it does not make bulk scans look like watched conversation turns.
+    Weave {
+        /// Only weave chunks newer than this duration, e.g. 1h, 24h, 7d.
+        /// Omit for the whole active corpus.
+        #[arg(long)]
+        since: Option<String>,
+        /// Number of chunk ids per synthesized source-kind batch.
+        #[arg(long, default_value_t = 256)]
+        epoch_size: usize,
+    },
     /// Inspect a single chunk by id.
     Inspect {
         /// Chunk id to inspect.
@@ -98,6 +120,45 @@ enum Command {
         #[command(subcommand)]
         verb: ThreadVerb,
     },
+    /// Manifest tooling (recover `ingest.sqlite` from `corpus.lance`).
+    Manifest {
+        #[command(subcommand)]
+        verb: ManifestVerb,
+    },
+    /// Memory-lens controls (P9b-min). The lens is the daemon's
+    /// background-injected MCP resource; these verbs read its state
+    /// from the local recall directory without spawning a client.
+    Lens {
+        #[command(subcommand)]
+        verb: LensVerb,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LensVerb {
+    /// Dump the most recently rendered lens markdown. Reads
+    /// `{root}/lens.md`, the side-of-disk copy the loop writes
+    /// alongside each registry update. Prints an empty-state hint
+    /// when the file is absent (daemon hasn't refreshed yet, or
+    /// the daemon was started with OSTK_RECALL_LENS_DISABLED).
+    Show,
+    /// Print the env-var incantation that disables the lens for
+    /// the next `serve` invocation. The disable is per-session by
+    /// design — bake-in opt-out behaviour requires touching
+    /// config.toml directly.
+    Disable,
+}
+
+#[derive(Debug, Subcommand)]
+enum ManifestVerb {
+    /// Reconstruct `ingest.sqlite` from `corpus.lance` rows alone.
+    ///
+    /// Use after a partial copy or disk failure that lost the SQLite
+    /// ledger but preserved the Lance directory. The rebuild populates
+    /// `ingest_chunks` + `ingest_sources` from the embedded
+    /// `source_config_id` column (P0); `mtime/size` are stamped as 0
+    /// and refresh on the next scan.
+    Rebuild,
 }
 
 #[derive(Debug, Subcommand)]
@@ -357,8 +418,7 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
     // a saturated queue drops lines rather than back-pressuring callers.
     // `_trace_guard` flushes pending events on drop; bind it to `main`'s
     // stack frame so it lives until shutdown.
-    let (non_blocking_stderr, _trace_guard) =
-        tracing_appender::non_blocking(std::io::stderr());
+    let (non_blocking_stderr, _trace_guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -370,6 +430,24 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
         worker_threads,
         "runtime caps: tokio worker_threads + rayon global pool"
     );
+
+    // Raise the open-file soft limit before any Lance work. macOS
+    // ships a 256-fd soft cap (`launchctl limit maxfiles`) that
+    // GUI-spawned processes inherit — the MCP server under Claude
+    // Code, scan subprocesses. Lance opens many fragment files when
+    // reading a large corpus, exhausting 256 mid-scan and surfacing
+    // as `Too many open files (os error 24)` in the weaver /
+    // turn-observer; that in turn starves the ambient attention
+    // scope the memory-lens watches. `increase_nofile_limit` clamps
+    // to the hard limit (and to `kern.maxfilesperproc` on macOS), so
+    // the worst case is a no-op. Best-effort: log and continue.
+    match rlimit::increase_nofile_limit(u64::MAX) {
+        Ok(limit) => tracing::info!(nofile_soft = limit, "raised RLIMIT_NOFILE soft limit"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not raise RLIMIT_NOFILE; large scans may hit os error 24"
+        ),
+    }
 
     let config_path = match cli.config.clone() {
         Some(p) => p,
@@ -431,12 +509,45 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                 "  total: items={} chunks={} upserted={} dup={} errors={}",
                 t.items_seen, t.chunks_emitted, t.chunks_upserted, t.chunks_skipped_dup, t.errors
             );
+            // The TurnEnd gate means bulk-scanned content is NOT woven into the
+            // thread graph by the live daemon — only watched conversation turns
+            // are. Surface the bridge so a fresh scan isn't a silent, un-woven
+            // corpus: point the operator at the explicit consolidation pass.
+            if !out.dry_run && t.chunks_upserted > 0 {
+                println!(
+                    "  -> {} new chunk(s) indexed but not yet woven; run `ostk-recall weave` to weave them into the thread graph",
+                    t.chunks_upserted
+                );
+            }
         }
-        Command::Optimize => {
+        Command::Optimize { aggressive } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            println!("running OptimizeAction::All (compact + prune + index)…");
-            let out = commands::optimize(&config_path, embedder).await?;
-            println!("done in {:.1}s", out.elapsed.as_secs_f64());
+            if aggressive {
+                println!("running aggressive optimize (compact + index + prune ALL old versions)…");
+            } else {
+                println!("running OptimizeAction::All (compact + prune + index)…");
+            }
+            let out = commands::optimize(&config_path, embedder, aggressive).await?;
+            match out.versions_pruned {
+                Some(n) => println!(
+                    "done in {:.1}s; pruned {n} old versions",
+                    out.elapsed.as_secs_f64()
+                ),
+                None => println!("done in {:.1}s", out.elapsed.as_secs_f64()),
+            }
+        }
+        Command::Weave { since, epoch_size } => {
+            let embedder = resolve_embedder(cli.config.as_ref())?;
+            let since = since.as_deref().map(parse_since_duration).transpose()?;
+            let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
+            println!(
+                "weave summary: batches={} chunks={} evidence_links={} proposed_weaves={} proposed_threads={}",
+                out.batches_processed,
+                out.chunks_seen,
+                out.evidence_links_written,
+                out.proposed_weaves,
+                out.proposed_threads_written
+            );
         }
         Command::Verify => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
@@ -476,8 +587,125 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             let out = run_thread(&dispatch, verb).await?;
             print_attention_output(json, &out);
         }
+        Command::Manifest { verb } => {
+            run_manifest(&config_path, verb).await?;
+        }
+        Command::Lens { verb } => {
+            run_lens(&config_path, verb)?;
+        }
     }
 
+    Ok(())
+}
+
+fn parse_since_duration(input: &str) -> Result<std::time::Duration> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--since must not be empty; use values like 1h, 24h, 7d");
+    }
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (num, unit) = trimmed.split_at(split);
+    if num.is_empty() || unit.is_empty() || !unit.chars().all(|c| c.is_ascii_alphabetic()) {
+        anyhow::bail!("invalid --since {input:?}; use values like 1h, 24h, 7d");
+    }
+    let value: u64 = num
+        .parse()
+        .with_context(|| format!("invalid --since number in {input:?}"))?;
+    let seconds = match unit {
+        "s" | "sec" | "secs" => value,
+        "m" | "min" | "mins" => value
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        "h" | "hr" | "hrs" => value
+            .checked_mul(60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        "d" | "day" | "days" => value
+            .checked_mul(24 * 60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        "w" | "week" | "weeks" => value
+            .checked_mul(7 * 24 * 60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        _ => anyhow::bail!("invalid --since unit {unit:?}; use s, m, h, d, or w"),
+    };
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+/// Dispatch `ostk-recall lens <verb>`.
+fn run_lens(config_path: &Path, verb: LensVerb) -> Result<()> {
+    match verb {
+        LensVerb::Show => {
+            let cfg = ostk_recall_core::Config::load(config_path)
+                .with_context(|| format!("loading config from {}", config_path.display()))?;
+            let root = cfg.expanded_root()?;
+            let lens_md = root.join(ostk_recall_cli::lens_loop::LENS_MARKDOWN_FILE);
+            if !lens_md.exists() {
+                println!(
+                    "_No lens rendered yet._ Start `ostk-recall serve --stdio` and wait for the first refresh.\n\
+                     (Empty-mind boot, OSTK_RECALL_LENS_DISABLED, or simply no attention drift since the daemon started.)"
+                );
+                return Ok(());
+            }
+            let body = std::fs::read_to_string(&lens_md)
+                .with_context(|| format!("reading {}", lens_md.display()))?;
+            print!("{body}");
+            if !body.ends_with('\n') {
+                println!();
+            }
+        }
+        LensVerb::Disable => {
+            // Per-session opt-out. Documented in p9b-lens-portfolio.md
+            // "Privacy + control". Baking-in disabled state requires
+            // editing config.toml; we deliberately don't muck with the
+            // user's config from a CLI verb.
+            println!(
+                "Set OSTK_RECALL_LENS_DISABLED=1 in the environment before launching\n\
+                 `ostk-recall serve --stdio` to disable the memory-lens daemon for the\n\
+                 lifetime of that serve invocation. For a persistent opt-out edit the\n\
+                 [lens] section of your config.toml (planned for v0.6.0-rc.1)."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch `ostk-recall manifest <verb>`.
+async fn run_manifest(config_path: &Path, verb: ManifestVerb) -> Result<()> {
+    match verb {
+        ManifestVerb::Rebuild => {
+            let cfg = ostk_recall_core::Config::load(config_path)
+                .with_context(|| format!("loading config from {}", config_path.display()))?;
+            let root = cfg.expanded_root()?;
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating corpus root {}", root.display()))?;
+            // Open both stores; the rebuild reads from corpus.lance and
+            // writes into ingest.sqlite. If ingest.sqlite holds the
+            // legacy v0.5 schema, the open path errors loudly per P0.
+            let store = ostk_recall_store::CorpusStore::open_or_create(
+                &root,
+                // Dim is fixed at corpus-create time. We open with the
+                // embedder's nominal dim; rebuild doesn't read embeddings.
+                0,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("open corpus: {e}"))?;
+            let ingest = ostk_recall_store::IngestDb::open(&root)
+                .map_err(|e| anyhow::anyhow!("open ingest ledger: {e}"))?;
+            let run_id = format!(
+                "manifest-rebuild-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            let n = ostk_recall_store::rebuild_ingest_manifest(&store, &ingest, &run_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("rebuild_ingest_manifest: {e}"))?;
+            println!("rebuilt {n} chunks into ingest.sqlite (run_id={run_id})");
+            println!("next step: run a full `ostk-recall scan` to refresh mtime/size metadata.");
+        }
+    }
     Ok(())
 }
 
@@ -697,5 +925,27 @@ fn print_attention_output(json: bool, value: &serde_json::Value) {
                 serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_since_duration;
+
+    #[test]
+    fn parse_since_duration_accepts_supported_units() {
+        assert_eq!(parse_since_duration("30s").unwrap().as_secs(), 30);
+        assert_eq!(parse_since_duration("15min").unwrap().as_secs(), 900);
+        assert_eq!(parse_since_duration("24h").unwrap().as_secs(), 86_400);
+        assert_eq!(parse_since_duration("7d").unwrap().as_secs(), 604_800);
+        assert_eq!(parse_since_duration("2weeks").unwrap().as_secs(), 1_209_600);
+    }
+
+    #[test]
+    fn parse_since_duration_rejects_invalid_forms() {
+        assert!(parse_since_duration("").is_err());
+        assert!(parse_since_duration("h").is_err());
+        assert!(parse_since_duration("12").is_err());
+        assert!(parse_since_duration("12 months").is_err());
     }
 }
