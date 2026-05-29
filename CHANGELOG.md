@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-alpha.4] - 2026-05-29
+
+Daemon transport milestone: `serve` becomes a real standalone daemon
+that serves MCP to many clients over a cross-platform local socket /
+named pipe, with a thin `connect` bridge for stdio clients and an
+in-process `--watch`. Fixes the long-standing "only stdio transport is
+currently supported" failure (surfaced on Windows).
+
+### Fixed
+
+- **`ostk-recall serve` (no `--stdio`) now actually runs.** It previously
+  errored with "only stdio transport is currently supported" on every
+  platform — the standalone daemon mode the README documented was never
+  wired. (Surfaced on Windows, where nothing else incidentally bound the
+  scan-trigger pipe.) `serve` now runs as a long-lived daemon and blocks
+  on Ctrl-C (`tokio` gains the `signal` feature).
+
+### Added
+
+- **Single daemon, many clients.** The standalone daemon serves MCP to
+  any number of clients over a cross-platform local endpoint (`AF_UNIX`
+  socket / Windows named pipe). The MCP resource-notification layer is
+  now genuinely multi-client: `ClientId::Network`, per-connection
+  outbound channels, lens `resources/updated` fan-out to all subscribers,
+  and subscription pruning on disconnect.
+- **`ostk-recall connect`** — a thin stdio↔socket bridge (no engine, no
+  lock, no scan) so a stdio-only MCP client reaches a running daemon
+  instead of spawning its own `serve`.
+- **`ostk-recall serve --watch`** — runs the filesystem watcher
+  in-process, delivering debounced batches straight to the scan path
+  (no socket loopback) and sharing one scan mutex with the trigger
+  socket so scans never overlap on the single-writer corpus. The
+  standalone `ostk-recall watch` process is retained for the decoupled
+  case.
+
 ## [0.6.0-alpha.3] - 2026-05-28
 
 The cognitive-memory substrate milestone. ostk-recall gains an ambient,

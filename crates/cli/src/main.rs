@@ -95,16 +95,35 @@ enum Command {
         chunk_id: String,
     },
     /// Serve the MCP endpoint.
+    ///
+    /// Without `--stdio`, runs as a standalone daemon: serves MCP to
+    /// many clients over a local socket / named pipe (dial it with
+    /// `ostk-recall connect`) and keeps the corpus fresh in the
+    /// background. With `--stdio`, this process is itself the MCP
+    /// server, talking JSON-RPC over its own stdin/stdout.
     Serve {
-        /// Use stdio transport.
+        /// Use stdio transport (this process is the MCP server).
         #[arg(long)]
         stdio: bool,
+        /// Daemon mode only: also run the filesystem watcher in-process
+        /// so file changes trigger a rescan without a separate
+        /// `ostk-recall watch`. Ignored under `--stdio`.
+        #[arg(long)]
+        watch: bool,
     },
     /// Watch configured source paths and poke the running `serve`'s
     /// scan-trigger socket whenever a debounced batch of events lands.
     /// Requires `[watch].enabled = true` in config; reuses each
     /// `[[sources]].paths` and `extensions`.
     Watch,
+    /// Bridge a stdio MCP client to a running `serve` daemon.
+    ///
+    /// A dumb byte pump: splices this process's stdin/stdout to the
+    /// daemon's MCP socket / named pipe. No engine, no corpus lock, no
+    /// scanning — point a stdio-only MCP client (Claude Code/Desktop)
+    /// at `ostk-recall connect` so it reaches the shared daemon instead
+    /// of spawning its own `serve`.
+    Connect,
     /// Attention substrate verbs (forward-attention runtime).
     Attention {
         /// Emit JSON instead of the human-readable summary.
@@ -571,12 +590,15 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             let result = commands::inspect(&config_path, embedder, &chunk_id).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        Command::Serve { stdio } => {
+        Command::Serve { stdio, watch } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            commands::serve(&config_path, embedder, stdio).await?;
+            commands::serve(&config_path, embedder, stdio, watch).await?;
         }
         Command::Watch => {
             commands::watch(&config_path).await?;
+        }
+        Command::Connect => {
+            commands::connect(&config_path).await?;
         }
         Command::Attention { json, verb } => {
             let dispatch = build_attention_dispatch(&config_path)?;

@@ -19,7 +19,7 @@ use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
     Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode,
 };
-use ostk_recall_mcp::{ResourceRegistry, Server};
+use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::lens::LensConfig;
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
@@ -893,14 +893,9 @@ pub async fn serve(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
     stdio: bool,
+    watch: bool,
 ) -> Result<()> {
     use std::io::Write as _;
-
-    if !stdio {
-        return Err(anyhow!(
-            "only stdio transport is currently supported; pass --stdio"
-        ));
-    }
 
     // Singleton guard: only one `serve` per corpus root.
     //
@@ -1074,17 +1069,50 @@ pub async fn serve(
         Arc::new(dispatch)
     });
 
+    // Single scan-in-flight mutex shared by the socket listener and the
+    // in-process `--watch` watcher, so a watcher-driven scan and an
+    // external socket poke never run concurrently on the single-writer
+    // corpus.
+    let scan_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+
     // Spawn background scan trigger listener
     let config_path_for_bg = config_path.to_path_buf();
     let embedder_for_bg = Arc::clone(&embedder);
     let ctx_for_bg = serve_ctx.clone();
+    let scan_lock_for_bg = Arc::clone(&scan_lock);
     tokio::spawn(async move {
-        if let Err(e) =
-            run_socket_listener(&sock_path, config_path_for_bg, embedder_for_bg, ctx_for_bg).await
+        if let Err(e) = run_socket_listener(
+            &sock_path,
+            config_path_for_bg,
+            embedder_for_bg,
+            ctx_for_bg,
+            scan_lock_for_bg,
+        )
+        .await
         {
             tracing::error!(error = %e, "background socket listener failed");
         }
     });
+
+    // `serve --watch`: run the filesystem watcher in-process and deliver
+    // debounced batches straight to the scan path (no socket loopback),
+    // sharing `scan_lock` with the socket listener so a watcher-driven
+    // scan and an external poke never overlap. The watcher is best-effort:
+    // if `[watch]` is misconfigured it logs and the daemon carries on.
+    if watch {
+        let config_path_for_watch = config_path.to_path_buf();
+        let sink = ScanTriggerSink::InProcess {
+            scan_lock: Arc::clone(&scan_lock),
+            embedder: Arc::clone(&embedder),
+            ctx: serve_ctx.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = run_watcher(&config_path_for_watch, sink).await {
+                tracing::warn!(error = %e, "in-process watcher exited; daemon continues without it");
+            }
+        });
+        tracing::info!("in-process watcher enabled (serve --watch)");
+    }
 
     // P9b-min — construct the memory-lens registry + resource and,
     // when the attention substrate is online, spawn the background
@@ -1151,20 +1179,49 @@ pub async fn serve(
         dim = engine.store().dim(),
         audit = engine.has_audit(),
         attention = dispatch.is_some(),
-        "mcp serve --stdio starting"
+        stdio,
+        "ostk-recall serve starting"
     );
     let server_base = match dispatch {
         Some(d) => Server::new(engine).with_attention(d),
         None => Server::new(engine),
     };
     let server = server_base.with_resources(lens_registry);
-    server
-        .run_stdio()
-        .await
-        .map_err(|e| anyhow!("mcp stdio: {e}"))?;
-    // Cancel the curator on a clean exit so the tokio runtime can drain.
+    if stdio {
+        // Direct stdio transport: this process IS the MCP server, talking
+        // JSON-RPC over its own stdin/stdout. Used by a client that spawns
+        // `serve --stdio` directly (and by the `connect` bridge's fallback).
+        server
+            .run_stdio()
+            .await
+            .map_err(|e| anyhow!("mcp stdio: {e}"))?;
+    } else {
+        // Standalone daemon: serve MCP to many clients over the
+        // cross-platform local endpoint while the background scan-trigger
+        // listener, idle curator, and memory-lens loop keep the corpus
+        // fresh. All connections share this one read-only engine + lens
+        // registry, so lens `resources/updated` notifications fan out to
+        // every subscribed client. Block until a shutdown signal so the
+        // background tasks stay alive; the `.serve.lock` flock releases on
+        // exit regardless.
+        let server = Arc::new(server);
+        let mcp_sock = mcp_endpoint_path(&root);
+        let mcp_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            if let Err(e) = run_mcp_listener(&mcp_sock, mcp_server).await {
+                tracing::error!(error = %e, "mcp listener exited with error");
+            }
+        });
+        tracing::info!(
+            "daemon mode: MCP listener + background freshening online; waiting for shutdown signal (Ctrl-C)"
+        );
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to listen for Ctrl-C; shutting down daemon");
+        }
+    }
+    // Cancel the curator/lens on a clean exit so the tokio runtime can drain.
     serve_cancel.cancel();
-    tracing::info!("mcp serve exited cleanly");
+    tracing::info!(stdio, "ostk-recall serve exited cleanly");
     Ok(())
 }
 
@@ -1410,10 +1467,8 @@ async fn run_socket_listener(
     config_path: PathBuf,
     embedder: Arc<dyn ChunkEmbedder>,
     ctx: Option<ServeContext>,
+    scan_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<()> {
-    use tokio::sync::Mutex;
-    let scan_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-
     #[cfg(unix)]
     {
         use tokio::net::UnixListener;
@@ -1472,6 +1527,214 @@ async fn run_socket_listener(
             }
         }
     }
+}
+
+/// Filesystem path of the daemon's MCP endpoint, distinct from the
+/// scan-trigger socket (`recall.sock`). On Unix this is the `AF_UNIX`
+/// path that [`run_mcp_listener`] binds and the `connect` bridge
+/// dials; on Windows it only seeds a distinct named-pipe name via
+/// [`pipe_name_for`] (the file itself is never created on disk).
+fn mcp_endpoint_path(root: &Path) -> PathBuf {
+    root.join("recall-mcp.sock")
+}
+
+/// Derive the Windows named-pipe name for a local IPC endpoint from
+/// its socket `path`. Unix binds `path` directly as an `AF_UNIX`
+/// socket; Windows has no filesystem sockets, so the path's file stem
+/// seeds a pipe name instead. The MCP listener and the `connect`
+/// bridge both route through this so the two sides agree on the name.
+#[cfg(windows)]
+fn pipe_name_for(path: &Path, fallback_stem: &str) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(fallback_stem);
+    format!(r"\\.\pipe\ostk-recall-{stem}")
+}
+
+/// Accept MCP client connections on the daemon's cross-platform local
+/// endpoint and serve each one as an independent JSON-RPC session.
+///
+/// Mirrors [`run_socket_listener`]'s transport split (`AF_UNIX` on
+/// Unix, named pipe on Windows) but, instead of reading a one-shot
+/// trigger frame, hands each accepted connection's read/write halves
+/// to [`Server::serve_with_client`] with a fresh [`ClientId::network`]
+/// id. The single `Arc<Server>` is shared across all connections —
+/// every connection reads through the same read-only `QueryEngine` and
+/// the same lens `ResourceRegistry`, so memory-lens
+/// `resources/updated` notifications fan out to every subscribed
+/// client. Each connection runs in its own task, so a slow or stuck
+/// client can't block the accept loop or its peers.
+async fn run_mcp_listener(path: &Path, server: Arc<Server>) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let next_id = AtomicU64::new(1);
+
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixListener;
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("binding MCP socket {}", path.display()))?;
+        tracing::info!(path = %path.display(), "listening for MCP clients (unix socket)");
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let server = Arc::clone(&server);
+                    tokio::spawn(async move {
+                        let (rd, wr) = stream.into_split();
+                        if let Err(e) = server.serve_with_client(ClientId::network(id), rd, wr).await
+                        {
+                            tracing::warn!(client = id, error = %e, "mcp connection ended with error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mcp socket accept failed");
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let pipe_name = pipe_name_for(path, "mcp");
+        // first_pipe_instance(true) on the FIRST create only; each accepted
+        // connect consumes the current instance, so spin up the next one
+        // before serving the connected pipe — that's what lets multiple
+        // MCP clients connect simultaneously.
+        let mut pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
+        tracing::info!(pipe = %pipe_name, "listening for MCP clients (named pipe)");
+
+        loop {
+            match pipe.connect().await {
+                Ok(()) => {
+                    let connected = pipe;
+                    pipe = ServerOptions::new().create(&pipe_name)?;
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let server = Arc::clone(&server);
+                    tokio::spawn(async move {
+                        let (rd, wr) = tokio::io::split(connected);
+                        if let Err(e) = server.serve_with_client(ClientId::network(id), rd, wr).await
+                        {
+                            tracing::warn!(client = id, error = %e, "mcp connection ended with error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mcp named pipe connect failed");
+                    // Re-create the listener so a transient error doesn't
+                    // wedge the loop on a half-broken instance.
+                    pipe = ServerOptions::new().create(&pipe_name)?;
+                }
+            }
+        }
+    }
+}
+
+/// Bridge this process's stdin/stdout to a running daemon's MCP
+/// endpoint (the `connect` command). A dumb byte pump: it opens no
+/// engine, takes no corpus lock, and runs no scan — it just splices
+/// bytes so a stdio-only MCP client reaches the shared daemon.
+///
+/// Fails with an actionable hint when no daemon is listening rather
+/// than silently spawning one (a second writer would be refused by the
+/// `.serve.lock` singleton guard anyway).
+pub async fn connect(config_path: &Path) -> Result<()> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
+    let root = cfg.expanded_root().context("resolving corpus.root")?;
+    let endpoint = mcp_endpoint_path(&root);
+
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixStream;
+        let stream = UnixStream::connect(&endpoint).await.map_err(|e| {
+            anyhow!(
+                "connecting to ostk-recall MCP daemon at {}: {e}\n\
+                 is a daemon running? start one with `ostk-recall serve --watch`",
+                endpoint.display()
+            )
+        })?;
+        let (mut sock_r, mut sock_w) = stream.into_split();
+        bridge_stdio(&mut sock_r, &mut sock_w).await
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe_name = pipe_name_for(&endpoint, "mcp");
+        let client = ClientOptions::new().open(&pipe_name).map_err(|e| {
+            anyhow!(
+                "connecting to ostk-recall MCP daemon pipe {pipe_name}: {e}\n\
+                 is a daemon running? start one with `ostk-recall serve --watch`"
+            )
+        })?;
+        let (mut sock_r, mut sock_w) = tokio::io::split(client);
+        bridge_stdio(&mut sock_r, &mut sock_w).await
+    }
+}
+
+/// Bidirectional splice for [`connect`]: copy stdin → socket and
+/// socket → stdout concurrently, each running to completion. When
+/// stdin hits EOF the socket write half is shut down so the daemon
+/// sees the client disconnect (and closes its side, ending the
+/// socket→stdout copy); when the daemon closes first, the stdout copy
+/// ends and the stdin copy unblocks once the client closes stdin.
+/// Neither direction is cut off early, so trailing JSON-RPC frames are
+/// not dropped.
+async fn bridge_stdio<R, W>(sock_r: &mut R, sock_w: &mut W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    splice_bidirectional(
+        sock_r,
+        sock_w,
+        &mut tokio::io::stdin(),
+        &mut tokio::io::stdout(),
+    )
+    .await
+}
+
+/// Core of [`bridge_stdio`]: copy `input` → `sock_w` and `sock_r` →
+/// `output` concurrently, each running to completion. When `input`
+/// hits EOF the socket write half is shut down so the daemon's reader
+/// sees the disconnect; the reverse copy ends when the daemon closes
+/// its side. Neither direction is cut off early, so trailing JSON-RPC
+/// frames survive. Split out from the stdin/stdout wiring so it can be
+/// driven over in-memory pipes in tests.
+async fn splice_bidirectional<R, W, In, Out>(
+    sock_r: &mut R,
+    sock_w: &mut W,
+    input: &mut In,
+    output: &mut Out,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    In: tokio::io::AsyncRead + Unpin,
+    Out: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncWriteExt, copy};
+
+    let to_sock = async {
+        let _ = copy(input, sock_w).await;
+        // Half-close the write side so the daemon's reader sees EOF.
+        let _ = sock_w.shutdown().await;
+    };
+    let to_output = async {
+        let _ = copy(sock_r, output).await;
+        let _ = output.flush().await;
+    };
+    tokio::join!(to_sock, to_output);
+    Ok(())
 }
 
 /// Maximum trigger frame size in bytes. Frames larger than this log a
@@ -1636,8 +1899,62 @@ fn source_label(source: &SourceConfig) -> String {
         .unwrap_or_else(|| source.kind.as_str().to_string())
 }
 
-#[allow(clippy::too_many_lines)]
+/// Where a watcher delivers a debounced scan-trigger batch.
+///
+/// The standalone `watch` command writes to the daemon's scan-trigger
+/// socket ([`ScanTriggerSink::Socket`]); `serve --watch` runs the same
+/// loop in-process and hands batches straight to [`spawn_scan_trigger`]
+/// ([`ScanTriggerSink::InProcess`]), skipping the socket loopback and
+/// sharing the daemon's scan mutex so the two never scan at once.
+enum ScanTriggerSink {
+    Socket,
+    InProcess {
+        scan_lock: Arc<tokio::sync::Mutex<()>>,
+        embedder: Arc<dyn ChunkEmbedder>,
+        ctx: Option<ServeContext>,
+    },
+}
+
+impl ScanTriggerSink {
+    const fn is_in_process(&self) -> bool {
+        matches!(self, Self::InProcess { .. })
+    }
+}
+
+/// Deliver one debounced `frame` to the configured sink. The socket
+/// arm awaits the kick (and can fail on a transient socket error); the
+/// in-process arm fires [`spawn_scan_trigger`] and returns immediately
+/// (the spawned task drops itself if the shared scan lock is held).
+async fn dispatch_scan_trigger(
+    sink: &ScanTriggerSink,
+    socket_path: &Path,
+    config_path: &Path,
+    frame: &[PathBuf],
+) -> Result<()> {
+    match sink {
+        ScanTriggerSink::Socket => kick_trigger_socket(socket_path, frame).await,
+        ScanTriggerSink::InProcess {
+            scan_lock,
+            embedder,
+            ctx,
+        } => {
+            spawn_scan_trigger(scan_lock, config_path, embedder, frame.to_vec(), ctx.clone());
+            Ok(())
+        }
+    }
+}
+
+/// Standalone `watch` command: drive [`run_watcher`] delivering pokes
+/// over the scan-trigger socket to a separately-running `serve`.
 pub async fn watch(config_path: &Path) -> Result<()> {
+    run_watcher(config_path, ScanTriggerSink::Socket).await
+}
+
+/// Filesystem-watch loop shared by the standalone `watch` command and
+/// the in-process watcher spawned by `serve --watch`. `sink` selects
+/// socket delivery (separate process) vs. direct in-process scans.
+#[allow(clippy::too_many_lines)]
+async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
     use std::time::Duration;
 
     use notify_debouncer_full::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
@@ -1737,6 +2054,7 @@ pub async fn watch(config_path: &Path) -> Result<()> {
         socket = %socket_path.display(),
         debounce_ms = watch_cfg.debounce_ms,
         roots = watched_roots.len(),
+        in_process = sink.is_in_process(),
         "scan-trigger watcher started"
     );
 
@@ -1806,7 +2124,10 @@ pub async fn watch(config_path: &Path) -> Result<()> {
                                     WatchMode::Legacy => &[],
                                     WatchMode::Incremental => &to_send,
                                 };
-                                if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
+                                if let Err(e) =
+                                    dispatch_scan_trigger(&sink, &socket_path, config_path, frame)
+                                        .await
+                                {
                                     tracing::warn!(
                                         socket = %socket_path.display(),
                                         label = %label,
@@ -1841,7 +2162,9 @@ pub async fn watch(config_path: &Path) -> Result<()> {
                         WatchMode::Legacy => &[],
                         WatchMode::Incremental => &to_send,
                     };
-                    if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
+                    if let Err(e) =
+                        dispatch_scan_trigger(&sink, &socket_path, config_path, frame).await
+                    {
                         tracing::warn!(
                             socket = %socket_path.display(),
                             label = %label,
@@ -2321,5 +2644,70 @@ mod force_wipe_tests {
         for f in files {
             assert!(!root.join(f).exists(), "{f} should have been removed");
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_transport_tests {
+    use super::{mcp_endpoint_path, splice_bidirectional};
+    use std::path::Path;
+
+    /// The daemon's MCP endpoint must not collide with the scan-trigger
+    /// socket: they're two independent listeners on the same corpus
+    /// root, and on Windows the distinct file stems seed distinct named
+    /// pipes. A collision would wedge one listener on the other's bind.
+    #[test]
+    fn mcp_endpoint_distinct_from_trigger_socket() {
+        let root = Path::new("/tmp/ostk-corpus");
+        let mcp = mcp_endpoint_path(root);
+        assert_eq!(mcp, root.join("recall-mcp.sock"));
+        assert_ne!(
+            mcp,
+            root.join("recall.sock"),
+            "MCP endpoint must differ from the scan-trigger socket"
+        );
+    }
+
+    /// The `connect` bridge core must pump bytes in BOTH directions and
+    /// not drop the daemon's reply: client stdin → socket, and the
+    /// daemon's response → client stdout.
+    #[tokio::test]
+    async fn splice_bidirectional_pumps_both_directions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Stand-in for the daemon socket: a duplex whose far end is the
+        // "daemon" task.
+        let (sock_client, daemon_end) = tokio::io::duplex(1024);
+        let (mut sock_r, mut sock_w) = tokio::io::split(sock_client);
+        let (mut daemon_r, mut daemon_w) = tokio::io::split(daemon_end);
+
+        // Client "stdin": test writes a request, then EOF (drop).
+        let (mut stdin_w, mut stdin_r) = tokio::io::duplex(1024);
+        // Client "stdout": splice writes here, test reads it back.
+        let (mut stdout_w, mut stdout_r) = tokio::io::duplex(1024);
+
+        // Daemon: read the request, echo a reply, then close its side.
+        let daemon = tokio::spawn(async move {
+            let mut buf = vec![0u8; 5];
+            daemon_r.read_exact(&mut buf).await.unwrap();
+            daemon_w.write_all(b"pong\n").await.unwrap();
+            buf
+            // daemon_r / daemon_w drop here → socket EOF to the client.
+        });
+
+        stdin_w.write_all(b"ping\n").await.unwrap();
+        drop(stdin_w);
+
+        splice_bidirectional(&mut sock_r, &mut sock_w, &mut stdin_r, &mut stdout_w)
+            .await
+            .unwrap();
+
+        assert_eq!(&daemon.await.unwrap(), b"ping\n", "request reached daemon");
+
+        // Close the write side so read_to_end on the client stdout sees EOF.
+        drop(stdout_w);
+        let mut got = Vec::new();
+        stdout_r.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"pong\n", "daemon reply reached client stdout");
     }
 }

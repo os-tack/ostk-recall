@@ -54,6 +54,49 @@ impl ChunkEmbedder for FakeEmbedder {
     }
 }
 
+/// Drive one full MCP connection over a duplex pair via the real
+/// [`Server::serve_with_client`] loop, subscribe it to the lens URI,
+/// and return the client's reader (positioned just after the subscribe
+/// reply) plus the spawned serve task. Used by the multi-client
+/// daemon fan-out test below.
+#[cfg(test)]
+async fn connect_and_subscribe(
+    server: std::sync::Arc<Server>,
+    client: ostk_recall_mcp::ClientId,
+    uri: &str,
+) -> (
+    tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (client_end, server_end) = tokio::io::duplex(8192);
+    let (srv_r, srv_w) = tokio::io::split(server_end);
+    let handle = tokio::spawn(async move { server.serve_with_client(client, srv_r, srv_w).await });
+
+    let (cli_r, mut cli_w) = tokio::io::split(client_end);
+    let mut reader = BufReader::new(cli_r);
+
+    let req = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\"params\":{{\"uri\":\"{uri}\"}}}}\n"
+    );
+    cli_w.write_all(req.as_bytes()).await.unwrap();
+
+    // Read until the subscribe reply (id == 1) lands, so the server has
+    // recorded the subscription before the caller fires an emit.
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.unwrap();
+        assert!(n > 0, "server closed before subscribe reply");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        if v.get("id").and_then(Value::as_i64) == Some(1) {
+            break;
+        }
+    }
+    (reader, cli_w, handle)
+}
+
 async fn build_server() -> (TempDir, Server) {
     // Bare-minimum QueryEngine. The resources tests never touch
     // tools/{list,call} so the seeded chunk is just a placeholder
@@ -562,5 +605,65 @@ async fn resources_notifications() {
     assert!(
         v.get("id").is_none() || v.get("id") == Some(&Value::Null),
         "notifications must not carry an id"
+    );
+}
+
+#[tokio::test]
+async fn daemon_fans_out_resource_update_to_two_network_clients() {
+    // End-to-end multi-client contract through the real
+    // `serve_with_client` loop: two concurrent network connections each
+    // subscribe, one emit reaches BOTH wires, and disconnecting one
+    // prunes its subscription (so the daemon doesn't leak dead ids).
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+
+    let (_tmp, server) = build_server().await;
+    let registry = server.resources();
+    registry.register(Arc::new(FakeResource::new("ostk://memory-lens", "body")));
+    let server = Arc::new(server);
+
+    let (mut r1, w1, h1) =
+        connect_and_subscribe(Arc::clone(&server), ClientId::network(1), "ostk://memory-lens")
+            .await;
+    let (mut r2, _w2, _h2) =
+        connect_and_subscribe(Arc::clone(&server), ClientId::network(2), "ostk://memory-lens")
+            .await;
+
+    assert_eq!(
+        registry.subscribers_for("ostk://memory-lens").len(),
+        2,
+        "both network connections must be subscribed under distinct ids"
+    );
+
+    registry.emit_resource_updated("ostk://memory-lens");
+
+    for (idx, reader) in [&mut r1, &mut r2].into_iter().enumerate() {
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap_or_else(|_| panic!("client {idx} timed out waiting for notification"))
+            .unwrap();
+        assert!(read > 0, "client {idx} got EOF instead of a notification");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            v.get("method").and_then(Value::as_str),
+            Some("notifications/resources/updated"),
+            "client {idx} must receive the resources/updated notification"
+        );
+    }
+
+    // Disconnect client 1: dropping both ends gives the server read EOF,
+    // so its serve loop exits and runs `remove_client` on the network id.
+    drop(r1);
+    drop(w1);
+    tokio::time::timeout(Duration::from_secs(2), h1)
+        .await
+        .expect("client 1 serve exits on disconnect")
+        .expect("client 1 serve task did not panic")
+        .expect("client 1 serve returned no io error");
+    assert_eq!(
+        registry.subscribers_for("ostk://memory-lens").len(),
+        1,
+        "disconnected client's subscription must be pruned"
     );
 }

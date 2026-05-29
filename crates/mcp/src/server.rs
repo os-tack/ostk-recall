@@ -133,8 +133,32 @@ impl Server {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // stdio transport: the process-scoped singleton client.
+        self.serve_with_client(ClientId::stdio_singleton(), reader, writer)
+            .await
+    }
+
+    /// Transport-agnostic serve loop for one connection identified by
+    /// `client`. The daemon's network listener calls this once per
+    /// accepted connection with a fresh [`ClientId::Network`]; the
+    /// stdio path goes through [`Self::serve`] with the singleton id.
+    ///
+    /// On exit a network client is fully evicted from the resource
+    /// registry (sender + subscriptions) so a long-lived daemon
+    /// doesn't leak dead ids; the stdio singleton keeps its
+    /// (process-scoped) subscriptions and only drops its sender.
+    pub async fn serve_with_client<R, W>(
+        &self,
+        client: ClientId,
+        reader: R,
+        writer: W,
+    ) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        self.resources.set_outbound(out_tx.clone());
+        self.resources.add_outbound(client.clone(), out_tx.clone());
 
         let writer_handle = tokio::spawn(writer_task(out_rx, writer));
 
@@ -158,7 +182,7 @@ impl Server {
                     continue;
                 }
                 let response = match serde_json::from_str::<Value>(trimmed) {
-                    Ok(v) => self.handle_request(v).await,
+                    Ok(v) => self.handle_request_as(v, &client).await,
                     Err(e) => Some(JsonRpcResponse::err(
                         Value::Null,
                         JsonRpcError::parse(format!("parse error: {e}")),
@@ -177,7 +201,14 @@ impl Server {
         .await;
 
         info!("mcp server shutting down");
-        self.resources.clear_outbound();
+        match &client {
+            // Network connection closed: evict its sender and prune
+            // its subscriptions so the daemon doesn't leak dead ids.
+            ClientId::Network { .. } => self.resources.remove_client(&client),
+            // stdio singleton: drop only the sender; process-scoped
+            // subscriptions are kept (serve_eof regression contract).
+            ClientId::StdioSingleton => self.resources.remove_outbound(&client),
+        }
         drop(out_tx);
         let writer_result = writer_handle.await;
 
@@ -194,7 +225,22 @@ impl Server {
     }
 
     /// Dispatch one JSON-RPC message. Returns None for notifications (no id).
+    /// `resources/subscribe` is attributed to the stdio singleton; the
+    /// daemon network path uses [`Self::handle_request_as`] with a
+    /// per-connection id.
     pub async fn handle_request(&self, raw: Value) -> Option<JsonRpcResponse> {
+        self.handle_request_as(raw, &ClientId::stdio_singleton())
+            .await
+    }
+
+    /// Dispatch one JSON-RPC message on behalf of `client`. `client`
+    /// only affects `resources/subscribe` routing; every other method
+    /// is client-agnostic.
+    pub async fn handle_request_as(
+        &self,
+        raw: Value,
+        client: &ClientId,
+    ) -> Option<JsonRpcResponse> {
         let req: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
             Ok(r) => r,
             Err(e) => {
@@ -226,7 +272,7 @@ impl Server {
                 Err(err) => Some(JsonRpcResponse::err(id, err)),
             },
             "resources/subscribe" => match resource_uri_param(&req.params) {
-                Ok(uri) => match self.resources.subscribe(ClientId::stdio_singleton(), &uri) {
+                Ok(uri) => match self.resources.subscribe(client.clone(), &uri) {
                     Ok(()) => Some(JsonRpcResponse::ok(id, json!({}))),
                     Err(err) => Some(JsonRpcResponse::err(id, err.into_rpc())),
                 },
