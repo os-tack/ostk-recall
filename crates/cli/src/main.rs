@@ -575,7 +575,7 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                     commands::consolidate(&config_path, embedder, since, epoch_size).await?;
                 let w = &out.window;
                 println!(
-                    "consolidate summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_threads={} proposals_pruned={} | bridges_written={} bridges_touched={} proposals_promoted={} threads_faded={}",
+                    "consolidate summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_threads={} proposals_pruned={} | bridges_written={} bridges_touched={} proposals_promoted={} threads_merged={} threads_abstracted={} threads_faded={}",
                     w.batches_processed,
                     w.chunks_seen,
                     w.evidence_links_written,
@@ -585,6 +585,8 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                     out.anchor_bridges_written,
                     out.anchor_bridges_touched,
                     out.proposals_promoted,
+                    out.threads_merged,
+                    out.threads_abstracted,
                     out.threads_faded,
                 );
             } else {

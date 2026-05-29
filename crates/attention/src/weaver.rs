@@ -12,12 +12,12 @@
 //! broadcast channel is observed and skipped (not fatal). The pipeline
 //! never blocks on us — the broadcast publisher is always non-blocking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use ostk_recall_core::attention::PrivacyTier;
+use ostk_recall_core::attention::{FoldDepth, PrivacyTier};
 use ostk_recall_core::{IngestOrigin, SourceKind, ThreadHandle};
 use ostk_recall_pipeline::{IngestEvent, Pipeline};
 use ostk_recall_store::{
@@ -141,6 +141,10 @@ pub struct ConsolidateOutcome {
     pub anchor_bridges_touched: usize,
     /// Recurring, high-cohesion proposals promoted to durable threads.
     pub proposals_promoted: usize,
+    /// Near-duplicate threads merged away (anchors near-identical).
+    pub threads_merged: usize,
+    /// Deeply-familiar stable threads folded to a sparse summary depth.
+    pub threads_abstracted: usize,
     /// Threads down-transitioned (Active→Slack→Dormant) by the idle fade.
     pub threads_faded: usize,
 }
@@ -170,6 +174,10 @@ const PROMOTE_MIN_COHESION: f32 = 0.9;
 const FADE_SLACK_IDLE_DAYS: f64 = 14.0;
 /// Base idle days after which a thread fades to `Dormant`.
 const FADE_DORMANT_IDLE_DAYS: f64 = 60.0;
+/// Anchor cosine at/above which two threads are near-duplicates and merge.
+/// Deliberately strict — merging deletes a thread, so the bar is "these are
+/// the same thread under two handles," not "these are related."
+const MERGE_ANCHOR_SIMILARITY: f32 = 0.95;
 
 /// Familiarity stretches the idle-fade windows: a saturated thread tolerates
 /// up to ~2× the idle before fading. Mirrors the `familiarity_floor` curve.
@@ -316,15 +324,99 @@ impl AutoWeaver {
             out.anchor_bridges_touched = pass.links_touched;
         }
 
-        // 3. Promote recurring, high-cohesion proposals to durable threads.
+        // 3. Merge near-duplicate threads (same thread under two handles).
+        //    Uses the same anchor snapshot; safe because it mutates the DB,
+        //    not the snapshot, and later steps re-query fresh.
+        out.threads_merged = self.merge_near_duplicate_threads(&snap)?;
+
+        // 4. Promote recurring, high-cohesion proposals to durable threads.
         out.proposals_promoted = self.promote_recurring_proposals()?;
 
-        // 4. Fade idle threads (the present curates the past). Down-only; the
+        // 5. Abstract deeply-familiar stable threads to a sparse summary fold.
+        out.threads_abstracted = self.abstract_stable_threads()?;
+
+        // 6. Fade idle threads (the present curates the past). Down-only; the
         //    live curator owns reanimation (it has the resonance signal this
         //    offline pass lacks).
         out.threads_faded = self.fade_idle_threads()?;
 
         Ok(out)
+    }
+
+    /// Merge near-duplicate threads — pairs whose anchors are near-identical
+    /// (`MERGE_ANCHOR_SIMILARITY`). Greedy: the more-familiar thread (tiebreak:
+    /// older) absorbs the other, so the consolidated map keeps the
+    /// load-bearing handle. Operates over the snapshot but mutates the DB;
+    /// merged-away handles are skipped for the rest of the pass.
+    fn merge_near_duplicate_threads(
+        &self,
+        snap: &AnchorSnapshot,
+    ) -> Result<usize, WeaverError> {
+        let threads = &snap.threads;
+        let mut merged_away: HashSet<String> = HashSet::new();
+        let mut count = 0usize;
+        for i in 0..threads.len() {
+            if merged_away.contains(threads[i].handle.as_str()) {
+                continue;
+            }
+            let Some(vi) = threads[i]
+                .anchor_chunk_id
+                .as_ref()
+                .and_then(|id| snap.anchor_embeds.get(id))
+            else {
+                continue;
+            };
+            for j in (i + 1)..threads.len() {
+                if merged_away.contains(threads[j].handle.as_str()) {
+                    continue;
+                }
+                let Some(vj) = threads[j]
+                    .anchor_chunk_id
+                    .as_ref()
+                    .and_then(|id| snap.anchor_embeds.get(id))
+                else {
+                    continue;
+                };
+                if cosine_similarity(vi, vj) < MERGE_ANCHOR_SIMILARITY {
+                    continue;
+                }
+                // Keep the stronger thread (more familiar; tiebreak: older).
+                let a = &threads[i];
+                let b = &threads[j];
+                let keep_a = a.familiarity > b.familiarity
+                    || (a.familiarity == b.familiarity && a.created_at <= b.created_at);
+                let (into, from) = if keep_a { (a, b) } else { (b, a) };
+                if self.threads.merge_thread(&from.handle, &into.handle)? {
+                    merged_away.insert(from.handle.as_str().to_string());
+                    count += 1;
+                    // If the outer thread was merged away, stop pairing it.
+                    if from.handle == threads[i].handle {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Fold deeply-familiar, stable (`Active`) threads to the most-collapsed
+    /// summary depth so the lens surfaces them sparsely — structural
+    /// abstraction via the existing `fold_override` primitive (no text
+    /// generation; the anchor already names the thread). Idempotent: threads
+    /// already folded are skipped.
+    fn abstract_stable_threads(&self) -> Result<usize, WeaverError> {
+        let mut count = 0usize;
+        for t in self.threads.list_threads(None)? {
+            if t.familiarity >= crate::FAMILIARITY_SATURATION
+                && t.tension == TensionState::Active
+                && t.fold_override != Some(FoldDepth::Folded)
+            {
+                self.threads
+                    .set_fold_override(&t.handle, Some(FoldDepth::Folded))?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Promote proposals whose distinct-content cluster is large and cohesive
@@ -1286,5 +1378,95 @@ mod tests {
                 .tension,
             TensionState::Dormant
         );
+    }
+
+    #[tokio::test]
+    async fn merge_near_duplicate_threads_absorbs_into_stronger() {
+        let fx = fixture().await;
+        // Two threads with byte-identical anchor embeddings (cosine 1.0).
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        fx.corpus
+            .upsert(&[chunk("anchor-keep"), chunk("anchor-dup")], &[v.clone(), v])
+            .await
+            .unwrap();
+        // `keep` is more familiar → it absorbs `dup`.
+        let mut keep = thread("keepthread", Some("anchor-keep"));
+        keep.familiarity = 10;
+        fx.threads.upsert_thread(&keep).unwrap();
+        fx.threads
+            .upsert_thread(&thread("dupthread", Some("anchor-dup")))
+            .unwrap();
+        // An evidence row on the soon-to-be-merged-away thread.
+        let now = Utc::now();
+        fx.threads
+            .add_evidence_link(&EvidenceLink {
+                id: 0,
+                thread_handle: ThreadHandle::new("dupthread").unwrap(),
+                original_path: PathBuf::from("evidence-1"),
+                current_path: None,
+                content_hash: None,
+                last_resolved_chunk_id: None,
+                relation_state: RelationState::Active,
+                association_type: AssociationType::Derived,
+                category: "doc".into(),
+                similarity: Some(0.9),
+                created_at: now,
+                updated_at: now,
+                touch_count: 1,
+                last_touched_at: now,
+            })
+            .unwrap();
+
+        let snap = weaver(&fx).load_anchor_snapshot().await.unwrap();
+        let merged = weaver(&fx).merge_near_duplicate_threads(&snap).unwrap();
+        assert_eq!(merged, 1);
+
+        // `dup` is gone; `keep` remains and inherited the evidence row.
+        assert!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("dupthread").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let kept_evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("keepthread").unwrap())
+            .unwrap();
+        assert!(
+            kept_evidence
+                .iter()
+                .any(|e| e.original_path == PathBuf::from("evidence-1")),
+            "merged-away thread's evidence is re-pointed onto the survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn abstract_stable_threads_folds_only_familiar_active() {
+        let fx = fixture().await;
+        let mut familiar = thread("familiar-active", None);
+        familiar.familiarity = crate::FAMILIARITY_SATURATION;
+        fx.threads.upsert_thread(&familiar).unwrap();
+
+        let mut casual = thread("casual-active", None);
+        casual.familiarity = 5;
+        fx.threads.upsert_thread(&casual).unwrap();
+
+        let mut fam_slack = thread("familiar-slack", None);
+        fam_slack.familiarity = crate::FAMILIARITY_SATURATION;
+        fam_slack.tension = TensionState::Slack;
+        fx.threads.upsert_thread(&fam_slack).unwrap();
+
+        let n = weaver(&fx).abstract_stable_threads().unwrap();
+        assert_eq!(n, 1, "only the deeply-familiar Active thread folds");
+        assert_eq!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("familiar-active").unwrap())
+                .unwrap()
+                .unwrap()
+                .fold_override,
+            Some(FoldDepth::Folded)
+        );
+        // Idempotent: a second pass folds nothing new.
+        assert_eq!(weaver(&fx).abstract_stable_threads().unwrap(), 0);
     }
 }

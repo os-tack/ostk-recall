@@ -1354,6 +1354,84 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(())
     }
 
+    /// Merge `from` into `into`: re-point every evidence and thread→thread
+    /// edge onto `into`, then delete `from`. Used by the P11b-full
+    /// consolidation merge pass for near-duplicate threads. Edges that would
+    /// collide on the target (same `(thread, path, category)`, or a would-be
+    /// `from == to` self-loop) are dropped — they are evidence the target
+    /// already holds. Chains a `ThreadDelete` for the merged-away handle.
+    /// Returns `false` (no-op) if `from == into` or `from` is absent.
+    pub fn merge_thread(&self, from: &ThreadHandle, into: &ThreadHandle) -> Result<bool> {
+        if from == into {
+            return Ok(false);
+        }
+        let merged = {
+            let mut conn = self.lock();
+            let exists = conn
+                .prepare("SELECT 1 FROM threads WHERE handle = ? LIMIT 1")?
+                .exists(params![from.as_str()])?;
+            if exists {
+                let tx = conn.transaction()?;
+                tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+                // chunk→thread evidence. OR IGNORE skips UNIQUE(thread, path,
+                // category) collisions; the leftover from-rows are then dropped.
+                tx.execute(
+                    "UPDATE OR IGNORE evidence_links SET thread_handle = ?1 WHERE thread_handle = ?2",
+                    params![into.as_str(), from.as_str()],
+                )?;
+                tx.execute(
+                    "DELETE FROM evidence_links WHERE thread_handle = ?1",
+                    params![from.as_str()],
+                )?;
+                // thread→thread edges on both endpoints. OR IGNORE skips
+                // UNIQUE(from,to,category) dups and CHECK(from<>to) self-loops.
+                tx.execute(
+                    "UPDATE OR IGNORE thread_thread_links SET from_thread = ?1 WHERE from_thread = ?2",
+                    params![into.as_str(), from.as_str()],
+                )?;
+                tx.execute(
+                    "UPDATE OR IGNORE thread_thread_links SET to_thread = ?1 WHERE to_thread = ?2",
+                    params![into.as_str(), from.as_str()],
+                )?;
+                tx.execute(
+                    "DELETE FROM thread_thread_links WHERE from_thread = ?1 OR to_thread = ?1",
+                    params![from.as_str()],
+                )?;
+                tx.execute(
+                    "DELETE FROM threads WHERE handle = ?1",
+                    params![from.as_str()],
+                )?;
+                tx.commit()?;
+                true
+            } else {
+                false
+            }
+        };
+        if merged {
+            self.sink.append(&ChainEvent::ThreadDelete {
+                handle: from.clone(),
+                ts: Utc::now(),
+            })?;
+        }
+        Ok(merged)
+    }
+
+    /// Set (or clear with `None`) a thread's fold override. Used by the
+    /// consolidation abstraction pass to fold deeply-familiar, stable threads
+    /// to a sparse summary depth. No chain event — fold depth is a
+    /// presentation hint, not a substrate-shape change. Errors if absent.
+    pub fn set_fold_override(&self, handle: &ThreadHandle, depth: Option<FoldDepth>) -> Result<()> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE threads SET fold_override = ? WHERE handle = ?",
+            params![depth.map(fold_to_str), handle.as_str()],
+        )?;
+        if n == 0 {
+            return Err(missing_thread(handle));
+        }
+        Ok(())
+    }
+
     // ---------- evidence ----------
 
     /// Insert an evidence row and return the new `id`.
