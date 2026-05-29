@@ -89,7 +89,12 @@ impl Default for LensConfig {
             // Attenuate operational telemetry from ambient surfacing by
             // default (still fully recall-able). Keep in sync with
             // `ostk_recall_core::config::default_lens_exclude_facets`.
-            exclude_facets: vec!["record_kind:audit_significant".to_string()],
+            // (RT-7 added `harness_orchestration` to the core default but left
+            // this copy behind — the guard test caught the drift.)
+            exclude_facets: vec![
+                "record_kind:audit_significant".to_string(),
+                "record_kind:harness_orchestration".to_string(),
+            ],
             candidate_k_per_lane: 32,
             dominance_threshold: 0.30,
         }
