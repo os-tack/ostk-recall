@@ -33,7 +33,9 @@ pub use query::{
     Axis, AxisAttribution, CompositeWeights, RankBy, ThreadQueryAttribution, ThreadQueryError,
     ThreadQueryParams, ThreadQueryReport, run_query,
 };
-pub use weaver::{AutoWeaver, ProposedWeave, WeaverError, WeaverOutcome, WeaverThresholds};
+pub use weaver::{
+    AutoWeaver, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome, WeaverThresholds,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;

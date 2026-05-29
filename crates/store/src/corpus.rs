@@ -12,7 +12,7 @@ use lancedb::index::Index;
 use lancedb::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FtsIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::OptimizeAction;
-use ostk_recall_core::Chunk;
+use ostk_recall_core::{Chunk, SourceKind};
 use thiserror::Error;
 
 use crate::schema::{CORPUS_TABLE, corpus_schema};
@@ -69,6 +69,13 @@ pub struct CorpusStore {
     conn: Connection,
     dim: usize,
     root: PathBuf,
+}
+
+/// One source-kind batch selected for a windowed corpus pass.
+#[derive(Debug, Clone)]
+pub struct CorpusWindowBatch {
+    pub source: SourceKind,
+    pub chunk_ids: Vec<String>,
 }
 
 impl CorpusStore {
@@ -1226,6 +1233,70 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Return non-stale chunk ids in a time window, grouped by source kind
+    /// and split into fixed-size batches.
+    ///
+    /// `since = None` means the whole active corpus. `since = Some(ts)`
+    /// excludes rows with NULL timestamps, which is the only defensible
+    /// interpretation for a lower-bound time filter.
+    pub async fn chunk_id_batches_by_source_window(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        epoch_size: usize,
+    ) -> Result<Vec<CorpusWindowBatch>> {
+        use std::collections::HashMap;
+
+        let epoch_size = epoch_size.max(1);
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let filter = match since {
+            Some(ts) => format!(
+                "stale = false AND ts >= TIMESTAMP '{}'",
+                ts.format("%Y-%m-%d %H:%M:%S")
+            ),
+            None => "stale = false".to_string(),
+        };
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "source".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        let mut grouped: HashMap<SourceKind, Vec<String>> = HashMap::new();
+        for batch in &batches {
+            let id_arr = column_as_str(batch, "chunk_id")?;
+            let source_arr = column_as_str(batch, "source")?;
+            for i in 0..batch.num_rows() {
+                let Some(source) = parse_source_kind(source_arr.value(i)) else {
+                    continue;
+                };
+                grouped
+                    .entry(source)
+                    .or_default()
+                    .push(id_arr.value(i).to_string());
+            }
+        }
+
+        let mut out = Vec::new();
+        for (source, mut ids) in grouped {
+            ids.sort();
+            for chunk in ids.chunks(epoch_size) {
+                out.push(CorpusWindowBatch {
+                    source,
+                    chunk_ids: chunk.to_vec(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.source
+                .as_str()
+                .cmp(b.source.as_str())
+                .then_with(|| a.chunk_ids.first().cmp(&b.chunk_ids.first()))
+        });
+        Ok(out)
+    }
+
     /// Mark every active chunk whose `extra_json` reports a `block_kind`
     /// of `tool_use` or `tool_result` as stale. Returns the row count
     /// matched before the update (so the caller can report what changed).
@@ -1362,6 +1433,28 @@ fn parse_source(s: &str) -> Option<ostk_recall_core::Source> {
         "gemini" => Source::Gemini,
         "thread" => Source::Thread,
         "membrane" => Source::Membrane,
+        _ => return None,
+    })
+}
+
+/// Map concrete stored source rows back to their scanner/source kind.
+fn parse_source_kind(s: &str) -> Option<SourceKind> {
+    Some(match s {
+        "markdown" => SourceKind::Markdown,
+        "code" => SourceKind::Code,
+        "claude_code" => SourceKind::ClaudeCode,
+        "ostk_decision"
+        | "ostk_needle"
+        | "ostk_audit_significant"
+        | "ostk_conversation"
+        | "ostk_session"
+        | "ostk_memory"
+        | "ostk_spec" => SourceKind::OstkProject,
+        "file_glob" => SourceKind::FileGlob,
+        "zip_export" => SourceKind::ZipExport,
+        "gemini" => SourceKind::Gemini,
+        "thread" => SourceKind::Thread,
+        "membrane" => SourceKind::Membrane,
         _ => return None,
     })
 }
@@ -1639,7 +1732,10 @@ mod tests {
                 .unwrap();
         }
         let before = store.version().await.unwrap();
-        assert!(before >= 8, "expected many versions before prune, got {before}");
+        assert!(
+            before >= 8,
+            "expected many versions before prune, got {before}"
+        );
 
         let pruned = store.optimize_compact_and_prune().await.unwrap();
         assert!(

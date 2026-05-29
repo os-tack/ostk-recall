@@ -17,10 +17,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use ostk_recall_core::{SourceKind, ThreadHandle};
+use ostk_recall_core::{IngestOrigin, SourceKind, ThreadHandle};
 use ostk_recall_pipeline::{IngestEvent, Pipeline};
 use ostk_recall_store::{
-    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, ThreadsDb,
+    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, ThreadRecord, ThreadsDb,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -101,6 +101,22 @@ pub struct WeaverOutcome {
     pub proposed_threads_written: usize,
 }
 
+/// Aggregate result from a windowed corpus weave pass.
+#[derive(Debug, Default)]
+pub struct WeaveWindowOutcome {
+    /// Number of synthesized source-kind batches processed.
+    pub batches_processed: usize,
+    /// Number of active corpus chunks handed to `process_event`.
+    pub chunks_seen: usize,
+    /// Count of newly inserted `evidence_links` rows. Existing links are
+    /// idempotent no-ops and are not counted here.
+    pub evidence_links_written: usize,
+    /// Count of detected chunk-to-multiple-anchor groupings.
+    pub proposed_weaves: usize,
+    /// Count of new `threads_proposed` rows.
+    pub proposed_threads_written: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WeaverError {
     #[error("store error: {0}")]
@@ -133,6 +149,55 @@ impl AutoWeaver {
             corpus,
             thresholds,
         }
+    }
+
+    /// Weave an explicit corpus window without weakening the live
+    /// TurnEnd gate in [`Self::run`].
+    ///
+    /// `since = None` scans the whole active corpus. `since = Some(d)`
+    /// scans chunks whose corpus timestamp is within the last `d`.
+    /// Batches are grouped by source kind so existing per-source
+    /// thresholds continue to apply. Synthetic membrane chunks are
+    /// skipped: they are substrate self-writes, not library content.
+    pub async fn weave_window(
+        &self,
+        since: Option<chrono::Duration>,
+        epoch_size: usize,
+    ) -> Result<WeaveWindowOutcome, WeaverError> {
+        let cutoff = since.map(|d| Utc::now() - d);
+        let anchor_snapshot = self.load_anchor_snapshot().await?;
+        let batches = self
+            .corpus
+            .chunk_id_batches_by_source_window(cutoff, epoch_size)
+            .await?;
+        let mut aggregate = WeaveWindowOutcome::default();
+        for batch in batches {
+            if batch.source == SourceKind::Membrane {
+                continue;
+            }
+            let event = IngestEvent {
+                project: None,
+                source: batch.source,
+                source_ids: vec![],
+                chunks_upserted: batch.chunk_ids.len(),
+                chunk_ids_upserted: batch.chunk_ids,
+                chunks_stale: 0,
+                ts: Utc::now(),
+                // This is intentionally Bulk. The live gate remains:
+                // only `run()` decides TurnEnd eligibility, while this
+                // explicit pass invokes the processing primitive.
+                origin: IngestOrigin::Bulk,
+            };
+            aggregate.chunks_seen += event.chunk_ids_upserted.len();
+            let outcome = self
+                .process_event_with_anchors(event, &anchor_snapshot)
+                .await?;
+            aggregate.batches_processed += 1;
+            aggregate.evidence_links_written += outcome.evidence_links_written;
+            aggregate.proposed_weaves += outcome.proposed_weaves.len();
+            aggregate.proposed_threads_written += outcome.proposed_threads_written;
+        }
+        Ok(aggregate)
     }
 
     /// Subscribe to `pipeline` and drive the weaver until `cancel`
@@ -191,6 +256,16 @@ impl AutoWeaver {
     /// any proposed weaves; on success the evidence links are already
     /// committed to the ledger.
     pub async fn process_event(&self, event: IngestEvent) -> Result<WeaverOutcome, WeaverError> {
+        let anchor_snapshot = self.load_anchor_snapshot().await?;
+        self.process_event_with_anchors(event, &anchor_snapshot)
+            .await
+    }
+
+    async fn process_event_with_anchors(
+        &self,
+        event: IngestEvent,
+        anchor_snapshot: &AnchorSnapshot,
+    ) -> Result<WeaverOutcome, WeaverError> {
         if event.chunk_ids_upserted.is_empty() {
             return Ok(WeaverOutcome {
                 event_seen: event,
@@ -204,16 +279,6 @@ impl AutoWeaver {
             .corpus
             .fetch_embeddings(&event.chunk_ids_upserted)
             .await?;
-        let threads = self.threads.list_threads(None)?;
-        let anchor_ids: Vec<String> = threads
-            .iter()
-            .filter_map(|t| t.anchor_chunk_id.clone())
-            .collect();
-        let anchor_embeds = if anchor_ids.is_empty() {
-            HashMap::new()
-        } else {
-            self.corpus.fetch_embeddings(&anchor_ids).await?
-        };
         let threshold = self.thresholds.for_source(event.source);
         let category = source_kind_to_category(event.source);
 
@@ -223,8 +288,8 @@ impl AutoWeaver {
             matched_chunks,
         } = self.match_against_anchors(
             &new_embeds,
-            &threads,
-            &anchor_embeds,
+            &anchor_snapshot.threads,
+            &anchor_snapshot.anchor_embeds,
             threshold,
             category,
         )?;
@@ -245,20 +310,40 @@ impl AutoWeaver {
         // never blocks the matched-path work above.
         let unmatched: Vec<(String, Vec<f32>)> = new_embeds
             .iter()
-            .filter(|(id, _)| !matched_chunks.contains(*id))
+            .filter(|(id, _)| {
+                !matched_chunks.contains(*id) && !anchor_snapshot.anchor_embeds.contains_key(*id)
+            })
             .map(|(id, v)| (id.clone(), v.clone()))
             .collect();
         let proposed_threads_written =
-            self.write_emergent_proposals(&unmatched).unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "auto-weaver: emergent-cluster write failed");
-                0
-            });
+            self.write_emergent_proposals(&unmatched)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(error = %err, "auto-weaver: emergent-cluster write failed");
+                    0
+                });
 
         Ok(WeaverOutcome {
             event_seen: event,
             evidence_links_written: links_written,
             proposed_weaves,
             proposed_threads_written,
+        })
+    }
+
+    async fn load_anchor_snapshot(&self) -> Result<AnchorSnapshot, WeaverError> {
+        let threads = self.threads.list_threads(None)?;
+        let anchor_ids: Vec<String> = threads
+            .iter()
+            .filter_map(|t| t.anchor_chunk_id.clone())
+            .collect();
+        let anchor_embeds = if anchor_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.corpus.fetch_embeddings(&anchor_ids).await?
+        };
+        Ok(AnchorSnapshot {
+            threads,
+            anchor_embeds,
         })
     }
 
@@ -280,6 +365,9 @@ impl AutoWeaver {
                 let Some(anchor_id) = &thread.anchor_chunk_id else {
                     continue;
                 };
+                if anchor_id == chunk_id {
+                    continue;
+                }
                 let Some(anchor_vec) = anchor_embeds.get(anchor_id) else {
                     continue;
                 };
@@ -380,6 +468,12 @@ struct MatchPassOutcome {
     matched_chunks: std::collections::HashSet<String>,
 }
 
+#[derive(Debug)]
+struct AnchorSnapshot {
+    threads: Vec<ThreadRecord>,
+    anchor_embeds: HashMap<String, Vec<f32>>,
+}
+
 /// Build a kebab-case proposed-thread handle from a cluster's member
 /// chunks. Format: `proposed-<8 hex chars>` — deterministic enough that
 /// repeated scans of the same cluster collapse to one row (the unique
@@ -442,16 +536,20 @@ mod tests {
     }
 
     fn chunk(id: &str) -> Chunk {
+        chunk_with(id, Source::Markdown, None)
+    }
+
+    fn chunk_with(id: &str, source: Source, ts: Option<chrono::DateTime<Utc>>) -> Chunk {
         Chunk {
             chunk_id: id.into(),
-            source: Source::Markdown,
+            source,
             project: Some("test".into()),
             source_id: format!("{id}.md"),
             facets: Default::default(),
             embedding_input_sha256: String::new(),
             source_config_id: "test-cfg".to_string(),
             chunk_index: 0,
-            ts: None,
+            ts,
             role: None,
             text: format!("text for {id}"),
             sha256: Chunk::content_hash(id),
@@ -549,6 +647,30 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].association_type, AssociationType::Derived);
         assert!(evidence[0].similarity.unwrap() > 0.99);
+    }
+
+    #[tokio::test]
+    async fn process_event_does_not_link_thread_to_its_own_anchor() {
+        let fx = fixture().await;
+        let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        fx.corpus
+            .upsert(&[chunk("anchor-1")], &[anchor_vec])
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor-1")))
+            .unwrap();
+        let out = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["anchor-1"]))
+            .await
+            .unwrap();
+        assert_eq!(out.evidence_links_written, 0);
+        assert!(
+            fx.threads
+                .list_evidence(&ThreadHandle::new("t1").unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -660,10 +782,7 @@ mod tests {
         let v2 = vec![1.0_f32, 0.01, 0.0, 0.0];
         let v3 = vec![1.0_f32, 0.0, 0.01, 0.0];
         fx.corpus
-            .upsert(
-                &[chunk("u1"), chunk("u2"), chunk("u3")],
-                &[v, v2, v3],
-            )
+            .upsert(&[chunk("u1"), chunk("u2"), chunk("u3")], &[v, v2, v3])
             .await
             .unwrap();
         let out = weaver(&fx)
@@ -679,6 +798,89 @@ mod tests {
         assert!(p.proposed_handle.starts_with("proposed-"));
         assert!(p.cohesion > 0.99);
         assert!(p.promoted_to.is_none());
+    }
+
+    #[tokio::test]
+    async fn weave_window_groups_by_source_threshold_and_skips_membrane() {
+        let fx = fixture().await;
+        let cos = 0.79_f32;
+        let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let other_vec = vec![cos, cos.mul_add(-cos, 1.0).sqrt(), 0.0, 0.0];
+        let now = Utc::now();
+        fx.corpus
+            .upsert(
+                &[
+                    chunk_with("anchor", Source::Markdown, Some(now)),
+                    chunk_with("code-hit", Source::Code, Some(now)),
+                    chunk_with("transcript-skip", Source::ClaudeCode, Some(now)),
+                    chunk_with("membrane-skip", Source::Membrane, Some(now)),
+                ],
+                &[
+                    anchor_vec.clone(),
+                    other_vec.clone(),
+                    other_vec.clone(),
+                    anchor_vec.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor")))
+            .unwrap();
+
+        let out = weaver(&fx).weave_window(None, 1).await.unwrap();
+        assert_eq!(out.chunks_seen, 3, "membrane chunks are not woven");
+        assert_eq!(out.evidence_links_written, 1);
+
+        let evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("t1").unwrap())
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].last_resolved_chunk_id.as_deref(),
+            Some("code-hit")
+        );
+        assert_eq!(evidence[0].category, "code");
+    }
+
+    #[tokio::test]
+    async fn weave_window_since_filters_candidate_chunks_not_anchors() {
+        let fx = fixture().await;
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        fx.corpus
+            .upsert(
+                &[
+                    chunk_with("anchor", Source::Markdown, Some(old)),
+                    chunk_with("old-candidate", Source::Markdown, Some(old)),
+                    chunk_with("new-candidate", Source::Markdown, Some(now)),
+                ],
+                &[v.clone(), v.clone(), v.clone()],
+            )
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor")))
+            .unwrap();
+
+        let out = weaver(&fx)
+            .weave_window(Some(chrono::Duration::hours(1)), 8)
+            .await
+            .unwrap();
+        assert_eq!(out.chunks_seen, 1);
+        assert_eq!(out.evidence_links_written, 1);
+
+        let evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("t1").unwrap())
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].last_resolved_chunk_id.as_deref(),
+            Some("new-candidate")
+        );
     }
 
     #[test]

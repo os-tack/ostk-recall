@@ -100,6 +100,8 @@ pub struct VerifyOutcome {
     pub report: VerifyReport,
 }
 
+pub type WeaveOutcome = ostk_recall_attention::WeaveWindowOutcome;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
     pub force: bool,
@@ -515,6 +517,33 @@ pub async fn scan_with_context(
         totals,
         dry_run,
     })
+}
+
+pub async fn weave(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    since: Option<Duration>,
+    epoch_size: usize,
+) -> Result<WeaveOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    std::fs::create_dir_all(&root)?;
+    let store = Arc::new(
+        CorpusStore::open_or_create(&root, embedder.dim())
+            .await
+            .map_err(|e| anyhow!("open corpus store: {e}"))?,
+    );
+    let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default());
+    let since = since
+        .map(chrono::Duration::from_std)
+        .transpose()
+        .map_err(|_| anyhow!("--since duration is too large for chrono"))?;
+    weaver
+        .weave_window(since, epoch_size.max(1))
+        .await
+        .map_err(|e| anyhow!("weave_window: {e}"))
 }
 
 /// Path-aware sibling of [`scan`].

@@ -76,6 +76,19 @@ enum Command {
         #[arg(long)]
         aggressive: bool,
     },
+    /// Run the explicit windowed auto-weaver pass over indexed content.
+    ///
+    /// This is the bulk/library counterpart to live TurnEnd weaving:
+    /// it does not make bulk scans look like watched conversation turns.
+    Weave {
+        /// Only weave chunks newer than this duration, e.g. 1h, 24h, 7d.
+        /// Omit for the whole active corpus.
+        #[arg(long)]
+        since: Option<String>,
+        /// Number of chunk ids per synthesized source-kind batch.
+        #[arg(long, default_value_t = 256)]
+        epoch_size: usize,
+    },
     /// Inspect a single chunk by id.
     Inspect {
         /// Chunk id to inspect.
@@ -405,8 +418,7 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
     // a saturated queue drops lines rather than back-pressuring callers.
     // `_trace_guard` flushes pending events on drop; bind it to `main`'s
     // stack frame so it lives until shutdown.
-    let (non_blocking_stderr, _trace_guard) =
-        tracing_appender::non_blocking(std::io::stderr());
+    let (non_blocking_stderr, _trace_guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -497,13 +509,21 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                 "  total: items={} chunks={} upserted={} dup={} errors={}",
                 t.items_seen, t.chunks_emitted, t.chunks_upserted, t.chunks_skipped_dup, t.errors
             );
+            // The TurnEnd gate means bulk-scanned content is NOT woven into the
+            // thread graph by the live daemon — only watched conversation turns
+            // are. Surface the bridge so a fresh scan isn't a silent, un-woven
+            // corpus: point the operator at the explicit consolidation pass.
+            if !out.dry_run && t.chunks_upserted > 0 {
+                println!(
+                    "  -> {} new chunk(s) indexed but not yet woven; run `ostk-recall weave` to weave them into the thread graph",
+                    t.chunks_upserted
+                );
+            }
         }
         Command::Optimize { aggressive } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
             if aggressive {
-                println!(
-                    "running aggressive optimize (compact + index + prune ALL old versions)…"
-                );
+                println!("running aggressive optimize (compact + index + prune ALL old versions)…");
             } else {
                 println!("running OptimizeAction::All (compact + prune + index)…");
             }
@@ -515,6 +535,19 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                 ),
                 None => println!("done in {:.1}s", out.elapsed.as_secs_f64()),
             }
+        }
+        Command::Weave { since, epoch_size } => {
+            let embedder = resolve_embedder(cli.config.as_ref())?;
+            let since = since.as_deref().map(parse_since_duration).transpose()?;
+            let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
+            println!(
+                "weave summary: batches={} chunks={} evidence_links={} proposed_weaves={} proposed_threads={}",
+                out.batches_processed,
+                out.chunks_seen,
+                out.evidence_links_written,
+                out.proposed_weaves,
+                out.proposed_threads_written
+            );
         }
         Command::Verify => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
@@ -563,6 +596,40 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_since_duration(input: &str) -> Result<std::time::Duration> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--since must not be empty; use values like 1h, 24h, 7d");
+    }
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (num, unit) = trimmed.split_at(split);
+    if num.is_empty() || unit.is_empty() || !unit.chars().all(|c| c.is_ascii_alphabetic()) {
+        anyhow::bail!("invalid --since {input:?}; use values like 1h, 24h, 7d");
+    }
+    let value: u64 = num
+        .parse()
+        .with_context(|| format!("invalid --since number in {input:?}"))?;
+    let seconds = match unit {
+        "s" | "sec" | "secs" => value,
+        "m" | "min" | "mins" => value
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        "h" | "hr" | "hrs" => value
+            .checked_mul(60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        "d" | "day" | "days" => value
+            .checked_mul(24 * 60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        "w" | "week" | "weeks" => value
+            .checked_mul(7 * 24 * 60 * 60)
+            .ok_or_else(|| anyhow::anyhow!("--since is too large"))?,
+        _ => anyhow::bail!("invalid --since unit {unit:?}; use s, m, h, d, or w"),
+    };
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 /// Dispatch `ostk-recall lens <verb>`.
@@ -858,5 +925,27 @@ fn print_attention_output(json: bool, value: &serde_json::Value) {
                 serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_since_duration;
+
+    #[test]
+    fn parse_since_duration_accepts_supported_units() {
+        assert_eq!(parse_since_duration("30s").unwrap().as_secs(), 30);
+        assert_eq!(parse_since_duration("15min").unwrap().as_secs(), 900);
+        assert_eq!(parse_since_duration("24h").unwrap().as_secs(), 86_400);
+        assert_eq!(parse_since_duration("7d").unwrap().as_secs(), 604_800);
+        assert_eq!(parse_since_duration("2weeks").unwrap().as_secs(), 1_209_600);
+    }
+
+    #[test]
+    fn parse_since_duration_rejects_invalid_forms() {
+        assert!(parse_since_duration("").is_err());
+        assert!(parse_since_duration("h").is_err());
+        assert!(parse_since_duration("12").is_err());
+        assert!(parse_since_duration("12 months").is_err());
     }
 }
