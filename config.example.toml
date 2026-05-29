@@ -40,6 +40,27 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
 # [runtime]
 # worker_threads = 4    # raise toward num_cpus() for one-shot CLI runs
 
+# ──────────────────────────────────────────────────────────────────────
+# Optional ambient memory lens. When `ostk-recall serve` runs with an
+# attention substrate online, a background loop maintains the
+# `ostk://memory-lens` MCP resource: a small, query-less portfolio of
+# corpus excerpts aligned to whatever the current attention/scope vector
+# is focused on. Subscribing clients get proactive context without asking
+# for it. Omit the block to accept the defaults shown; set
+# `OSTK_RECALL_LENS_DISABLED=1` to turn the loop off for a session, or
+# inspect/disable at runtime with `ostk-recall lens show` / `lens disable`.
+#
+# [lens]
+# token_budget = 4000          # hard cap on the rendered lens; excerpts truncate to fit
+# min_excerpt_tokens = 200     # floor — drop a slot rather than truncate below this
+# drift_threshold = 0.15       # cosine *distance* that triggers a refresh (~0.987 similarity)
+# poll_interval_secs = 5       # how often the background loop wakes
+# candidate_k_per_lane = 32    # per-lane candidate cap (dense lane today)
+# dominance_threshold = 0.30   # min share of total score a feature needs to own a slot
+# exclude_facets = [           # key:value facets that bar a chunk from the lens
+#     "status:archived",       #   (privacy / status denylist)
+# ]
+
 # One [[sources]] table per logical corpus slice.
 # `project` is a free-text tag — namespace your corpora however you like.
 
@@ -88,6 +109,10 @@ ignore = [
     "vendor/**",
     "**/__pycache__/**",
 ]
+# Optional per-source facets: key → values, stamped onto every chunk this
+# source emits. Used for filtered recall and for the lens `exclude_facets`
+# denylist above. Single-value keys replace; multi-value keys accumulate.
+facets = { tier = ["reference"], lang = ["rust"] }
 
 [[sources]]
 kind = "file_glob"
@@ -109,12 +134,25 @@ paths = ["~/Downloads/claude-data-export-*.zip"]
 # When omitted, the watcher is disabled and `ostk-recall watch` exits
 # at startup with a clear message.
 #
-# Recommended-source guidance (best practice — see comments below):
-# include sources where saves represent intent to re-index (codebases,
-# notes, plans). EXCLUDE sources whose files are written continuously
-# by the LLM tools you're using — claude_code, gemini, and the
-# self-writing parts of ostk_project (.ostk/journal.jsonl, epoch
-# seals) — otherwise the watcher fires constantly.
+# Recommended-source guidance (updated for the v0.6 TurnEnd gate):
+#
+#   INCLUDE conversation transcripts — `claude_code` and `gemini`. As of
+#   v0.6 these are the *only* sources that drive live cognition: a watched
+#   transcript append is a "TurnEnd" that wakes the turn observer
+#   (familiarity, membrane), the auto-weaver (evidence links), and the
+#   ambient memory lens. This is safe now — appends dedup to only-new
+#   turns, commits are batched, and non-transcript sources never trigger
+#   cognition regardless of how they arrive. (Pre-v0.6 advice was the
+#   opposite — back then every ingest looked like a live turn, so watching
+#   transcripts flooded the corpus. The gate fixed that.)
+#
+#   INCLUDE codebases / notes / plans — saves there are intent to
+#   re-index. They get ingested and become searchable, but, not being
+#   transcripts, they do NOT trigger cognition.
+#
+#   EXCLUDE self-writing non-transcript sources like `ostk_project`
+#   (`.ostk/journal.jsonl`, epoch seals) — watching them just causes
+#   constant re-index churn with no cognition benefit.
 #
 # [watch]
 # enabled = true
@@ -129,7 +167,11 @@ paths = ["~/Downloads/claude-data-export-*.zip"]
 # #                 ingest. Empty body still falls back to legacy
 # #                 scan-all on either side, so old↔new versions
 # #                 across the wire degrade gracefully.
-# mode = "legacy"
+# #
+# # Recommended for the live-cognition flow: "incremental". It keeps the
+# # save→corpus latency low enough that watched transcript TurnEnds feel
+# # live. ("legacy" is still the built-in default pending field bake-in.)
+# mode = "incremental"
 #
 # # Debounce window (ms). When omitted, defaults are per-platform —
 # # Linux 800 (inotify is precise; saves are the burst), macOS 1500
@@ -142,12 +184,13 @@ paths = ["~/Downloads/claude-data-export-*.zip"]
 # # every source. When set, ONLY sources whose `project` tag matches drive
 # # the watcher — useful for skipping the noisy auto-writers above.
 # projects = [
+#     "claude-code-history",  # ← watch these: transcript appends are the
+#     "gemini-cli-history",   #   TurnEnds that drive live cognition (v0.6+)
 #     "notes",
 #     "experiments",
 #     "claude-plans",         # if you index ~/.claude/plans, watch it
-#     # NOT "claude-code-history"   — JSONL appends every LLM turn
-#     # NOT "gemini-cli-history"    — same churn pattern
-#     # NOT "ostk"                  — .ostk/ self-writes on every verb
+#     # NOT "ostk"            — .ostk/ self-writes on every verb (churn, no
+#     #                         cognition benefit — it isn't a transcript)
 # ]
 #
 # # Override the trigger socket path. Defaults to <corpus.root>/recall.sock
