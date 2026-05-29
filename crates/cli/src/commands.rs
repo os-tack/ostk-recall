@@ -726,8 +726,22 @@ pub async fn scan_reingest(
         .delete_by_chunk_ids(&ids)
         .map_err(|e| anyhow!("delete_by_chunk_ids: {e}"))?;
 
+    // Clear the per-file cursors too. Deleting chunk rows alone is not
+    // enough: the Tier-1 metadata check in `ingest_source` would then see
+    // every file as unchanged and skip re-parsing, leaving the project
+    // under-filled. Clearing cursors for the project's sources forces the
+    // follow-up scan to re-read everything from scratch.
+    let mut cursors_cleared = 0u64;
+    for source_cfg in &cfg.sources {
+        if source_cfg.project.as_deref() == Some(reingest_project) {
+            cursors_cleared += ingest
+                .clear_source_metadata(&source_cfg.source_config_id)
+                .map_err(|e| anyhow!("clear_source_metadata: {e}"))?;
+        }
+    }
+
     println!(
-        "reingest {reingest_project}: deleted {lance_deleted} corpus rows, {ingest_deleted} ingest rows"
+        "reingest {reingest_project}: deleted {lance_deleted} corpus rows, {ingest_deleted} ingest rows, cleared {cursors_cleared} source cursors"
     );
 
     drop(store);

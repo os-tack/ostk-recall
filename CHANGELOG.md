@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scan --reingest <project>` no longer under-fills the project.** It
+  deleted the corpus + `ingest_chunks` rows but left the `ingest_sources`
+  cursors, so the follow-up rescan saw every file as unchanged (Tier-1
+  metadata check) and skipped re-parsing — restoring only files that had
+  changed since the last scan. `scan_reingest` now clears the per-config
+  cursors (`IngestDb::clear_source_metadata`) for the project's sources, so
+  the rescan re-reads everything from scratch. (Surfaced while completing
+  RT-6's `<system-reminder>` purge, which is exactly a "parser changed,
+  files unchanged" reingest.)
+
 ### Added
 
 - **P11b-full — temporal consolidation: the past weaves the future.** The
