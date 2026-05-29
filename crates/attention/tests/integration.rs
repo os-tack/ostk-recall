@@ -819,6 +819,8 @@ async fn autoweaver_links_resonant_ingest_and_skips_non_resonant() {
                             similarity: Some(sim),
                             created_at: now,
                             updated_at: now,
+                            touch_count: 1,
+                            last_touched_at: now,
                         })
                         .unwrap();
                     links += 1;

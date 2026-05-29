@@ -173,6 +173,16 @@ pub struct EvidenceLink {
     pub similarity: Option<f32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Number of times this edge has re-resonated (P11b-full). Starts
+    /// at 1 on insert; the weaver bumps it each time a chunk re-matches
+    /// an anchor whose edge already exists. Drives `edge_activation`'s
+    /// touch floor — recurring canyon edges strengthen across passes.
+    pub touch_count: u32,
+    /// Wall-clock of the most recent (re-)resonance. Starts equal to
+    /// `created_at`; the weaver advances it on re-touch. The idle term
+    /// in `edge_activation` decays against this, so edges that stop
+    /// resonating fade in activation without being deleted.
+    pub last_touched_at: DateTime<Utc>,
 }
 
 /// A row in the `thread_thread_links` table — directed evidence edge
@@ -1019,6 +1029,32 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_from ON thread_thread_links(from_th
 CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread);
 ",
         )?;
+
+        // --- idempotent column adds (P11b-full: edge activation) ---
+        // `migrate` predates a versioned-migration mechanism; the bodies
+        // above use CREATE TABLE IF NOT EXISTS, which never adds columns
+        // to a table that already exists. Add the edge-activation
+        // components by hand, guarded by a `table_info` probe so re-running
+        // migrate on every open stays a no-op once the columns exist.
+        add_column_if_missing(
+            conn,
+            "evidence_links",
+            "touch_count",
+            "ALTER TABLE evidence_links ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 1",
+        )?;
+        add_column_if_missing(
+            conn,
+            "evidence_links",
+            "last_touched_at",
+            "ALTER TABLE evidence_links ADD COLUMN last_touched_at TEXT",
+        )?;
+        // Backfill rows created before the column existed: a fresh edge's
+        // activation clock starts at creation (newest available stamp).
+        conn.execute(
+            "UPDATE evidence_links SET last_touched_at = COALESCE(updated_at, created_at) \
+             WHERE last_touched_at IS NULL",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1331,8 +1367,9 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
                 "INSERT INTO evidence_links
                  (thread_handle, original_path, current_path, content_hash,
                   last_resolved_chunk_id, relation_state, association_type,
-                  category, similarity, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  category, similarity, created_at, updated_at,
+                  touch_count, last_touched_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     link.thread_handle.as_str(),
                     path_to_str(&link.original_path),
@@ -1345,6 +1382,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
                     link.similarity,
                     link.created_at.to_rfc3339(),
                     link.updated_at.to_rfc3339(),
+                    link.touch_count,
+                    link.last_touched_at.to_rfc3339(),
                 ],
             )?;
             conn.last_insert_rowid()
@@ -1358,13 +1397,44 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(id)
     }
 
+    /// Re-touch an existing edge (P11b-full future→past curation): bump
+    /// `touch_count` and advance `last_touched_at`. Keyed on the same
+    /// `(thread_handle, original_path, category)` tuple the UNIQUE
+    /// constraint uses, so it pairs with the weaver's idempotent-insert
+    /// path: a re-resonance that hits the UNIQUE violation calls this to
+    /// strengthen the edge instead of dropping the signal on the floor.
+    /// Returns `true` if a row was updated. No chain event — a re-touch
+    /// is a transient activation bump, not a substrate-shape change.
+    pub fn touch_evidence_link(
+        &self,
+        thread: &ThreadHandle,
+        original_path: &Path,
+        category: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE evidence_links
+             SET touch_count = touch_count + 1, last_touched_at = ?
+             WHERE thread_handle = ? AND original_path = ? AND category = ?",
+            params![
+                now.to_rfc3339(),
+                thread.as_str(),
+                path_to_str(original_path),
+                category,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     /// All evidence rows for a thread, ordered by `created_at ASC`.
     pub fn list_evidence(&self, handle: &ThreadHandle) -> Result<Vec<EvidenceLink>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, thread_handle, original_path, current_path, content_hash,
                     last_resolved_chunk_id, relation_state, association_type,
-                    category, similarity, created_at, updated_at
+                    category, similarity, created_at, updated_at,
+                    touch_count, last_touched_at
              FROM evidence_links
              WHERE thread_handle = ?
              ORDER BY created_at ASC, id ASC",
@@ -1822,6 +1892,8 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
     let similarity: Option<f64> = r.get(9)?;
     let created_s: String = r.get(10)?;
     let updated_s: String = r.get(11)?;
+    let touch_count: i64 = r.get(12)?;
+    let last_touched_s: Option<String> = r.get(13)?;
 
     let handle = ThreadHandle::new(handle_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
@@ -1830,11 +1902,19 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
     let association_type = AssociationType::parse(&association_s).map_err(to_sql_err)?;
     let created_at = parse_ts(&created_s).map_err(to_sql_err)?;
     let updated_at = parse_ts(&updated_s).map_err(to_sql_err)?;
+    // Backfill guarantees last_touched_at is non-null after migrate, but
+    // tolerate a null defensively (fall back to created_at).
+    let last_touched_at = match last_touched_s {
+        Some(s) => parse_ts(&s).map_err(to_sql_err)?,
+        None => created_at,
+    };
     // SQLite REAL is f64; on-the-wire similarity is f32. The cast
     // truncates mantissa bits but cannot overflow — the value was an
     // f32 at insert time.
     #[allow(clippy::cast_possible_truncation)]
     let similarity = similarity.map(|f| f as f32);
+    #[allow(clippy::cast_sign_loss)]
+    let touch_count = touch_count.max(0) as u32;
     Ok(EvidenceLink {
         id,
         thread_handle: handle,
@@ -1848,7 +1928,31 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
         similarity,
         created_at,
         updated_at,
+        touch_count,
+        last_touched_at,
     })
+}
+
+/// Add `column` to `table` via `alter_sql` unless it already exists.
+/// Idempotent: a `PRAGMA table_info` probe makes re-running `migrate`
+/// (which happens on every `open`) a no-op once the column is present.
+/// Predates a versioned-migration mechanism; see `migrate`.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let exists = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        stmt.query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(std::result::Result::ok)
+            .any(|name| name == column)
+    };
+    if !exists {
+        conn.execute(alter_sql, [])?;
+    }
+    Ok(())
 }
 
 fn row_to_thread_thread_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadThreadLink> {
@@ -2065,6 +2169,8 @@ mod tests {
             similarity: None,
             created_at: now,
             updated_at: now,
+            touch_count: 1,
+            last_touched_at: now,
         }
     }
 
@@ -2108,6 +2214,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn evidence_activation_columns_backfill_on_legacy_db() {
+        // A pre-P11b-full evidence_links table (no touch_count /
+        // last_touched_at) with one row. migrate() must add the columns
+        // and backfill last_touched_at from updated_at without error.
+        let tmp = TempDir::new().unwrap();
+        let pre = Connection::open(tmp.path().join("threads.sqlite")).unwrap();
+        pre.execute_batch(
+            "CREATE TABLE evidence_links (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 thread_handle TEXT NOT NULL,
+                 original_path TEXT NOT NULL,
+                 current_path TEXT,
+                 content_hash TEXT,
+                 last_resolved_chunk_id TEXT,
+                 relation_state TEXT NOT NULL DEFAULT 'active',
+                 association_type TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 similarity REAL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO evidence_links
+                 (thread_handle, original_path, association_type, category,
+                  created_at, updated_at)
+             VALUES ('legacy-thread', 'chunk-x', 'derived', 'doc',
+                     '2026-01-01T00:00:00+00:00', '2026-02-02T00:00:00+00:00');",
+        )
+        .unwrap();
+        drop(pre);
+
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let conn = db.lock();
+        let (touch, last_touched): (i64, String) = conn
+            .query_row(
+                "SELECT touch_count, last_touched_at FROM evidence_links WHERE original_path = 'chunk-x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(touch, 1, "legacy rows default to touch_count 1");
+        assert_eq!(
+            last_touched, "2026-02-02T00:00:00+00:00",
+            "last_touched_at backfills from updated_at"
+        );
+    }
+
+    #[test]
+    fn evidence_touch_count_round_trips_and_bumps() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("edge-thread")).unwrap();
+        let link = sample_evidence("edge-thread", "chunk-y", "doc");
+        let created = link.created_at;
+        db.add_evidence_link(&link).unwrap();
+
+        let back = &db.list_evidence(&handle("edge-thread")).unwrap()[0];
+        assert_eq!(back.touch_count, 1);
+        assert_eq!(back.last_touched_at, created);
+
+        // Re-touch: count bumps, timestamp advances, no duplicate row.
+        let later = created + chrono::Duration::hours(3);
+        let touched = db
+            .touch_evidence_link(&handle("edge-thread"), Path::new("chunk-y"), "doc", later)
+            .unwrap();
+        assert!(touched, "existing edge is re-touched");
+        let rows = db.list_evidence(&handle("edge-thread")).unwrap();
+        assert_eq!(rows.len(), 1, "re-touch updates in place, no new row");
+        assert_eq!(rows[0].touch_count, 2);
+        assert_eq!(rows[0].last_touched_at, later);
+
+        // A non-existent edge re-touch is a no-op miss.
+        let missed = db
+            .touch_evidence_link(&handle("edge-thread"), Path::new("nope"), "doc", later)
+            .unwrap();
+        assert!(!missed, "touch on a missing edge reports no update");
     }
 
     #[test]

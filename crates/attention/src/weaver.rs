@@ -92,6 +92,10 @@ pub struct WeaverOutcome {
     /// event. Idempotent collisions (already-written edges) do not
     /// count.
     pub evidence_links_written: usize,
+    /// Count of existing edges re-touched (touch_count bumped) because a
+    /// chunk re-resonated with an anchor it had already linked. The
+    /// future→past curation signal (P11b-full).
+    pub evidence_links_touched: usize,
     /// Per-chunk groupings the weaver detected but did not write —
     /// the caller decides whether to surface them as candidate threads.
     pub proposed_weaves: Vec<ProposedWeave>,
@@ -111,6 +115,8 @@ pub struct WeaveWindowOutcome {
     /// Count of newly inserted `evidence_links` rows. Existing links are
     /// idempotent no-ops and are not counted here.
     pub evidence_links_written: usize,
+    /// Count of existing edges re-touched (strengthened) across the pass.
+    pub evidence_links_touched: usize,
     /// Count of detected chunk-to-multiple-anchor groupings.
     pub proposed_weaves: usize,
     /// Count of new `threads_proposed` rows.
@@ -203,6 +209,7 @@ impl AutoWeaver {
                 .await?;
             aggregate.batches_processed += 1;
             aggregate.evidence_links_written += outcome.evidence_links_written;
+            aggregate.evidence_links_touched += outcome.evidence_links_touched;
             aggregate.proposed_weaves += outcome.proposed_weaves.len();
             aggregate.proposed_threads_written += outcome.proposed_threads_written;
         }
@@ -283,6 +290,7 @@ impl AutoWeaver {
             return Ok(WeaverOutcome {
                 event_seen: event,
                 evidence_links_written: 0,
+                evidence_links_touched: 0,
                 proposed_weaves: vec![],
                 proposed_threads_written: 0,
             });
@@ -297,6 +305,7 @@ impl AutoWeaver {
 
         let MatchPassOutcome {
             links_written,
+            links_touched,
             chunk_to_anchors,
             matched_chunks,
         } = self.match_against_anchors(
@@ -338,6 +347,7 @@ impl AutoWeaver {
         Ok(WeaverOutcome {
             event_seen: event,
             evidence_links_written: links_written,
+            evidence_links_touched: links_touched,
             proposed_weaves,
             proposed_threads_written,
         })
@@ -406,6 +416,8 @@ impl AutoWeaver {
                     similarity: Some(sim),
                     created_at: now,
                     updated_at: now,
+                    touch_count: 1,
+                    last_touched_at: now,
                 };
                 match self.threads.add_evidence_link(&link) {
                     Ok(_) => {
@@ -416,13 +428,27 @@ impl AutoWeaver {
                             .push(thread.handle.clone());
                     }
                     Err(StoreError::UniqueViolation { .. }) => {
-                        // The (thread, path, category) edge was written
-                        // in a prior batch. Idempotent no-op.
-                        tracing::trace!(
-                            thread = %thread.handle,
-                            chunk = %chunk_id,
-                            "auto-weaver: evidence link already exists",
-                        );
+                        // The (thread, path, category) edge already exists.
+                        // A re-resonance is the future→past curation signal
+                        // (P11b-full): bump touch_count + last_touched_at so
+                        // recurring canyon edges strengthen instead of the
+                        // signal being dropped. Counts as a link touched.
+                        match self.threads.touch_evidence_link(
+                            &thread.handle,
+                            &link.original_path,
+                            &link.category,
+                            now,
+                        ) {
+                            Ok(true) => out.links_touched += 1,
+                            Ok(false) => {
+                                tracing::trace!(
+                                    thread = %thread.handle,
+                                    chunk = %chunk_id,
+                                    "auto-weaver: re-touch found no matching edge",
+                                );
+                            }
+                            Err(err) => return Err(WeaverError::from(err)),
+                        }
                     }
                     Err(err) => return Err(WeaverError::from(err)),
                 }
@@ -477,6 +503,7 @@ impl AutoWeaver {
 #[derive(Debug, Default)]
 struct MatchPassOutcome {
     links_written: usize,
+    links_touched: usize,
     chunk_to_anchors: HashMap<String, Vec<ThreadHandle>>,
     matched_chunks: std::collections::HashSet<String>,
 }
@@ -661,6 +688,53 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].association_type, AssociationType::Derived);
         assert!(evidence[0].similarity.unwrap() > 0.99);
+    }
+
+    #[tokio::test]
+    async fn re_resonance_touches_existing_edge() {
+        // First pass writes the edge; a second pass over the same chunk
+        // re-resonates with the same anchor → the edge is re-touched
+        // (touch_count bumps, last_touched_at advances), not duplicated.
+        // This is the P11b-full future→past curation loop.
+        let fx = fixture().await;
+        let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        fx.corpus
+            .upsert(
+                &[chunk("anchor-1"), chunk("new-1")],
+                &[anchor_vec.clone(), anchor_vec.clone()],
+            )
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor-1")))
+            .unwrap();
+
+        let first = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["new-1"]))
+            .await
+            .unwrap();
+        assert_eq!(first.evidence_links_written, 1);
+        assert_eq!(first.evidence_links_touched, 0);
+
+        let second = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["new-1"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.evidence_links_written, 0,
+            "the edge already exists; no new row"
+        );
+        assert_eq!(
+            second.evidence_links_touched, 1,
+            "the re-resonance strengthens the existing edge"
+        );
+
+        let evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("t1").unwrap())
+            .unwrap();
+        assert_eq!(evidence.len(), 1, "re-touch must not duplicate the row");
+        assert_eq!(evidence[0].touch_count, 2);
     }
 
     #[tokio::test]

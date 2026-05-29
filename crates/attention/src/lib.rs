@@ -79,6 +79,29 @@ pub const OFF_DIAGONAL_TENSION_MAX: f32 = 0.2;
 /// Resonance above this counts as "resonant enough" for off-diagonal lift.
 pub const OFF_DIAGONAL_RESONANCE_MIN: f32 = 0.7;
 
+// --- edge activation (P11b-full) ------------------------------------------
+// Componentized activation for evidence edges, per the ratified
+// p11-temporal-consolidation decision: f(similarity, time-distance,
+// last_touched_at, touch_count) with decay. Edges saturate faster than
+// threads — a handful of re-resonances is already a strong "this bridge
+// keeps mattering" signal — so the touch curve uses its own saturation.
+
+/// `touch_count` at which an edge's activation floor / slow-decay flattens.
+pub const EDGE_TOUCH_SATURATION: u32 = 8;
+/// Idle-decay per day for a single-touch edge.
+pub const EDGE_DECAY_RATE_BASE: f32 = 0.08;
+/// Idle-decay per day for a saturated (heavily re-touched) edge.
+pub const EDGE_DECAY_RATE_FAMILIAR: f32 = 0.01;
+/// Similarity at/above which the time-distance bridge bonus applies. Below
+/// it, age does NOT rescue a weak match (ratified decision #2: time
+/// distance upweights high-similarity bridges, it does not rescue weak
+/// semantic matches).
+pub const EDGE_BRIDGE_SIMILARITY_MIN: f32 = 0.7;
+/// Max multiplicative bridge bonus for a maximally long-range, high-sim edge.
+pub const EDGE_BRIDGE_GAIN: f32 = 0.5;
+/// Age (days) at which the bridge bonus reaches its cap.
+pub const EDGE_BRIDGE_AGE_REF_DAYS: f32 = 365.0;
+
 /// Linear interpolation between BASE and FAMILIAR over F in `[0, FAMILIARITY_SATURATION]`.
 #[must_use]
 // familiarity is small (saturates at 20); FAMILIARITY_SATURATION is a const.
@@ -98,6 +121,61 @@ pub fn familiarity_floor(familiarity: u32) -> f32 {
         (familiarity as f32 / FAMILIARITY_SATURATION as f32).min(1.0),
         0.1,
     )
+}
+
+/// Edge activation floor, rising 0.1 → 1.0 as `touch_count` climbs to
+/// `EDGE_TOUCH_SATURATION`. Analogous to `familiarity_floor` but on the
+/// faster edge-touch curve.
+#[must_use]
+// A fresh edge has touch_count 1 (one resonance), so the curve is keyed
+// on `touch_count - 1`: a single-touch edge sits at the baseline (lowest
+// floor, fastest decay) and saturates after `EDGE_TOUCH_SATURATION`
+// *additional* touches.
+#[allow(clippy::cast_precision_loss)]
+pub fn edge_touch_floor(touch_count: u32) -> f32 {
+    0.9f32.mul_add(
+        (touch_count.saturating_sub(1) as f32 / EDGE_TOUCH_SATURATION as f32).min(1.0),
+        0.1,
+    )
+}
+
+/// Per-day idle decay for an edge, interpolating BASE → FAMILIAR as
+/// `touch_count` saturates. Heavily re-touched edges decay slower.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn edge_decay_rate(touch_count: u32) -> f32 {
+    let t = (touch_count.saturating_sub(1) as f32 / EDGE_TOUCH_SATURATION as f32).min(1.0);
+    (EDGE_DECAY_RATE_FAMILIAR - EDGE_DECAY_RATE_BASE).mul_add(t, EDGE_DECAY_RATE_BASE)
+}
+
+/// Componentized edge activation `f(similarity, age_days, idle_days, touch_count)`.
+///
+/// Two components, combined multiplicatively so that activation **decays to
+/// zero if the edge is never re-touched** (ratified decision #2 — the lens
+/// must not become a hairball), while the durable row is never deleted:
+///
+/// - **recency gate** = `edge_touch_floor(tc) · exp(-edge_decay_rate(tc) · idle_days)`.
+///   `idle_days` is time since `last_touched_at`. Touches raise the floor and
+///   slow the decay, so a bridge that keeps re-resonating stays warm.
+/// - **bridge factor** = `similarity · (1 + bonus)`, where the time-distance
+///   `bonus` upweights *high-similarity* long-range edges (`age_days` since
+///   creation) — a canyon-spanning resonance is worth more than same-day
+///   context. Below `EDGE_BRIDGE_SIMILARITY_MIN` the bonus is 0: age does not
+///   rescue a weak match.
+///
+/// Result is `>= 0` (bounded by ~`1.0 * (1 + EDGE_BRIDGE_GAIN)`).
+#[must_use]
+pub fn edge_activation(similarity: f32, age_days: f32, idle_days: f32, touch_count: u32) -> f32 {
+    let idle = idle_days.max(0.0);
+    let recency = edge_touch_floor(touch_count) * (-edge_decay_rate(touch_count) * idle).exp();
+    let sim = similarity.clamp(0.0, 1.0);
+    let bonus = if sim >= EDGE_BRIDGE_SIMILARITY_MIN {
+        let frac = (age_days.max(0.0).ln_1p() / EDGE_BRIDGE_AGE_REF_DAYS.ln_1p()).min(1.0);
+        EDGE_BRIDGE_GAIN * frac
+    } else {
+        0.0
+    };
+    recency * sim * (1.0 + bonus)
 }
 
 /// Cosine similarity. Returns 0.0 if either vector is zero-norm or empty,
@@ -1695,6 +1773,62 @@ mod tests {
         assert!(approx_eq(familiarity_floor(0), 0.1, 1e-6));
         assert!(approx_eq(familiarity_floor(20), 1.0, 1e-6));
         assert!(approx_eq(familiarity_floor(40), 1.0, 1e-6));
+    }
+
+    #[test]
+    fn edge_touch_floor_and_decay_saturate() {
+        // A fresh single-touch edge is the baseline; saturation is reached
+        // after EDGE_TOUCH_SATURATION (8) additional touches, i.e. at 9.
+        assert!(approx_eq(edge_touch_floor(1), 0.1, 1e-6));
+        assert!(approx_eq(edge_touch_floor(9), 1.0, 1e-6));
+        assert!(approx_eq(edge_touch_floor(40), 1.0, 1e-6));
+        assert!(approx_eq(edge_decay_rate(1), EDGE_DECAY_RATE_BASE, 1e-6));
+        assert!(approx_eq(edge_decay_rate(9), EDGE_DECAY_RATE_FAMILIAR, 1e-6));
+        // More touches → slower decay.
+        assert!(edge_decay_rate(2) > edge_decay_rate(6));
+    }
+
+    #[test]
+    fn edge_activation_re_touch_beats_idle() {
+        // Same similarity/age; a recently re-touched, well-worn edge
+        // outscores a once-touched edge that has gone idle for a month.
+        let warm = edge_activation(0.8, 30.0, 0.0, 5);
+        let idle = edge_activation(0.8, 30.0, 30.0, 1);
+        assert!(warm > idle, "re-touched edge ({warm}) must beat idle ({idle})");
+    }
+
+    #[test]
+    fn edge_activation_long_range_high_sim_beats_same_day() {
+        // Equal similarity / idle / touch: the canyon-spanning (old) edge
+        // earns the time-distance bridge bonus the same-day one does not.
+        let bridge = edge_activation(0.9, 300.0, 1.0, 2);
+        let same_day = edge_activation(0.9, 1.0, 1.0, 2);
+        assert!(
+            bridge > same_day,
+            "long-range high-sim edge ({bridge}) must beat same-day ({same_day})"
+        );
+    }
+
+    #[test]
+    fn edge_activation_age_does_not_rescue_weak_match() {
+        // Below the similarity floor, age confers no bonus — a weak match
+        // is not rescued by being old.
+        let old_weak = edge_activation(0.5, 300.0, 0.0, 1);
+        let new_weak = edge_activation(0.5, 1.0, 0.0, 1);
+        assert!(
+            approx_eq(old_weak, new_weak, 1e-6),
+            "weak matches get no time-distance bonus: {old_weak} vs {new_weak}"
+        );
+    }
+
+    #[test]
+    fn edge_activation_decays_toward_zero_when_abandoned() {
+        // An un-re-touched edge fades far below a fresh one — the gate that
+        // keeps the lens from becoming a hairball.
+        let fresh = edge_activation(0.8, 10.0, 0.0, 1);
+        let abandoned = edge_activation(0.8, 10.0, 365.0, 1);
+        assert!(abandoned < fresh);
+        assert!(abandoned < 0.01, "year-idle single-touch edge nearly vanishes: {abandoned}");
     }
 
     // ---- Phase A: real-embedder path ---------------------------------

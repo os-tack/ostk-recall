@@ -366,6 +366,8 @@ pub async fn thread_link(
         similarity: None,
         created_at: now,
         updated_at: now,
+        touch_count: 1,
+        last_touched_at: now,
     };
     let id = d.threads.add_evidence_link(&link)?;
     Ok(json!({ "evidence_id": id }))
