@@ -17,7 +17,8 @@ use ostk_recall_attention::{
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
-    Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode,
+    CompiledRecordRules, Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind,
+    WatchMode, WeaverSettings,
 };
 use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
@@ -314,11 +315,21 @@ type AmbientHandles = (
     tokio::task::JoinHandle<()>,
 );
 
+/// Compile the effective record rules (P12) from config into the pipeline
+/// overlay. Surfaces config-level rule errors (bad regex, unknown
+/// `source_kind`/`source`, no-predicate rule) as a load-time failure.
+fn compile_record_rules(cfg: &Config) -> Result<Arc<CompiledRecordRules>> {
+    CompiledRecordRules::build(&cfg.effective_record_rules())
+        .map(Arc::new)
+        .map_err(|e| anyhow!("record rules: {e}"))
+}
+
 fn spawn_ambient_daemons(
     pipeline: &Arc<Pipeline>,
     corpus: &Arc<CorpusStore>,
     threads: &Arc<ThreadsDb>,
     attention: Option<Arc<dyn AttentionForwardStore>>,
+    weaver_exclude_facets: Vec<String>,
 ) -> AmbientHandles {
     let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads));
     if let Some(attn) = attention {
@@ -332,11 +343,14 @@ fn spawn_ambient_daemons(
     // already `Arc`-shared, so this is a clone of a pointer.
     observer = observer.with_chain_sink(threads.chain_sink());
     let observer = Arc::new(observer);
-    let weaver = Arc::new(AutoWeaver::new(
-        Arc::clone(threads),
-        Arc::clone(corpus),
-        WeaverThresholds::default(),
-    ));
+    let weaver = Arc::new(
+        AutoWeaver::new(
+            Arc::clone(threads),
+            Arc::clone(corpus),
+            WeaverThresholds::default(),
+        )
+        .with_exclude_facets(weaver_exclude_facets),
+    );
     let cancel = CancellationToken::new();
 
     let observer_handle = {
@@ -410,15 +424,23 @@ pub async fn scan_with_context(
     ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
-        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
+        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder))
+            .with_dry_run(dry_run)
+            .with_record_rules(compile_record_rules(&cfg)?),
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db
-        .as_ref()
-        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
+    let ambient = threads_db.as_ref().map(|threads| {
+        spawn_ambient_daemons(
+            &pipeline,
+            &store,
+            threads,
+            attention_dyn.clone(),
+            WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+        )
+    });
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -536,7 +558,8 @@ pub async fn weave(
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
     let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
-    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default());
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default())
+        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets);
     let since = since
         .map(chrono::Duration::from_std)
         .transpose()
@@ -566,7 +589,8 @@ pub async fn consolidate(
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
     let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
-    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default());
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default())
+        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets);
     let since = since
         .map(chrono::Duration::from_std)
         .transpose()
@@ -617,15 +641,23 @@ pub async fn scan_paths_with_context(
     ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
-        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
+        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder))
+            .with_dry_run(dry_run)
+            .with_record_rules(compile_record_rules(&cfg)?),
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db
-        .as_ref()
-        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
+    let ambient = threads_db.as_ref().map(|threads| {
+        spawn_ambient_daemons(
+            &pipeline,
+            &store,
+            threads,
+            attention_dyn.clone(),
+            WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+        )
+    });
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;

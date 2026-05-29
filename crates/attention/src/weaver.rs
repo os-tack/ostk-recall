@@ -198,13 +198,24 @@ const fn tension_rank(t: TensionState) -> u8 {
     }
 }
 
-/// True if a chunk's facets mark it as harness orchestration apparatus
-/// (RT-7): such chunks are excluded from anchor-matching and emergent
-/// proposals so they never form threads, mirroring the lens denylist.
-fn is_harness_apparatus(facets: &ostk_recall_core::FacetSet) -> bool {
+/// The default weaver facet denylist (P12). Preserves pre-P12 behavior: only
+/// `record_kind:harness_orchestration` (RT-7) is treated as apparatus. NOTE:
+/// `record_kind:audit_significant` is attenuated from the *lens* by default but
+/// is intentionally NOT excluded from weaving — adding it here is a deliberate
+/// thread-graph policy change the operator opts into via `[weaver]`.
+#[must_use]
+pub fn default_weaver_exclude_facets() -> Vec<String> {
+    vec!["record_kind:harness_orchestration".to_string()]
+}
+
+/// True if any of a chunk's facets is in the weaver's configured exclude set
+/// (P12, generalizing the former hardcoded RT-7 `is_harness_apparatus` check):
+/// such chunks are excluded from anchor-matching and emergent proposals so they
+/// never form threads, mirroring the lens denylist.
+fn has_excluded_facet(facets: &ostk_recall_core::FacetSet, exclude: &[String]) -> bool {
     ostk_recall_core::to_list(facets)
         .iter()
-        .any(|f| f == "record_kind:harness_orchestration")
+        .any(|f| exclude.iter().any(|e| e == f))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -225,11 +236,16 @@ pub struct AutoWeaver {
     threads: Arc<ThreadsDb>,
     corpus: Arc<CorpusStore>,
     thresholds: WeaverThresholds,
+    /// Facet denylist (P12): chunks carrying any of these are treated as
+    /// apparatus and skipped for anchor-matching + proposal seeding. Defaults
+    /// to [`default_weaver_exclude_facets`]; production wires `[weaver]
+    /// exclude_facets` via [`AutoWeaver::with_exclude_facets`].
+    exclude_facets: Vec<String>,
 }
 
 impl AutoWeaver {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         threads: Arc<ThreadsDb>,
         corpus: Arc<CorpusStore>,
         thresholds: WeaverThresholds,
@@ -238,7 +254,16 @@ impl AutoWeaver {
             threads,
             corpus,
             thresholds,
+            exclude_facets: default_weaver_exclude_facets(),
         }
+    }
+
+    /// Override the weaver facet denylist (P12). Production passes
+    /// `Config::weaver` (`WeaverSettings::resolve(...).exclude_facets`).
+    #[must_use]
+    pub fn with_exclude_facets(mut self, exclude_facets: Vec<String>) -> Self {
+        self.exclude_facets = exclude_facets;
+        self
     }
 
     /// Weave an explicit corpus window without weakening the live
@@ -585,7 +610,7 @@ impl AutoWeaver {
             .await?;
         let new_embeds: HashMap<String, Vec<f32>> = fetched
             .into_iter()
-            .filter(|(_, (chunk, _))| !is_harness_apparatus(&chunk.facets))
+            .filter(|(_, (chunk, _))| !has_excluded_facet(&chunk.facets, &self.exclude_facets))
             .filter_map(|(id, (_, emb))| emb.map(|e| (id, e)))
             .collect();
         let threshold = self.thresholds.for_source(event.source);
@@ -848,6 +873,40 @@ mod tests {
     use tempfile::TempDir;
 
     const DIM: usize = 4;
+
+    fn facets_with(record_kind: &str) -> ostk_recall_core::FacetSet {
+        let mut f = ostk_recall_core::FacetSet::new();
+        ostk_recall_core::merge_override(&mut f, "record_kind", vec![record_kind.to_string()]);
+        f
+    }
+
+    #[test]
+    fn default_weaver_excludes_only_harness_orchestration() {
+        // P12 review finding 8: the default weaver denylist preserves pre-P12
+        // behavior — harness_orchestration is excluded, audit_significant is
+        // NOT (it is a lens-only exclusion; excluding it from weaving would be
+        // a deliberate, opt-in thread-graph change).
+        let default = default_weaver_exclude_facets();
+        assert_eq!(default, vec!["record_kind:harness_orchestration".to_string()]);
+        assert!(has_excluded_facet(&facets_with("harness_orchestration"), &default));
+        assert!(
+            !has_excluded_facet(&facets_with("audit_significant"), &default),
+            "audit_significant must NOT be excluded from weaving by default"
+        );
+        assert!(!has_excluded_facet(&facets_with("anything_else"), &default));
+    }
+
+    #[test]
+    fn configured_extra_weaver_exclude_facet_is_honored() {
+        // An operator who opts audit_significant into the weaver denylist gets it.
+        let exclude = vec![
+            "record_kind:harness_orchestration".to_string(),
+            "record_kind:audit_significant".to_string(),
+        ];
+        assert!(has_excluded_facet(&facets_with("audit_significant"), &exclude));
+        assert!(has_excluded_facet(&facets_with("harness_orchestration"), &exclude));
+        assert!(!has_excluded_facet(&facets_with("normal"), &exclude));
+    }
 
     struct Fixture {
         _tmp: TempDir,

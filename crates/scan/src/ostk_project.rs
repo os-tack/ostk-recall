@@ -35,7 +35,9 @@ use ostk_recall_core::{
 use ostk_recall_store::{AuditEventRow, EventsDb};
 use serde::Deserialize;
 
-use crate::anthropic_session::{drop_local_command_wrappers, drop_tool_blocks, parse_session_file};
+// `drop_local_command_wrappers` moved to the config record-rule overlay (P12);
+// `drop_tool_blocks` is structural and stays.
+use crate::anthropic_session::{drop_tool_blocks, parse_session_file};
 use crate::code::walk_and_window;
 use crate::fcp_rust;
 use crate::markdown::split_markdown;
@@ -1015,9 +1017,10 @@ fn scan_sessions(root: &Path, project: Option<&str>, source_config_id: &str) -> 
             source_config_id,
             mtime,
         )?;
-        chunks.extend(drop_local_command_wrappers(drop_tool_blocks(
-            session_chunks,
-        )));
+        // `drop_tool_blocks` is structural and stays; the command-wrapper drop
+        // moved to the config record-rule overlay (P12), scoped to
+        // source_kind=ostk_project + source=ostk_session, applied pipeline-side.
+        chunks.extend(drop_tool_blocks(session_chunks));
     }
     Ok(chunks)
 }
@@ -1047,7 +1050,6 @@ fn scan_one_session(
         mtime,
     )
     .map(drop_tool_blocks)
-    .map(drop_local_command_wrappers)
 }
 
 // ──────────────────────────────── memory ────────────────────────────────

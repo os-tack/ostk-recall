@@ -208,7 +208,7 @@ impl CompiledRecordRules {
     /// An empty ruleset — never matches, digest is constant. For test
     /// ergonomics and any caller that intentionally runs without rules.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             compiled: Vec::new(),
             raw: Vec::new(),

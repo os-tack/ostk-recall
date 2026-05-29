@@ -13,8 +13,8 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use ostk_recall_core::{
-    Chunk, IngestOrigin, RetentionPolicy, Scanner, SourceConfig, SourceItem, SourceKind,
-    cfg_overlay_hash, compose_header, filter_to_allowlist, merge_override,
+    Chunk, CompiledRecordRules, IngestOrigin, RetentionPolicy, RuleDecision, Scanner, SourceConfig,
+    SourceItem, SourceKind, cfg_overlay_hash, compose_header, filter_to_allowlist, merge_override,
 };
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
@@ -84,6 +84,10 @@ pub struct PipelineStats {
     pub chunks_skipped_dup: usize,
     pub chunks_purged: usize,
     pub chunks_staled: usize,
+    /// Chunks a record rule (P12) dropped this run. The `chunks_purged` count
+    /// covers the corpus rows actually deleted (dropped chunks that had been
+    /// ingested before); this counts the rule matches.
+    pub chunks_dropped_by_rule: usize,
     pub errors: usize,
 }
 
@@ -97,9 +101,19 @@ impl PipelineStats {
         self.chunks_skipped_dup += other.chunks_skipped_dup;
         self.chunks_purged += other.chunks_purged;
         self.chunks_staled += other.chunks_staled;
+        self.chunks_dropped_by_rule += other.chunks_dropped_by_rule;
         self.errors += other.errors;
         self
     }
+}
+
+/// Outcome of applying the record-rule overlay to a single chunk (P12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleOutcome {
+    /// Keep the chunk (possibly with a `record_kind` tag stamped).
+    Keep,
+    /// Drop the chunk: skip embedding and purge any previously-ingested copy.
+    Drop,
 }
 
 pub struct Pipeline {
@@ -109,6 +123,12 @@ pub struct Pipeline {
     dry_run: bool,
     run_id: String,
     events: broadcast::Sender<IngestEvent>,
+    /// P12 interpretation overlay. Applied to every chunk at ingest (both the
+    /// full-scan and watch/scan_paths paths). Defaults to an empty ruleset
+    /// (no-op) so test/programmatic construction is unchanged; production
+    /// callers thread `Config::effective_record_rules()` via
+    /// [`Pipeline::with_record_rules`].
+    record_rules: Arc<CompiledRecordRules>,
 }
 
 impl Pipeline {
@@ -125,12 +145,22 @@ impl Pipeline {
             dry_run: false,
             run_id: Uuid::now_v7().to_string(),
             events,
+            record_rules: Arc::new(CompiledRecordRules::empty()),
         }
     }
 
     #[must_use]
     pub const fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
+        self
+    }
+
+    /// Install the compiled record-rule overlay (P12). Production callers
+    /// pass `Config::effective_record_rules()` compiled via
+    /// `CompiledRecordRules::build`.
+    #[must_use]
+    pub fn with_record_rules(mut self, rules: Arc<CompiledRecordRules>) -> Self {
+        self.record_rules = rules;
         self
     }
 
@@ -222,12 +252,63 @@ impl Pipeline {
         "default"
     }
 
-    /// P1: hash the per-source overlay state — legacy `project` + the
-    /// operator `facets` override — so Tier-1 (mtime/size) can detect
-    /// "operator changed facets without touching the file" and force a
-    /// re-parse. Delegates to `core::cfg_overlay_hash`.
-    fn cfg_overlay_hash(&self, cfg: &SourceConfig) -> String {
-        cfg_overlay_hash(cfg.project.as_deref(), &cfg.facets)
+    /// Hash the per-source overlay state — legacy `project` + the operator
+    /// `facets` override (P1), plus the per-source-kind record-rule digest and
+    /// the scanner's `parse_version` (P12) — so Tier-1 (mtime/size) forces a
+    /// re-parse when the operator changes facets, edits a record rule that can
+    /// match this source, or a scanner bumps its parse version, even when the
+    /// file itself is unchanged. Delegates to `core::cfg_overlay_hash`.
+    fn cfg_overlay_hash(&self, cfg: &SourceConfig, scanner: &dyn Scanner) -> String {
+        let extra = format!(
+            "rr:{}|pv:{}",
+            self.record_rules.digest_for(cfg.kind),
+            scanner.parse_version()
+        );
+        cfg_overlay_hash(cfg.project.as_deref(), &cfg.facets, &extra)
+    }
+
+    /// P12: apply the config-driven record-rule overlay to one chunk. Returns
+    /// [`RuleOutcome::Drop`] when a `drop` rule matched (the caller skips and
+    /// purges the chunk); otherwise stamps any `record_kind` tag and returns
+    /// [`RuleOutcome::Keep`]. Runs at the top of BOTH ingest loops (full scan
+    /// and watch/scan_paths) — before `apply_p1_overlay` — so a tag is visible
+    /// to the operator-override merge and the embedding-input hash.
+    fn apply_record_rules(&self, chunk: &mut Chunk, cfg: &SourceConfig) -> RuleOutcome {
+        match self.record_rules.decide(
+            &chunk.text,
+            chunk.source,
+            chunk.role.as_deref(),
+            cfg.kind,
+        ) {
+            RuleDecision::Drop => RuleOutcome::Drop,
+            RuleDecision::Tag(record_kind) => {
+                merge_override(&mut chunk.facets, "record_kind", vec![record_kind]);
+                RuleOutcome::Keep
+            }
+            RuleDecision::Keep => RuleOutcome::Keep,
+        }
+    }
+
+    /// Purge chunks dropped by a record rule from both the corpus and the
+    /// ingest ledger. Needed because `RetentionPolicy::Keep` sources (e.g.
+    /// `claude_code`, `ostk_project`) are not cleaned by the orphan sweep, so a
+    /// newly-dropped, previously-ingested chunk would otherwise linger. No-op
+    /// for ids that were never ingested. Runs after each ingest loop.
+    async fn purge_dropped(&self, dropped: &[String], stats: &mut PipelineStats) {
+        if dropped.is_empty() || self.dry_run {
+            return;
+        }
+        match self.store.delete_chunks(dropped).await {
+            Ok(n) => stats.chunks_purged += n as usize,
+            Err(e) => {
+                tracing::warn!(error = %e, "record-rule drop purge: corpus delete failed");
+                stats.errors += 1;
+            }
+        }
+        if let Err(e) = self.ingest.delete_by_chunk_ids(dropped) {
+            tracing::warn!(error = %e, "record-rule drop purge: ingest delete failed");
+            stats.errors += 1;
+        }
     }
 
     // Casts: `d.as_micros() as i64` and `meta.len() as i64` are intentional —
@@ -242,6 +323,7 @@ impl Pipeline {
     pub async fn ingest_source(&self, scanner: &dyn Scanner, cfg: &SourceConfig) -> PipelineStats {
         let mut stats = PipelineStats::default();
         let mut to_embed: Vec<Chunk> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
         let mut event_source_ids: HashSet<String> = HashSet::new();
         let source_kind_str = scanner.kind().as_str();
 
@@ -258,8 +340,9 @@ impl Pipeline {
 
             // Tier 1: File-level metadata check, gated by cfg-overlay
             // hash so operator facet edits force re-parse even when the
-            // file mtime/size are unchanged (P1).
-            let overlay_hash = self.cfg_overlay_hash(cfg);
+            // file mtime/size are unchanged (P1), plus record-rule digest +
+            // scanner parse_version (P12).
+            let overlay_hash = self.cfg_overlay_hash(cfg, scanner);
             if let Some(path) = &item.path {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mtime = meta
@@ -319,6 +402,15 @@ impl Pipeline {
             stats.chunks_emitted += chunks.len();
 
             for mut chunk in chunks {
+                // P12: record-rule overlay BEFORE P1. A drop skips the chunk
+                // (and purges any previously-ingested copy); a tag stamps
+                // record_kind so it flows into the embedding-input hash.
+                if self.apply_record_rules(&mut chunk, cfg) == RuleOutcome::Drop {
+                    stats.chunks_dropped_by_rule += 1;
+                    dropped.push(chunk.chunk_id);
+                    continue;
+                }
+
                 // P1: stamp facets + embedding_input_sha256 BEFORE dedupe
                 // so the Tier-2 check observes facet edits.
                 self.apply_p1_overlay(&mut chunk, cfg);
@@ -350,6 +442,10 @@ impl Pipeline {
                 }
             }
         }
+
+        // P12: purge chunks dropped by a record rule from corpus + ingest
+        // ledger (orphan sweep won't, for Keep-retention sources).
+        self.purge_dropped(&dropped, &mut stats).await;
 
         let mut upserted_chunk_ids: Vec<String> = Vec::new();
         if !to_embed.is_empty() && !self.dry_run {
@@ -624,6 +720,7 @@ impl Pipeline {
     ) -> (PipelineStats, HashSet<PathBuf>) {
         let mut stats = PipelineStats::default();
         let mut to_embed: Vec<Chunk> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
         let mut yielded: HashSet<PathBuf> = HashSet::new();
         let source_kind_str = scanner.kind().as_str();
         let project = cfg.project.as_deref().unwrap_or("default");
@@ -643,7 +740,7 @@ impl Pipeline {
             stats.items_seen += 1;
 
             // Tier 1: file-level metadata short-circuit (same as ingest_source).
-            let overlay_hash = self.cfg_overlay_hash(cfg);
+            let overlay_hash = self.cfg_overlay_hash(cfg, scanner);
             if let Some(path) = &item.path {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mtime = meta
@@ -703,6 +800,13 @@ impl Pipeline {
             stats.chunks_emitted += chunks.len();
 
             for mut chunk in chunks {
+                // P12: same shared overlay as the full-scan path — a watched
+                // transcript append cannot bypass record rules.
+                if self.apply_record_rules(&mut chunk, cfg) == RuleOutcome::Drop {
+                    stats.chunks_dropped_by_rule += 1;
+                    dropped.push(chunk.chunk_id);
+                    continue;
+                }
                 self.apply_p1_overlay(&mut chunk, cfg);
                 match self
                     .ingest
@@ -729,6 +833,9 @@ impl Pipeline {
                 }
             }
         }
+
+        // P12: purge record-rule-dropped chunks (Keep-retention safe).
+        self.purge_dropped(&dropped, &mut stats).await;
 
         let mut upserted_chunk_ids: Vec<String> = Vec::new();
         let mut event_source_ids: HashSet<String> = HashSet::new();

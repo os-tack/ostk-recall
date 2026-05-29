@@ -60,6 +60,8 @@ fn make_cfg(fixtures_dir: &Path) -> SourceConfig {
         watch: None,
         runtime: None,
         lens: None,
+        record_rules: None,
+        weaver: None,
     };
     cfg.validate_and_seal().expect("seal");
     cfg.sources.remove(0)
