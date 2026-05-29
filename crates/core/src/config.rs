@@ -186,7 +186,13 @@ fn default_lens_dominance_threshold() -> f32 {
 /// Operational telemetry is attenuated from ambient surfacing by default
 /// (still fully recall-able). Keep in sync with `LensConfig::default()`.
 fn default_lens_exclude_facets() -> Vec<String> {
-    vec!["record_kind:audit_significant".to_string()]
+    vec![
+        "record_kind:audit_significant".to_string(),
+        // RT-7: Claude Code multi-agent `<teammate-message>` orchestration
+        // envelopes — apparatus, attenuated from ambient surfacing but kept
+        // recall-able.
+        "record_kind:harness_orchestration".to_string(),
+    ]
 }
 
 impl Default for LensSettings {

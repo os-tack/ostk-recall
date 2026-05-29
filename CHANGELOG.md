@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **RT-7 — demux Claude Code multi-agent orchestration off the content
+  channel.** `<teammate-message>` envelopes are harness apparatus (the same
+  class as `<system-reminder>`): being templated they formed degenerate
+  high-familiarity threads (`team-lead`, `teammate-message`) and surfaced in
+  the ambient lens. `tag_harness_orchestration` (claude_code parse) now stamps
+  them `record_kind=harness_orchestration` — **tag, don't drop**, since they
+  carry task-description history; the lens denylist
+  (`config::default_lens_exclude_facets`) keeps them out of ambient surfacing
+  and the weaver skips them as anchor/proposal candidates, so they can't form
+  threads. New `ostk-recall thread delete <handle>` verb (chains `ThreadDelete`)
+  to prune apparatus / frequency-promoted threads without forgetting any chunk.
+
 ### Fixed
 
 - **`scan --reingest <project>` no longer under-fills the project.** It

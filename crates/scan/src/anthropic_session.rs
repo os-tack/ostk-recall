@@ -365,6 +365,37 @@ pub fn drop_system_reminders(chunks: Vec<Chunk>) -> Vec<Chunk> {
         .collect()
 }
 
+/// Tag (don't drop) chunks whose text is a Claude Code multi-agent
+/// `<teammate-message ...>` orchestration envelope — the inter-agent routing
+/// wrapper the harness injects when agents coordinate (RT-7). Same apparatus
+/// class as `<system-reminder>`: it is the recording/coordination apparatus,
+/// not experienced thinking, and being templated it forms degenerate
+/// high-familiarity threads (`team-lead`, `teammate-message`) and surfaces in
+/// the ambient lens. *Unlike* pure reminders these envelopes carry task
+/// descriptions with implementation-history value, so we **attenuate rather
+/// than delete**: stamp `record_kind=harness_orchestration` so the lens
+/// denylist (`config::default_lens_exclude_facets`) keeps them out of ambient
+/// surfacing and the weaver skips them as anchor/proposal candidates, while
+/// they stay fully recall-able. Conservative: only chunks whose trimmed text
+/// *starts with* the tag are tagged, so an envelope quoted inside a real
+/// message keeps its content facets.
+#[must_use]
+pub fn tag_harness_orchestration(chunks: Vec<Chunk>) -> Vec<Chunk> {
+    chunks
+        .into_iter()
+        .map(|mut c| {
+            if c.text.trim_start().starts_with("<teammate-message") {
+                ostk_recall_core::merge_override(
+                    &mut c.facets,
+                    "record_kind",
+                    vec!["harness_orchestration".to_string()],
+                );
+            }
+            c
+        })
+        .collect()
+}
+
 /// Materialize blocks into chunks. `chunk_index` is monotonic across the
 /// session; `parent_ids` holds the previous chunk's id so `recall_link`
 /// can chain backward through the session.
@@ -821,6 +852,40 @@ mod tests {
                 "design the weaver",
                 "the <system-reminder> tag is harness instrumentation"
             ]
+        );
+    }
+
+    /// `tag_harness_orchestration` stamps `record_kind=harness_orchestration`
+    /// on `<teammate-message>` envelopes (kept, not dropped) and leaves real
+    /// content untouched — including a message that merely mentions the term.
+    #[test]
+    fn tag_harness_orchestration_marks_only_envelopes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"<teammate-message teammate_id=\"team-lead\">{{\"type\":\"task_assignment\",\"taskId\":\"5\"}}</teammate-message>"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"I'll message the team-lead about the design"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+            .unwrap();
+        let tagged = tag_harness_orchestration(raw);
+        assert_eq!(tagged.len(), 2, "nothing is dropped — tag, don't delete");
+        let facets0 = ostk_recall_core::to_list(&tagged[0].facets);
+        assert!(
+            facets0.iter().any(|f| f == "record_kind:harness_orchestration"),
+            "the <teammate-message> envelope is tagged: {facets0:?}"
+        );
+        let facets1 = ostk_recall_core::to_list(&tagged[1].facets);
+        assert!(
+            !facets1.iter().any(|f| f == "record_kind:harness_orchestration"),
+            "prose that merely mentions team-lead is untouched: {facets1:?}"
         );
     }
 

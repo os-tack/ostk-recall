@@ -294,6 +294,14 @@ enum ThreadVerb {
         #[arg(long = "to")]
         target_tier: String,
     },
+    /// Delete a thread by handle (chains `ThreadDelete`; CASCADE drops its
+    /// evidence). The underlying corpus chunks are untouched — use this to
+    /// prune apparatus / frequency-promoted threads (e.g. harness
+    /// orchestration vocab) without forgetting any observation.
+    Delete {
+        /// Thread handle to delete.
+        handle: String,
+    },
     /// List threads, optionally filtered by tension.
     List {
         #[arg(long)]
@@ -882,6 +890,14 @@ async fn run_thread(d: &AttentionDispatch, verb: ThreadVerb) -> Result<serde_jso
         } => attn_cli::run_thread_promote(d, handle_from_proposed, target_tier)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ThreadVerb::Delete { handle } => {
+            let h = ostk_recall_core::ThreadHandle::new(&handle)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            d.threads
+                .delete_thread(&h)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            serde_json::json!({ "deleted": handle })
+        }
         ThreadVerb::List {
             scope_project,
             tension,

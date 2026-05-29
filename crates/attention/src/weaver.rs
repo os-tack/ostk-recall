@@ -198,6 +198,15 @@ const fn tension_rank(t: TensionState) -> u8 {
     }
 }
 
+/// True if a chunk's facets mark it as harness orchestration apparatus
+/// (RT-7): such chunks are excluded from anchor-matching and emergent
+/// proposals so they never form threads, mirroring the lens denylist.
+fn is_harness_apparatus(facets: &ostk_recall_core::FacetSet) -> bool {
+    ostk_recall_core::to_list(facets)
+        .iter()
+        .any(|f| f == "record_kind:harness_orchestration")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WeaverError {
     #[error("store error: {0}")]
@@ -565,10 +574,20 @@ impl AutoWeaver {
             });
         }
 
-        let new_embeds = self
+        // Fetch chunks (not just embeddings) so we can gate apparatus by
+        // facet: RT-7 harness-orchestration envelopes must not anchor or seed
+        // emergent proposals (that is how the `team-lead`/`teammate-message`
+        // degenerate threads formed). They stay in the corpus + recall; they
+        // just don't drive cognition.
+        let fetched = self
             .corpus
-            .fetch_embeddings(&event.chunk_ids_upserted)
+            .fetch_chunks_by_ids(&event.chunk_ids_upserted)
             .await?;
+        let new_embeds: HashMap<String, Vec<f32>> = fetched
+            .into_iter()
+            .filter(|(_, (chunk, _))| !is_harness_apparatus(&chunk.facets))
+            .filter_map(|(id, (_, emb))| emb.map(|e| (id, e)))
+            .collect();
         let threshold = self.thresholds.for_source(event.source);
         let category = source_kind_to_category(event.source);
 
@@ -1468,5 +1487,47 @@ mod tests {
         );
         // Idempotent: a second pass folds nothing new.
         assert_eq!(weaver(&fx).abstract_stable_threads().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn harness_apparatus_chunks_do_not_weave() {
+        // A harness-orchestration-tagged chunk must not anchor-match or seed
+        // proposals, even when it resonates perfectly — that is how the
+        // team-lead / teammate-message degenerate threads formed (RT-7).
+        let fx = fixture().await;
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let good = chunk("good");
+        let mut appar = chunk("appar");
+        ostk_recall_core::merge_override(
+            &mut appar.facets,
+            "record_kind",
+            vec!["harness_orchestration".to_string()],
+        );
+        fx.corpus
+            .upsert(&[chunk("anchor-1"), good, appar], &[v.clone(), v.clone(), v.clone()])
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor-1")))
+            .unwrap();
+
+        let out = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["good", "appar"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evidence_links_written, 1,
+            "only the non-apparatus chunk links to the anchor"
+        );
+        let evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("t1").unwrap())
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].original_path,
+            std::path::PathBuf::from("good"),
+            "the apparatus chunk is excluded from weaving"
+        );
     }
 }

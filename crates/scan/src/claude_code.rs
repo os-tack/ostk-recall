@@ -25,7 +25,8 @@ use ostk_recall_core::{
 use walkdir::WalkDir;
 
 use crate::anthropic_session::{
-    drop_local_command_wrappers, drop_system_reminders, drop_tool_blocks, parse_session_file,
+    drop_local_command_wrappers, drop_system_reminders, drop_tool_blocks,
+    parse_session_file, tag_harness_orchestration,
 };
 
 /// Scanner for Claude Code session logs.
@@ -97,6 +98,7 @@ impl Scanner for ClaudeCodeScanner {
         .map(drop_tool_blocks)
         .map(drop_local_command_wrappers)
         .map(drop_system_reminders)
+        .map(tag_harness_orchestration)
     }
 }
 
