@@ -44,6 +44,26 @@ impl SourceKind {
         }
     }
 
+    /// Parse a `SourceKind` from its `as_str` form. Returns `None` for
+    /// unknown values. Symmetric with [`SourceKind::as_str`]; used to
+    /// validate operator-authored `record_rule` `source_kind` predicates at
+    /// config-compile time (rather than silently never-matching).
+    #[must_use]
+    pub fn parse_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "markdown" => Self::Markdown,
+            "code" => Self::Code,
+            "claude_code" => Self::ClaudeCode,
+            "ostk_project" => Self::OstkProject,
+            "file_glob" => Self::FileGlob,
+            "zip_export" => Self::ZipExport,
+            "gemini" => Self::Gemini,
+            "thread" => Self::Thread,
+            "membrane" => Self::Membrane,
+            _ => return None,
+        })
+    }
+
     /// Returns the list of concrete [`Source`] variants this kind can produce.
     /// Used during orphan sweeps to ensure all related subtypes are cleaned.
     #[must_use]
@@ -138,6 +158,32 @@ impl Source {
             Self::Thread => "thread",
             Self::Membrane => "membrane",
         }
+    }
+
+    /// Parse a concrete `Source` from its `as_str` form. Returns `None` for
+    /// unknown values. Symmetric with [`Source::as_str`]; used to validate
+    /// operator-authored `record_rule` `source` predicates at config-compile
+    /// time.
+    #[must_use]
+    pub fn parse_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "markdown" => Self::Markdown,
+            "code" => Self::Code,
+            "claude_code" => Self::ClaudeCode,
+            "ostk_decision" => Self::OstkDecision,
+            "ostk_needle" => Self::OstkNeedle,
+            "ostk_audit_significant" => Self::OstkAuditSignificant,
+            "ostk_conversation" => Self::OstkConversation,
+            "ostk_session" => Self::OstkSession,
+            "ostk_memory" => Self::OstkMemory,
+            "ostk_spec" => Self::OstkSpec,
+            "file_glob" => Self::FileGlob,
+            "zip_export" => Self::ZipExport,
+            "gemini" => Self::Gemini,
+            "thread" => Self::Thread,
+            "membrane" => Self::Membrane,
+            _ => return None,
+        })
     }
 }
 

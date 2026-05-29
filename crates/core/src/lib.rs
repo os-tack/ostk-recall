@@ -10,6 +10,7 @@ pub mod chunk;
 pub mod config;
 pub mod error;
 pub mod facets;
+pub mod record_rules;
 pub mod scanner;
 pub mod source;
 pub mod types;
@@ -21,7 +22,7 @@ pub use attention::{
 pub use chunk::{Chunk, Links};
 pub use config::{
     Config, CorpusConfig, EmbedderConfig, LensSettings, RerankerConfig, RuntimeConfig,
-    SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig, WatchMode,
+    SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig, WatchMode, WeaverSettings,
     compute_source_config_id, default_worker_threads,
 };
 pub use error::{Error, Result};
@@ -29,6 +30,9 @@ pub use facets::{
     ALLOWLIST_VERSION, Cardinality, EMBED_FACET_ALLOWLIST, FacetSet, HEADER_FORMAT_VERSION,
     cardinality_of, cfg_overlay_hash, compose_header, filter_to_allowlist, from_list,
     is_valid_facet_key, merge_override, to_list,
+};
+pub use record_rules::{
+    CompiledRecordRules, RecordRule, RuleAction, RuleDecision, RuleMatch, default_record_rules,
 };
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};

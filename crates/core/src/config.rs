@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::record_rules::{RecordRule, default_record_rules};
 use crate::source::SourceKind;
 
 /// Top-level configuration loaded from `config.toml`.
@@ -33,6 +34,18 @@ pub struct Config {
     /// the daemon's runtime `LensConfig`.
     #[serde(default)]
     pub lens: Option<LensSettings>,
+    /// Optional config-driven interpretation rules (P12). `[[record_rule]]`
+    /// blocks each `pattern → action` (drop / tag `record_kind`), applied once
+    /// in the pipeline overlay stage for all scanners. **Omit** the section to
+    /// use the built-in [`default_record_rules`] (the apparatus filters);
+    /// **present** (even an empty list) replaces the defaults entirely. See
+    /// [`crate::record_rules`].
+    #[serde(default, rename = "record_rule")]
+    pub record_rules: Option<Vec<RecordRule>>,
+    /// Optional weaver tuning. Omit to accept defaults (attenuate only
+    /// `record_kind:harness_orchestration` from weaving).
+    #[serde(default)]
+    pub weaver: Option<WeaverSettings>,
 }
 
 /// Runtime resource caps. Each field is the upper bound on the
@@ -206,6 +219,43 @@ impl Default for LensSettings {
             candidate_k_per_lane: default_lens_candidate_k_per_lane(),
             dominance_threshold: default_lens_dominance_threshold(),
         }
+    }
+}
+
+/// Weaver tuning, surfaced as the optional `[weaver]` block (P12).
+///
+/// `exclude_facets` lists `key:value` facet entries whose presence makes the
+/// weaver treat a chunk as apparatus — it is skipped for anchor-matching and
+/// proposal seeding (generalizes the former hardcoded
+/// `is_harness_apparatus` check). The default preserves pre-P12 behavior:
+/// only `record_kind:harness_orchestration` is excluded. Excluding
+/// `record_kind:audit_significant` from *weaving* would be a deliberate
+/// thread-graph behavior change (that exclusion is established for the lens
+/// only) and must be opted into explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeaverSettings {
+    #[serde(default = "default_weaver_exclude_facets")]
+    pub exclude_facets: Vec<String>,
+}
+
+fn default_weaver_exclude_facets() -> Vec<String> {
+    vec!["record_kind:harness_orchestration".to_string()]
+}
+
+impl Default for WeaverSettings {
+    fn default() -> Self {
+        Self {
+            exclude_facets: default_weaver_exclude_facets(),
+        }
+    }
+}
+
+impl WeaverSettings {
+    /// Resolve from an optional `[weaver]` block, falling back to defaults.
+    #[must_use]
+    pub fn resolve(slot: Option<&Self>) -> Self {
+        slot.cloned().unwrap_or_default()
     }
 }
 
@@ -479,6 +529,17 @@ impl Config {
     /// Expand the corpus root (`~` → home, `$VAR` → env).
     pub fn expanded_root(&self) -> Result<PathBuf> {
         expand_path(&self.corpus.root)
+    }
+
+    /// The effective record-rule set (P12): the operator's `[[record_rule]]`
+    /// list verbatim when present (even an empty list = "explicitly no rules"),
+    /// else the built-in [`default_record_rules`]. Pipeline construction is fed
+    /// this — there is no silent no-op fallback on the production path.
+    #[must_use]
+    pub fn effective_record_rules(&self) -> Vec<RecordRule> {
+        self.record_rules
+            .clone()
+            .unwrap_or_else(default_record_rules)
     }
 }
 

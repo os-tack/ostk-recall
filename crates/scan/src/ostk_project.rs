@@ -202,6 +202,14 @@ impl Scanner for OstkProjectScanner {
         SourceKind::OstkProject
     }
 
+    // P12: bumped to 1 — the session sub-scan's command-wrapper filtering moves
+    // into the config record-rule overlay (P12-B), changing the emitted-chunk
+    // set for `Source::OstkSession` chunks. Folded into the Tier-1 freshness
+    // key so the first post-P12 scan re-parses.
+    fn parse_version(&self) -> u32 {
+        1
+    }
+
     fn discover<'a>(
         &'a self,
         cfg: &'a SourceConfig,

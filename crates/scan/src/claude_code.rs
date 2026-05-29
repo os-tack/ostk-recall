@@ -38,6 +38,14 @@ impl Scanner for ClaudeCodeScanner {
         SourceKind::ClaudeCode
     }
 
+    // P12: bumped to 1 because the emitted-chunk set changes when the
+    // hardcoded apparatus filters move out of `parse` into the config
+    // record-rule overlay (P12-B). Folded into the Tier-1 freshness key so the
+    // first post-P12 scan re-parses already-ingested transcripts.
+    fn parse_version(&self) -> u32 {
+        1
+    }
+
     fn discover<'a>(
         &'a self,
         cfg: &'a SourceConfig,
