@@ -1,12 +1,20 @@
-//! End-to-end test for the ambient-pickup path.
+//! End-to-end test for the P11 bulk/live boundary.
 //!
 //! Drives the production `commands::scan` entry point with a markdown
 //! corpus that (a) mentions a pre-seeded thread handle and (b) contains
 //! a chunk whose `FakeEmbedder` output collides with a pre-seeded
-//! anchor's vector. The wiring in `commands::scan` spawns the
-//! `TurnObserver` + `AutoWeaver` daemons against the same `Pipeline`,
-//! so after the scan returns we expect the threads ledger to show
-//! advanced familiarity AND at least one derived evidence link.
+//! anchor's vector. A bulk scan is `IngestOrigin::Bulk`, which is NOT a
+//! TurnEnd, so the ambient daemons (`TurnObserver` + `AutoWeaver`) must
+//! leave the ledger untouched — this guards the P11a gate against
+//! regressing back to "library load == live cognition" (the bug that
+//! flooded the corpus with one membrane commit per historical chunk).
+//!
+//! Weaving bulk content is instead the job of the explicit
+//! `commands::weave` pass (P11b / `weave_window`), so after `weave`
+//! returns we expect the resonant chunk to have produced at least one
+//! derived evidence link. Familiarity stays 0 throughout: it advances
+//! only on live watched conversation-transcript TurnEnds (covered by the
+//! observer unit tests), never on a bulk scan or an offline weave.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -64,7 +72,7 @@ paths = ['{fixture}']
 }
 
 #[tokio::test]
-async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
+async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
     let corpus = TempDir::new().unwrap();
     let fixture = TempDir::new().unwrap();
     let config_dir = TempDir::new().unwrap();
@@ -140,6 +148,10 @@ async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
     }
 
     // --- production scan entry point: spawns ambient daemons --------
+    // The daemons are spawned, but a bulk scan emits only
+    // `IngestOrigin::Bulk` events — none of them TurnEnds — so the
+    // observer and weaver must skip every one and leave the ledger
+    // untouched.
     let embedder: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
     let outcome = commands::scan(&config_path, Arc::clone(&embedder), None, false)
         .await
@@ -150,37 +162,57 @@ async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
         outcome.totals
     );
 
-    // --- assertions: daemons should have mutated the ledger ---------
+    // --- gate assertion: a bulk scan must NOT trigger live cognition.
+    // resonant.md resonates with the seeded anchor and mention.md names
+    // the known handle, yet because the scan is Bulk (not a watched
+    // conversation TurnEnd) neither daemon may fire. Regressing this is
+    // the version-explosion bug returning.
+    {
+        let db = ThreadsDb::open(corpus.path()).unwrap();
+        let after = db
+            .get_thread(&handle)
+            .unwrap()
+            .expect("seeded thread missing after scan");
+        let evidence = db.list_evidence(&handle).unwrap();
+        assert_eq!(
+            after.familiarity, 0,
+            "P11a gate regressed: bulk scan advanced familiarity to {} \
+             (observer fired on a non-TurnEnd)",
+            after.familiarity
+        );
+        assert!(
+            evidence.is_empty(),
+            "P11a gate regressed: bulk scan wrote {} evidence link(s) \
+             (weaver fired on a non-TurnEnd)",
+            evidence.len()
+        );
+    }
+
+    // --- explicit weave: the bulk-content coverage path (P11b) -------
+    // `commands::weave` runs `weave_window(None)` over the whole corpus.
+    // This is how bulk-ingested content is woven into the thread graph
+    // now that the live daemon deliberately ignores it.
+    let weave_out = commands::weave(&config_path, Arc::clone(&embedder), None, 1)
+        .await
+        .expect("weave");
+
     let db = ThreadsDb::open(corpus.path()).unwrap();
     let after = db
         .get_thread(&handle)
         .unwrap()
-        .expect("seeded thread missing after scan");
+        .expect("seeded thread missing after weave");
     let evidence = db.list_evidence(&handle).unwrap();
-
-    // Aggregate both signals before panicking — surfacing both at once
-    // is more informative when the V1 wiring has a partial bug.
-    let mut failures: Vec<String> = Vec::new();
-    if after.familiarity < 1 {
-        failures.push(format!(
-            "familiarity advancement: expected >= 1 after observer saw \
-             mention.md; got {}",
-            after.familiarity
-        ));
-    }
-    if evidence.is_empty() {
-        failures.push(
-            "evidence_links row from auto-weaver: expected >= 1 from \
-             resonant.md; got 0"
-                .into(),
-        );
-    }
     assert!(
-        failures.is_empty(),
-        "ambient pickup did not mutate the ledger after scan \
-         (familiarity={}, evidence_count={}):\n  - {}",
-        after.familiarity,
-        evidence.len(),
-        failures.join("\n  - "),
+        !evidence.is_empty(),
+        "explicit weave wrote no evidence link from resonant.md \
+         (weave summary: {weave_out:?}); expected >= 1 against the \
+         pre-seeded anchor",
+    );
+    // Familiarity is the observer's responsibility and advances only on
+    // live watched TurnEnds — an offline weave must never touch it.
+    assert_eq!(
+        after.familiarity, 0,
+        "weave must not advance familiarity (observer-only); got {}",
+        after.familiarity
     );
 }
