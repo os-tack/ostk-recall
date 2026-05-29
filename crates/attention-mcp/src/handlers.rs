@@ -25,8 +25,7 @@ use ostk_recall_attention::emergent::{
     DEFAULT_SINCE_HOURS as EMERGENT_DEFAULT_SINCE_HOURS, EmergentError, discover_and_surface,
 };
 use ostk_recall_attention::novelty::{
-    DEFAULT_BASELINE_DAYS as NOVELTY_DEFAULT_BASELINE_DAYS,
-    DEFAULT_LIMIT as NOVELTY_DEFAULT_LIMIT,
+    DEFAULT_BASELINE_DAYS as NOVELTY_DEFAULT_BASELINE_DAYS, DEFAULT_LIMIT as NOVELTY_DEFAULT_LIMIT,
     DEFAULT_MIN_CLUSTER as NOVELTY_DEFAULT_MIN_CLUSTER,
     DEFAULT_RECLUSTER_THRESHOLD as NOVELTY_DEFAULT_RECLUSTER_THRESHOLD,
     DEFAULT_SINCE_HOURS as NOVELTY_DEFAULT_SINCE_HOURS, NoveltyError, surface_novelty,
@@ -58,7 +57,9 @@ pub enum AttentionHandlersError {
     Store(#[from] StoreError),
     #[error("privacy tier {0:?} is not permitted for this caller")]
     PrivacyForbidden(PrivacyTier),
-    #[error("emergent surfacing requires CorpusStore — wire one via AttentionDispatch::with_corpus")]
+    #[error(
+        "emergent surfacing requires CorpusStore — wire one via AttentionDispatch::with_corpus"
+    )]
     CorpusUnavailable,
     #[error("emergent surfacing failed: {0}")]
     Emergent(#[from] EmergentError),
@@ -465,22 +466,14 @@ pub async fn thread_evidence(
 ) -> Result<Value, AttentionHandlersError> {
     use ostk_recall_store::ThreadThreadLink;
 
-    let action = args
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            AttentionHandlersError::InvalidParams(
-                "thread_evidence: missing required `action`".into(),
-            )
-        })?;
+    let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
+        AttentionHandlersError::InvalidParams("thread_evidence: missing required `action`".into())
+    })?;
     match action {
         "add" => {
-            let from = args
-                .get("from")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AttentionHandlersError::InvalidParams("thread_evidence add: missing `from`".into())
-                })?;
+            let from = args.get("from").and_then(Value::as_str).ok_or_else(|| {
+                AttentionHandlersError::InvalidParams("thread_evidence add: missing `from`".into())
+            })?;
             let to = args.get("to").and_then(Value::as_str).ok_or_else(|| {
                 AttentionHandlersError::InvalidParams("thread_evidence add: missing `to`".into())
             })?;
@@ -508,14 +501,11 @@ pub async fn thread_evidence(
             Ok(json!({ "id": id, "chained": true }))
         }
         "list" => {
-            let handle_str = args
-                .get("handle")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AttentionHandlersError::InvalidParams(
-                        "thread_evidence list: missing `handle`".into(),
-                    )
-                })?;
+            let handle_str = args.get("handle").and_then(Value::as_str).ok_or_else(|| {
+                AttentionHandlersError::InvalidParams(
+                    "thread_evidence list: missing `handle`".into(),
+                )
+            })?;
             let handle = ThreadHandle::new(handle_str)?;
             let direction = args
                 .get("direction")
@@ -589,18 +579,14 @@ pub async fn thread_emergent(
         .and_then(Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(DEFAULT_MIN_CLUSTER_SIZE);
-    let persist = args
-        .get("persist")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let persist = args.get("persist").and_then(Value::as_bool).unwrap_or(true);
     #[allow(clippy::cast_possible_truncation)]
     let cohesion_threshold = args
         .get("cohesion_threshold")
         .and_then(Value::as_f64)
-        .map_or(
-            ostk_recall_attention::cluster::EMERGENT_THRESHOLD,
-            |v| v as f32,
-        );
+        .map_or(ostk_recall_attention::cluster::EMERGENT_THRESHOLD, |v| {
+            v as f32
+        });
     let min_neighbours = args
         .get("min_neighbours")
         .and_then(Value::as_u64)
@@ -846,9 +832,7 @@ pub async fn thread_query(
     d: &AttentionDispatch,
     args: Value,
 ) -> Result<Value, AttentionHandlersError> {
-    use ostk_recall_attention::{
-        Axis, CompositeWeights, RankBy, ThreadQueryParams, run_query,
-    };
+    use ostk_recall_attention::{Axis, CompositeWeights, RankBy, ThreadQueryParams, run_query};
 
     let Some(corpus) = d.corpus.as_ref() else {
         return Err(AttentionHandlersError::CorpusUnavailable);
@@ -893,9 +877,8 @@ pub async fn thread_query(
     }
     if let Some(w) = args.get("composite_weights") {
         #[allow(clippy::cast_possible_truncation)]
-        let pick = |key: &str| -> Option<f32> {
-            w.get(key).and_then(Value::as_f64).map(|v| v as f32)
-        };
+        let pick =
+            |key: &str| -> Option<f32> { w.get(key).and_then(Value::as_f64).map(|v| v as f32) };
         let d = pick("density").unwrap_or(params.composite_weights.density);
         let a = pick("activity").unwrap_or(params.composite_weights.activity);
         let n = pick("novelty").unwrap_or(params.composite_weights.novelty);
@@ -1216,7 +1199,9 @@ pub async fn attention_focus(
         );
     }
     let surface = surface_after_focus(d, &scope, &args).await;
-    Ok(focus_outcome_to_json(&outcome, "pinned", "previous", surface))
+    Ok(focus_outcome_to_json(
+        &outcome, "pinned", "previous", surface,
+    ))
 }
 
 /// Promote a previously-pinned focus from history back to the pin
@@ -1250,7 +1235,12 @@ pub async fn attention_refocus(
     // Response uses `swapped_out` instead of `previous` so callers
     // can tell apart "I pinned a fresh query" from "I rotated to a
     // known one." Same field shape otherwise.
-    Ok(focus_outcome_to_json(&outcome, "pinned", "swapped_out", surface))
+    Ok(focus_outcome_to_json(
+        &outcome,
+        "pinned",
+        "swapped_out",
+        surface,
+    ))
 }
 
 /// Clear the scope's pin. The cleared focus is pushed to history
@@ -1272,7 +1262,9 @@ pub async fn attention_unfocus(
         );
     }
     let surface = surface_after_focus(d, &scope, &args).await;
-    Ok(focus_outcome_to_json(&outcome, "pinned", "unpinned", surface))
+    Ok(focus_outcome_to_json(
+        &outcome, "pinned", "unpinned", surface,
+    ))
 }
 
 /// Read-only snapshot of the scope's focus state. Returns the
@@ -2182,7 +2174,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, AttentionHandlersError::Attention(AttentionError::FocusHistoryMiss(_))),
+            matches!(
+                err,
+                AttentionHandlersError::Attention(AttentionError::FocusHistoryMiss(_))
+            ),
             "expected FocusHistoryMiss, got {err:?}"
         );
     }
@@ -2194,13 +2189,20 @@ mod tests {
         attention_focus(&d, json!({"scope": scope, "query": "X"}))
             .await
             .unwrap();
-        let out = attention_unfocus(&d, json!({"scope": scope})).await.unwrap();
+        let out = attention_unfocus(&d, json!({"scope": scope}))
+            .await
+            .unwrap();
         assert_eq!(out["unpinned"]["query"].as_str(), Some("X"));
         assert!(out["pinned"].is_null());
-        assert_eq!(out["history"].as_array().unwrap()[0]["query"].as_str(), Some("X"));
+        assert_eq!(
+            out["history"].as_array().unwrap()[0]["query"].as_str(),
+            Some("X")
+        );
 
         // Idempotent second call: nothing to clear, history unchanged.
-        let out = attention_unfocus(&d, json!({"scope": scope})).await.unwrap();
+        let out = attention_unfocus(&d, json!({"scope": scope}))
+            .await
+            .unwrap();
         assert!(out["unpinned"].is_null());
         assert!(out["pinned"].is_null());
         assert_eq!(out["history"].as_array().unwrap().len(), 1);
@@ -2266,9 +2268,7 @@ mod tests {
     /// Build a dispatch wired with a corpus and a deterministic
     /// embedder so the focus-pin path produces a real vec that is
     /// dim-compatible with seeded chunk embeddings.
-    async fn build_dispatch_with_resonance_corpus()
-        -> (TempDir, TempDir, Arc<AttentionDispatch>)
-    {
+    async fn build_dispatch_with_resonance_corpus() -> (TempDir, TempDir, Arc<AttentionDispatch>) {
         use ostk_recall_core::{Chunk, Links as CoreLinks, Source};
         use ostk_recall_store::CorpusStore;
 
@@ -2276,7 +2276,9 @@ mod tests {
             dim: usize,
         }
         impl ostk_recall_pipeline::ChunkEmbedder for AxisZeroEmbedder {
-            fn dim(&self) -> usize { self.dim }
+            fn dim(&self) -> usize {
+                self.dim
+            }
             fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
                 texts
                     .iter()
@@ -2356,9 +2358,7 @@ mod tests {
         }
         corpus.upsert(&chunks, &embs).await.unwrap();
 
-        let d = Arc::new(
-            AttentionDispatch::new(attention, threads).with_corpus(corpus),
-        );
+        let d = Arc::new(AttentionDispatch::new(attention, threads).with_corpus(corpus));
         (tmp_threads, tmp_corpus, d)
     }
 
@@ -2438,7 +2438,9 @@ mod tests {
 
         // Phase F invariant: a pin shaped this response, so a
         // `lens` block must be present, declaring the focus query.
-        let lens = out.get("lens").expect("lens block must be present when pinned + resonance");
+        let lens = out
+            .get("lens")
+            .expect("lens block must be present when pinned + resonance");
         assert_eq!(lens["focus_query"].as_str(), Some("focused on the A topic"));
         assert_eq!(lens["applied_to_axis"].as_str(), Some("resonance"));
 
@@ -2481,12 +2483,9 @@ mod tests {
         // response is unshaped by the pin → no `lens` block.
         // Discipline: the substrate never quietly applies a focus.
         let (_tmp_t, _tmp_c, d) = build_dispatch_with_resonance_corpus().await;
-        attention_focus(
-            &d,
-            json!({"scope": {"project": "p"}, "query": "X"}),
-        )
-        .await
-        .unwrap();
+        attention_focus(&d, json!({"scope": {"project": "p"}, "query": "X"}))
+            .await
+            .unwrap();
         let out = thread_query(
             &d,
             json!({

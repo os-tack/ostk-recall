@@ -472,9 +472,7 @@ impl ChainEvent {
                 "scope": scope,
                 "reason": reason.as_str(),
             }),
-            Self::LensIncluded {
-                chunk_id, slot, ..
-            } => serde_json::json!({
+            Self::LensIncluded { chunk_id, slot, .. } => serde_json::json!({
                 "chunk_id": chunk_id,
                 "slot": slot,
             }),

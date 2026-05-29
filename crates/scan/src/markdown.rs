@@ -340,7 +340,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     #[test]
     fn split_three_h2_sections() {

@@ -41,20 +41,14 @@ impl ChunkEmbedder for CountingEmbedder {
             .iter()
             .map(|t| {
                 let seed = ((t.len() % 100) as f32) * 0.01;
-                (0..DIM)
-                    .map(|i| (i as f32).mul_add(0.001, seed))
-                    .collect()
+                (0..DIM).map(|i| (i as f32).mul_add(0.001, seed)).collect()
             })
             .collect()
     }
 }
 
 async fn make_pipeline(corpus_root: &Path) -> (Pipeline, Arc<CountingEmbedder>) {
-    let store = Arc::new(
-        CorpusStore::open_or_create(corpus_root, DIM)
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(CorpusStore::open_or_create(corpus_root, DIM).await.unwrap());
     let ingest = Arc::new(IngestDb::open(corpus_root).unwrap());
     let counter = Arc::new(CountingEmbedder::new());
     let emb: Arc<dyn ChunkEmbedder> = counter.clone();
@@ -64,7 +58,10 @@ async fn make_pipeline(corpus_root: &Path) -> (Pipeline, Arc<CountingEmbedder>) 
 fn make_cfg(fixtures_dir: &Path, facets_override: &[(&str, &[&str])]) -> SourceConfig {
     let mut overrides = std::collections::BTreeMap::new();
     for (k, vs) in facets_override {
-        overrides.insert((*k).to_string(), vs.iter().map(|v| (*v).to_string()).collect());
+        overrides.insert(
+            (*k).to_string(),
+            vs.iter().map(|v| (*v).to_string()).collect(),
+        );
     }
     let mut cfg = Config {
         corpus: ostk_recall_core::CorpusConfig {
@@ -129,11 +126,7 @@ async fn changing_allowlisted_facet_forces_reembed() {
 async fn changing_non_allowlisted_facet_skips_reembed() {
     let fixtures = TempDir::new().unwrap();
     let corpus = TempDir::new().unwrap();
-    std::fs::write(
-        fixtures.path().join("a.md"),
-        "# Alpha\n\nbody text\n",
-    )
-    .unwrap();
+    std::fs::write(fixtures.path().join("a.md"), "# Alpha\n\nbody text\n").unwrap();
 
     let scanner = ostk_recall_scan::markdown::MarkdownScanner;
 
@@ -145,11 +138,7 @@ async fn changing_non_allowlisted_facet_skips_reembed() {
 
     // Force a fresh metadata read by bumping mtime so Tier-1 doesn't
     // short-circuit on (mtime, size) match.
-    std::fs::write(
-        fixtures.path().join("a.md"),
-        "# Alpha\n\nbody text\n",
-    )
-    .unwrap();
+    std::fs::write(fixtures.path().join("a.md"), "# Alpha\n\nbody text\n").unwrap();
     // Run 2: change session_id (NOT in allowlist).
     let (pipeline2, counter2) = make_pipeline(corpus.path()).await;
     let cfg2 = make_cfg(fixtures.path(), &[("session_id", &["session-2"])]);

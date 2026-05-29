@@ -134,7 +134,12 @@ impl Scanner for FileGlobScanner {
                     item.source_id
                 ))
             })?;
-            let chunk_id = Chunk::make_id(Source::FileGlob, &item.source_id, chunk_index, &item.source_config_id);
+            let chunk_id = Chunk::make_id(
+                Source::FileGlob,
+                &item.source_id,
+                chunk_index,
+                &item.source_config_id,
+            );
             let sha256 = Chunk::content_hash(&seg);
             let links = Links {
                 file_path: Some(abs_path.clone()),
@@ -314,7 +319,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     #[test]
     fn split_basic_paragraphs() {

@@ -264,9 +264,15 @@ async fn cross_project_scope_isolation_via_mcp() {
         .collect();
 
     assert!(a_handles.contains("alpha-thread"));
-    assert!(!a_handles.contains("beta-thread"), "alpha must not see beta");
+    assert!(
+        !a_handles.contains("beta-thread"),
+        "alpha must not see beta"
+    );
     assert!(b_handles.contains("beta-thread"));
-    assert!(!b_handles.contains("alpha-thread"), "beta must not see alpha");
+    assert!(
+        !b_handles.contains("alpha-thread"),
+        "beta must not see alpha"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -494,8 +500,14 @@ async fn curator_active_to_slack_transition() {
         .attend(&scope, "stepwise-thread context")
         .await
         .unwrap();
-    let h = install_at_score(&attention, &threads, &scope, "step-active", TensionState::Active)
-        .await;
+    let h = install_at_score(
+        &attention,
+        &threads,
+        &scope,
+        "step-active",
+        TensionState::Active,
+    )
+    .await;
 
     // Pin thresholds: active above score, slack below. Score lives in
     // the (slack, active) band → Active should fall to Slack.
@@ -527,17 +539,15 @@ async fn curator_active_to_slack_transition() {
         .snapshot()
         .into_iter()
         .filter_map(|e| match e {
-            ChainEvent::TensionTransition { handle, from, to, .. } => Some((handle, from, to)),
+            ChainEvent::TensionTransition {
+                handle, from, to, ..
+            } => Some((handle, from, to)),
             _ => None,
         })
         .collect();
-    assert!(
-        transitions
-            .iter()
-            .any(|(hh, from, to)| hh == &h
-                && *from == TensionState::Active
-                && *to == TensionState::Slack)
-    );
+    assert!(transitions.iter().any(|(hh, from, to)| hh == &h
+        && *from == TensionState::Active
+        && *to == TensionState::Slack));
 }
 
 #[tokio::test]
@@ -552,8 +562,14 @@ async fn curator_slack_to_dormant_transition() {
         .attend(&scope, "stepwise-thread context")
         .await
         .unwrap();
-    let h = install_at_score(&attention, &threads, &scope, "step-slack", TensionState::Slack)
-        .await;
+    let h = install_at_score(
+        &attention,
+        &threads,
+        &scope,
+        "step-slack",
+        TensionState::Slack,
+    )
+    .await;
 
     // Tighter thresholds: score below archive → Slack should fall to
     // Dormant.
@@ -778,8 +794,12 @@ async fn autoweaver_links_resonant_ingest_and_skips_non_resonant() {
             let mut links = 0usize;
             for (cid, cvec) in &new {
                 for t in &rows {
-                    let Some(aid) = &t.anchor_chunk_id else { continue };
-                    let Some(avec) = anchors.get(aid) else { continue };
+                    let Some(aid) = &t.anchor_chunk_id else {
+                        continue;
+                    };
+                    let Some(avec) = anchors.get(aid) else {
+                        continue;
+                    };
                     let sim = ostk_recall_attention::cosine_similarity(cvec, avec);
                     if sim < threshold {
                         continue;
@@ -845,9 +865,7 @@ async fn autoweaver_links_resonant_ingest_and_skips_non_resonant() {
         1,
         "merge must NOT create a new thread — only the operator-seeded one persists"
     );
-    let evidence = threads
-        .list_evidence(&handle("anchored-thread"))
-        .unwrap();
+    let evidence = threads.list_evidence(&handle("anchored-thread")).unwrap();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].association_type, AssociationType::Derived);
     assert!(evidence[0].similarity.unwrap() > 0.99);
@@ -892,9 +910,7 @@ async fn autoweaver_links_resonant_ingest_and_skips_non_resonant() {
     // Final ledger shape: still exactly one thread; only the merge arm
     // wrote evidence.
     assert_eq!(threads.list_threads(None).unwrap().len(), 1);
-    let evidence = threads
-        .list_evidence(&handle("anchored-thread"))
-        .unwrap();
+    let evidence = threads.list_evidence(&handle("anchored-thread")).unwrap();
     assert_eq!(
         evidence.len(),
         1,

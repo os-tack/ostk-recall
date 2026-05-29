@@ -48,8 +48,7 @@ pub const MEMORY_LENS_NAME: &str = "ostk-recall memory lens";
 /// `ostk-recall lens show` dump the current lens without spawning
 /// an MCP client.
 pub const LENS_MARKDOWN_FILE: &str = "lens.md";
-pub const MEMORY_LENS_DESCRIPTION: &str =
-    "Ambient memory lens — automatically surfaces chunks aligned with current attention. \
+pub const MEMORY_LENS_DESCRIPTION: &str = "Ambient memory lens — automatically surfaces chunks aligned with current attention. \
      Re-rendered when attention drifts or the pinned focus changes. \
      Resource content is markdown; subscribe for `notifications/resources/updated` to be \
      told when to re-read.";
@@ -118,7 +117,11 @@ impl Resource for MemoryLensResource {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
         };
-        Ok(ResourceContent::text(MEMORY_LENS_URI, self.mime_type(), body))
+        Ok(ResourceContent::text(
+            MEMORY_LENS_URI,
+            self.mime_type(),
+            body,
+        ))
     }
 }
 
@@ -318,8 +321,11 @@ pub async fn snapshot_attention(
 ) -> LensTickSnapshot {
     let scope_vector = attention.scope_vector(scope).await.ok().flatten();
     let rolling_vec = attention.rolling_vec(scope).await.ok().flatten();
-    let pin_fingerprint =
-        compute_pin_fingerprint_from_vectors(scope_vector.as_deref(), rolling_vec.as_deref(), scope);
+    let pin_fingerprint = compute_pin_fingerprint_from_vectors(
+        scope_vector.as_deref(),
+        rolling_vec.as_deref(),
+        scope,
+    );
     LensTickSnapshot {
         rolling_vec,
         scope_vector,
@@ -517,7 +523,10 @@ mod tests {
     #[test]
     fn cosine_distance_dim_mismatch_returns_two() {
         let d = cosine_distance(&[1.0, 0.0], &[1.0, 0.0, 0.0]);
-        assert!((d - 2.0).abs() < 1e-6, "dim mismatch must not look like no-drift");
+        assert!(
+            (d - 2.0).abs() < 1e-6,
+            "dim mismatch must not look like no-drift"
+        );
     }
 
     #[test]
@@ -543,7 +552,10 @@ mod tests {
         let s = scope();
         let pin = vec![1.0, 0.0, 0.0];
         let fp = compute_pin_fingerprint_from_vectors(Some(&pin), None, &s);
-        assert!(fp.is_some(), "scope_vector with no rolling = pin freshly placed");
+        assert!(
+            fp.is_some(),
+            "scope_vector with no rolling = pin freshly placed"
+        );
     }
 
     #[test]
@@ -563,9 +575,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let corpus = rt.block_on(async {
-            CorpusStore::open_or_create(tmp.path(), 8).await.unwrap()
-        });
+        let corpus =
+            rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 8).await.unwrap() });
         let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
         assert!(matches!(d, LensRefreshDecision::EmptyMind));
     }
@@ -612,11 +623,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let corpus = rt.block_on(async {
-            CorpusStore::open_or_create(tmp.path(), 3).await.unwrap()
-        });
+        let corpus =
+            rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
         let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
-        assert!(matches!(d, LensRefreshDecision::Refresh { .. }), "got {d:?}");
+        assert!(
+            matches!(d, LensRefreshDecision::Refresh { .. }),
+            "got {d:?}"
+        );
     }
 
     #[test]
@@ -670,7 +683,10 @@ mod tests {
         let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
         // Empty corpus → empty lens → Refresh (UnchangedContent
         // requires a prior fingerprint that matches).
-        assert!(matches!(d, LensRefreshDecision::Refresh { .. }), "got {d:?}");
+        assert!(
+            matches!(d, LensRefreshDecision::Refresh { .. }),
+            "got {d:?}"
+        );
     }
 
     // ---- apply_decision side-effects ----
@@ -737,7 +753,14 @@ mod tests {
                 ..LensState::default()
             },
         };
-        apply_decision(decision, &mut state, &resource, &registry, &sink, tmp.path());
+        apply_decision(
+            decision,
+            &mut state,
+            &resource,
+            &registry,
+            &sink,
+            tmp.path(),
+        );
 
         // 1. Resource body updated.
         assert_eq!(resource.snapshot(), "rendered body");

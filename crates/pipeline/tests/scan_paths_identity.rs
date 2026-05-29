@@ -25,20 +25,14 @@ impl ChunkEmbedder for FakeEmbedder {
             .iter()
             .map(|t| {
                 let seed = ((t.len() % 100) as f32) * 0.01;
-                (0..DIM)
-                    .map(|i| (i as f32).mul_add(0.001, seed))
-                    .collect()
+                (0..DIM).map(|i| (i as f32).mul_add(0.001, seed)).collect()
             })
             .collect()
     }
 }
 
 async fn make_pipeline(corpus_root: &Path) -> Pipeline {
-    let store = Arc::new(
-        CorpusStore::open_or_create(corpus_root, DIM)
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(CorpusStore::open_or_create(corpus_root, DIM).await.unwrap());
     let ingest = Arc::new(IngestDb::open(corpus_root).unwrap());
     let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
     Pipeline::new(store, ingest, emb)
@@ -110,8 +104,10 @@ async fn scan_paths_preserves_chunk_id_across_edit() {
     // Re-embed should happen (content changed); same number of chunks
     // because the file structure is similar. chunks_upserted > 0 confirms
     // the merge_insert path ran.
-    assert!(s2.chunks_upserted > 0 || s2.chunks_skipped_dup == upserted_initial,
-        "either re-embedded or detected unchanged: {s2:?}");
+    assert!(
+        s2.chunks_upserted > 0 || s2.chunks_skipped_dup == upserted_initial,
+        "either re-embedded or detected unchanged: {s2:?}"
+    );
 
     // The corpus total should equal the initial upsert (merge_insert on
     // same chunk_ids leaves the row count unchanged).

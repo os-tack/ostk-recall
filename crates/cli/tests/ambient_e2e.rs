@@ -80,8 +80,7 @@ async fn ambient_pickup_advances_familiarity_and_writes_evidence() {
     // Mention fixture: contains the known handle as a kebab-case token,
     // surrounded by non-handle characters so the observer's word-boundary
     // check fires.
-    let mention_body =
-        "We keep circling three-time-scales as the same shape under three names.\n";
+    let mention_body = "We keep circling three-time-scales as the same shape under three names.\n";
 
     std::fs::write(fixture.path().join("resonant.md"), resonant_body).unwrap();
     std::fs::write(fixture.path().join("mention.md"), mention_body).unwrap();

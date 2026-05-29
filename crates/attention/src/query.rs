@@ -58,8 +58,10 @@ use crate::activity::{
 };
 use crate::cluster::{EMERGENT_THRESHOLD, MIN_NEIGHBOURS_IN_CLUSTER, mean_pairwise_cosine};
 use crate::cosine_similarity;
-use crate::emergent::{DEFAULT_MIN_CLUSTER_SIZE as EMERGENT_DEFAULT_MIN_CLUSTER, EmergentError,
-    EmergentReport, discover_and_surface};
+use crate::emergent::{
+    DEFAULT_MIN_CLUSTER_SIZE as EMERGENT_DEFAULT_MIN_CLUSTER, EmergentError, EmergentReport,
+    discover_and_surface,
+};
 use crate::novelty::{
     DEFAULT_BASELINE_DAYS, DEFAULT_MIN_CLUSTER as NOVELTY_DEFAULT_MIN_CLUSTER, NoveltyError,
     NoveltyReport, surface_novelty,
@@ -172,12 +174,7 @@ impl CompositeWeights {
     /// Used by `attention-mcp::handlers::thread_query` when the
     /// request carries `composite_weights.resonance`.
     #[must_use]
-    pub fn new_with_resonance(
-        density: f32,
-        activity: f32,
-        novelty: f32,
-        resonance: f32,
-    ) -> Self {
+    pub fn new_with_resonance(density: f32, activity: f32, novelty: f32, resonance: f32) -> Self {
         let safe = |w: f32| if w.is_finite() && w >= 0.0 { w } else { 0.0 };
         let w = Self {
             density: safe(density),
@@ -415,15 +412,9 @@ pub async fn run_query(
     backfill_cross_axis(corpus, &mut rows, since, &params).await?;
 
     rows.retain(|r| {
-        let d_ok = r
-            .density_score
-            .map_or(true, |s| s >= params.min_density);
-        let a_ok = r
-            .activity_score
-            .map_or(true, |s| s >= params.min_activity);
-        let n_ok = r
-            .novelty_score
-            .map_or(true, |s| s >= params.min_novelty);
+        let d_ok = r.density_score.map_or(true, |s| s >= params.min_density);
+        let a_ok = r.activity_score.map_or(true, |s| s >= params.min_activity);
+        let n_ok = r.novelty_score.map_or(true, |s| s >= params.min_novelty);
         let res_ok = r
             .resonance_score
             .map_or(true, |s| s >= params.min_resonance);
@@ -466,8 +457,8 @@ async fn backfill_cross_axis(
     // that already have all enabled axes populated (no work to do).
     // Resonance always triggers a fetch when enabled + a focus vec is
     // present, since no surfacing primitive supplies it.
-    let resonance_active = params.signals.contains(&Axis::Resonance)
-        && params.resonance_focus_vec.is_some();
+    let resonance_active =
+        params.signals.contains(&Axis::Resonance) && params.resonance_focus_vec.is_some();
     let mut all_ids: Vec<String> = Vec::new();
     for r in rows.iter() {
         let needs_any = (params.signals.contains(&Axis::Density) && r.density_score.is_none())
@@ -492,7 +483,12 @@ async fn backfill_cross_axis(
     // None fallback for clusters whose project is the empty string.
     let mut baselines: HashMap<Option<String>, Option<Vec<f32>>> = HashMap::new();
     if params.signals.contains(&Axis::Novelty) {
-        baselines.insert(None, corpus.project_baseline_mean(None, params.baseline_days).await?);
+        baselines.insert(
+            None,
+            corpus
+                .project_baseline_mean(None, params.baseline_days)
+                .await?,
+        );
         let mut projects: Vec<String> = rows
             .iter()
             .filter(|r| !r.project.is_empty())
@@ -501,7 +497,9 @@ async fn backfill_cross_axis(
         projects.sort();
         projects.dedup();
         for p in projects {
-            let b = corpus.project_baseline_mean(Some(&p), params.baseline_days).await?;
+            let b = corpus
+                .project_baseline_mean(Some(&p), params.baseline_days)
+                .await?;
             baselines.insert(Some(p), b);
         }
     }
@@ -589,10 +587,7 @@ async fn backfill_cross_axis(
 /// Mean vector over the embeddings present in `embeddings` for the
 /// given chunk_ids. Returns `None` when no chunk_id resolves —
 /// callers treat that as "centroid undefined, skip the axis."
-fn mean_vec(
-    chunk_ids: &[String],
-    embeddings: &HashMap<String, Vec<f32>>,
-) -> Option<Vec<f32>> {
+fn mean_vec(chunk_ids: &[String], embeddings: &HashMap<String, Vec<f32>>) -> Option<Vec<f32>> {
     let mut sum: Option<Vec<f32>> = None;
     let mut n: u32 = 0;
     for id in chunk_ids {
@@ -778,7 +773,11 @@ mod tests {
     #[test]
     fn composite_weights_reject_negative_and_zero_sum() {
         let w = CompositeWeights::new(-1.0, 0.0, 0.0);
-        assert_eq!(w, CompositeWeights::default(), "all-zero falls back to uniform");
+        assert_eq!(
+            w,
+            CompositeWeights::default(),
+            "all-zero falls back to uniform"
+        );
         let w2 = CompositeWeights::new(2.0, 1.0, 1.0);
         assert!((w2.density - 2.0).abs() < 1e-6);
         assert!((w2.activity - 1.0).abs() < 1e-6);
@@ -795,10 +794,7 @@ mod tests {
     #[test]
     fn rank_by_parse() {
         assert_eq!(RankBy::parse("composite"), Some(RankBy::Composite));
-        assert_eq!(
-            RankBy::parse("density"),
-            Some(RankBy::Axis(Axis::Density))
-        );
+        assert_eq!(RankBy::parse("density"), Some(RankBy::Axis(Axis::Density)));
         assert_eq!(RankBy::parse("nope"), None);
     }
 

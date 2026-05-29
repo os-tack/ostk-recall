@@ -274,7 +274,14 @@ impl Scanner for OstkProjectScanner {
             let project = item
                 .project
                 .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()));
-            return self.parse_routed(sub, &root, &file, project.as_deref(), &item.source_config_id, &item.ignore);
+            return self.parse_routed(
+                sub,
+                &root,
+                &file,
+                project.as_deref(),
+                &item.source_config_id,
+                &item.ignore,
+            );
         }
 
         // Legacy `discover` flow: SourceItem.path is the project root,
@@ -290,9 +297,17 @@ impl Scanner for OstkProjectScanner {
         let mut out: Vec<Chunk> = Vec::new();
 
         // 1. decisions
-        out.extend(scan_decisions(&root, project.as_deref(), &item.source_config_id)?);
+        out.extend(scan_decisions(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+        )?);
         // 2. needles
-        out.extend(scan_needles(&root, project.as_deref(), &item.source_config_id)?);
+        out.extend(scan_needles(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+        )?);
         // 3. audit (firehose → events.duckdb, significant → chunks)
         out.extend(scan_audit(
             &root,
@@ -301,15 +316,37 @@ impl Scanner for OstkProjectScanner {
             self.events.as_deref(),
         )?);
         // 4. conversations
-        out.extend(scan_conversations(&root, project.as_deref(), &item.source_config_id)?);
+        out.extend(scan_conversations(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+        )?);
         // 5. sessions
-        out.extend(scan_sessions(&root, project.as_deref(), &item.source_config_id)?);
+        out.extend(scan_sessions(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+        )?);
         // 6. memory pages
-        out.extend(scan_memory(&root, project.as_deref(), &item.source_config_id)?);
+        out.extend(scan_memory(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+        )?);
         // 7. spec + draft markdown — honors per-source ignore patterns
-        out.extend(scan_specs(&root, project.as_deref(), &item.source_config_id, &ignore_patterns));
+        out.extend(scan_specs(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+            &ignore_patterns,
+        ));
         // 8. source code — honors per-source ignore patterns
-        out.extend(scan_code(&root, project.as_deref(), &item.source_config_id, &ignore_patterns));
+        out.extend(scan_code(
+            &root,
+            project.as_deref(),
+            &item.source_config_id,
+            &ignore_patterns,
+        ));
 
         Ok(out)
     }
@@ -339,7 +376,13 @@ impl OstkProjectScanner {
             SubArea::Conversations => scan_one_conversation(file, project, source_config_id),
             SubArea::Sessions => scan_one_session(file, project, source_config_id),
             SubArea::Spec => Ok(scan_one_spec(root, file, project, source_config_id)),
-            SubArea::Code => Ok(scan_one_code(root, file, project, source_config_id, ignore_patterns)),
+            SubArea::Code => Ok(scan_one_code(
+                root,
+                file,
+                project,
+                source_config_id,
+                ignore_patterns,
+            )),
         }
     }
 }
@@ -366,7 +409,11 @@ struct DecisionRow {
     timestamp: Option<DateTime<Utc>>,
 }
 
-fn scan_decisions(root: &Path, project: Option<&str>, source_config_id: &str) -> Result<Vec<Chunk>> {
+fn scan_decisions(
+    root: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+) -> Result<Vec<Chunk>> {
     let file = root.join(".ostk/decisions.jsonl");
     if !file.exists() {
         return Ok(Vec::new());
@@ -406,7 +453,12 @@ fn scan_decisions(root: &Path, project: Option<&str>, source_config_id: &str) ->
             parts.push(reason.to_string());
         }
         let body = parts.join("\n\n");
-        let chunk_id = Chunk::make_id(Source::OstkDecision, &dec.key, chunk_index, source_config_id);
+        let chunk_id = Chunk::make_id(
+            Source::OstkDecision,
+            &dec.key,
+            chunk_index,
+            source_config_id,
+        );
         let sha256 = Chunk::content_hash(&body);
         let links = Links {
             file_path: Some(abs.clone()),
@@ -488,7 +540,12 @@ fn scan_needles(root: &Path, project: Option<&str>, source_config_id: &str) -> R
         let desc = needle.description.clone().unwrap_or_default();
         let ac = needle.ac.as_ref().map(value_to_string).unwrap_or_default();
         let body = format!("{title}\n\n{desc}\n\n{ac}");
-        let chunk_id = Chunk::make_id(Source::OstkNeedle, &needle.id, chunk_index, source_config_id);
+        let chunk_id = Chunk::make_id(
+            Source::OstkNeedle,
+            &needle.id,
+            chunk_index,
+            source_config_id,
+        );
         let sha256 = Chunk::content_hash(&body);
         let links = Links {
             file_path: Some(abs.clone()),
@@ -517,7 +574,12 @@ fn scan_needles(root: &Path, project: Option<&str>, source_config_id: &str) -> R
 
 // ───────────────────────────────── audit ────────────────────────────────
 
-fn scan_audit(root: &Path, project: Option<&str>, source_config_id: &str, events: Option<&EventsDb>) -> Result<Vec<Chunk>> {
+fn scan_audit(
+    root: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+    events: Option<&EventsDb>,
+) -> Result<Vec<Chunk>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
@@ -571,8 +633,14 @@ fn scan_audit(root: &Path, project: Option<&str>, source_config_id: &str, events
         let row = build_audit_row(&value, project, prev_hash);
 
         if is_significant(&value) {
-            let chunk =
-                build_significant_chunk(&value, project, source_config_id, row.row_key.clone(), &abs, chunk_index);
+            let chunk = build_significant_chunk(
+                &value,
+                project,
+                source_config_id,
+                row.row_key.clone(),
+                &abs,
+                chunk_index,
+            );
             chunks.push(chunk);
             chunk_index = chunk_index.saturating_add(1);
         }
@@ -698,7 +766,12 @@ fn build_significant_chunk(
     let summary =
         format!("On {ts_str}, agent {agent} emitted {event} (tool={tool}) which {outcome}");
 
-    let chunk_id = Chunk::make_id(Source::OstkAuditSignificant, &row_key, chunk_index, source_config_id);
+    let chunk_id = Chunk::make_id(
+        Source::OstkAuditSignificant,
+        &row_key,
+        chunk_index,
+        source_config_id,
+    );
     let sha256 = Chunk::content_hash(&summary);
     let links = Links {
         file_path: Some(abs_path.to_string()),
@@ -748,7 +821,11 @@ struct ConversationRow {
     msg: Option<String>,
 }
 
-fn scan_conversations(root: &Path, project: Option<&str>, source_config_id: &str) -> Result<Vec<Chunk>> {
+fn scan_conversations(
+    root: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+) -> Result<Vec<Chunk>> {
     let dir = root.join(".ostk/conversations");
     if !dir.exists() {
         return Ok(Vec::new());
@@ -790,7 +867,12 @@ fn scan_conversations(root: &Path, project: Option<&str>, source_config_id: &str
                 "{stem}:{}",
                 row.turn.unwrap_or_else(|| u64::from(chunk_index))
             );
-            let chunk_id = Chunk::make_id(Source::OstkConversation, &source_id, chunk_index, source_config_id);
+            let chunk_id = Chunk::make_id(
+                Source::OstkConversation,
+                &source_id,
+                chunk_index,
+                source_config_id,
+            );
             let sha256 = Chunk::content_hash(&body);
             let links = Links {
                 file_path: Some(abs.clone()),
@@ -820,7 +902,11 @@ fn scan_conversations(root: &Path, project: Option<&str>, source_config_id: &str
 
 /// Single-file path-routed variant of `scan_conversations`. Parses
 /// exactly the requested `.jsonl` file; identical chunking shape.
-fn scan_one_conversation(path: &Path, project: Option<&str>, source_config_id: &str) -> Result<Vec<Chunk>> {
+fn scan_one_conversation(
+    path: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+) -> Result<Vec<Chunk>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -854,7 +940,12 @@ fn scan_one_conversation(path: &Path, project: Option<&str>, source_config_id: &
             "{stem}:{}",
             row.turn.unwrap_or_else(|| u64::from(chunk_index))
         );
-        let chunk_id = Chunk::make_id(Source::OstkConversation, &source_id, chunk_index, source_config_id);
+        let chunk_id = Chunk::make_id(
+            Source::OstkConversation,
+            &source_id,
+            chunk_index,
+            source_config_id,
+        );
         let sha256 = Chunk::content_hash(&body);
         let links = Links {
             file_path: Some(abs.clone()),
@@ -901,9 +992,17 @@ fn scan_sessions(root: &Path, project: Option<&str>, source_config_id: &str) -> 
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mtime = file_mtime_utc(path).ok();
-        let session_chunks =
-            parse_session_file(path, Source::OstkSession, &source_id, project, source_config_id, mtime)?;
-        chunks.extend(drop_local_command_wrappers(drop_tool_blocks(session_chunks)));
+        let session_chunks = parse_session_file(
+            path,
+            Source::OstkSession,
+            &source_id,
+            project,
+            source_config_id,
+            mtime,
+        )?;
+        chunks.extend(drop_local_command_wrappers(drop_tool_blocks(
+            session_chunks,
+        )));
     }
     Ok(chunks)
 }
@@ -911,7 +1010,11 @@ fn scan_sessions(root: &Path, project: Option<&str>, source_config_id: &str) -> 
 /// Single-file path-routed variant of `scan_sessions`. Parses exactly
 /// the requested `.jsonl` session file via the shared anthropic-session
 /// chunker; identical output shape.
-fn scan_one_session(path: &Path, project: Option<&str>, source_config_id: &str) -> Result<Vec<Chunk>> {
+fn scan_one_session(
+    path: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+) -> Result<Vec<Chunk>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -920,9 +1023,16 @@ fn scan_one_session(path: &Path, project: Option<&str>, source_config_id: &str) 
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mtime = file_mtime_utc(path).ok();
-    parse_session_file(path, Source::OstkSession, &source_id, project, source_config_id, mtime)
-        .map(drop_tool_blocks)
-        .map(drop_local_command_wrappers)
+    parse_session_file(
+        path,
+        Source::OstkSession,
+        &source_id,
+        project,
+        source_config_id,
+        mtime,
+    )
+    .map(drop_tool_blocks)
+    .map(drop_local_command_wrappers)
 }
 
 // ──────────────────────────────── memory ────────────────────────────────
@@ -981,7 +1091,12 @@ fn scan_memory(root: &Path, project: Option<&str>, source_config_id: &str) -> Re
         if body.trim().is_empty() {
             continue;
         }
-        let chunk_id = Chunk::make_id(Source::OstkMemory, &page.name, chunk_index, source_config_id);
+        let chunk_id = Chunk::make_id(
+            Source::OstkMemory,
+            &page.name,
+            chunk_index,
+            source_config_id,
+        );
         let sha256 = Chunk::content_hash(&body);
         let links = Links {
             file_path: Some(abs_index.clone()),
@@ -1010,7 +1125,12 @@ fn scan_memory(root: &Path, project: Option<&str>, source_config_id: &str) -> Re
 
 // ─────────────────────────────── specs ──────────────────────────────────
 
-fn scan_specs(root: &Path, project: Option<&str>, source_config_id: &str, ignore_patterns: &[String]) -> Vec<Chunk> {
+fn scan_specs(
+    root: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+    ignore_patterns: &[String],
+) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_index: u32 = 0;
     for subdir in ["docs/spec", "docs/draft"] {
@@ -1039,7 +1159,8 @@ fn scan_specs(root: &Path, project: Option<&str>, source_config_id: &str, ignore
             let mtime = file_mtime_utc(path).ok();
             let abs = absolute(path);
             for seg in split_markdown(&text) {
-                let chunk_id = Chunk::make_id(Source::OstkSpec, &source_id, chunk_index, source_config_id);
+                let chunk_id =
+                    Chunk::make_id(Source::OstkSpec, &source_id, chunk_index, source_config_id);
                 let sha256 = Chunk::content_hash(&seg);
                 let links = Links {
                     file_path: Some(abs.clone()),
@@ -1071,7 +1192,12 @@ fn scan_specs(root: &Path, project: Option<&str>, source_config_id: &str, ignore
 /// Single-file path-routed variant of `scan_specs`. Parses exactly the
 /// requested `.md` file under `docs/spec` or `docs/draft`; identical
 /// chunking shape.
-fn scan_one_spec(root: &Path, path: &Path, project: Option<&str>, source_config_id: &str) -> Vec<Chunk> {
+fn scan_one_spec(
+    root: &Path,
+    path: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+) -> Vec<Chunk> {
     if !path.is_file() {
         return Vec::new();
     }
@@ -1120,7 +1246,12 @@ fn scan_one_spec(root: &Path, path: &Path, project: Option<&str>, source_config_
 
 // ──────────────────────────────── code ──────────────────────────────────
 
-fn scan_code(root: &Path, project: Option<&str>, source_config_id: &str, ignore_patterns: &[String]) -> Vec<Chunk> {
+fn scan_code(
+    root: &Path,
+    project: Option<&str>,
+    source_config_id: &str,
+    ignore_patterns: &[String],
+) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_index: u32 = 0;
     for subdir in ["src", "crates", "lib"] {
@@ -1177,7 +1308,8 @@ fn scan_code(root: &Path, project: Option<&str>, source_config_id: &str, ignore_
                     // monotonic counter stays consistent across files.
                     for mut c in rust_chunks {
                         c.chunk_index = chunk_index;
-                        c.chunk_id = Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
+                        c.chunk_id =
+                            Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
                         chunks.push(c);
                         chunk_index = chunk_index.saturating_add(1);
                     }
@@ -1188,7 +1320,8 @@ fn scan_code(root: &Path, project: Option<&str>, source_config_id: &str, ignore_
             for window in
                 walk_and_window(&text, crate::code::WINDOW_LINES, crate::code::OVERLAP_LINES)
             {
-                let chunk_id = Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
+                let chunk_id =
+                    Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
                 let sha256 = Chunk::content_hash(&window);
                 let links = Links {
                     file_path: Some(abs.clone()),
@@ -1252,21 +1385,20 @@ fn scan_one_code(
         .and_then(|x| x.to_str())
         .is_some_and(|x| x.eq_ignore_ascii_case("rs"));
     if is_rust {
-        if let Some(rust_chunks) =
-            fcp_rust::chunk_rust_file(
-                path,
-                &text,
-                Source::Code,
-                &source_id,
-                project,
-                source_config_id,
-                mtime,
-                &abs,
-            )
-        {
+        if let Some(rust_chunks) = fcp_rust::chunk_rust_file(
+            path,
+            &text,
+            Source::Code,
+            &source_id,
+            project,
+            source_config_id,
+            mtime,
+            &abs,
+        ) {
             for mut c in rust_chunks {
                 c.chunk_index = chunk_index;
-                c.chunk_id = Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
+                c.chunk_id =
+                    Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
                 chunks.push(c);
                 chunk_index = chunk_index.saturating_add(1);
             }
@@ -1437,7 +1569,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     #[test]
     fn ostk_project_expands_into_all_subsystems() {

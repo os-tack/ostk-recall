@@ -83,8 +83,8 @@ pub const SAMPLE_LIMIT: usize = 5;
 /// or no qualifying clusters — those are valid "nothing to surface"
 /// outcomes, not errors.
 #[allow(clippy::too_many_arguments)] // v0.3.1: discipline rule says expose constants
-                                     // as args; the v0.4.0 `thread_query` work absorbs
-                                     // this surface into a single multi-axis verb.
+// as args; the v0.4.0 `thread_query` work absorbs
+// this surface into a single multi-axis verb.
 pub async fn discover_and_surface(
     corpus: &Arc<CorpusStore>,
     threads: &Arc<ThreadsDb>,
@@ -99,8 +99,12 @@ pub async fn discover_and_surface(
     if sample.is_empty() {
         return Ok(Vec::new());
     }
-    let clusters: Vec<EmergentCluster> =
-        find_clusters_with(&sample, threshold, min_cluster_size, min_in_cluster_neighbours);
+    let clusters: Vec<EmergentCluster> = find_clusters_with(
+        &sample,
+        threshold,
+        min_cluster_size,
+        min_in_cluster_neighbours,
+    );
     if clusters.is_empty() {
         return Ok(Vec::new());
     }

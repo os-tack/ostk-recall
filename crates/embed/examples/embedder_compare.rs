@@ -111,7 +111,11 @@ fn run_model2vec() -> BenchResult {
         query_texts.push(q1);
         query_texts.push(q2);
     }
-    let all: Vec<&str> = anchor_texts.iter().chain(query_texts.iter()).copied().collect();
+    let all: Vec<&str> = anchor_texts
+        .iter()
+        .chain(query_texts.iter())
+        .copied()
+        .collect();
 
     let t = Instant::now();
     let vecs = emb.encode_batch(&all);
@@ -146,7 +150,11 @@ fn run_fastembed(name: &str, model: EmbeddingModel) -> Option<BenchResult> {
         query_texts.push(q1.to_string());
         query_texts.push(q2.to_string());
     }
-    let all: Vec<String> = anchor_texts.iter().chain(query_texts.iter()).cloned().collect();
+    let all: Vec<String> = anchor_texts
+        .iter()
+        .chain(query_texts.iter())
+        .cloned()
+        .collect();
 
     let t = Instant::now();
     let vecs = emb.embed(all, None).expect("encode");
@@ -190,7 +198,10 @@ fn main() {
 
     let mut results = Vec::new();
     results.push(run_model2vec());
-    if let Some(r) = run_fastembed("fastembed / BGE-small-en-v1.5", EmbeddingModel::BGESmallENV15) {
+    if let Some(r) = run_fastembed(
+        "fastembed / BGE-small-en-v1.5",
+        EmbeddingModel::BGESmallENV15,
+    ) {
         results.push(r);
     }
     if let Some(r) = run_fastembed("fastembed / MiniLM-L6-v2", EmbeddingModel::AllMiniLML6V2) {

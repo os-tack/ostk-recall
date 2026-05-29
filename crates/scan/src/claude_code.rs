@@ -135,7 +135,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     #[test]
     fn project_derivation() {
@@ -232,7 +232,9 @@ mod tests {
         assert!(all_chunks.iter().any(|c| c.text == "start"));
         assert!(all_chunks.iter().any(|c| c.text == "end"));
         assert!(
-            all_chunks.iter().any(|c| c.project.as_deref() == Some("foo")),
+            all_chunks
+                .iter()
+                .any(|c| c.project.as_deref() == Some("foo")),
             "project carried through"
         );
     }

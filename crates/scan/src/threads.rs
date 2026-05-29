@@ -374,7 +374,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     fn write_thread(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);

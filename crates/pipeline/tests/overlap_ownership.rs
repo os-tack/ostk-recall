@@ -29,20 +29,14 @@ impl ChunkEmbedder for FakeEmbedder {
             .iter()
             .map(|t| {
                 let seed = ((t.len() % 100) as f32) * 0.01;
-                (0..DIM)
-                    .map(|i| (i as f32).mul_add(0.001, seed))
-                    .collect()
+                (0..DIM).map(|i| (i as f32).mul_add(0.001, seed)).collect()
             })
             .collect()
     }
 }
 
 async fn make_pipeline(corpus_root: &Path) -> Pipeline {
-    let store = Arc::new(
-        CorpusStore::open_or_create(corpus_root, DIM)
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(CorpusStore::open_or_create(corpus_root, DIM).await.unwrap());
     let ingest = Arc::new(IngestDb::open(corpus_root).unwrap());
     let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
     Pipeline::new(store, ingest, emb)

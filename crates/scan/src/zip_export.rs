@@ -158,7 +158,12 @@ impl Scanner for ZipExportScanner {
                     continue;
                 }
                 let source_id = format!("{zip_name}:{conv_uuid}:{}", msg.uuid);
-                let chunk_id = Chunk::make_id(Source::ZipExport, &source_id, chunk_index, &item.source_config_id);
+                let chunk_id = Chunk::make_id(
+                    Source::ZipExport,
+                    &source_id,
+                    chunk_index,
+                    &item.source_config_id,
+                );
                 let sha256 = Chunk::content_hash(&text);
                 let links = Links {
                     file_path: Some(abs_path.clone()),
@@ -332,7 +337,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     #[test]
     fn discover_matches_zip() {

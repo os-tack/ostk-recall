@@ -152,7 +152,8 @@ pub async fn build_lens(
     corpus: &CorpusStore,
     config: &LensConfig,
 ) -> Result<Lens> {
-    let candidates = ambient_candidates(corpus, attn_ctx, None, config.candidate_k_per_lane).await?;
+    let candidates =
+        ambient_candidates(corpus, attn_ctx, None, config.candidate_k_per_lane).await?;
 
     // P9b-min owns its own engine — there is exactly one feature in
     // play (attention_affinity) and no async prepare(). P9b-full
@@ -269,7 +270,10 @@ fn is_attention_dominant(h: &RankedHit, feature: &str, threshold: f32) -> bool {
 }
 
 fn attention_contribution(h: &RankedHit, feature: &str) -> f32 {
-    h.features.get(feature).map(|a| a.contribution).unwrap_or(0.0)
+    h.features
+        .get(feature)
+        .map(|a| a.contribution)
+        .unwrap_or(0.0)
 }
 
 // ---------------------------------------------------------------------
@@ -439,7 +443,10 @@ mod tests {
         let text = "alpha bravo charlie delta echo foxtrot";
         let excerpt = excerpt_centered_on_best_sentence(text, 3);
         assert!(excerpt.starts_with("alpha bravo charlie"));
-        assert!(excerpt.contains('…'), "truncated excerpts must include an ellipsis");
+        assert!(
+            excerpt.contains('…'),
+            "truncated excerpts must include an ellipsis"
+        );
     }
 
     #[test]
@@ -569,7 +576,10 @@ mod tests {
         // budget=300, min=200, two ~200-token chunks. First fits
         // (uses 200, leaves 100); second's floor (200) doesn't fit
         // → slot skipped. Result: one entry only.
-        let big_text: String = (0..200).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let big_text: String = (0..200)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let hits = vec![
             ranked_hit("c1", &big_text, 0.9),
             ranked_hit("c2", &big_text, 0.8),

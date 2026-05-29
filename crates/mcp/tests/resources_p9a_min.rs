@@ -345,16 +345,10 @@ impl AsyncWrite for ErrWriter {
         self.writes.fetch_add(1, Ordering::SeqCst);
         Poll::Ready(Err(std::io::Error::other("synthetic writer error")))
     }
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -530,7 +524,10 @@ async fn serve_eof_releases_registry_outbound_for_future_runs() {
     // Re-installing and emitting works (sanity).
     registry.set_outbound(tx);
     registry.emit_resource_updated("ostk://x");
-    let _ = rx.recv().await.expect("post-reinstall emit reaches channel");
+    let _ = rx
+        .recv()
+        .await
+        .expect("post-reinstall emit reaches channel");
 }
 
 #[tokio::test]

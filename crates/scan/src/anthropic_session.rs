@@ -430,8 +430,15 @@ mod tests {
         )
         .unwrap();
 
-        let chunks =
-            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", Some("proj"), "test-cfg", None).unwrap();
+        let chunks = parse_session_file(
+            &path,
+            Source::ClaudeCode,
+            "s.jsonl",
+            Some("proj"),
+            "test-cfg",
+            None,
+        )
+        .unwrap();
         assert_eq!(chunks.len(), 5, "expected 5 chunks, got {}", chunks.len());
 
         // Roles in order: user, assistant, tool, tool_result, assistant
@@ -491,7 +498,9 @@ mod tests {
             r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"first"}},{{"type":"tool_use","name":"x","input":{{}}}},{{"type":"text","text":"second"}}]}},"timestamp":"2026-04-17T10:00:00Z"}}"#
         )
         .unwrap();
-        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks =
+            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+                .unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].text, "first");
         assert_eq!(chunks[0].role.as_deref(), Some("assistant"));
@@ -519,7 +528,9 @@ mod tests {
             r#"{{"type":"user","message":{{"role":"user","content":"   "}},"timestamp":"2026-04-17T10:00:01Z"}}"#
         )
         .unwrap();
-        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks =
+            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+                .unwrap();
         assert_eq!(chunks.len(), 1, "expected only the non-empty text chunk");
         assert_eq!(chunks[0].text, "real");
     }
@@ -550,7 +561,15 @@ mod tests {
         )
         .unwrap();
 
-        let chunks = parse_session_file(&path, Source::OstkSession, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks = parse_session_file(
+            &path,
+            Source::OstkSession,
+            "s.jsonl",
+            None,
+            "test-cfg",
+            None,
+        )
+        .unwrap();
         // 4 messages, each yields one block → 4 chunks.
         assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].text, "q1");
@@ -583,7 +602,9 @@ mod tests {
             "timestamp": "2026-04-17T10:00:00Z"
         });
         writeln!(f, "{line}").unwrap();
-        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks =
+            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+                .unwrap();
         assert_eq!(chunks.len(), 1);
         let body = &chunks[0].text;
         assert_eq!(chunks[0].role.as_deref(), Some("tool_result"));
@@ -615,7 +636,9 @@ mod tests {
             "timestamp": "2026-04-17T10:00:00Z"
         });
         writeln!(f, "{line}").unwrap();
-        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks =
+            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+                .unwrap();
         assert_eq!(chunks.len(), 1);
         let body = &chunks[0].text;
         assert!(body.contains("[tool_result: ok]"));
@@ -640,7 +663,9 @@ mod tests {
             "timestamp": "2026-04-17T10:00:00Z"
         });
         writeln!(f, "{line}").unwrap();
-        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks =
+            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+                .unwrap();
         assert_eq!(chunks.len(), 1);
         let body = &chunks[0].text;
         assert!(!body.contains("…[truncated"));
@@ -685,7 +710,8 @@ mod tests {
             r#"{{"type":"assistant","message":{{"role":"assistant","content":"here's an idea"}},"timestamp":"2026-04-17T10:00:04Z"}}"#
         )
         .unwrap();
-        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+            .unwrap();
         assert_eq!(raw.len(), 5);
         let kept = drop_local_command_wrappers(raw);
         assert_eq!(kept.len(), 2);
@@ -721,7 +747,8 @@ mod tests {
             r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"a2"}}]}},"timestamp":"2026-04-17T10:00:03Z"}}"#
         )
         .unwrap();
-        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+            .unwrap();
         assert_eq!(raw.len(), 5);
         let kept = drop_tool_blocks(raw);
         assert_eq!(kept.len(), 3);
@@ -747,7 +774,9 @@ mod tests {
             r#"{{"type":"assistant","message":{{"role":"assistant","content":"hi"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
         )
         .unwrap();
-        let chunks = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None).unwrap();
+        let chunks =
+            parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+                .unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "hi");
     }

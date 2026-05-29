@@ -270,8 +270,11 @@ impl Pipeline {
                     let size = meta.len() as i64;
 
                     if let Ok(Some((old_mtime, old_size, old_overlay))) =
-                        self.ingest
-                            .get_source_metadata(source_kind_str, &cfg.source_config_id, &item.source_id)
+                        self.ingest.get_source_metadata(
+                            source_kind_str,
+                            &cfg.source_config_id,
+                            &item.source_id,
+                        )
                     {
                         if old_mtime == mtime && old_size == size && old_overlay == overlay_hash {
                             if self
@@ -302,7 +305,10 @@ impl Pipeline {
                 }
             }
 
-            let chunks = match scanner.parse(SourceItem { source_config_id: cfg.source_config_id.clone(), ..item }) {
+            let chunks = match scanner.parse(SourceItem {
+                source_config_id: cfg.source_config_id.clone(),
+                ..item
+            }) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "parse failed");
@@ -406,10 +412,11 @@ impl Pipeline {
             match cfg.kind.retention_policy() {
                 RetentionPolicy::Delete => {
                     for s in cfg.kind.sources() {
-                        match self
-                            .ingest
-                            .delete_orphans(s.as_str(), &cfg.source_config_id, &self.run_id)
-                        {
+                        match self.ingest.delete_orphans(
+                            s.as_str(),
+                            &cfg.source_config_id,
+                            &self.run_id,
+                        ) {
                             Ok(orphans) => {
                                 if !orphans.is_empty() {
                                     if let Err(e) = self.store.delete_chunks(&orphans).await {
@@ -427,10 +434,11 @@ impl Pipeline {
                 }
                 RetentionPolicy::Stale => {
                     for s in cfg.kind.sources() {
-                        match self
-                            .ingest
-                            .mark_orphans_stale(s.as_str(), &cfg.source_config_id, &self.run_id)
-                        {
+                        match self.ingest.mark_orphans_stale(
+                            s.as_str(),
+                            &cfg.source_config_id,
+                            &self.run_id,
+                        ) {
                             Ok(orphans) => {
                                 if !orphans.is_empty() {
                                     if let Err(e) = self.store.mark_chunks_stale(&orphans).await {
@@ -646,8 +654,11 @@ impl Pipeline {
                     let size = meta.len() as i64;
 
                     if let Ok(Some((old_mtime, old_size, old_overlay))) =
-                        self.ingest
-                            .get_source_metadata(source_kind_str, &cfg.source_config_id, &item.source_id)
+                        self.ingest.get_source_metadata(
+                            source_kind_str,
+                            &cfg.source_config_id,
+                            &item.source_id,
+                        )
                     {
                         if old_mtime == mtime && old_size == size && old_overlay == overlay_hash {
                             if self
@@ -678,7 +689,10 @@ impl Pipeline {
                 }
             }
 
-            let chunks = match scanner.parse(SourceItem { source_config_id: cfg.source_config_id.clone(), ..item }) {
+            let chunks = match scanner.parse(SourceItem {
+                source_config_id: cfg.source_config_id.clone(),
+                ..item
+            }) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "parse failed");
@@ -1099,7 +1113,7 @@ mod tests {
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),
         }
-        }
+    }
 
     async fn make_pipeline(corpus_root: &Path, dim: usize) -> Pipeline {
         let store = Arc::new(CorpusStore::open_or_create(corpus_root, dim).await.unwrap());
@@ -1126,7 +1140,9 @@ mod tests {
 
         let pipeline = make_pipeline(corpus.path(), 16).await;
         // Snapshot version after corpus create+index, before ingest.
-        let store = CorpusStore::open_or_create(corpus.path(), 16).await.unwrap();
+        let store = CorpusStore::open_or_create(corpus.path(), 16)
+            .await
+            .unwrap();
         let v_before = store.version().await.unwrap();
 
         let scanner = CodeScanner;

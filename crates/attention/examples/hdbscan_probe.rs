@@ -50,16 +50,18 @@ fn synth_dataset() -> Vec<Vec<f32>> {
 }
 
 fn run_once(data: &[Vec<f32>]) -> Vec<i32> {
-    let hp = HdbscanHyperParams::builder()
-        .min_cluster_size(5)
-        .build();
+    let hp = HdbscanHyperParams::builder().min_cluster_size(5).build();
     let model = Hdbscan::new(data, hp);
     model.cluster().expect("clustering should succeed")
 }
 
 fn main() {
     let data = synth_dataset();
-    println!("synthesized {} points across 3 blobs in {}-D", data.len(), DIM);
+    println!(
+        "synthesized {} points across 3 blobs in {}-D",
+        data.len(),
+        DIM
+    );
 
     // Determinism: run twice, compare labels element-wise.
     let labels_1 = run_once(&data);
@@ -88,12 +90,9 @@ fn main() {
     println!("blob majority labels: {majorities:?}");
 
     // Distinct non-noise majorities. -1 is HDBSCAN's noise label.
-    let distinct: std::collections::HashSet<_> =
-        majorities.iter().filter(|&&l| l >= 0).collect();
+    let distinct: std::collections::HashSet<_> = majorities.iter().filter(|&&l| l >= 0).collect();
     if distinct.len() < 3 {
-        eprintln!(
-            "FAIL: expected 3 distinct non-noise majorities, got {distinct:?}"
-        );
+        eprintln!("FAIL: expected 3 distinct non-noise majorities, got {distinct:?}");
         std::process::exit(1);
     }
     println!("PASS: 3 distinct non-noise majority labels — clusters recovered");
