@@ -112,7 +112,7 @@ pub async fn discover_and_surface(
     let now = Utc::now();
     let mut reports: Vec<EmergentReport> = Vec::with_capacity(clusters.len());
     for cluster in clusters {
-        let handle = generate_proposed_handle(&cluster.chunk_ids, now);
+        let handle = generate_proposed_handle(&cluster.chunk_ids);
 
         if persist {
             let record = ProposedThreadRecord {

@@ -118,6 +118,14 @@ pub fn find_clusters_with(
             continue;
         }
 
+        // Resonance is weighted by distinct information, not raw count: a
+        // cluster that is mostly the same content repeated (identical
+        // embeddings) is redundancy, not an emergent theme. Require enough
+        // *distinct* embeddings to clear the size floor before proposing.
+        if distinct_embedding_count(chunks, &members) < min_cluster_size {
+            continue;
+        }
+
         let mut ids: Vec<String> = members.iter().map(|&i| chunks[i].0.clone()).collect();
         ids.sort();
 
@@ -190,7 +198,12 @@ pub fn mean_pairwise_cosine(embeddings: &[Vec<f32>]) -> f32 {
     if pairs == 0 {
         return 0.0;
     }
-    total / f32::from(u16::try_from(pairs).unwrap_or(u16::MAX))
+    // `pairs` is N(N-1)/2 and can exceed u16::MAX for large clusters (N>362);
+    // the old `u16::try_from(...).unwrap_or(u16::MAX)` capped the divisor and
+    // inflated cohesion above 1.0. Divide by the true pair count.
+    #[allow(clippy::cast_precision_loss)] // display metric; precision loss negligible
+    let denom = pairs as f32;
+    total / denom
 }
 
 fn average_pairwise_cosine(chunks: &[(String, Vec<f32>)], members: &[usize]) -> f32 {
@@ -208,7 +221,30 @@ fn average_pairwise_cosine(chunks: &[(String, Vec<f32>)], members: &[usize]) -> 
     if pairs == 0 {
         return 0.0;
     }
-    total / f32::from(u16::try_from(pairs).unwrap_or(u16::MAX))
+    #[allow(clippy::cast_precision_loss)] // display metric; precision loss negligible
+    let denom = pairs as f32;
+    total / denom
+}
+
+/// Count distinct embeddings among a cluster's members.
+///
+/// Identical content produces an identical (deterministic) embedding, so
+/// this is the resonance-layer proxy for distinct *information*: a cluster
+/// of 509 byte-identical chunks has distinct-count 1. We hash the f32 bit
+/// patterns; an astronomically-unlikely collision would only undercount,
+/// which is the conservative direction (treats more as redundant).
+fn distinct_embedding_count(chunks: &[(String, Vec<f32>)], members: &[usize]) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut seen: HashSet<u64> = HashSet::new();
+    for &i in members {
+        let mut h = DefaultHasher::new();
+        for x in &chunks[i].1 {
+            x.to_bits().hash(&mut h);
+        }
+        seen.insert(h.finish());
+    }
+    seen.len()
 }
 
 // -----------------------------------------------------------------------
@@ -279,6 +315,43 @@ mod tests {
             c.cohesion
         );
         assert_eq!(c.centroid.len(), dim);
+    }
+
+    #[test]
+    fn identical_content_cluster_rejected_as_redundancy() {
+        // Six byte-identical embeddings: dense and tight, but distinct
+        // information is 1 — redundancy, not an emergent theme. The
+        // distinct-content gate must reject it (this is the 509× class).
+        let dim = 16;
+        let dup = near_axis(0, dim, 0.001);
+        let chunks: Vec<(String, Vec<f32>)> =
+            (0..6).map(|i| v(&format!("dup-{i}"), dup.clone())).collect();
+        let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
+        assert!(
+            clusters.is_empty(),
+            "identical-content cluster must be rejected by the distinct-count gate"
+        );
+    }
+
+    #[test]
+    fn cohesion_does_not_overflow_for_large_cluster() {
+        // >362 distinct members → pair count exceeds u16::MAX. The old
+        // divisor cap inflated cohesion above 1.0; it must stay a valid
+        // similarity in [0, 1].
+        let dim = 16;
+        let chunks: Vec<(String, Vec<f32>)> = (0..400)
+            .map(|i| {
+                let jitter = (i as f32).mul_add(1e-5, 0.001);
+                v(&format!("hot-{i:04}"), near_axis(0, dim, jitter))
+            })
+            .collect();
+        let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
+        assert_eq!(clusters.len(), 1, "400 near-axis vectors form one cluster");
+        assert!(
+            clusters[0].cohesion <= 1.0 && clusters[0].cohesion > 0.9,
+            "cohesion must be a valid similarity, got {}",
+            clusters[0].cohesion
+        );
     }
 
     #[test]

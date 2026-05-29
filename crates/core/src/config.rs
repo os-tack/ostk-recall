@@ -147,8 +147,11 @@ pub struct LensSettings {
     #[serde(default = "default_lens_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// `key:value` facet entries that exclude a chunk from the lens
-    /// (privacy / status denylist), e.g. `["status:archived"]`.
-    #[serde(default)]
+    /// (privacy / status denylist), e.g. `["status:archived"]`. Defaults
+    /// to attenuating operational telemetry (`record_kind:audit_significant`)
+    /// from ambient surfacing — it stays fully recall-able. Set an explicit
+    /// (possibly empty) list to override.
+    #[serde(default = "default_lens_exclude_facets")]
     pub exclude_facets: Vec<String>,
     /// Per-lane candidate cap (the dense lane in p9b-min).
     #[serde(default = "default_lens_candidate_k_per_lane")]
@@ -180,6 +183,11 @@ const fn default_lens_candidate_k_per_lane() -> usize {
 fn default_lens_dominance_threshold() -> f32 {
     0.30
 }
+/// Operational telemetry is attenuated from ambient surfacing by default
+/// (still fully recall-able). Keep in sync with `LensConfig::default()`.
+fn default_lens_exclude_facets() -> Vec<String> {
+    vec!["record_kind:audit_significant".to_string()]
+}
 
 impl Default for LensSettings {
     fn default() -> Self {
@@ -188,7 +196,7 @@ impl Default for LensSettings {
             min_excerpt_tokens: default_lens_min_excerpt_tokens(),
             drift_threshold: default_lens_drift_threshold(),
             poll_interval_secs: default_lens_poll_interval_secs(),
-            exclude_facets: Vec::new(),
+            exclude_facets: default_lens_exclude_facets(),
             candidate_k_per_lane: default_lens_candidate_k_per_lane(),
             dominance_threshold: default_lens_dominance_threshold(),
         }

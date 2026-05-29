@@ -1684,6 +1684,24 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         )?;
         Ok(n)
     }
+
+    /// Delete *unpromoted* proposals older than `age`. Promoted rows are
+    /// always kept (they record a real promotion). Returns rows deleted.
+    ///
+    /// Proposals are regenerable derived overlay: the weaver re-proposes a
+    /// still-live cluster on the next pass (idempotently, via the
+    /// content-based handle), so pruning a stale unpromoted proposal
+    /// un-freezes a transient judgment — it forgets no primary observation.
+    /// This is the consolidation counterweight to unbounded capture.
+    pub fn prune_proposed_threads_older_than(&self, age: chrono::Duration) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - age).to_rfc3339();
+        let conn = self.lock();
+        let n = conn.execute(
+            "DELETE FROM threads_proposed WHERE promoted_to IS NULL AND created_at < ?",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
 }
 
 // ---------- helpers ----------
@@ -1939,6 +1957,57 @@ mod tests {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn prune_proposed_threads_drops_only_stale_unpromoted() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(30);
+
+        let mk = |handle: &str, created: DateTime<Utc>, promoted: Option<&str>| {
+            ProposedThreadRecord {
+                id: 0,
+                proposed_handle: handle.to_string(),
+                chunk_ids: vec![format!("{handle}-chunk")],
+                centroid_vec: vec![0.1, 0.2],
+                cohesion: 0.9,
+                created_at: created,
+                promoted_to: promoted.map(str::to_string),
+            }
+        };
+
+        db.insert_proposed_thread(&mk("stale-unpromoted", old, None))
+            .unwrap();
+        db.insert_proposed_thread(&mk("stale-promoted", old, Some("real-thread")))
+            .unwrap();
+        db.insert_proposed_thread(&mk("fresh-unpromoted", now, None))
+            .unwrap();
+
+        let pruned = db
+            .prune_proposed_threads_older_than(chrono::Duration::days(7))
+            .unwrap();
+        assert_eq!(pruned, 1, "only the stale unpromoted row is pruned");
+
+        let remaining: Vec<String> = db
+            .list_proposed_threads()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.proposed_handle)
+            .collect();
+        assert!(
+            remaining.contains(&"stale-promoted".to_string()),
+            "promoted proposals are kept regardless of age"
+        );
+        assert!(
+            remaining.contains(&"fresh-unpromoted".to_string()),
+            "recent proposals are kept"
+        );
+        assert!(
+            !remaining.contains(&"stale-unpromoted".to_string()),
+            "stale unpromoted proposal is pruned"
+        );
     }
 
     /// Errors on `append_within` — used to exercise the rollback path

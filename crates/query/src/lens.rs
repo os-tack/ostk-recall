@@ -86,7 +86,10 @@ impl Default for LensConfig {
             min_excerpt_tokens: 200,
             drift_threshold: 0.15,
             poll_interval_secs: 5,
-            exclude_facets: Vec::new(),
+            // Attenuate operational telemetry from ambient surfacing by
+            // default (still fully recall-able). Keep in sync with
+            // `ostk_recall_core::config::default_lens_exclude_facets`.
+            exclude_facets: vec!["record_kind:audit_significant".to_string()],
             candidate_k_per_lane: 32,
             dominance_threshold: 0.30,
         }
@@ -203,6 +206,10 @@ fn allocate_attention_portfolio(ranked: &[RankedHit], config: &LensConfig) -> Ve
     let mut entries: Vec<LensEntry> = Vec::new();
     let mut tokens_used = 0_usize;
     let mut selected: HashSet<String> = HashSet::new();
+    // Dedup by *content* (sha256), not only chunk_id: two distinct
+    // observations of byte-identical text must not both take a slot — the
+    // lens reflects distinct information, not repeated strikes of the same.
+    let mut selected_content: HashSet<String> = HashSet::new();
 
     for _seat in 0..COUNT {
         // Pick the highest-scoring unselected hit where attention is
@@ -212,6 +219,7 @@ fn allocate_attention_portfolio(ranked: &[RankedHit], config: &LensConfig) -> Ve
         let pick = ranked
             .iter()
             .filter(|h| !selected.contains(&h.candidate.chunk.chunk_id))
+            .filter(|h| !selected_content.contains(&h.candidate.chunk.sha256))
             .filter(|h| is_attention_dominant(h, FEATURE, config.dominance_threshold))
             .max_by(|a, b| {
                 let aa = attention_contribution(a, FEATURE);
@@ -254,6 +262,7 @@ fn allocate_attention_portfolio(ranked: &[RankedHit], config: &LensConfig) -> Ve
             truncated,
         });
         selected.insert(hit.candidate.chunk.chunk_id.clone());
+        selected_content.insert(hit.candidate.chunk.sha256.clone());
     }
 
     entries
@@ -569,6 +578,20 @@ mod tests {
             assert_eq!(entry.slot_name, "attention");
             assert!(entry.slot_reason.contains("aligned"));
         }
+    }
+
+    #[test]
+    fn allocator_dedups_byte_identical_content() {
+        // Two distinct observations (different chunk_id) of byte-identical
+        // text (same sha256). The lens reflects distinct information, so the
+        // second must not take a slot — this is the two-identical-entries bug.
+        let mut h1 = ranked_hit("c1", "same body text", 0.9);
+        let mut h2 = ranked_hit("c2", "same body text", 0.8);
+        h1.candidate.chunk.sha256 = "dup-sha".to_string();
+        h2.candidate.chunk.sha256 = "dup-sha".to_string();
+        let entries = allocate_attention_portfolio(&[h1, h2], &LensConfig::default());
+        assert_eq!(entries.len(), 1, "second byte-identical candidate dropped");
+        assert_eq!(entries[0].chunk_id, "c1", "highest-scoring kept");
     }
 
     #[test]

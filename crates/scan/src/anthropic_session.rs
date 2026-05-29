@@ -343,6 +343,28 @@ pub fn drop_tool_blocks(chunks: Vec<Chunk>) -> Vec<Chunk> {
         .collect()
 }
 
+/// Drop chunks whose text is a harness `<system-reminder>` block.
+///
+/// These are instructions the runtime injects into the transcript stream
+/// (e.g. "Respond with just the action or changes…") — the *recording
+/// apparatus*, not experienced content. Being byte-identical across hundreds
+/// of turns, they form the largest degenerate clusters in
+/// [`crate::attention::emergent`] surfacing (a 509-member, cohesion≈1.0 blob
+/// observed in a live corpus). Like [`drop_tool_blocks`] and
+/// [`drop_local_command_wrappers`], callers feeding the attention corpus
+/// should run parse output through this filter.
+///
+/// Conservative by design: only chunks whose trimmed text *starts with* the
+/// tag are dropped, so a reminder embedded inside a real message is retained
+/// rather than discarding genuine content.
+#[must_use]
+pub fn drop_system_reminders(chunks: Vec<Chunk>) -> Vec<Chunk> {
+    chunks
+        .into_iter()
+        .filter(|c| !c.text.trim_start().starts_with("<system-reminder>"))
+        .collect()
+}
+
 /// Materialize blocks into chunks. `chunk_index` is monotonic across the
 /// session; `parent_ids` holds the previous chunk's id so `recall_link`
 /// can chain backward through the session.
@@ -759,6 +781,47 @@ mod tests {
         assert_eq!(kinds, vec!["user", "assistant_text", "assistant_text"]);
         let texts: Vec<&str> = kept.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["q", "a1", "a2"]);
+    }
+
+    /// `drop_system_reminders` removes pure harness `<system-reminder>`
+    /// chunks (the apparatus) but keeps real content — including a message
+    /// that merely *mentions* a reminder mid-text.
+    #[test]
+    fn drop_system_reminders_filters_apparatus() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Real user prose
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"design the weaver"}},"timestamp":"2026-04-17T10:00:00Z"}}"#
+        )
+        .unwrap();
+        // Pure harness reminder (the apparatus)
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"<system-reminder>Respond with just the action or changes and without a thinking block.</system-reminder>"}},"timestamp":"2026-04-17T10:00:01Z"}}"#
+        )
+        .unwrap();
+        // Real content that merely references a reminder mid-text — must survive
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":"the <system-reminder> tag is harness instrumentation"}},"timestamp":"2026-04-17T10:00:02Z"}}"#
+        )
+        .unwrap();
+        let raw = parse_session_file(&path, Source::ClaudeCode, "s.jsonl", None, "test-cfg", None)
+            .unwrap();
+        assert_eq!(raw.len(), 3);
+        let kept = drop_system_reminders(raw);
+        assert_eq!(kept.len(), 2, "only the pure reminder chunk is dropped");
+        let texts: Vec<&str> = kept.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "design the weaver",
+                "the <system-reminder> tag is harness instrumentation"
+            ]
+        );
     }
 
     /// Skip wrapper types that aren't user/assistant.

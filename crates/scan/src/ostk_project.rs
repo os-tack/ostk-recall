@@ -29,7 +29,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{
-    Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
+    Chunk, Error, FacetSet, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
+    merge_override,
 };
 use ostk_recall_store::{AuditEventRow, EventsDb};
 use serde::Deserialize;
@@ -778,12 +779,18 @@ fn build_significant_chunk(
         duckdb_row_key: Some(row_key.clone()),
         ..Links::default()
     };
+    // Tag the channel so ambient surfacing can attenuate operational
+    // telemetry by default (lens `exclude_facets`) while it stays fully
+    // recall-able. `record_kind` is embedding-allowlisted, so it also
+    // separates these in embedding space. (gate, don't delete)
+    let mut facets = FacetSet::new();
+    merge_override(&mut facets, "record_kind", vec!["audit_significant".to_string()]);
     Chunk {
         chunk_id,
         source: Source::OstkAuditSignificant,
         project: project.map(str::to_string),
         source_id: row_key,
-        facets: Default::default(),
+        facets,
         embedding_input_sha256: String::new(),
         source_config_id: source_config_id.to_string(),
         chunk_index,
@@ -1460,6 +1467,31 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+
+    #[test]
+    fn significant_audit_chunk_carries_record_kind_facet() {
+        let value = serde_json::json!({
+            "ts": "2026-05-18T03:32:20Z",
+            "event": "tool.bash",
+            "tool": "bash",
+            "agent": "a1",
+            "success": false
+        });
+        let chunk = build_significant_chunk(
+            &value,
+            Some("proj"),
+            "cfg",
+            "rowkey".to_string(),
+            "/abs/journal.jsonl",
+            0,
+        );
+        let facets = ostk_recall_core::to_list(&chunk.facets);
+        assert!(
+            facets.iter().any(|f| f == "record_kind:audit_significant"),
+            "audit chunk should carry record_kind facet; got {facets:?}"
+        );
+        assert!(chunk.text.contains("which failed"));
     }
 
     #[test]

@@ -541,12 +541,13 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             let since = since.as_deref().map(parse_since_duration).transpose()?;
             let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
             println!(
-                "weave summary: batches={} chunks={} evidence_links={} proposed_weaves={} proposed_threads={}",
+                "weave summary: batches={} chunks={} evidence_links={} proposed_weaves={} proposed_threads={} proposals_pruned={}",
                 out.batches_processed,
                 out.chunks_seen,
                 out.evidence_links_written,
                 out.proposed_weaves,
-                out.proposed_threads_written
+                out.proposed_threads_written,
+                out.proposals_pruned
             );
         }
         Command::Verify => {

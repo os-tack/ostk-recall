@@ -115,7 +115,16 @@ pub struct WeaveWindowOutcome {
     pub proposed_weaves: usize,
     /// Count of new `threads_proposed` rows.
     pub proposed_threads_written: usize,
+    /// Count of stale, unpromoted proposals pruned at the end of the pass
+    /// (the consolidation counterweight; promoted proposals are kept).
+    pub proposals_pruned: usize,
 }
+
+/// Unpromoted emergent proposals older than this are pruned at the end of a
+/// `weave_window` pass. Generous enough to leave recent proposals for
+/// operator review; the content-based handle prevents re-accumulation, so
+/// this only clears the genuinely stale tail.
+const PROPOSED_PRUNE_AGE_DAYS: i64 = 14;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WeaverError {
@@ -197,6 +206,10 @@ impl AutoWeaver {
             aggregate.proposed_weaves += outcome.proposed_weaves.len();
             aggregate.proposed_threads_written += outcome.proposed_threads_written;
         }
+        // Consolidation counterweight: fade the stale, unpromoted tail.
+        aggregate.proposals_pruned = self
+            .threads
+            .prune_proposed_threads_older_than(chrono::Duration::days(PROPOSED_PRUNE_AGE_DAYS))?;
         Ok(aggregate)
     }
 
@@ -431,7 +444,7 @@ impl AutoWeaver {
         let now = Utc::now();
         let mut written = 0usize;
         for cluster in clusters {
-            let handle = generate_proposed_handle(&cluster.chunk_ids, now);
+            let handle = generate_proposed_handle(&cluster.chunk_ids);
             let rec = ostk_recall_store::ProposedThreadRecord {
                 id: 0,
                 proposed_handle: handle,
@@ -475,21 +488,22 @@ struct AnchorSnapshot {
 }
 
 /// Build a kebab-case proposed-thread handle from a cluster's member
-/// chunks. Format: `proposed-<8 hex chars>` — deterministic enough that
-/// repeated scans of the same cluster collapse to one row (the unique
-/// constraint absorbs the duplicate), short enough to fit
-/// `ThreadHandle`'s 64-char / 4-hyphen budget.
-pub(crate) fn generate_proposed_handle(chunk_ids: &[String], ts: chrono::DateTime<Utc>) -> String {
+/// chunks. Format: `proposed-<8 hex chars>` — a pure function of the
+/// (sorted) member set, short enough to fit `ThreadHandle`'s 64-char /
+/// 4-hyphen budget.
+///
+/// Content-based, with no timestamp: the same cluster re-surfaced on any
+/// later weave collapses to the same handle and the UNIQUE constraint
+/// absorbs it (idempotent). Previously the handle mixed in the date, so an
+/// identical cluster re-proposed every day — the main driver of unbounded
+/// proposal accumulation.
+pub(crate) fn generate_proposed_handle(chunk_ids: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for id in chunk_ids {
         hasher.update(id.as_bytes());
         hasher.update(b"\n");
     }
-    // Include the date (not the full ts) so the same cluster surfaced
-    // in two scans on the same day collides; a different day yields a
-    // new proposal (which the operator can still merge).
-    hasher.update(ts.format("%Y%m%d").to_string().as_bytes());
     let digest = hasher.finalize();
     let short = hex::encode(&digest[..4]);
     format!("proposed-{short}")
