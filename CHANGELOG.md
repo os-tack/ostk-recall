@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-alpha.3] - 2026-05-28
+
+The cognitive-memory substrate milestone. ostk-recall gains an ambient,
+query-less memory lens, attention-aware recall, a thread/anchor graph, and
+the P11 TurnEnd gate + temporal-consolidation base.
+
+> **Pre-release (maintainers / early adopters).** This is a **destructive
+> upgrade for v0.5 corpora**: P0 changed the chunk_id formula, and P10
+> migration tooling is not yet shipped (nor is the `reset --keep-threads`
+> escape hatch). Re-scan from sources after upgrading. The full v0.6.0 is
+> reserved for when migration + the enrichment/RC phases land — see
+> `rollout.md`.
+
+### Cognitive-memory phases (P0–P11)
+
+- **P0 — identity foundation** (`a0387e2`): physical `source_config_id` +
+  chunk_id rekey + Lance ownership column. *Destructive: invalidates v0.5
+  corpora.*
+- **P1 — facets overlay** (`90345c9`): per-chunk facets, `before` filter,
+  `embedding_input_sha256` re-embed/skip dedupe key.
+- **P2 — capability probes** (`61ba8d3`, `b37c4f8`).
+- **P3A — lens-first rank foundation** (`f32a5e9`): `Candidate` /
+  `RankedHit` / `RankEngine` over weighted lane evidence (BM25 + dense, RRF
+  preserved), with full per-feature attribution on every hit.
+- **P6A — rolling attention EMA** (`8821b8a`): `rolling_vec` EMA blend;
+  `effective_vec` priority chain pinned → rolling → transient.
+- **P9a-min — MCP resources protocol** (`8b47988`):
+  `resources/list|read|subscribe`; writer-task stdio transport.
+- **P9b-min — first active lens** (`37d265b`…`69615ea`): the ambient,
+  query-less `ostk://memory-lens` resource — diversity-aware allocator,
+  token budget, refractory penalty, persisted lens state.
+- **P11a — TurnEnd gate** (`a1c71c2`): `IngestOrigin{Bulk,Watch,Synthetic}`;
+  the observer + weaver now fire *only* on watched conversation-transcript
+  TurnEnds. Fixes the bulk-replay corpus-version explosion and the synthetic
+  feedback loop, and turns on live cognition for real.
+- **P11b base — temporal consolidation** (`e07b12b`): `weave_window` +
+  `ostk-recall weave [--since]` — explicit whole-corpus / windowed weave for
+  the bulk content the live daemon deliberately skips. `scan` prints a
+  `weave` hint so a fresh scan is never a silent un-woven corpus.
+
+### Scan robustness & version hygiene (`a1c71c2`)
+
+- Raise `RLIMIT_NOFILE` at startup — fixes "too many open files" bulk-scan
+  crashes under the macOS 256-fd soft cap.
+- Gemini scanner accepts string-or-array message content.
+- Decisions scanner accepts both `{key}` and `{decision,status}` schemas.
+- Commit batching decoupled from the embed batch (stops Lance version
+  explosion); `ostk-recall optimize --aggressive` collapses old versions.
+- `init --force` removes orphaned sqlite WAL/SHM sidecars.
+- `[lens]` config block wired into the schema.
+
+### Tooling
+
+- Repo-wide `cargo fmt` sweep on edition 2024 (`789da54`).
+
+### Earlier unreleased work (pre-v0.6 attention groundwork)
+
 - `ThreadThreadLink` Rust API on `ThreadsDb` (insert, list-from,
   list-to, delete, count) now chain-emitting AND exposed through MCP
   via the new `thread_evidence` action-routed verb.
