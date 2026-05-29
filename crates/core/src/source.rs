@@ -81,6 +81,17 @@ impl SourceKind {
             _ => RetentionPolicy::Keep,
         }
     }
+
+    /// True for sources that are live conversation transcripts with
+    /// turn-end semantics — i.e. a chunk corresponds to a conversational
+    /// exchange the agent actually had. Only these drive the
+    /// TurnObserver's live cognition (a watched ingest of one of these is
+    /// a "TurnEnd"). Code / docs / project records / static exports are
+    /// content to index, not turns to observe.
+    #[must_use]
+    pub const fn is_conversation_transcript(self) -> bool {
+        matches!(self, Self::ClaudeCode | Self::Gemini)
+    }
 }
 
 /// Concrete source of a chunk, as stored on a row. Granular subtypes for

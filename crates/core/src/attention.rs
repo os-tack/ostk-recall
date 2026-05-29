@@ -258,6 +258,42 @@ pub struct IngestEvent {
     pub chunks_upserted: usize,
     pub chunks_stale: usize,
     pub ts: DateTime<Utc>,
+    /// Provenance of this ingest — see [`IngestOrigin`]. Defaults to
+    /// `Bulk` so older serialized events never accidentally read as a
+    /// live TurnEnd.
+    #[serde(default)]
+    pub origin: IngestOrigin,
+}
+
+/// Provenance of an [`IngestEvent`] — distinguishes "loading the library"
+/// from "the agent thinking." The ambient cognition daemons gate on this:
+/// the TurnObserver reacts only to a `Watch` ingest of a conversation
+/// transcript (a TurnEnd), never to a bulk `Scan` (which would replay
+/// history through live cognition) or to the substrate's own `Synthetic`
+/// writes (which would feed back on themselves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestOrigin {
+    /// Full corpus scan (`Pipeline::ingest_source`) — bulk library load.
+    #[default]
+    Bulk,
+    /// Incremental, watch-triggered scan (`Pipeline::scan_paths`) — the
+    /// live signal: genuinely-new content arriving as the agent works.
+    Watch,
+    /// In-process synthetic injection (`Pipeline::ingest_synthetic`) —
+    /// membrane / attention self-writes. Never re-observed.
+    Synthetic,
+}
+
+impl IngestEvent {
+    /// True when this event is a real conversation turn ending: a watched
+    /// ingest of a conversation-transcript source. The TurnObserver fires
+    /// its live-cognition pipeline (attention EMA, recognition/membrane,
+    /// familiarity) only on these.
+    #[must_use]
+    pub fn is_turn_end(&self) -> bool {
+        self.origin == IngestOrigin::Watch && self.source.is_conversation_transcript()
+    }
 }
 
 #[cfg(test)]
@@ -402,12 +438,45 @@ mod tests {
             chunks_upserted: 2,
             chunks_stale: 0,
             ts: Utc::now(),
+            origin: IngestOrigin::Watch,
         };
         let v: IngestEvent = round_trip(&e);
         assert_eq!(v.source_ids, e.source_ids);
         assert_eq!(v.chunk_ids_upserted, e.chunk_ids_upserted);
         assert_eq!(v.chunks_upserted, 2);
         assert_eq!(v.chunks_stale, 0);
+        assert_eq!(v.origin, IngestOrigin::Watch);
+    }
+
+    #[test]
+    fn ingest_origin_defaults_to_bulk() {
+        // A missing `origin` (older serialized events) must read as Bulk
+        // so it never accidentally drives live cognition.
+        assert_eq!(IngestOrigin::default(), IngestOrigin::Bulk);
+    }
+
+    #[test]
+    fn is_turn_end_only_for_watched_conversation_transcripts() {
+        let mk = |origin, source| IngestEvent {
+            project: None,
+            source,
+            source_ids: vec![],
+            chunk_ids_upserted: vec![],
+            chunks_upserted: 0,
+            chunks_stale: 0,
+            ts: Utc::now(),
+            origin,
+        };
+        // The one true case: a watched conversation transcript.
+        assert!(mk(IngestOrigin::Watch, SourceKind::ClaudeCode).is_turn_end());
+        assert!(mk(IngestOrigin::Watch, SourceKind::Gemini).is_turn_end());
+        // Bulk scan of a transcript → library load, not live cognition.
+        assert!(!mk(IngestOrigin::Bulk, SourceKind::ClaudeCode).is_turn_end());
+        // Synthetic (membrane) → never re-observed (feedback guard).
+        assert!(!mk(IngestOrigin::Synthetic, SourceKind::ClaudeCode).is_turn_end());
+        // Watched non-transcript (code/markdown) → content, not a turn.
+        assert!(!mk(IngestOrigin::Watch, SourceKind::Code).is_turn_end());
+        assert!(!mk(IngestOrigin::Watch, SourceKind::Markdown).is_turn_end());
     }
 
     #[test]

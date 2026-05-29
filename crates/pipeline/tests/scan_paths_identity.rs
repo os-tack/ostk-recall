@@ -65,6 +65,7 @@ fn make_cfg(fixtures_dir: &Path) -> SourceConfig {
         reranker: None,
         watch: None,
         runtime: None,
+        lens: None,
     };
     cfg.validate_and_seal().expect("seal");
     cfg.sources.remove(0)

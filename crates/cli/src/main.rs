@@ -66,7 +66,16 @@ enum Command {
     /// small fragments, prune old versions, fold appended data into
     /// existing scalar / FTS indices. Cheap to re-run; idempotent. Use
     /// after a long ingest backlog to restore fast indexed lookups.
-    Optimize,
+    Optimize {
+        /// Also prune ALL historical versions, collapsing the corpus to
+        /// its latest version. Overrides Lance's default ~14-day
+        /// retention (the normal pass leaves recent versions in place),
+        /// so this is how you undo a version explosion from a heavy scan.
+        /// ONLY safe when nothing else is writing the corpus — stop
+        /// `serve`/`watch` and any running `scan` first.
+        #[arg(long)]
+        aggressive: bool,
+    },
     /// Inspect a single chunk by id.
     Inspect {
         /// Chunk id to inspect.
@@ -410,6 +419,24 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
         "runtime caps: tokio worker_threads + rayon global pool"
     );
 
+    // Raise the open-file soft limit before any Lance work. macOS
+    // ships a 256-fd soft cap (`launchctl limit maxfiles`) that
+    // GUI-spawned processes inherit — the MCP server under Claude
+    // Code, scan subprocesses. Lance opens many fragment files when
+    // reading a large corpus, exhausting 256 mid-scan and surfacing
+    // as `Too many open files (os error 24)` in the weaver /
+    // turn-observer; that in turn starves the ambient attention
+    // scope the memory-lens watches. `increase_nofile_limit` clamps
+    // to the hard limit (and to `kern.maxfilesperproc` on macOS), so
+    // the worst case is a no-op. Best-effort: log and continue.
+    match rlimit::increase_nofile_limit(u64::MAX) {
+        Ok(limit) => tracing::info!(nofile_soft = limit, "raised RLIMIT_NOFILE soft limit"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not raise RLIMIT_NOFILE; large scans may hit os error 24"
+        ),
+    }
+
     let config_path = match cli.config.clone() {
         Some(p) => p,
         None => commands::default_config_path()?,
@@ -471,11 +498,23 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                 t.items_seen, t.chunks_emitted, t.chunks_upserted, t.chunks_skipped_dup, t.errors
             );
         }
-        Command::Optimize => {
+        Command::Optimize { aggressive } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            println!("running OptimizeAction::All (compact + prune + index)…");
-            let out = commands::optimize(&config_path, embedder).await?;
-            println!("done in {:.1}s", out.elapsed.as_secs_f64());
+            if aggressive {
+                println!(
+                    "running aggressive optimize (compact + index + prune ALL old versions)…"
+                );
+            } else {
+                println!("running OptimizeAction::All (compact + prune + index)…");
+            }
+            let out = commands::optimize(&config_path, embedder, aggressive).await?;
+            match out.versions_pruned {
+                Some(n) => println!(
+                    "done in {:.1}s; pruned {n} old versions",
+                    out.elapsed.as_secs_f64()
+                ),
+                None => println!("done in {:.1}s", out.elapsed.as_secs_f64()),
+            }
         }
         Command::Verify => {
             let embedder = resolve_embedder(cli.config.as_ref())?;

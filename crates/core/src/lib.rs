@@ -15,12 +15,12 @@ pub mod source;
 pub mod types;
 
 pub use attention::{
-    AttentionPage, AttentionScope, AttentionSkipReason, FoldDepth, IngestEvent, PrivacyTier,
-    ScoreAttribution, ThreadHandle, ThreadHandleError,
+    AttentionPage, AttentionScope, AttentionSkipReason, FoldDepth, IngestEvent, IngestOrigin,
+    PrivacyTier, ScoreAttribution, ThreadHandle, ThreadHandleError,
 };
 pub use chunk::{Chunk, Links};
 pub use config::{
-    Config, CorpusConfig, EmbedderConfig, RerankerConfig, RuntimeConfig,
+    Config, CorpusConfig, EmbedderConfig, LensSettings, RerankerConfig, RuntimeConfig,
     SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig, WatchMode,
     compute_source_config_id, default_worker_threads,
 };

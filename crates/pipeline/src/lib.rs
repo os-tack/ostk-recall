@@ -13,14 +13,23 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use ostk_recall_core::{
-    Chunk, RetentionPolicy, Scanner, SourceConfig, SourceItem, SourceKind, cfg_overlay_hash,
-    compose_header, filter_to_allowlist, merge_override,
+    Chunk, IngestOrigin, RetentionPolicy, Scanner, SourceConfig, SourceItem, SourceKind,
+    cfg_overlay_hash, compose_header, filter_to_allowlist, merge_override,
 };
 use ostk_recall_embed::Embedder;
 use ostk_recall_store::{CorpusStore, IngestChunkRow, IngestDb};
 
-/// Batch size used when calling the embedder.
+/// Batch size used when calling the embedder. Kept small for model
+/// throughput / memory; this is the *embed* unit, not the *commit* unit.
 pub const EMBED_BATCH: usize = 64;
+
+/// Number of chunks accumulated before a single corpus `merge_insert`
+/// (one Lance commit / version). Decoupled from [`EMBED_BATCH`] so a
+/// full scan creates one version per `COMMIT_BATCH`, not one per 64 —
+/// otherwise version count (and thus fragment/fd/iops pressure) scales
+/// ~linearly with corpus size and never prunes (auto-cleanup is off).
+/// At ~2048, a 100k-chunk corpus is ~50 commits instead of ~1560.
+pub const COMMIT_BATCH: usize = 2048;
 
 /// Capacity of the post-ingest broadcast channel.
 ///
@@ -235,7 +244,6 @@ impl Pipeline {
         let mut to_embed: Vec<Chunk> = Vec::new();
         let mut event_source_ids: HashSet<String> = HashSet::new();
         let source_kind_str = scanner.kind().as_str();
-        let project = cfg.project.as_deref().unwrap_or("default");
 
         for item_res in scanner.discover(cfg) {
             let item = match item_res {
@@ -339,21 +347,41 @@ impl Pipeline {
 
         let mut upserted_chunk_ids: Vec<String> = Vec::new();
         if !to_embed.is_empty() && !self.dry_run {
+            // Embed in EMBED_BATCH units (model throughput) but commit in
+            // COMMIT_BATCH units (one Lance version per flush). Streaming
+            // the embeds keeps peak memory bounded; the buffer flushes
+            // when it reaches COMMIT_BATCH and once more at the end.
+            let mut pending: Vec<Chunk> = Vec::new();
+            let mut pending_embeds: Vec<Vec<f32>> = Vec::new();
             for batch in to_embed.chunks(EMBED_BATCH) {
-                match self.embed_and_persist(batch, project).await {
-                    Ok(n) => {
-                        stats.chunks_upserted += n;
-                        upserted_chunk_ids.extend(batch.iter().map(|c| c.chunk_id.clone()));
-                        for c in batch {
-                            event_source_ids.insert(c.source_id.clone());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "embed/persist batch failed");
-                        stats.errors += 1;
-                    }
+                let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+                let embeddings = self.embedder.encode_batch(&texts);
+                if embeddings.len() != batch.len() {
+                    tracing::warn!(error = "dim mismatch", "embed batch failed");
+                    stats.errors += 1;
+                    continue;
+                }
+                pending.extend_from_slice(batch);
+                pending_embeds.extend(embeddings);
+                if pending.len() >= COMMIT_BATCH {
+                    self.flush_pending(
+                        &mut pending,
+                        &mut pending_embeds,
+                        &mut stats,
+                        &mut upserted_chunk_ids,
+                        &mut event_source_ids,
+                    )
+                    .await;
                 }
             }
+            self.flush_pending(
+                &mut pending,
+                &mut pending_embeds,
+                &mut stats,
+                &mut upserted_chunk_ids,
+                &mut event_source_ids,
+            )
+            .await;
         }
 
         // Orphan Sweep — multi-project safety contract
@@ -430,6 +458,8 @@ impl Pipeline {
                 chunks_upserted: stats.chunks_upserted,
                 chunks_stale: stats.chunks_staled,
                 ts: Utc::now(),
+                // Full-corpus scan = bulk library load, never a TurnEnd.
+                origin: IngestOrigin::Bulk,
             });
         }
 
@@ -512,6 +542,9 @@ impl Pipeline {
                 chunks_upserted: stats.chunks_upserted,
                 chunks_stale: 0,
                 ts: Utc::now(),
+                // Substrate self-write (membrane/attention). Never
+                // re-observed — closes the observer feedback loop.
+                origin: IngestOrigin::Synthetic,
             });
         }
 
@@ -683,16 +716,43 @@ impl Pipeline {
             }
         }
 
+        let mut upserted_chunk_ids: Vec<String> = Vec::new();
+        let mut event_source_ids: HashSet<String> = HashSet::new();
         if !to_embed.is_empty() && !self.dry_run {
             for batch in to_embed.chunks(EMBED_BATCH) {
                 match self.embed_and_persist(batch, project).await {
-                    Ok(n) => stats.chunks_upserted += n,
+                    Ok(n) => {
+                        stats.chunks_upserted += n;
+                        upserted_chunk_ids.extend(batch.iter().map(|c| c.chunk_id.clone()));
+                        for c in batch {
+                            event_source_ids.insert(c.source_id.clone());
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "embed/persist batch failed");
                         stats.errors += 1;
                     }
                 }
             }
+        }
+
+        // Broadcast a Watch-origin event. This is the incremental/live
+        // path: a watched ingest of a conversation transcript is a
+        // TurnEnd, which is the ONLY thing that drives the ambient
+        // cognition daemons. (The full-scan path emits `Bulk`, which the
+        // daemons skip.) Non-transcript watched sources still emit, but
+        // `IngestEvent::is_turn_end()` filters them out downstream.
+        if !self.dry_run && !upserted_chunk_ids.is_empty() && self.events.receiver_count() > 0 {
+            let _ = self.events.send(IngestEvent {
+                project: cfg.project.clone(),
+                source: cfg.kind,
+                source_ids: event_source_ids.into_iter().collect(),
+                chunk_ids_upserted: upserted_chunk_ids,
+                chunks_upserted: stats.chunks_upserted,
+                chunks_stale: stats.chunks_staled,
+                ts: Utc::now(),
+                origin: IngestOrigin::Watch,
+            });
         }
 
         (stats, yielded)
@@ -794,18 +854,35 @@ impl Pipeline {
         batch: &[Chunk],
         project: &str,
     ) -> Result<usize, PipelineError> {
+        let _ = project;
         let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
         let embeddings = self.embedder.encode_batch(&texts);
         if embeddings.len() != batch.len() {
             return Err(PipelineError::Embedder("dim mismatch".into()));
         }
+        self.commit_batch(batch, &embeddings).await?;
+        Ok(batch.len())
+    }
 
+    /// Persist one already-embedded batch: a single corpus
+    /// `merge_insert` (one Lance commit / version) plus the per-chunk
+    /// ingest-ledger rows. Callers that want fewer versions accumulate
+    /// across several [`EMBED_BATCH`] embeds and call this once per
+    /// [`COMMIT_BATCH`].
+    async fn commit_batch(
+        &self,
+        chunks: &[Chunk],
+        embeddings: &[Vec<f32>],
+    ) -> Result<(), PipelineError> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
         self.store
-            .upsert(batch, &embeddings)
+            .upsert(chunks, embeddings)
             .await
             .map_err(|e| PipelineError::Store(e.to_string()))?;
 
-        for chunk in batch {
+        for chunk in chunks {
             let row = IngestChunkRow {
                 chunk_id: chunk.chunk_id.clone(),
                 source: chunk.source.as_str().to_string(),
@@ -819,7 +896,39 @@ impl Pipeline {
                 .record_chunk(&row, Some(&self.run_id))
                 .map_err(|e| PipelineError::Store(e.to_string()))?;
         }
-        Ok(batch.len())
+        Ok(())
+    }
+
+    /// Commit the accumulated buffer as one Lance version and fold the
+    /// outcome into the scan's running totals, then clear the buffers. A
+    /// commit error is logged + counted (not propagated), preserving the
+    /// prior per-batch resilience — one bad flush doesn't abort the scan.
+    async fn flush_pending(
+        &self,
+        pending: &mut Vec<Chunk>,
+        pending_embeds: &mut Vec<Vec<f32>>,
+        stats: &mut PipelineStats,
+        upserted_chunk_ids: &mut Vec<String>,
+        event_source_ids: &mut HashSet<String>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        match self.commit_batch(pending, pending_embeds).await {
+            Ok(()) => {
+                stats.chunks_upserted += pending.len();
+                upserted_chunk_ids.extend(pending.iter().map(|c| c.chunk_id.clone()));
+                for c in pending.iter() {
+                    event_source_ids.insert(c.source_id.clone());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, count = pending.len(), "commit batch failed");
+                stats.errors += 1;
+            }
+        }
+        pending.clear();
+        pending_embeds.clear();
     }
 
     pub async fn verify_counts(&self) -> Result<VerifyReport, PipelineError> {
@@ -997,6 +1106,56 @@ mod tests {
         let ingest = Arc::new(IngestDb::open(corpus_root).unwrap());
         let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder { dim });
         Pipeline::new(store, ingest, emb)
+    }
+
+    /// Regression for the version-explosion fix: a single source whose
+    /// chunk count spans several EMBED_BATCHes (but stays under
+    /// COMMIT_BATCH) must produce ONE Lance commit, not one per 64.
+    #[tokio::test]
+    async fn ingest_source_commits_in_batches_not_per_embed_batch() {
+        use ostk_recall_scan::code::CodeScanner;
+        let fixtures = TempDir::new().unwrap();
+        let corpus = TempDir::new().unwrap();
+        // ~30k lines → CodeScanner (≈200-line windows, 20 overlap) yields
+        // well over 2 * EMBED_BATCH chunks, far under COMMIT_BATCH.
+        let mut big = String::with_capacity(400_000);
+        for i in 0..30_000 {
+            big.push_str(&format!("let v{i} = {i};\n"));
+        }
+        std::fs::write(fixtures.path().join("big.rs"), &big).unwrap();
+
+        let pipeline = make_pipeline(corpus.path(), 16).await;
+        // Snapshot version after corpus create+index, before ingest.
+        let store = CorpusStore::open_or_create(corpus.path(), 16).await.unwrap();
+        let v_before = store.version().await.unwrap();
+
+        let scanner = CodeScanner;
+        let cfg = SourceConfig {
+            kind: SourceKind::Code,
+            project: Some("commit-batch-test".into()),
+            paths: vec![fixtures.path().to_string_lossy().into_owned()],
+            ignore: vec![],
+            extensions: vec!["rs".into()],
+            id: None,
+            source_config_id: "test-cfg".to_string(),
+            facets: Default::default(),
+        };
+        let stats = pipeline.ingest_source(&scanner, &cfg).await;
+
+        assert!(
+            stats.chunks_upserted > 2 * EMBED_BATCH,
+            "test needs >2 embed batches to be meaningful; got {} chunks",
+            stats.chunks_upserted
+        );
+        let v_after = store.version().await.unwrap();
+        let delta = v_after - v_before;
+        // Batched commit: one COMMIT_BATCH flush = 1 version (+slack for any
+        // index/sweep commit). Per-EMBED_BATCH would be ceil(chunks/64) ≥ 3.
+        assert!(
+            delta <= 2,
+            "expected ~1 commit for {} chunks (COMMIT_BATCH={COMMIT_BATCH}), got {delta} versions",
+            stats.chunks_upserted
+        );
     }
 
     #[tokio::test]

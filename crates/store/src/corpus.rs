@@ -118,6 +118,15 @@ impl CorpusStore {
         Ok(n)
     }
 
+    /// Current Lance dataset version of the corpus table. Each commit
+    /// (`merge_insert`, delete, optimize) bumps this. Opening the table
+    /// fresh returns the latest version, so callers see commits made by
+    /// other handles. Used to verify commit batching and prune passes.
+    pub async fn version(&self) -> Result<u64> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        Ok(table.version().await?)
+    }
+
     /// Ensure the Tantivy FTS index exists on the `text` column. Idempotent —
     /// no-op if already present. `full_text_search` in lancedb requires this.
     pub async fn ensure_fts_index(&self) -> Result<()> {
@@ -951,6 +960,33 @@ impl CorpusStore {
         Ok(())
     }
 
+    /// Aggressive optimize: compact + reindex (via [`OptimizeAction::All`]),
+    /// then prune **all** historical versions, collapsing the table to its
+    /// latest version. Returns the number of old versions removed.
+    ///
+    /// Unlike [`Self::optimize_all`], this overrides Lance's default
+    /// retention: `delete_unverified = true` bypasses the 7-day
+    /// in-progress-transaction guard so versions created *today* are
+    /// actually removed. That is the only way to undo a version explosion
+    /// from a heavy scan without waiting two weeks — but it is **only safe
+    /// when no other process is writing this corpus**. Callers must
+    /// guarantee exclusivity (the `optimize --aggressive` CLI path makes
+    /// the operator responsible).
+    pub async fn optimize_compact_and_prune(&self) -> Result<u64> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        // 1. Compact small fragments + fold new data into indices.
+        table.optimize(OptimizeAction::All).await?;
+        // 2. Prune every version older than "now" (keep only the latest).
+        let stats = table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(chrono::Duration::zero()),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await?;
+        Ok(stats.prune.map_or(0, |p| p.old_versions))
+    }
+
     /// Cheap, scan-time variant of [`Self::optimize_all`]: just fold any
     /// fragments appended since the last index build into the existing
     /// scalar / FTS indices. Skips `Compact` and `Prune` because both
@@ -1586,6 +1622,32 @@ mod tests {
         // Empty input is a no-op.
         let empty = store.fetch_embeddings(&[]).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimize_compact_and_prune_removes_old_versions_keeps_data() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+        // Many separate upserts → many versions (mimics per-batch commits).
+        for i in 0..8 {
+            store
+                .upsert(
+                    &[sample_chunk(&format!("c{i}"), "text")],
+                    &[vec![1.0, 0.0, 0.0, 0.0]],
+                )
+                .await
+                .unwrap();
+        }
+        let before = store.version().await.unwrap();
+        assert!(before >= 8, "expected many versions before prune, got {before}");
+
+        let pruned = store.optimize_compact_and_prune().await.unwrap();
+        assert!(
+            pruned > 0,
+            "aggressive prune should remove historical versions, removed {pruned}"
+        );
+        // Prune drops history, never live rows.
+        assert_eq!(store.row_count().await.unwrap(), 8);
     }
 
     #[tokio::test]

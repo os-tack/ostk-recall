@@ -522,6 +522,14 @@ impl TurnObserver {
                 res = rx.recv() => {
                     match res {
                         Ok(event) => {
+                            // Live cognition fires ONLY on a TurnEnd: a
+                            // watched conversation-transcript ingest. Bulk
+                            // scans (replaying history through the live
+                            // pipeline) and synthetic self-writes (membrane
+                            // feedback) are skipped.
+                            if !event.is_turn_end() {
+                                continue;
+                            }
                             let scope = AttentionScope {
                                 project: event
                                     .project
@@ -573,6 +581,9 @@ impl TurnObserver {
                     // handshake doesn't race the broadcast. Best-effort
                     // observe; per-event errors stay non-fatal.
                     while let Ok(event) = rx.try_recv() {
+                        if !event.is_turn_end() {
+                            continue;
+                        }
                         let scope = AttentionScope {
                             project: event
                                 .project

@@ -16,7 +16,9 @@ use ostk_recall_attention::{
 };
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
-use ostk_recall_core::{Config, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode};
+use ostk_recall_core::{
+    Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode,
+};
 use ostk_recall_mcp::{ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::lens::LensConfig;
@@ -213,11 +215,19 @@ fn force_wipe_corpus(root: &Path) -> Result<()> {
         eprintln!("forcing re-init: removing {}", lance.display());
         std::fs::remove_dir_all(&lance).with_context(|| format!("removing {}", lance.display()))?;
     }
+    // Remove each SQLite DB *and* its WAL-mode sidecars. Deleting only the
+    // main `.sqlite` while leaving an orphaned `-wal`/`-shm` behind puts
+    // SQLite in a broken state: a later read-only open fails with "unable
+    // to open database file" (which crashes `serve` → MCP `-32000`) and a
+    // read-write open can abort the scan, silently stranding the corpus
+    // empty. So wipe the sidecars in the same pass.
     for db_name in ["ingest.sqlite", "events.sqlite"] {
-        let p = root.join(db_name);
-        if p.exists() {
-            eprintln!("forcing re-init: removing {}", p.display());
-            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let p = root.join(format!("{db_name}{suffix}"));
+            if p.exists() {
+                eprintln!("forcing re-init: removing {}", p.display());
+                std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+            }
         }
     }
     Ok(())
@@ -681,6 +691,9 @@ pub async fn inspect(
 pub struct OptimizeOutcome {
     /// Wall-clock duration of the optimize pass.
     pub elapsed: std::time::Duration,
+    /// Number of historical versions pruned. `Some` only on the
+    /// `--aggressive` path; `None` for the conservative default pass.
+    pub versions_pruned: Option<u64>,
 }
 
 /// Run Lance's `OptimizeAction::All` against the corpus table —
@@ -691,6 +704,7 @@ pub struct OptimizeOutcome {
 pub async fn optimize(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
+    aggressive: bool,
 ) -> Result<OptimizeOutcome> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
@@ -699,12 +713,22 @@ pub async fn optimize(
         .await
         .map_err(|e| anyhow!("open corpus store: {e}"))?;
     let started = std::time::Instant::now();
-    store
-        .optimize_all()
-        .await
-        .map_err(|e| anyhow!("optimize: {e}"))?;
+    let versions_pruned = if aggressive {
+        let n = store
+            .optimize_compact_and_prune()
+            .await
+            .map_err(|e| anyhow!("optimize: {e}"))?;
+        Some(n)
+    } else {
+        store
+            .optimize_all()
+            .await
+            .map_err(|e| anyhow!("optimize: {e}"))?;
+        None
+    };
     Ok(OptimizeOutcome {
         elapsed: started.elapsed(),
+        versions_pruned,
     })
 }
 
@@ -817,6 +841,22 @@ fn events_db_if_wanted(
     } else {
         Ok(None)
     }
+}
+
+/// Map the optional `[lens]` config block onto the daemon's runtime
+/// `LensConfig`. `None` (no `[lens]` block) yields the daemon
+/// defaults. Kept as a free function so the mapping is unit-testable
+/// without spinning up `serve`.
+fn resolve_lens_config(settings: Option<&LensSettings>) -> LensConfig {
+    settings.map_or_else(LensConfig::default, |l| LensConfig {
+        token_budget: l.token_budget,
+        min_excerpt_tokens: l.min_excerpt_tokens,
+        drift_threshold: l.drift_threshold,
+        poll_interval_secs: l.poll_interval_secs,
+        exclude_facets: l.exclude_facets.clone(),
+        candidate_k_per_lane: l.candidate_k_per_lane,
+        dominance_threshold: l.dominance_threshold,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1054,6 +1094,9 @@ pub async fn serve(
         let cancel = serve_cancel.clone();
         let scope = ambient_scope_default();
         let state_dir = lens_state_dir.clone();
+        // Map the optional `[lens]` config block onto the daemon's
+        // runtime LensConfig; absent block → defaults.
+        let lens_config = resolve_lens_config(cfg.lens.as_ref());
         tokio::spawn(async move {
             run_lens_loop(
                 attention,
@@ -1061,7 +1104,7 @@ pub async fn serve(
                 registry,
                 resource,
                 chain_sink_clone,
-                LensConfig::default(),
+                lens_config,
                 scope,
                 state_dir,
                 initial_state,
@@ -2171,5 +2214,83 @@ mod watch_mode_tests {
     fn watch_mode_default_is_legacy() {
         let w = WatchConfig::default();
         assert_eq!(w.mode, WatchMode::Legacy);
+    }
+}
+
+#[cfg(test)]
+mod lens_config_tests {
+    use super::{LensSettings, resolve_lens_config};
+
+    /// The `[lens]` config defaults are duplicated in `core` (serde
+    /// can't reach across to `query`). This guard fails loudly if the
+    /// two ever drift, which would silently change daemon behavior for
+    /// users who omit the block.
+    #[test]
+    fn lens_settings_default_matches_query_default() {
+        let mapped = resolve_lens_config(Some(&LensSettings::default()));
+        let dflt = ostk_recall_query::lens::LensConfig::default();
+        assert_eq!(mapped.token_budget, dflt.token_budget);
+        assert_eq!(mapped.min_excerpt_tokens, dflt.min_excerpt_tokens);
+        assert!((mapped.drift_threshold - dflt.drift_threshold).abs() < f32::EPSILON);
+        assert_eq!(mapped.poll_interval_secs, dflt.poll_interval_secs);
+        assert_eq!(mapped.exclude_facets, dflt.exclude_facets);
+        assert_eq!(mapped.candidate_k_per_lane, dflt.candidate_k_per_lane);
+        assert!((mapped.dominance_threshold - dflt.dominance_threshold).abs() < f32::EPSILON);
+    }
+
+    /// Absent `[lens]` block resolves to the daemon default verbatim.
+    #[test]
+    fn resolve_lens_config_none_is_default() {
+        let mapped = resolve_lens_config(None);
+        let dflt = ostk_recall_query::lens::LensConfig::default();
+        assert_eq!(mapped.token_budget, dflt.token_budget);
+        assert_eq!(mapped.poll_interval_secs, dflt.poll_interval_secs);
+    }
+
+    /// Explicit overrides flow through.
+    #[test]
+    fn resolve_lens_config_applies_overrides() {
+        let settings = LensSettings {
+            token_budget: 1234,
+            poll_interval_secs: 9,
+            exclude_facets: vec!["status:archived".into()],
+            ..LensSettings::default()
+        };
+        let mapped = resolve_lens_config(Some(&settings));
+        assert_eq!(mapped.token_budget, 1234);
+        assert_eq!(mapped.poll_interval_secs, 9);
+        assert_eq!(mapped.exclude_facets, vec!["status:archived".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod force_wipe_tests {
+    use super::force_wipe_corpus;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Regression: `init --force` must remove SQLite WAL/SHM sidecars,
+    /// not just the main `.sqlite`. An orphaned `-wal` (main file gone)
+    /// breaks the next open — read-only fails outright (crashing `serve`
+    /// → MCP `-32000`), read-write can abort mid-scan.
+    #[test]
+    fn force_wipe_removes_sqlite_wal_shm_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let files = [
+            "events.sqlite",
+            "events.sqlite-wal",
+            "events.sqlite-shm",
+            "ingest.sqlite",
+            "ingest.sqlite-wal",
+            "ingest.sqlite-shm",
+        ];
+        for f in files {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        force_wipe_corpus(root).unwrap();
+        for f in files {
+            assert!(!root.join(f).exists(), "{f} should have been removed");
+        }
     }
 }

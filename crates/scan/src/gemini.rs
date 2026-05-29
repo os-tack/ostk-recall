@@ -23,10 +23,30 @@ struct GeminiSession {
 struct GeminiMessage {
     #[serde(rename = "type")]
     msg_type: String, // "user", "gemini"
-    content: Vec<ContentPart>,
+    #[serde(default)]
+    content: MessageContent,
     timestamp: String,
     #[serde(default)]
     tokens: Option<TokenInfo>,
+}
+
+/// A message's `content` arrives in two shapes across Gemini session
+/// logs: a structured `[{text: ...}, ...]` array, or — for simpler
+/// turns — a bare string. An untagged enum accepts both; without it
+/// the string form fails the whole file with
+/// `invalid type: string ..., expected a sequence` and drops every
+/// chunk in that session.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        Self::Parts(Vec::new())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,9 +178,49 @@ impl Scanner for GeminiScanner {
 }
 
 fn extract_text(msg: &GeminiMessage) -> String {
-    msg.content
-        .iter()
-        .filter_map(|p| p.text.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n")
+    match &msg.content {
+        MessageContent::Text(s) => s.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| p.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_both_string_and_array_content() {
+        // Regression: a message whose `content` is a bare string used
+        // to fail the whole file with `invalid type: string ...,
+        // expected a sequence`, dropping every chunk in the session.
+        let json = r#"{
+            "sessionId": "s1",
+            "messages": [
+                {"type": "user", "content": "plain string turn", "timestamp": "2026-01-01T00:00:00Z"},
+                {"type": "gemini", "content": [{"text": "structured"}, {"text": "parts"}], "timestamp": "2026-01-01T00:00:01Z"}
+            ]
+        }"#;
+        let session: GeminiSession =
+            serde_json::from_str(json).expect("string + array content must both parse");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(extract_text(&session.messages[0]), "plain string turn");
+        assert_eq!(extract_text(&session.messages[1]), "structured\nparts");
+    }
+
+    #[test]
+    fn missing_content_defaults_to_empty() {
+        let json = r#"{
+            "sessionId": "s2",
+            "messages": [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z"}
+            ]
+        }"#;
+        let session: GeminiSession =
+            serde_json::from_str(json).expect("absent content must default, not error");
+        assert_eq!(extract_text(&session.messages[0]), "");
+    }
 }

@@ -153,6 +153,13 @@ impl AutoWeaver {
                 res = rx.recv() => {
                     match res {
                         Ok(event) => {
+                            // Weave live TurnEnds incrementally; bulk-
+                            // ingested content is woven by the periodic
+                            // whole-corpus epoch pass, not per event
+                            // (avoids per-bulk-event corpus queries).
+                            if !event.is_turn_end() {
+                                continue;
+                            }
                             if let Err(err) = self.process_event(event).await {
                                 tracing::warn!(error = %err, "auto-weaver: process_event failed");
                             }
@@ -167,6 +174,9 @@ impl AutoWeaver {
                     // Drain anything already queued before exiting so the
                     // shutdown handshake doesn't race the broadcast.
                     while let Ok(event) = rx.try_recv() {
+                        if !event.is_turn_end() {
+                            continue;
+                        }
                         if let Err(err) = self.process_event(event).await {
                             tracing::warn!(error = %err, "auto-weaver: process_event failed during drain");
                         }
@@ -474,6 +484,7 @@ mod tests {
             chunks_upserted: chunk_ids.len(),
             chunks_stale: 0,
             ts: Utc::now(),
+            origin: ostk_recall_core::IngestOrigin::Watch,
         }
     }
 

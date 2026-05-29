@@ -73,6 +73,7 @@ fn build_config(fixtures_dir: &Path, blocks: Vec<SourceConfig>) -> Config {
         reranker: None,
         watch: None,
         runtime: None,
+        lens: None,
     };
     cfg.validate_and_seal()
         .expect("config should validate + seal");

@@ -28,6 +28,11 @@ pub struct Config {
     /// Power users running a one-shot CLI can raise these.
     #[serde(default)]
     pub runtime: Option<RuntimeConfig>,
+    /// Optional memory-lens (p9b) tuning. Omit the `[lens]` block to
+    /// accept the daemon defaults. `ostk-recall serve` maps this onto
+    /// the daemon's runtime `LensConfig`.
+    #[serde(default)]
+    pub lens: Option<LensSettings>,
 }
 
 /// Runtime resource caps. Each field is the upper bound on the
@@ -114,6 +119,79 @@ impl RerankerConfig {
     #[must_use]
     pub fn resolve(slot: Option<&Self>) -> Self {
         slot.cloned().unwrap_or_default()
+    }
+}
+
+/// Memory-lens (p9b) tuning, surfaced as the optional `[lens]` block.
+///
+/// Mirrors the daemon's runtime `LensConfig` (in `ostk-recall-query`)
+/// field-for-field. `core` can't depend on `query`, so the daemon
+/// maps this onto its own type at `serve` startup; a guard test in
+/// the CLI crate keeps these defaults in lock-step. Every field has a
+/// serde default, so a `[lens]` block may set only the knobs it cares
+/// about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LensSettings {
+    /// Token cap on the rendered lens. Excerpts truncate to fit.
+    #[serde(default = "default_lens_token_budget")]
+    pub token_budget: usize,
+    /// Floor below which a slot is dropped rather than truncated.
+    #[serde(default = "default_lens_min_excerpt_tokens")]
+    pub min_excerpt_tokens: usize,
+    /// Cosine *distance* threshold that triggers a refresh. `0.15` ≈
+    /// 0.987 cosine similarity.
+    #[serde(default = "default_lens_drift_threshold")]
+    pub drift_threshold: f32,
+    /// How often the background loop wakes up, in seconds.
+    #[serde(default = "default_lens_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// `key:value` facet entries that exclude a chunk from the lens
+    /// (privacy / status denylist), e.g. `["status:archived"]`.
+    #[serde(default)]
+    pub exclude_facets: Vec<String>,
+    /// Per-lane candidate cap (the dense lane in p9b-min).
+    #[serde(default = "default_lens_candidate_k_per_lane")]
+    pub candidate_k_per_lane: usize,
+    /// Minimum share of total score a feature must contribute to own a
+    /// slot, as a fraction.
+    #[serde(default = "default_lens_dominance_threshold")]
+    pub dominance_threshold: f32,
+}
+
+// Defaults below MUST match `ostk_recall_query::lens::LensConfig::default()`.
+// The `lens_settings_default_matches_query_default` test in the CLI crate
+// fails loudly if they drift.
+const fn default_lens_token_budget() -> usize {
+    4000
+}
+const fn default_lens_min_excerpt_tokens() -> usize {
+    200
+}
+fn default_lens_drift_threshold() -> f32 {
+    0.15
+}
+const fn default_lens_poll_interval_secs() -> u64 {
+    5
+}
+const fn default_lens_candidate_k_per_lane() -> usize {
+    32
+}
+fn default_lens_dominance_threshold() -> f32 {
+    0.30
+}
+
+impl Default for LensSettings {
+    fn default() -> Self {
+        Self {
+            token_budget: default_lens_token_budget(),
+            min_excerpt_tokens: default_lens_min_excerpt_tokens(),
+            drift_threshold: default_lens_drift_threshold(),
+            poll_interval_secs: default_lens_poll_interval_secs(),
+            exclude_facets: Vec::new(),
+            candidate_k_per_lane: default_lens_candidate_k_per_lane(),
+            dominance_threshold: default_lens_dominance_threshold(),
+        }
     }
 }
 

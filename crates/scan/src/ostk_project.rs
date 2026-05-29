@@ -348,9 +348,18 @@ impl OstkProjectScanner {
 
 #[derive(Debug, Deserialize)]
 struct DecisionRow {
+    // `decisions.jsonl` carries two record shapes: the original
+    // `{key, value, reason, timestamp}` and the newer kernel-written
+    // `{decision, status, reason}`. Accept either spelling of the
+    // identifier so the latter no longer fails with
+    // `missing field 'key'`.
+    #[serde(alias = "decision")]
     key: String,
     #[serde(default)]
     value: serde_json::Value,
+    /// Present on kernel-written records (e.g. `"A"` = accepted).
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -378,11 +387,25 @@ fn scan_decisions(root: &Path, project: Option<&str>, source_config_id: &str) ->
             }
         };
         let value_text = value_to_string(&dec.value);
-        let body = if let Some(reason) = dec.reason.as_deref() {
-            format!("{value_text}\n\n{reason}")
+        // Assemble the embedded body from whatever fields the row
+        // carries. Lead with the structured value when present;
+        // otherwise lead with the decision name so kernel-written
+        // `{decision,status,reason}` rows keep their identifier in
+        // the searchable text. `status` (when present) is folded in
+        // between.
+        let mut parts: Vec<String> = Vec::new();
+        if value_text.is_empty() {
+            parts.push(dec.key.clone());
         } else {
-            value_text
-        };
+            parts.push(value_text);
+        }
+        if let Some(status) = dec.status.as_deref() {
+            parts.push(format!("status: {status}"));
+        }
+        if let Some(reason) = dec.reason.as_deref() {
+            parts.push(reason.to_string());
+        }
+        let body = parts.join("\n\n");
         let chunk_id = Chunk::make_id(Source::OstkDecision, &dec.key, chunk_index, source_config_id);
         let sha256 = Chunk::content_hash(&body);
         let links = Links {
@@ -1305,6 +1328,36 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+
+    #[test]
+    fn scan_decisions_accepts_both_key_and_decision_schemas() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".ostk")).unwrap();
+        write_jsonl(
+            &tmp.path().join(".ostk/decisions.jsonl"),
+            &[
+                // original schema: `key` + `value`
+                r#"{"key":"K1","value":"adopt X","reason":"tradeoff study","timestamp":"2026-04-17T10:00:00Z"}"#,
+                // newer kernel schema: `decision` + `status`, no `value`
+                r#"{"decision":"KERNEL_SHIPPED","status":"A","reason":"phases 1-5 done"}"#,
+            ],
+        );
+        let chunks = scan_decisions(tmp.path(), Some("proj"), "cfg").unwrap();
+        assert_eq!(chunks.len(), 2, "both record shapes must produce chunks");
+
+        // Original schema: source_id == key, body leads with value.
+        assert_eq!(chunks[0].source_id, "K1");
+        assert!(chunks[0].text.contains("adopt X"));
+        assert!(chunks[0].text.contains("tradeoff study"));
+
+        // Newer schema: `decision` is accepted as the identifier, the
+        // name leads the body (no structured value), and status is
+        // folded in.
+        assert_eq!(chunks[1].source_id, "KERNEL_SHIPPED");
+        assert!(chunks[1].text.contains("KERNEL_SHIPPED"));
+        assert!(chunks[1].text.contains("status: A"));
+        assert!(chunks[1].text.contains("phases 1-5 done"));
     }
 
     fn write_fixture(root: &Path) {
