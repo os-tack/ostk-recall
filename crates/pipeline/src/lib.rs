@@ -914,7 +914,6 @@ impl Pipeline {
         if self.dry_run {
             return stats;
         }
-        let project = cfg.project.as_deref().unwrap_or("default");
         let Ok(roots) = cfg.expanded_paths() else {
             return stats;
         };
