@@ -259,11 +259,18 @@ impl Pipeline {
     /// match this source, or a scanner bumps its parse version, even when the
     /// file itself is unchanged. Delegates to `core::cfg_overlay_hash`.
     fn cfg_overlay_hash(&self, cfg: &SourceConfig, scanner: &dyn Scanner) -> String {
-        let extra = format!(
-            "rr:{}|pv:{}",
-            self.record_rules.digest_for(cfg.kind),
-            scanner.parse_version()
-        );
+        let rules_digest = self.record_rules.digest_for(cfg.kind);
+        let parse_version = scanner.parse_version();
+        // Preserve the pre-P12 hash exactly for sources with NO applicable
+        // record rules AND parse_version 0 — otherwise the P12 upgrade would
+        // flip every source's Tier-1 key and re-parse the whole corpus
+        // (including the expensive code re-index), not just the affected
+        // source kinds.
+        let extra = if rules_digest.is_empty() && parse_version == 0 {
+            String::new()
+        } else {
+            format!("rr:{rules_digest}|pv:{parse_version}")
+        };
         cfg_overlay_hash(cfg.project.as_deref(), &cfg.facets, &extra)
     }
 

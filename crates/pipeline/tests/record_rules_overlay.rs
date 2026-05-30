@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ostk_recall_core::{
     Chunk, CompiledRecordRules, Config, RecordRule, RuleAction, RuleMatch, Scanner, Source,
-    SourceConfig, SourceItem, SourceKind,
+    SourceConfig, SourceItem, SourceKind, default_record_rules,
 };
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline};
 use ostk_recall_store::{CorpusStore, IngestDb};
@@ -204,6 +204,36 @@ async fn editing_a_record_rule_forces_reparse() {
         c2.count() > 0,
         "editing a record rule must flip the Tier-1 digest and re-parse"
     );
+}
+
+#[tokio::test]
+async fn unaffected_source_kind_does_not_reparse_under_default_rules() {
+    // Regression guard: enabling P12 with the DEFAULT ruleset (scoped to
+    // claude_code/ostk_project) must NOT force a markdown source to re-parse —
+    // its Tier-1 hash has to stay byte-identical to the no-rules value, or the
+    // whole corpus re-parses on upgrade (the slow-scan bug).
+    let fixtures = TempDir::new().unwrap();
+    let corpus = TempDir::new().unwrap();
+    std::fs::write(fixtures.path().join("a.md"), "# H\n\nbody\n").unwrap();
+    let scanner = ostk_recall_scan::markdown::MarkdownScanner;
+    let cfg = markdown_cfg(fixtures.path());
+
+    // Run 1: no rules at all.
+    let (p1, c1, _) = make_pipeline(corpus.path(), &[]).await;
+    p1.ingest_source(&scanner, &cfg).await;
+    assert!(c1.count() > 0, "baseline embed");
+
+    // Run 2: the DEFAULT ruleset is now active, but none of it targets
+    // markdown → digest_for(Markdown) == "" → extra digest empty → same hash →
+    // Tier-1 skip, no re-embed.
+    let (p2, c2, _) = make_pipeline(corpus.path(), &default_record_rules()).await;
+    let s2 = p2.ingest_source(&scanner, &cfg).await;
+    assert_eq!(
+        c2.count(),
+        0,
+        "markdown must Tier-1-skip under the default rules (no re-embed); stats={s2:?}"
+    );
+    assert_eq!(s2.items_skipped, 1, "the file should be Tier-1-skipped");
 }
 
 #[tokio::test]

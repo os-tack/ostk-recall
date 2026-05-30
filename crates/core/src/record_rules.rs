@@ -323,18 +323,29 @@ impl CompiledRecordRules {
     /// unscoped). Folded into the per-source Tier-1 freshness key so editing a
     /// rule for one source_kind re-parses only that kind's sources, not the
     /// whole corpus.
+    ///
+    /// **Returns an empty string when no rule applies to `kind`.** The empty
+    /// case is load-bearing: the pipeline maps it (with `parse_version == 0`)
+    /// to an empty Tier-1 `extra_digest`, which reproduces the pre-P12 hash
+    /// byte-for-byte so unaffected sources (markdown/code/…) keep Tier-1
+    /// skipping instead of re-parsing the whole corpus.
     #[must_use]
     pub fn digest_for(&self, kind: SourceKind) -> String {
-        let mut h = Sha256::new();
-        h.update(b"record_rules_v1");
-        for r in &self.raw {
-            let applies = match &r.r#match.source_kind {
+        let applicable: Vec<&RecordRule> = self
+            .raw
+            .iter()
+            .filter(|r| match &r.r#match.source_kind {
                 None => true,
                 Some(v) => v.iter().any(|s| SourceKind::parse_str(s) == Some(kind)),
-            };
-            if applies {
-                hash_rule(&mut h, r);
-            }
+            })
+            .collect();
+        if applicable.is_empty() {
+            return String::new();
+        }
+        let mut h = Sha256::new();
+        h.update(b"record_rules_v1");
+        for r in applicable {
+            hash_rule(&mut h, r);
         }
         hex::encode(&h.finalize()[..16])
     }
@@ -569,6 +580,19 @@ mod tests {
             action: RuleAction::Drop,
         }]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn digest_for_is_empty_when_no_rule_applies() {
+        // Load-bearing for the Tier-1 hash: an empty digest (no applicable
+        // rule) + parse_version 0 reproduces the pre-P12 hash, so unaffected
+        // sources keep Tier-1 skipping instead of re-parsing the whole corpus.
+        let rules = build_default();
+        assert_eq!(rules.digest_for(SourceKind::Markdown), "");
+        assert_eq!(rules.digest_for(SourceKind::Code), "");
+        assert_eq!(rules.digest_for(SourceKind::Gemini), "");
+        assert!(!rules.digest_for(SourceKind::ClaudeCode).is_empty());
+        assert!(!rules.digest_for(SourceKind::OstkProject).is_empty());
     }
 
     #[test]

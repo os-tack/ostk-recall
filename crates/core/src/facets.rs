@@ -183,8 +183,14 @@ pub fn cfg_overlay_hash(
         }
         h.update(b"|");
     }
-    h.update(b"|extra:");
-    h.update(extra_digest.as_bytes());
+    // IMPORTANT: only mix in the extra section when non-empty, so a source
+    // with no applicable record rules + parse_version 0 hashes
+    // byte-identically to the pre-P12 (P1-only) value and keeps Tier-1
+    // skipping — otherwise adding P12 would force a full-corpus re-parse.
+    if !extra_digest.is_empty() {
+        h.update(b"|extra:");
+        h.update(extra_digest.as_bytes());
+    }
     hex::encode(&h.finalize()[..16])
 }
 
