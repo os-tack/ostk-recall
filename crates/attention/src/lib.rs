@@ -381,6 +381,23 @@ pub trait AttentionForwardStore: Send + Sync {
         Ok(0.0)
     }
 
+    /// Install or replace a thread's anchor vector in `scope`.
+    ///
+    /// Used by the boot-time re-anchoring pass (`cli::commands::serve`)
+    /// and by `thread_create`'s live-seed path to pull a thread's
+    /// persistent `anchor_chunk_id` embedding from the corpus and seed
+    /// its in-memory anchor — so a freshly created waypoint resonates
+    /// without waiting for the next `serve` boot. Stores without
+    /// per-scope vector state no-op (default).
+    async fn seed_anchor(
+        &self,
+        _scope: &AttentionScope,
+        _handle: ThreadHandle,
+        _anchor: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        Ok(())
+    }
+
     /// Apply an explicit fade factor (multiplies the floor).
     async fn decay(&self, handle: &ThreadHandle, factor: f32) -> Result<(), AttentionError>;
 
@@ -801,52 +818,6 @@ impl InMemoryAttention {
     #[must_use]
     pub fn embedder_dim(&self) -> Option<usize> {
         self.embedder.as_ref().map(|e| e.dim())
-    }
-
-    /// Install or replace a thread's anchor vector. Used by the
-    /// boot-time re-anchoring pass in `cli::commands::serve` to
-    /// pull each thread's persistent `anchor_chunk_id` from the
-    /// corpus and seed its in-memory anchor with the real
-    /// embedder's vector. Without this, threads materialised by
-    /// chain replay carry empty anchors (resonance = 0) until
-    /// they're touched by a fresh `familiarize` or `fold` — and
-    /// even then, the anchor would only reflect the scope's
-    /// current attention vector, not the thread's persistent
-    /// identity in the corpus.
-    ///
-    /// The corresponding scope is implied by the caller (replay
-    /// scope today; could be the thread's `created_scope_key`
-    /// once that's plumbed through). If the thread already has
-    /// in-memory state, only the anchor is replaced — tension,
-    /// familiarity, last_touched_at, and depth are preserved.
-    #[allow(clippy::significant_drop_tightening)]
-    pub async fn seed_anchor(
-        &self,
-        scope: &AttentionScope,
-        handle: ThreadHandle,
-        anchor: Vec<f32>,
-    ) -> Result<(), AttentionError> {
-        let key = ScopeKey::from(scope);
-        let was_private = scope.privacy_tier == PrivacyTier::T0Private;
-        let now = Utc::now();
-        let mut inner = self.inner.write().await;
-        let scope_state = inner.scopes.entry(key.clone()).or_default();
-        scope_state
-            .threads
-            .entry(handle)
-            .and_modify(|t| t.anchor.clone_from(&anchor))
-            .or_insert_with(|| ThreadState {
-                tension: 0.0,
-                mentions: 0,
-                resonance: 0,
-                last_touched_at: now,
-                depth: FoldDepth::Folded,
-                fade_multiplier: 1.0,
-                anchor,
-                origin: key,
-                origin_was_private: was_private,
-            });
-        Ok(())
     }
 
     /// Materialise `handle` in `scope` (if absent) and SET its durable
@@ -1277,6 +1248,45 @@ impl AttentionForwardStore for InMemoryAttention {
             rolling_vec: updated,
             lambda: self.lambda,
         })
+    }
+
+    /// Install or replace a thread's anchor vector in `scope`.
+    ///
+    /// Without this, threads materialised by chain replay carry empty
+    /// anchors (resonance = 0) until touched by a fresh `familiarize`
+    /// or `fold` — and even then, the anchor would only reflect the
+    /// scope's current attention vector, not the thread's persistent
+    /// identity in the corpus. If the thread already has in-memory
+    /// state, only the anchor is replaced — tension, familiarity,
+    /// last_touched_at, and depth are preserved.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn seed_anchor(
+        &self,
+        scope: &AttentionScope,
+        handle: ThreadHandle,
+        anchor: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        let key = ScopeKey::from(scope);
+        let was_private = scope.privacy_tier == PrivacyTier::T0Private;
+        let now = Utc::now();
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key.clone()).or_default();
+        scope_state
+            .threads
+            .entry(handle)
+            .and_modify(|t| t.anchor.clone_from(&anchor))
+            .or_insert_with(|| ThreadState {
+                tension: 0.0,
+                mentions: 0,
+                resonance: 0,
+                last_touched_at: now,
+                depth: FoldDepth::Folded,
+                fade_multiplier: 1.0,
+                anchor,
+                origin: key,
+                origin_was_private: was_private,
+            });
+        Ok(())
     }
 
     async fn surface(

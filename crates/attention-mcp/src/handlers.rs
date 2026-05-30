@@ -334,8 +334,36 @@ pub async fn thread_create(
     // owner of the on-disk `.ostk/threads/*.md` body.
     let _ = input.body;
     d.threads.upsert_thread(&record)?;
+
+    // Live-seed the in-memory anchor so a freshly created waypoint
+    // resonates immediately — without waiting for the next `serve` boot
+    // re-anchor pass (frontier-surfacer-scope quick-win). Mirrors
+    // `re_anchor_threads_from_corpus`: fetch the anchor chunk's embedding
+    // from the corpus and seed it into the same `replay`/`substrate`
+    // scope boot uses, so the cross-scope `surface()` reaches it from any
+    // query scope. Best-effort: a missing corpus handle or a
+    // stale/absent chunk leaves the durable row intact (boot re-anchor
+    // recovers it on the next start) and reports `seeded_anchor: false`.
+    let mut seeded_anchor = false;
+    if let (Some(chunk_id), Some(corpus)) = (record.anchor_chunk_id.as_ref(), d.corpus.as_ref()) {
+        let embeddings = corpus.fetch_embeddings(std::slice::from_ref(chunk_id)).await?;
+        if let Some(vec) = embeddings.get(chunk_id) {
+            let scope = AttentionScope {
+                project: None,
+                session_id: Some("replay".into()),
+                agent: Some("substrate".into()),
+                privacy_tier: input.scope.privacy_tier,
+            };
+            d.attention
+                .seed_anchor(&scope, record.handle.clone(), vec.clone())
+                .await?;
+            seeded_anchor = true;
+        }
+    }
+
     Ok(json!({
         "record": thread_record_to_json(&record),
+        "seeded_anchor": seeded_anchor,
     }))
 }
 
@@ -2019,6 +2047,87 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0]["handle"], "alpha-thread");
         assert_eq!(recs[0]["tension"], "slack");
+    }
+
+    #[tokio::test]
+    async fn thread_create_live_seeds_anchor_without_restart() {
+        // Frontier-A quick-win: a freshly created, corpus-anchored
+        // waypoint must resonate immediately — no `serve` restart to
+        // let the boot re-anchor pass seed the in-memory vector.
+        let (_tt, _tc, d) = build_dispatch_with_resonance_corpus().await;
+
+        // `a-0` is the axis-0-aligned corpus chunk in the fixture.
+        let out = thread_create(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "handle": "frontier-waypoint",
+                "anchor_chunk_id": "a-0",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["seeded_anchor"].as_bool(),
+            Some(true),
+            "anchor present in corpus must be live-seeded"
+        );
+
+        // WITHOUT restarting: attend an axis-0 query in the project
+        // scope, then the waypoint's resonance against that scope must
+        // be ~1 — proving the in-memory anchor is live (resonance()
+        // resolves the replay-scope anchor cross-scope). Pre-fix this
+        // was 0: the anchor was only persisted to disk.
+        let scope_p = AttentionScope {
+            project: Some("p".into()),
+            ..Default::default()
+        };
+        d.attention
+            .attend(&scope_p, "axis zero focus")
+            .await
+            .unwrap();
+        let handle = ThreadHandle::new("frontier-waypoint").unwrap();
+        let res = d.attention.resonance(&scope_p, &handle).await.unwrap();
+        assert!(
+            res > 0.95,
+            "live-seeded anchor must resonate ~1 against an aligned query, got {res}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_create_missing_chunk_reports_not_seeded() {
+        // Corpus is wired but the anchor points outside it (stale /
+        // deleted chunk). The durable row is still written; the live
+        // seed is skipped and reported as such — boot re-anchor will
+        // pick it up later if the chunk reappears.
+        let (_tt, _tc, d) = build_dispatch_with_resonance_corpus().await;
+        let out = thread_create(
+            &d,
+            json!({
+                "scope": {"project": "p"},
+                "handle": "stale-anchor",
+                "anchor_chunk_id": "does-not-exist",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["seeded_anchor"].as_bool(), Some(false));
+        assert_eq!(out["record"]["handle"], "stale-anchor");
+    }
+
+    #[tokio::test]
+    async fn thread_create_without_corpus_reports_not_seeded() {
+        // No corpus handle on the dispatch → no live seed possible.
+        // The durable row is created regardless.
+        let (_tmp, d) = build_dispatch();
+        let out = thread_create(
+            &d,
+            json!({"handle": "no-corpus", "anchor_chunk_id": "a-0"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["seeded_anchor"].as_bool(), Some(false));
+        assert_eq!(out["record"]["handle"], "no-corpus");
     }
 
     #[tokio::test]
