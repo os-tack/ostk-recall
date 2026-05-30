@@ -1,18 +1,16 @@
 //! Query- and attention-context types consumed by the rank engine and
 //! lane functions.
 //!
-//! **P3A — minimal shape.** The full `AttentionContext` defined in
-//! `architecture.md` § "Context types" carries `rolling_vec`,
-//! `recent_entities`, `active_thread_handles`, `pseudo_query`,
-//! `chain_log`, and the two-phase `enrich_for_lens` pattern. Those
-//! fields land in P6A (rolling vector + scope-vector priority chain)
-//! and P9b-min (lens loop) as their owners ship.
-//!
-//! P3A consumes only `scope_vector`, which already exists today via
-//! `InMemoryAttention::scope_vector()`. Keeping the type minimal here
-//! avoids dragging the chain-log trait and concept-store handles into
-//! a phase that has no consumer for them yet — they accrete when the
-//! features that need them do.
+//! `AttentionContext` grows by phase: `scope_vector` (P3A), `rolling_vec`
+//! (P6A), and now `chain_log` (P7b — the access-ledger reader the ACT-R
+//! freshness feature consumes). Remaining `architecture.md` fields
+//! (`recent_entities`, `active_thread_handles`, `pseudo_query`, the
+//! two-phase `enrich_for_lens` constructor) accrete as their owning
+//! features (P7/P8/P9b-full) ship.
+
+use std::sync::Arc;
+
+use ostk_recall_store::ChainLogReader;
 
 /// The query side of a rank call.
 ///
@@ -69,7 +67,7 @@ impl QueryContext {
 /// `scope_vector`. P9b-min adds the two-phase
 /// `enrich_for_lens` constructor that does async concept-label /
 /// pseudo-query work after the attention lock drops.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AttentionContext {
     /// Effective attention vector (`pinned → rolling → transient`).
     /// `None` only at empty-mind boot (no pin, no rolling, no
@@ -82,6 +80,28 @@ pub struct AttentionContext {
     /// values directly; ranking still uses `scope_vector` so the
     /// operator's pin (if any) stays authoritative.
     pub rolling_vec: Option<Vec<f32>>,
+    /// P7b — read handle on the chunk-access ledger, consumed by the
+    /// ACT-R [`crate::freshness`] feature's `prepare()`. `None` on the
+    /// explicit-recall path and until P9b-full wires the lens loop's
+    /// reader; the Freshness feature degrades to `chunk.ts`-only
+    /// (creation-recency) base activation when absent.
+    pub chain_log: Option<Arc<dyn ChainLogReader>>,
+}
+
+// Hand-written: `Arc<dyn ChainLogReader>` is not `Debug`, so the struct
+// can't derive it. Print the vecs as-is (preserving prior output) and the
+// chain-log handle as a presence marker.
+impl std::fmt::Debug for AttentionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttentionContext")
+            .field("scope_vector", &self.scope_vector)
+            .field("rolling_vec", &self.rolling_vec)
+            .field(
+                "chain_log",
+                &self.chain_log.as_ref().map_or("none", |_| "set"),
+            )
+            .finish()
+    }
 }
 
 impl AttentionContext {
@@ -90,6 +110,7 @@ impl AttentionContext {
         Self {
             scope_vector: None,
             rolling_vec: None,
+            chain_log: None,
         }
     }
 
@@ -98,7 +119,17 @@ impl AttentionContext {
         Self {
             scope_vector: Some(vec),
             rolling_vec: None,
+            chain_log: None,
         }
+    }
+
+    /// Attach a read handle on the access ledger so the ACT-R
+    /// [`crate::freshness`] feature can pull retrieval history in its
+    /// `prepare()`. Additive builder; leaves the vectors untouched.
+    #[must_use]
+    pub fn with_chain_log(mut self, reader: Arc<dyn ChainLogReader>) -> Self {
+        self.chain_log = Some(reader);
+        self
     }
 
     /// Populate the rolling channel and, when no effective scope

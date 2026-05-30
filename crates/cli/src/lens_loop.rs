@@ -186,6 +186,10 @@ impl LensTickSnapshot {
         AttentionContext {
             scope_vector: self.scope_vector.clone(),
             rolling_vec: self.rolling_vec.clone(),
+            // P7b: the ledger reader is wired into the lens by P9b-full
+            // when the freshness slot lands; the attention-only P9b-min
+            // lens has no freshness feature, so None is correct here.
+            chain_log: None,
         }
     }
 }
