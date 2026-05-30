@@ -21,9 +21,10 @@ pub use attention::{
 };
 pub use chunk::{Chunk, Links};
 pub use config::{
-    Config, CorpusConfig, EmbedderConfig, LensSettings, RerankerConfig, RuntimeConfig,
-    SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig, WatchMode, WeaverSettings,
-    compute_source_config_id, default_worker_threads,
+    Config, CorpusConfig, EmbedderConfig, LensSettings, ProfileWeights, RankProfile, RankingConfig,
+    RerankerConfig, RuntimeConfig, SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig,
+    WatchMode, WeaverSettings, compute_source_config_id, default_profile_weights,
+    default_worker_threads,
 };
 pub use error::{Error, Result};
 pub use facets::{

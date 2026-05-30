@@ -341,11 +341,101 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
+// ---- config-driven engine construction (P5) ---------------------------
+
+/// Build a [`RankEngine`] from a profile weight map (P5).
+///
+/// **Single source of truth for engine construction** — both production
+/// `recall` / lens paths and the `rank_bench` harness build their engines
+/// here, so a weight that ships and a weight that was benched can never
+/// drift. The map comes from [`ostk_recall_core::Config::effective_ranking_weights`]
+/// (a profile's compiled-in defaults overlaid by `[ranking.weights.*]`).
+///
+/// Only features named in `weights` are registered; an entry's value is the
+/// engine weight. This preserves production parity: the explicit profile's
+/// compiled default is `{rrf: 1.0}`, so the built engine registers exactly
+/// `rrf` at weight 1.0 — numerically identical to the pre-P5 hardcoded
+/// builder. Unknown feature ids are ignored (forward-compat for features
+/// that land in a later phase but appear in a hand-edited config).
+///
+/// Known feature ids:
+/// - `rrf` — normalized reciprocal-rank fusion of the lane evidence.
+/// - `bm25` — soft-sigmoid-normalized raw BM25 (`s / (s + K_BM25)`).
+/// - `attention_affinity` — cosine(scope_vector, candidate embedding).
+/// - `freshness` — ACT-R access-recency (P7b); reads `attn.chain_log` when
+///   present, else falls back to chunk creation time. Registered with
+///   [`crate::freshness::FreshnessFactory::default`] tuning.
+#[must_use]
+pub fn build_engine_from_weights(weights: &BTreeMap<String, f32>) -> RankEngine {
+    let mut engine = RankEngine::new();
+    for (name, &weight) in weights {
+        engine = match name.as_str() {
+            "rrf" => engine.with_fn_feature("rrf", weight, |c, _q, _a| {
+                c.rrf_score.map_or(0.0, crate::lanes::rrf_score_normalized)
+            }),
+            "bm25" => engine.with_fn_feature("bm25", weight, |c, _q, _a| {
+                c.bm25_score
+                    .map_or(0.0, |s| s / (s + crate::hybrid::K_BM25))
+            }),
+            "attention_affinity" => {
+                engine.with_fn_feature("attention_affinity", weight, |c, _q, a| {
+                    attention_affinity_score(c, a)
+                })
+            }
+            "freshness" => engine.with_factory(
+                Arc::new(crate::freshness::FreshnessFactory::default()),
+                weight,
+            ),
+            // Unknown id: a feature not (yet) known to this builder. Ignore
+            // rather than panic so a forward-looking config doesn't break an
+            // older binary.
+            _ => engine,
+        };
+    }
+    engine
+}
+
 #[cfg(test)]
 mod tests {
     use ostk_recall_core::{Chunk, FacetSet, Links, Source};
 
     use super::*;
+
+    #[test]
+    fn build_engine_registers_only_mapped_known_features() {
+        let mut w = BTreeMap::new();
+        w.insert("rrf".to_string(), 1.0);
+        w.insert("freshness".to_string(), 0.5);
+        w.insert("unknown_feature_xyz".to_string(), 9.0);
+        let engine = build_engine_from_weights(&w);
+        let names: Vec<&str> = engine.feature_names().collect();
+        assert!(names.contains(&"rrf"), "rrf registered");
+        assert!(names.contains(&"freshness"), "freshness registered");
+        assert!(
+            !names.contains(&"unknown_feature_xyz"),
+            "unknown id must be ignored, not registered"
+        );
+        assert_eq!(engine.feature_count(), 2, "only known mapped features");
+    }
+
+    #[test]
+    fn build_engine_explicit_default_is_rrf_only() {
+        // Production parity: the explicit profile's compiled default
+        // ({rrf: 1.0}) must build an engine identical in shape to the
+        // pre-P5 hardcoded rrf-only builder.
+        let w = ostk_recall_core::default_profile_weights(ostk_recall_core::RankProfile::Explicit);
+        let engine = build_engine_from_weights(&w);
+        let names: Vec<&str> = engine.feature_names().collect();
+        assert_eq!(names, vec!["rrf"]);
+    }
+
+    #[test]
+    fn build_engine_ambient_default_is_attention_only() {
+        let w = ostk_recall_core::default_profile_weights(ostk_recall_core::RankProfile::Ambient);
+        let engine = build_engine_from_weights(&w);
+        let names: Vec<&str> = engine.feature_names().collect();
+        assert_eq!(names, vec!["attention_affinity"]);
+    }
 
     fn dummy_chunk(id: &str) -> Chunk {
         Chunk {

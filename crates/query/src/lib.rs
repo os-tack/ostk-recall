@@ -42,6 +42,7 @@ pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
 pub use rank::{
     FeatureAttribution, FnFactory, RankEngine, RankFeatureFactory, RankFeatureInstance, RankedHit,
+    build_engine_from_weights,
 };
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;

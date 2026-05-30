@@ -46,6 +46,14 @@ pub struct Config {
     /// `record_kind:harness_orchestration` from weaving).
     #[serde(default)]
     pub weaver: Option<WeaverSettings>,
+    /// Optional rank-engine feature weights (P5), keyed by retrieval
+    /// profile. Omit the `[ranking]` block to accept the compiled-in
+    /// defaults (explicit recall: `rrf = 1.0`; ambient/lens:
+    /// `attention_affinity = 1.0`) — these match shipped v0.6 behavior.
+    /// Present (even partial) overlays the compiled-in defaults; see
+    /// [`ProfileWeights::effective`].
+    #[serde(default)]
+    pub ranking: Option<RankingConfig>,
 }
 
 /// Runtime resource caps. Each field is the upper bound on the
@@ -256,6 +264,109 @@ impl WeaverSettings {
     #[must_use]
     pub fn resolve(slot: Option<&Self>) -> Self {
         slot.cloned().unwrap_or_default()
+    }
+}
+
+/// Retrieval profile a weight map applies to (P5). `Explicit` is the
+/// user-text `recall` path (lanes + rerank); `Ambient` is the lens /
+/// attention-driven path (no reranker — the rank features ARE the ranking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankProfile {
+    Explicit,
+    Ambient,
+}
+
+/// Compiled-in default rank-engine weights for a profile. These define
+/// shipped v0.6 behavior when no `[ranking]` block is present:
+/// explicit recall fuses on RRF only; ambient ranks on attention affinity.
+/// P5's empirical bench tunes these; ratified weights are committed here.
+#[must_use]
+pub fn default_profile_weights(profile: RankProfile) -> std::collections::BTreeMap<String, f32> {
+    let mut m = std::collections::BTreeMap::new();
+    match profile {
+        RankProfile::Explicit => {
+            m.insert("rrf".to_string(), 1.0);
+        }
+        RankProfile::Ambient => {
+            m.insert("attention_affinity".to_string(), 1.0);
+        }
+    }
+    m
+}
+
+/// Rank-engine feature weights (P5), surfaced as the optional `[ranking]`
+/// block. Known feature ids: `rrf`, `bm25`, `attention_affinity`,
+/// `freshness`. Unknown ids are accepted (forward-compat for features that
+/// land later) and ignored by an engine builder that doesn't know them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankingConfig {
+    #[serde(default)]
+    pub weights: ProfileWeights,
+}
+
+/// Per-profile weight maps with fall-through. The effective map for a
+/// profile is the compiled-in [`default_profile_weights`] overlaid by
+/// `[ranking.weights.default]`, then by the profile-specific map (profile
+/// entries win; keys absent from the profile fall through).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileWeights {
+    /// Fall-through weights applied to every profile.
+    #[serde(default)]
+    pub default: std::collections::BTreeMap<String, f32>,
+    /// Explicit-recall overrides.
+    #[serde(default)]
+    pub explicit: std::collections::BTreeMap<String, f32>,
+    /// Ambient/lens overrides.
+    #[serde(default)]
+    pub ambient: std::collections::BTreeMap<String, f32>,
+}
+
+impl ProfileWeights {
+    /// The effective weight map for `profile`: compiled-in defaults,
+    /// overlaid by `default`, overlaid by the profile-specific map.
+    #[must_use]
+    pub fn effective(&self, profile: RankProfile) -> std::collections::BTreeMap<String, f32> {
+        let mut m = default_profile_weights(profile);
+        for (k, v) in &self.default {
+            m.insert(k.clone(), *v);
+        }
+        let profile_map = match profile {
+            RankProfile::Explicit => &self.explicit,
+            RankProfile::Ambient => &self.ambient,
+        };
+        for (k, v) in profile_map {
+            m.insert(k.clone(), *v);
+        }
+        m
+    }
+}
+
+impl RankingConfig {
+    /// Effective weight map for `profile`, resolving an optional
+    /// `[ranking]` block against the compiled-in defaults.
+    #[must_use]
+    pub fn effective_weights(
+        slot: Option<&Self>,
+        profile: RankProfile,
+    ) -> std::collections::BTreeMap<String, f32> {
+        slot.map_or_else(
+            || default_profile_weights(profile),
+            |r| r.weights.effective(profile),
+        )
+    }
+}
+
+impl Config {
+    /// Effective rank-engine weight map for a retrieval profile (P5).
+    /// Falls back to [`default_profile_weights`] when `[ranking]` is omitted.
+    #[must_use]
+    pub fn effective_ranking_weights(
+        &self,
+        profile: RankProfile,
+    ) -> std::collections::BTreeMap<String, f32> {
+        RankingConfig::effective_weights(self.ranking.as_ref(), profile)
     }
 }
 
@@ -966,6 +1077,79 @@ mode = "burst"
         assert!(
             err.contains("burst") || err.contains("unknown") || err.contains("variant"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ranking_omitted_uses_compiled_defaults() {
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        assert!(cfg.ranking.is_none());
+        let explicit = cfg.effective_ranking_weights(RankProfile::Explicit);
+        assert_eq!(explicit.get("rrf").copied(), Some(1.0));
+        assert_eq!(explicit.len(), 1, "explicit default is rrf only");
+        let ambient = cfg.effective_ranking_weights(RankProfile::Ambient);
+        assert_eq!(ambient.get("attention_affinity").copied(), Some(1.0));
+        assert_eq!(ambient.len(), 1, "ambient default is attention only");
+    }
+
+    #[test]
+    fn ranking_profile_overlays_default_and_compiled() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[ranking.weights.default]
+freshness = 0.5
+
+[ranking.weights.explicit]
+bm25 = 2.0
+rrf = 0.25
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let explicit = cfg.effective_ranking_weights(RankProfile::Explicit);
+        // compiled rrf=1.0 overridden by explicit rrf=0.25
+        assert_eq!(explicit.get("rrf").copied(), Some(0.25));
+        // default freshness=0.5 falls through (no explicit override)
+        assert_eq!(explicit.get("freshness").copied(), Some(0.5));
+        // explicit-only bm25
+        assert_eq!(explicit.get("bm25").copied(), Some(2.0));
+
+        // Ambient sees the default overlay but not the explicit map.
+        let ambient = cfg.effective_ranking_weights(RankProfile::Ambient);
+        assert_eq!(ambient.get("attention_affinity").copied(), Some(1.0));
+        assert_eq!(ambient.get("freshness").copied(), Some(0.5));
+        assert!(
+            !ambient.contains_key("bm25"),
+            "explicit-only weight must not leak into ambient"
+        );
+    }
+
+    #[test]
+    fn ranking_block_round_trips() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[ranking.weights.ambient]
+attention_affinity = 0.8
+freshness = 0.3
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let r = cfg.ranking.as_ref().unwrap();
+        assert_eq!(r.weights.ambient.get("attention_affinity").copied(), Some(0.8));
+        assert_eq!(r.weights.ambient.get("freshness").copied(), Some(0.3));
+        // Re-serialize and re-parse: stable.
+        let toml_out = toml::to_string(&cfg).unwrap();
+        let cfg2: Config = toml::from_str(&toml_out).unwrap();
+        assert_eq!(
+            cfg2.effective_ranking_weights(RankProfile::Ambient),
+            cfg.effective_ranking_weights(RankProfile::Ambient)
         );
     }
 }
