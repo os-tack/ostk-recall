@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};
 
+use ostk_recall_store::ChainEvent;
+
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::resources::{ClientId, ResourceRegistry};
 use crate::tools::tool_list;
@@ -66,6 +68,23 @@ impl Server {
     pub fn with_attention(mut self, dispatch: Arc<AttentionDispatch>) -> Self {
         self.attention = Some(dispatch);
         self
+    }
+
+    /// P7b: append access-ledger events, best-effort. Requires the
+    /// attention dispatch (which owns the threads ledger + chain sink) —
+    /// on the `--stdio`/no-attention path there is no sink and events are
+    /// silently skipped. A ledger write must NEVER fail the recall that
+    /// produced it, so append errors are logged and swallowed.
+    fn log_access_events(&self, events: &[ChainEvent]) {
+        let Some(dispatch) = self.attention.as_ref() else {
+            return;
+        };
+        let sink = dispatch.threads.chain_sink();
+        for ev in events {
+            if let Err(e) = sink.append(ev) {
+                warn!(error = %e, kind = ev.kind_str(), "access-ledger append failed (best-effort)");
+            }
+        }
     }
 
     /// Replace the resource registry. Callers needing to register
@@ -335,6 +354,7 @@ impl Server {
                 let p: RecallParams = serde_json::from_value(args.clone())
                     .map_err(|e| JsonRpcError::invalid_params(format!("recall args: {e}")))?;
                 let bias = p.attention_bias.clone();
+                let query_hash = query_hash(&p.query);
                 let mut hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
                 // Phase F: lens declaration. Capture the pinned focus
                 // (if any) BEFORE applying bias so we can attach a
@@ -348,6 +368,19 @@ impl Server {
                         apply_attention_bias(&mut hits, &bias, dispatch).await;
                     }
                 }
+                // P7b: log one ExplicitRecall access event per returned hit
+                // (best-effort; daemon path only). ACT-R freshness is
+                // per-chunk, so each surfaced chunk is its own access.
+                let now = chrono::Utc::now();
+                let events: Vec<ChainEvent> = hits
+                    .iter()
+                    .map(|h| ChainEvent::ExplicitRecall {
+                        chunk_id: h.chunk_id.clone(),
+                        query_hash: query_hash.clone(),
+                        ts: now,
+                    })
+                    .collect();
+                self.log_access_events(&events);
                 match lens {
                     Some(lens) => json!({ "hits": hits, "lens": lens }),
                     None => json!({ "hits": hits }),
@@ -395,6 +428,17 @@ impl Server {
                     return Err(JsonRpcError::invalid_params("query must be non-empty"));
                 }
                 let hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                // P7b: capture chunk_ids BEFORE `collapse` consumes `hits`;
+                // log one RecallFault access event per retrieved chunk.
+                let now = chrono::Utc::now();
+                let events: Vec<ChainEvent> = hits
+                    .iter()
+                    .map(|h| ChainEvent::RecallFault {
+                        chunk_id: h.chunk_id.clone(),
+                        ts: now,
+                    })
+                    .collect();
+                self.log_access_events(&events);
                 let pages = Synthesizer::collapse(hits);
                 let named: Vec<Value> = pages
                     .iter()
@@ -691,6 +735,17 @@ fn build_recall_lens(
             "embedding_weight": bias.embedding_weight,
         },
     }))
+}
+
+/// Opaque short hash of a normalized query, stored on `ExplicitRecall`
+/// access events so "which query surfaced this chunk" is recoverable
+/// without persisting the full query text. `access_history` never reads
+/// it — it exists purely for future provenance analysis.
+fn query_hash(query: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    query.trim().to_lowercase().hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 fn query_error_to_rpc(err: QueryError) -> JsonRpcError {

@@ -328,6 +328,28 @@ pub enum ChainEvent {
         slot: String,
         ts: DateTime<Utc>,
     },
+    /// P7b — a chunk was surfaced by an explicit `recall` (one event per
+    /// returned hit). `query_hash` is an opaque short hash of the
+    /// normalized query (we don't store the full text); `access_history`
+    /// ignores it. Audit-only on replay — the access ledger is read on
+    /// demand, never replayed into in-memory state.
+    ExplicitRecall {
+        chunk_id: String,
+        query_hash: String,
+        ts: DateTime<Utc>,
+    },
+    /// P7b — a chunk was retrieved by a `recall_fault` synthesis pass.
+    RecallFault {
+        chunk_id: String,
+        ts: DateTime<Utc>,
+    },
+    /// P7b — an operator explicitly selected a chunk from a surface.
+    /// Variant + ledger support ship now; no producer yet (no
+    /// operator-select surface exists). Strongest "proven-useful" signal.
+    OperatorSelected {
+        chunk_id: String,
+        ts: DateTime<Utc>,
+    },
 }
 
 /// Sink for substrate chain rows.
@@ -381,6 +403,9 @@ impl ChainEvent {
             Self::RollingVectorSnapshot { .. } => "rolling_vector_snapshot",
             Self::AttentionTurnSkipped { .. } => "attention_turn_skipped",
             Self::LensIncluded { .. } => "lens_included",
+            Self::ExplicitRecall { .. } => "explicit_recall",
+            Self::RecallFault { .. } => "recall_fault",
+            Self::OperatorSelected { .. } => "operator_selected",
         }
     }
 
@@ -400,7 +425,10 @@ impl ChainEvent {
             | Self::FocusSet { ts, .. }
             | Self::RollingVectorSnapshot { ts, .. }
             | Self::AttentionTurnSkipped { ts, .. }
-            | Self::LensIncluded { ts, .. } => ts,
+            | Self::LensIncluded { ts, .. }
+            | Self::ExplicitRecall { ts, .. }
+            | Self::RecallFault { ts, .. }
+            | Self::OperatorSelected { ts, .. } => ts,
         }
     }
 
@@ -500,6 +528,16 @@ impl ChainEvent {
                 "chunk_id": chunk_id,
                 "slot": slot,
             }),
+            Self::ExplicitRecall {
+                chunk_id,
+                query_hash,
+                ..
+            } => serde_json::json!({
+                "chunk_id": chunk_id,
+                "query_hash": query_hash,
+            }),
+            Self::RecallFault { chunk_id, .. } => serde_json::json!({ "chunk_id": chunk_id }),
+            Self::OperatorSelected { chunk_id, .. } => serde_json::json!({ "chunk_id": chunk_id }),
         };
         serde_json::to_string(&v)
     }
@@ -820,6 +858,19 @@ impl ChainEvent {
                 slot: s_field("slot")?,
                 ts,
             },
+            "explicit_recall" => Self::ExplicitRecall {
+                chunk_id: s_field("chunk_id")?,
+                query_hash: s_field("query_hash")?,
+                ts,
+            },
+            "recall_fault" => Self::RecallFault {
+                chunk_id: s_field("chunk_id")?,
+                ts,
+            },
+            "operator_selected" => Self::OperatorSelected {
+                chunk_id: s_field("chunk_id")?,
+                ts,
+            },
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
                     message: format!("unknown chain kind: {other}"),
@@ -828,6 +879,159 @@ impl ChainEvent {
             }
         };
         Ok(ev)
+    }
+}
+
+// ---------------------------------------------------------------------
+// P7b — access ledger
+// ---------------------------------------------------------------------
+
+/// A kind of chunk *access* contributing to ACT-R base activation. Unlike
+/// [`ChainEvent`], this includes a synthetic `Creation` (sourced from the
+/// chunk's own `ts`, never a chain row) alongside the four ledger-backed
+/// access events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessKind {
+    /// The chunk's own creation time (`chunk.ts`); the document-recency
+    /// baseline, not a chain event.
+    Creation,
+    /// Surfaced by an explicit `recall`.
+    ExplicitRecall,
+    /// Included in a rendered memory-lens.
+    LensIncluded,
+    /// Retrieved by a `recall_fault` synthesis pass.
+    RecallFault,
+    /// Explicitly selected by an operator from a surface.
+    OperatorSelected,
+}
+
+impl AccessKind {
+    /// Map a `chain_log.kind` string to its access kind. Returns `None`
+    /// for non-access kinds (thread/evidence/attention events). `Creation`
+    /// has no chain-kind — it is synthesized from `chunk.ts`.
+    #[must_use]
+    pub fn from_kind_str(kind: &str) -> Option<Self> {
+        match kind {
+            "explicit_recall" => Some(Self::ExplicitRecall),
+            "lens_included" => Some(Self::LensIncluded),
+            "recall_fault" => Some(Self::RecallFault),
+            "operator_selected" => Some(Self::OperatorSelected),
+            _ => None,
+        }
+    }
+}
+
+/// Per-`AccessKind` weights for the ACT-R activation sum. Configurable so
+/// P5 / P9b-full can tune retrieval signal strength without touching the
+/// freshness math. An explicit retrieval / operator selection is the
+/// strongest "proven-useful" signal; an ambient lens inclusion the weakest.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessWeights {
+    pub creation: f32,
+    pub explicit_recall: f32,
+    pub lens_included: f32,
+    pub recall_fault: f32,
+    pub operator_selected: f32,
+}
+
+impl Default for AccessWeights {
+    fn default() -> Self {
+        Self {
+            creation: 1.0,
+            explicit_recall: 1.0,
+            operator_selected: 1.0,
+            recall_fault: 0.7,
+            lens_included: 0.5,
+        }
+    }
+}
+
+impl AccessWeights {
+    #[must_use]
+    pub const fn weight_of(&self, kind: AccessKind) -> f32 {
+        match kind {
+            AccessKind::Creation => self.creation,
+            AccessKind::ExplicitRecall => self.explicit_recall,
+            AccessKind::LensIncluded => self.lens_included,
+            AccessKind::RecallFault => self.recall_fault,
+            AccessKind::OperatorSelected => self.operator_selected,
+        }
+    }
+}
+
+/// Read-only access to the chunk-access ledger backing ACT-R freshness.
+///
+/// Synchronous (the backing query is a single indexed SQLite scan under a
+/// `Mutex`, like [`ThreadsDb::iter_chain`]); callers in async contexts
+/// invoke it inline without awaiting. The trait lets the query crate hold
+/// an `Arc<dyn ChainLogReader>` without depending on the concrete
+/// [`ThreadsDb`].
+pub trait ChainLogReader: Send + Sync {
+    /// For each requested `chunk_id`, the access events at/after `since`,
+    /// as `(kind, ts)` pairs in ascending `ts`. Chunks with no events are
+    /// absent from the map. Does NOT include `Creation` — callers
+    /// synthesize that from `chunk.ts`.
+    fn access_history(
+        &self,
+        chunk_ids: &[String],
+        since: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<String, Vec<(AccessKind, DateTime<Utc>)>>>;
+}
+
+impl ChainLogReader for ThreadsDb {
+    fn access_history(
+        &self,
+        chunk_ids: &[String],
+        since: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<String, Vec<(AccessKind, DateTime<Utc>)>>> {
+        let mut out: std::collections::HashMap<String, Vec<(AccessKind, DateTime<Utc>)>> =
+            std::collections::HashMap::new();
+        if chunk_ids.is_empty() {
+            return Ok(out);
+        }
+        let wanted: std::collections::HashSet<&str> =
+            chunk_ids.iter().map(String::as_str).collect();
+        let conn = self.lock();
+        // Filter by ts (indexed range) + access kinds in SQL; extract the
+        // chunk_id from the JSON payload and filter to `wanted` in Rust.
+        // Read the row `ts` column directly — NOT via `ChainEvent::from_row`,
+        // which synthesizes `Utc::now()` and would collapse every age to ~1h.
+        let mut stmt = conn.prepare(
+            "SELECT ts, kind, payload FROM chain_log \
+             WHERE ts >= ?1 AND kind IN \
+             ('explicit_recall', 'lens_included', 'recall_fault', 'operator_selected') \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt
+            .query_map([since.to_rfc3339()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        for (ts_s, kind, payload) in rows {
+            let Some(access) = AccessKind::from_kind_str(&kind) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            let Some(chunk_id) = v.get("chunk_id").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if !wanted.contains(chunk_id) {
+                continue;
+            }
+            let Ok(ts) = DateTime::parse_from_rfc3339(&ts_s) else {
+                continue;
+            };
+            out.entry(chunk_id.to_string())
+                .or_default()
+                .push((access, ts.with_timezone(&Utc)));
+        }
+        Ok(out)
     }
 }
 
@@ -1033,6 +1237,10 @@ CREATE TABLE IF NOT EXISTS chain_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_kind ON chain_log(kind);
+-- P7b access-ledger reads filter by `ts >= since` (the selective
+-- predicate); index `ts` so `ChainLogReader::access_history` is an
+-- indexed range scan, not a full table walk.
+CREATE INDEX IF NOT EXISTS idx_chain_ts ON chain_log(ts);
 
 -- thread → thread evidence edges (v0.4.x). evidence_links is
 -- chunk → thread (path-shaped source); this table captures the

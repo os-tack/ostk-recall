@@ -1411,7 +1411,13 @@ async fn replay_chain_into_attention(
             // P9b-full but replay does not restore any in-memory
             // state. last_portfolio_chunk_ids is carried in
             // lens_state.json instead.
-            | ChainEvent::LensIncluded { .. } => {}
+            | ChainEvent::LensIncluded { .. }
+            // P7b: access-ledger events are audit-only on replay — the
+            // ledger is read on demand by `ChainLogReader::access_history`
+            // (for ACT-R freshness), never replayed into in-memory state.
+            | ChainEvent::ExplicitRecall { .. }
+            | ChainEvent::RecallFault { .. }
+            | ChainEvent::OperatorSelected { .. } => {}
         }
     }
 
