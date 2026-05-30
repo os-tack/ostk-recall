@@ -674,7 +674,26 @@ fn compute_score_parts(
     // genuinely resonated. Decay *rate* still tracks mentions (the
     // decay_rate rework is deferred) so a frequently-seen thread fades
     // gently — but from a baseline floor, so it can't dominate.
-    let floor = familiarity_floor(state.resonance) * state.fade_multiplier;
+    //
+    // Context-diversity gate (frontier-resonance-gate-tuning): a
+    // frequency-derived stop-handle (high mentions, low resonance rate
+    // — `is_stop_handle`) has its resonance *diluted* across ubiquitous
+    // co-occurrence. The raw `resonance` count is then a poor salience
+    // proxy: `top-level` resonated 11 times across 1177 mentions
+    // (rate 0.009) — enough to lift its floor a hair above a real idea
+    // like `cognitive-memory` (11/22, rate 0.5). The resonance/mentions
+    // rate is the durable, already-tracked proxy for resonance *spread*
+    // (11 hits in 1177 contexts is narrow; 11 in 22 is concentrated), so
+    // a stop-handle is weighted down to the unresonant baseline floor.
+    // Gate, don't delete: the durable row and `recall` / `thread_list`
+    // reachability are untouched; only the proactive surfacer floor is
+    // clamped, so diluted resonance never buys idle dominance.
+    let resonance_floor = if is_stop_handle(state.mentions, state.resonance) {
+        familiarity_floor(0)
+    } else {
+        familiarity_floor(state.resonance)
+    };
+    let floor = resonance_floor * state.fade_multiplier;
     let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
     let resonance_term = ALPHA * resonance;
     let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
@@ -2110,6 +2129,54 @@ mod tests {
              {} should out-rank filler (1000 mentions, 0 resonance) {}",
             idea.score,
             filler.score
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_handle_floor_clamped_by_context_diversity() {
+        // frontier-resonance-gate-tuning: two threads with the SAME
+        // resonance counter (11) and identically-aligned anchors — so
+        // the live resonance *term* is equal. They differ only in
+        // mentions: `topword` is a frequency-derived stop-handle
+        // (1177 mentions, rate 0.009 ≪ STOPWORD_RATE_MAX — the real
+        // `top-level` numbers), `idea` is a genuine concept (22/11,
+        // rate 0.5 — the real `cognitive-memory` numbers). Pre-gate
+        // their floors were equal (familiarity_floor(11) ≈ 0.595); the
+        // context-diversity gate clamps the diluted-resonance
+        // stop-handle to the unresonant baseline so the concentrated
+        // idea out-ranks it.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        store
+            .seed_anchor(&scope, handle("topword"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("topword"), 1177, 11)
+            .await
+            .unwrap();
+
+        store
+            .seed_anchor(&scope, handle("idea"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("idea"), 22, 11)
+            .await
+            .unwrap();
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let topword = pages.iter().find(|p| p.handle == "topword").unwrap();
+        let idea = pages.iter().find(|p| p.handle == "idea").unwrap();
+        assert!(
+            idea.score > topword.score,
+            "diluted-resonance stop-handle (1177/11) must not tie a \
+             concentrated idea (22/11): idea {} vs topword {}",
+            idea.score,
+            topword.score
         );
     }
 
