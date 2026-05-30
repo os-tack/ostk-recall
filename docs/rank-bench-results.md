@@ -95,33 +95,96 @@ cargo run --release -p ostk-recall --example rank_bench -- \
 
 Peak RSS: n/a (fixture run on macOS).
 
-## §Operator results (real corpus — PENDING)
+## §Operator results (real corpus — 2026-05-30)
 
-> This section is the seam for the maintainer's `--corpus` run. Replace the
-> placeholders; do not ship fabricated numbers.
+Run on the maintainer's live corpus. Release build, reranker **OFF** (the bench
+measures the RRF + rank-engine path P5 tunes; the production reranker runs on top
+of this and replaces the score — see the frame note in the gate decision).
 
-- Corpus mix (counts by source): _pending_
-- Query set size + categories: _pending_
-- Quality table (configs 1–5 + 8): _pending_
-- Latency + memory (Linux): _pending_
-- Sensitivity sweep per weight: _pending_
-- Qualitative spot-check (top-3 for 5 representative queries, 1–5): _pending_
+- **Corpus**: `~/.local/share/ostk-recall/corpus.lance`, **119,965 chunks**,
+  `minishlab/potion-retrieval-32M` (512-dim). Source mix: claude_code 55,274 ·
+  code 54,462 · markdown 6,609 · ostk_spec 2,357 · ostk_decision 521 ·
+  ostk_session 200 · ostk_audit_significant 259 · ostk_needle 95 · gemini 132 ·
+  membrane 40 · ostk_memory 3.
+- **Query set**: 15 queries (`tests/fixtures/bench/queries.corpus.json`),
+  `source_id`-labeled from live recall. Categories: topical ×9, entity ×4,
+  vague ×2. (`--iters` defaulted to 5 — a known harness arg-parse nit, see
+  below; affects latency sample count only, not quality.)
 
-### Gate decision (P5 → P9b-full) — PENDING
+**Quality (explicit profile, reranker off)**
 
-Per `p5-bench.md`: a config beats baseline (config 2) if ≥10% relative MRR@10
-improvement, OR ≥10% relative Recall@10 with no >5% regression on the other, AND
-no qualitative regression.
+| Config | MRR@10 | Success@10 | Recall@10* |
+|---|---|---|---|
+| C1 rrf=1.0 | 0.581 | 0.733 | 0.430 |
+| C4 rrf=1.0 + bm25=0.5 | 0.581 | 0.733 | 0.430 |
 
-- [ ] **Improvement found** → commit tuned defaults to
-      `crates/core/src/config.rs` `[ranking.weights.{explicit,ambient}]` (the
-      `effective(profile)` resolver and `build_engine_from_weights` are already
-      wired; only the default values change).
-- [ ] **Neutral** → keep the compiled defaults (explicit `rrf=1.0`, ambient
-      `attention_affinity=1.0`); document neutral retrieval, ship the framework.
-      The substrate value (P6/P7/P7b/P8/P9) is independent of a retrieval-quality
-      win.
+Adding bm25 as an additive rank feature at 0.5 changes nothing vs rrf-only.
+
+**Latency (µs, p50/p95/p99 — release, 120k chunks)**
+
+| Config | candidate-gen | rank | post-rank† | end-to-end |
+|---|---|---|---|---|
+| C1 | 215,897 / 229,466 / 231,736 | 38 / 43 / 47 | 76,333 / 87,798 / 92,667 | 295,748 / 313,749 / 320,995 |
+| C4 | 218,905 / 238,139 / 239,408 | 41 / 47 / 52 | 73,716 / 89,008 / 97,462 | 293,344 / 315,937 / 320,464 |
+
+- **candidate-gen (Lance I/O) dominates** end-to-end (~216 ms of ~296 ms p50).
+- **The rank engine is ~free** (38 µs p50). This empirically validates the P5
+  frame: feature weights cost nothing; the latency budget is all retrieval I/O.
+- post-rank (76 ms) is the derived remainder absorbing run-to-run Lance
+  variance; with no reranker loaded the real in-memory stages are microseconds.
+
+**Sensitivity sweep (MRR@10 vs weight)**
+
+- **bm25**: 0→0.559, 0.25→**0.581**, 0.5→0.581, 1→0.559, 2→0.503. A tiny bump at
+  0.25–0.5, then it *regresses* at weight ≥1 (the additive bm25 term starts
+  out-voting rrf's fused ordering on some queries).
+- **rrf**: 0→**0.000** (total collapse), 0.25→0.581, 0.5→0.581, 1→0.581,
+  2→0.581. RRF is load-bearing and **saturating** — any weight ≥0.25 is
+  identical; magnitude past that is irrelevant.
+
+**Lens rotation (ambient, 8 turns)**: repeated-chunk rate 0.129, rotation rate
+**0.871** — the attention-only ambient path rotates well on the real corpus.
+
+### Gate decision (P5 → P9b-full): **NEUTRAL — ship framework, keep defaults**
+
+Per `p5-bench.md`'s pre-registered criteria, a config must beat baseline by ≥10%
+relative MRR@10 (or Recall@10 with no >5% regression elsewhere). **No config
+clears the bar:**
+
+- bm25 as an additive rank feature is at best **+0.0** (it's within noise at low
+  weight) and **regresses** at weight ≥1 — not a 10% improvement under any
+  setting.
+- rrf saturates at ≥0.25; there's no weight magnitude that improves on the
+  `rrf=1.0` default.
+
+This is exactly the `p5-bench.md` "if nothing meets the gate" path:
+
+- [x] **Neutral** → **keep the compiled defaults** (explicit `rrf=1.0`, ambient
+      `attention_affinity=1.0`). No re-weighting is committed to `config.rs`. The
+      `[ranking.weights]` config + `effective(profile)` resolver +
+      `build_engine_from_weights` ship as the tunable framework; the substrate
+      value (P6/P7/P7b/P8/P9) is independent of a retrieval-quality win.
+- [ ] ~~Improvement found~~ — not observed.
+
+**Frame caveat (load-bearing).** This measures the **reranker-off** rank path.
+In production the cross-encoder reranker runs and **replaces** the engine score,
+so these explicit-path rank weights only reshape the candidate pool fed to the
+reranker — consistent with the ratified relevance/salience split. The rank-engine
+weights are decisive in the **ambient/lens path** (no reranker), which is what
+P9b-full consumes; the neutral explicit-path result does **not** argue against
+the lens-path freshness/entity/concept slots P9b-full adds. A future bench pass
+*with* the reranker wired into the example would measure the full explicit stack
+(config 2); that's a harness extension, not a P5 blocker.
 
 Header-format choice (`EMBED_HEADER_FORMAT_VERSION`) and the
-`[ranking.multivector] enabled` default are **out of scope for this phase** (the
-header experiment is deferred; P4 multivector is not started).
+`[ranking.multivector] enabled` default remain **out of scope** (header
+experiment deferred; P4 not started).
+
+### Known harness nits (follow-ups, non-blocking)
+
+- `--iters N` is dropped (arg-parse advances the index twice for valued flags),
+  so latency used the default 5 samples. Fix: don't double-increment in valued
+  arms. Quality is unaffected.
+- Peak RSS prints `n/a` on macOS (Linux-only `/proc` path). Expected.
+- The reranker is not wired into the example (config 2 shows skipped). Wiring it
+  would let the bench measure the full production explicit stack.
