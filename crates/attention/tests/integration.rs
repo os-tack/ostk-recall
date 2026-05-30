@@ -117,7 +117,8 @@ fn seed_thread(db: &ThreadsDb, name: &str, anchor: Option<&str>) -> ThreadHandle
     db.upsert_thread(&ThreadRecord {
         handle: h.clone(),
         tension: TensionState::Active,
-        familiarity: 0,
+        mentions: 0,
+        resonance: 0,
         last_touched_at: Utc::now(),
         anchor_chunk_id: anchor.map(String::from),
         fold_override: None,
@@ -153,8 +154,8 @@ async fn familiarity_increments_ledger_and_emits_batch_with_turn_seq() {
     let observer = TurnObserver::new(pipeline, db.clone());
     observer.refresh_known_handles().await.unwrap();
 
-    let starting_familiarity = db.get_thread(&h).unwrap().unwrap().familiarity;
-    assert_eq!(starting_familiarity, 0);
+    let starting_mentions = db.get_thread(&h).unwrap().unwrap().mentions;
+    assert_eq!(starting_mentions, 0);
 
     // Drain the upsert chain event so we only assert against the
     // observer's output below.
@@ -168,7 +169,7 @@ async fn familiarity_increments_ledger_and_emits_batch_with_turn_seq() {
         .unwrap();
     assert_eq!(res.familiarity_increments, vec![h.clone()]);
 
-    let after = db.get_thread(&h).unwrap().unwrap().familiarity;
+    let after = db.get_thread(&h).unwrap().unwrap().mentions;
     assert_eq!(
         after, 1,
         "ledger column must advance (regression guard for 212b37c)"
@@ -180,7 +181,7 @@ async fn familiarity_increments_ledger_and_emits_batch_with_turn_seq() {
         .observe(&scope_for("haystack"), turn, 43, "sess-1", None)
         .await
         .unwrap();
-    let after_two = db.get_thread(&h).unwrap().unwrap().familiarity;
+    let after_two = db.get_thread(&h).unwrap().unwrap().mentions;
     assert_eq!(after_two, 2, "second turn must advance ledger again");
 
     let batches: Vec<_> = sink
@@ -196,9 +197,10 @@ async fn familiarity_increments_ledger_and_emits_batch_with_turn_seq() {
     assert_eq!(batches.len(), 2, "one batch per turn");
     assert_eq!(batches[0].1, 42);
     assert_eq!(batches[1].1, 43);
-    // Each batch carries (handle, post-increment value).
-    assert_eq!(batches[0].0, vec![(h.clone(), 1)]);
-    assert_eq!(batches[1].0, vec![(h, 2)]);
+    // Each batch carries (handle, mentions_after, resonance_after). No
+    // attention store is wired in this test, so resonance stays 0.
+    assert_eq!(batches[0].0, vec![(h.clone(), 1, 0)]);
+    assert_eq!(batches[1].0, vec![(h, 2, 0)]);
 }
 
 // ---------------------------------------------------------------------
@@ -347,7 +349,8 @@ async fn ledger_persists_across_reopen() {
         db.upsert_thread(&ThreadRecord {
             handle: h.clone(),
             tension: TensionState::Slack,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: Utc::now(),
             anchor_chunk_id: Some("anchor-c1".into()),
             fold_override: Some(FoldDepth::Half),
@@ -357,7 +360,7 @@ async fn ledger_persists_across_reopen() {
         })
         .unwrap();
         for _ in 0..5 {
-            db.increment_familiarity(&h).unwrap();
+            db.increment_mentions(&h).unwrap();
         }
         db.set_tension(&h, TensionState::Active).unwrap();
     }
@@ -369,7 +372,7 @@ async fn ledger_persists_across_reopen() {
         .get_thread(&h)
         .unwrap()
         .expect("thread row survives reopen");
-    assert_eq!(recovered.familiarity, 5);
+    assert_eq!(recovered.mentions, 5);
     assert_eq!(recovered.tension, TensionState::Active);
     assert_eq!(recovered.fold_override, Some(FoldDepth::Half));
     assert_eq!(recovered.anchor_chunk_id.as_deref(), Some("anchor-c1"));
@@ -392,6 +395,8 @@ async fn ledger_persists_across_reopen() {
             ReplayEvent::Familiarize {
                 scope: scope.clone(),
                 handle: h.clone(),
+                mentions: 5,
+                resonance: 0,
             },
         ])
         .await
@@ -462,7 +467,8 @@ async fn install_at_score(
         .upsert_thread(&ThreadRecord {
             handle: h.clone(),
             tension: start_tension,
-            familiarity: 20,
+            mentions: 20,
+            resonance: 20,
             last_touched_at: stale,
             anchor_chunk_id: None,
             fold_override: None,
@@ -703,7 +709,8 @@ async fn mcp_surface_payload_carries_full_score_attribution() {
         "tension",
         "resonance",
         "off_diagonal_lift",
-        "familiarity",
+        "mentions",
+        "resonance_count",
         "time_since_touch_secs",
     ] {
         assert!(
@@ -711,8 +718,9 @@ async fn mcp_surface_payload_carries_full_score_attribution() {
             "ScoreAttribution.{field} missing from MCP surface payload"
         );
     }
-    assert!(why["familiarity"].is_number());
-    assert!(why["familiarity"].as_u64().unwrap() >= 5);
+    assert!(why["mentions"].is_number());
+    assert!(why["mentions"].as_u64().unwrap() >= 5);
+    assert!(why["resonance_count"].is_number());
     assert!(why["resonance"].is_number());
     assert!(why["tension"].is_number());
     assert!(why["off_diagonal_lift"].is_number());

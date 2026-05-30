@@ -132,7 +132,13 @@ fn bad_enum(field: &str, value: &str) -> StoreError {
 pub struct ThreadRecord {
     pub handle: ThreadHandle,
     pub tension: TensionState,
-    pub familiarity: u32,
+    /// Raw literal-match recurrence (the pre-split `familiarity`). Kept
+    /// for reachability / reanimation; does NOT drive the floor.
+    pub mentions: u32,
+    /// Resonance-gated recurrence — the salience counter that drives
+    /// `familiarity_floor`. Backfilled to 0 on migration (the intended
+    /// reset: salience is re-earned by present resonance).
+    pub resonance: u32,
     pub last_touched_at: DateTime<Utc>,
     pub anchor_chunk_id: Option<String>,
     pub fold_override: Option<FoldDepth>,
@@ -237,8 +243,14 @@ pub enum ChainEvent {
         to: RelationState,
         ts: DateTime<Utc>,
     },
+    /// Per-turn batch of recurrence ticks. Each entry is
+    /// `(handle, mentions_after, resonance_after)` — the post-increment
+    /// durable counters, so chain replay reconstructs both exactly
+    /// (the replay scope has no attention vector, so resonance cannot
+    /// be recomputed at replay time). Pre-split rows carry 2-element
+    /// `[handle, mentions]` entries; those decode with `resonance = 0`.
     FamiliarityBatch {
-        entries: Vec<(ThreadHandle, u32)>,
+        entries: Vec<(ThreadHandle, u32, u32)>,
         turn_seq: u64,
         ts: DateTime<Utc>,
     },
@@ -437,7 +449,9 @@ impl ChainEvent {
             } => {
                 let pairs: Vec<serde_json::Value> = entries
                     .iter()
-                    .map(|(h, fam)| serde_json::json!([h.as_str(), fam]))
+                    .map(|(h, mentions, resonance)| {
+                        serde_json::json!([h.as_str(), mentions, resonance])
+                    })
                     .collect();
                 serde_json::json!({
                     "entries": pairs,
@@ -588,7 +602,8 @@ impl ChainEvent {
                             source: None,
                         })
                     })?;
-                let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(entries_raw.len());
+                let mut entries: Vec<(ThreadHandle, u32, u32)> =
+                    Vec::with_capacity(entries_raw.len());
                 for row in entries_raw {
                     let pair = row.as_array().ok_or_else(|| {
                         StoreError::Lance(lancedb::Error::Other {
@@ -605,7 +620,7 @@ impl ChainEvent {
                                 source: None,
                             })
                         })?;
-                    let fam = pair
+                    let mentions = pair
                         .get(1)
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| {
@@ -614,19 +629,32 @@ impl ChainEvent {
                                 source: None,
                             })
                         })?;
+                    // Pre-split rows are 2-element `[handle, mentions]`;
+                    // the third slot is the resonance counter (default 0
+                    // for legacy rows, which is the intended salience reset).
+                    let resonance = pair
+                        .get(2)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
                     let h = ThreadHandle::new(h_s).map_err(|e| {
                         StoreError::Lance(lancedb::Error::Other {
                             message: format!("familiarity entry bad handle: {e}"),
                             source: None,
                         })
                     })?;
-                    let fam_u32 = u32::try_from(fam).map_err(|_| {
+                    let mentions_u32 = u32::try_from(mentions).map_err(|_| {
                         StoreError::Lance(lancedb::Error::Other {
-                            message: format!("familiarity count overflow: {fam}"),
+                            message: format!("familiarity count overflow: {mentions}"),
                             source: None,
                         })
                     })?;
-                    entries.push((h, fam_u32));
+                    let resonance_u32 = u32::try_from(resonance).map_err(|_| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("resonance count overflow: {resonance}"),
+                            source: None,
+                        })
+                    })?;
+                    entries.push((h, mentions_u32, resonance_u32));
                 }
                 let turn_seq = v
                     .get("turn_seq")
@@ -948,17 +976,18 @@ impl ThreadsDb {
 CREATE TABLE IF NOT EXISTS threads (
     handle TEXT PRIMARY KEY,
     tension TEXT NOT NULL DEFAULT 'active',
-    familiarity INTEGER NOT NULL DEFAULT 0,
+    mentions INTEGER NOT NULL DEFAULT 0,
     last_touched_at TEXT NOT NULL,
     anchor_chunk_id TEXT,
     fold_override TEXT,
     created_at TEXT NOT NULL,
     created_scope_key TEXT,
-    privacy_tier TEXT NOT NULL DEFAULT 't1_project'
+    privacy_tier TEXT NOT NULL DEFAULT 't1_project',
+    resonance INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_tension ON threads(tension);
-CREATE INDEX IF NOT EXISTS idx_threads_familiarity ON threads(familiarity);
+CREATE INDEX IF NOT EXISTS idx_threads_resonance ON threads(resonance);
 CREATE INDEX IF NOT EXISTS idx_threads_anchor ON threads(anchor_chunk_id)
     WHERE anchor_chunk_id IS NOT NULL;
 
@@ -1055,6 +1084,26 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
              WHERE last_touched_at IS NULL",
             [],
         )?;
+
+        // --- salience-vs-familiarity split (resonance-gated familiarity) ---
+        // `familiarity` is document-frequency in disguise; split it into
+        // `mentions` (raw recurrence, this column carried over verbatim) and
+        // a new `resonance` counter (gated salience) that drives the floor.
+        // On a pre-split DB the table exists with a `familiarity` column;
+        // rename it in place (preserving the accumulated counts as
+        // `mentions`) and add `resonance` defaulted to 0 — the intended
+        // reset, since salience is re-earned by present resonance.
+        if column_exists(conn, "threads", "familiarity")?
+            && !column_exists(conn, "threads", "mentions")?
+        {
+            conn.execute("ALTER TABLE threads RENAME COLUMN familiarity TO mentions", [])?;
+        }
+        add_column_if_missing(
+            conn,
+            "threads",
+            "resonance",
+            "ALTER TABLE threads ADD COLUMN resonance INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -1097,19 +1146,20 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
                 .exists(params![record.handle.as_str()])?;
             conn.execute(
                 "INSERT OR REPLACE INTO threads
-                 (handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                  fold_override, created_at, created_scope_key, privacy_tier)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                  fold_override, created_at, created_scope_key, privacy_tier, resonance)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     record.handle.as_str(),
                     record.tension.as_str(),
-                    record.familiarity,
+                    record.mentions,
                     record.last_touched_at.to_rfc3339(),
                     record.anchor_chunk_id,
                     record.fold_override.map(fold_to_str),
                     record.created_at.to_rfc3339(),
                     record.created_scope_key,
                     privacy_to_str(record.privacy_tier),
+                    record.resonance,
                 ],
             )?;
             !exists
@@ -1157,8 +1207,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     pub fn get_thread(&self, handle: &ThreadHandle) -> Result<Option<ThreadRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                    fold_override, created_at, created_scope_key, privacy_tier
+            "SELECT handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                    fold_override, created_at, created_scope_key, privacy_tier, resonance
              FROM threads WHERE handle = ? LIMIT 1",
         )?;
         let res = stmt.query_row(params![handle.as_str()], row_to_thread);
@@ -1175,8 +1225,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         let rows = match tension {
             Some(t) => {
                 let mut stmt = conn.prepare(
-                    "SELECT handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                            fold_override, created_at, created_scope_key, privacy_tier
+                    "SELECT handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                            fold_override, created_at, created_scope_key, privacy_tier, resonance
                      FROM threads WHERE tension = ? ORDER BY last_touched_at DESC",
                 )?;
                 stmt.query_map(params![t.as_str()], row_to_thread)?
@@ -1184,8 +1234,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                            fold_override, created_at, created_scope_key, privacy_tier
+                    "SELECT handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                            fold_override, created_at, created_scope_key, privacy_tier, resonance
                      FROM threads ORDER BY last_touched_at DESC",
                 )?;
                 stmt.query_map([], row_to_thread)?
@@ -1212,27 +1262,68 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(())
     }
 
-    /// Increment familiarity and return the post-increment value.
+    /// Increment `mentions` (raw literal-match recurrence) and return the
+    /// post-increment value.
     ///
-    /// Does NOT chain — the turn observer batches familiarity ticks
+    /// Does NOT chain — the turn observer batches recurrence ticks
     /// through [`ChainEvent::FamiliarityBatch`] (see chain-policy doc).
-    pub fn increment_familiarity(&self, handle: &ThreadHandle) -> Result<u32> {
+    pub fn increment_mentions(&self, handle: &ThreadHandle) -> Result<u32> {
+        self.increment_counter(handle, "mentions")
+    }
+
+    /// Increment `resonance` (the resonance-gated salience counter that
+    /// drives the floor) and return the post-increment value. Called by
+    /// the observer only when a mention lands in a turn that resonates
+    /// with the thread anchor >= `RESONANCE_GATE`.
+    ///
+    /// Does NOT chain — batched alongside `mentions` in the same
+    /// [`ChainEvent::FamiliarityBatch`].
+    pub fn increment_resonance(&self, handle: &ThreadHandle) -> Result<u32> {
+        self.increment_counter(handle, "resonance")
+    }
+
+    /// Read the current `resonance` counter without mutating it. Used by
+    /// the observer to stamp the post-batch value for a non-resonant
+    /// mention (mentions advanced, resonance held).
+    pub fn current_resonance(&self, handle: &ThreadHandle) -> Result<u32> {
+        let conn = self.lock();
+        let value: i64 = conn
+            .query_row(
+                "SELECT resonance FROM threads WHERE handle = ?",
+                params![handle.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| missing_thread(handle))?;
+        u32::try_from(value).map_err(|_| {
+            StoreError::Lance(lancedb::Error::Other {
+                message: format!("resonance out of range for thread {handle}: {value}"),
+                source: None,
+            })
+        })
+    }
+
+    /// Shared `UPDATE col = col + 1 RETURNING col` body for the two
+    /// recurrence counters. `column` is a fixed internal string literal
+    /// (`"mentions"` / `"resonance"`), never user input — no injection
+    /// surface.
+    fn increment_counter(&self, handle: &ThreadHandle, column: &str) -> Result<u32> {
         let conn = self.lock();
         let n = conn.execute(
-            "UPDATE threads SET familiarity = familiarity + 1 WHERE handle = ?",
+            &format!("UPDATE threads SET {column} = {column} + 1 WHERE handle = ?"),
             params![handle.as_str()],
         )?;
         if n == 0 {
             return Err(missing_thread(handle));
         }
         let new_value: i64 = conn.query_row(
-            "SELECT familiarity FROM threads WHERE handle = ?",
+            &format!("SELECT {column} FROM threads WHERE handle = ?"),
             params![handle.as_str()],
             |r| r.get(0),
         )?;
         u32::try_from(new_value).map_err(|_| {
             StoreError::Lance(lancedb::Error::Other {
-                message: format!("familiarity overflow for thread {handle}: {new_value}"),
+                message: format!("{column} overflow for thread {handle}: {new_value}"),
                 source: None,
             })
         })
@@ -1243,7 +1334,7 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     /// across the turn and flush once at turn-end.
     pub fn record_familiarity_batch(
         &self,
-        entries: Vec<(ThreadHandle, u32)>,
+        entries: Vec<(ThreadHandle, u32, u32)>,
         turn_seq: u64,
     ) -> Result<()> {
         if entries.is_empty() {
@@ -1922,13 +2013,14 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
     let handle_s: String = r.get(0)?;
     let tension_s: String = r.get(1)?;
-    let familiarity_i: i64 = r.get(2)?;
+    let mentions_i: i64 = r.get(2)?;
     let last_touched_s: String = r.get(3)?;
     let anchor: Option<String> = r.get(4)?;
     let fold_s: Option<String> = r.get(5)?;
     let created_s: String = r.get(6)?;
     let scope_key: Option<String> = r.get(7)?;
     let privacy_s: String = r.get(8)?;
+    let resonance_i: i64 = r.get(9)?;
 
     let handle = ThreadHandle::new(handle_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1942,12 +2034,15 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
         .map_err(to_sql_err)?;
     let created_at = parse_ts(&created_s).map_err(to_sql_err)?;
     let privacy_tier = privacy_parse(&privacy_s).map_err(to_sql_err)?;
-    let familiarity = u32::try_from(familiarity_i)
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, familiarity_i))?;
+    let mentions = u32::try_from(mentions_i)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, mentions_i))?;
+    let resonance = u32::try_from(resonance_i)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, resonance_i))?;
     Ok(ThreadRecord {
         handle,
         tension,
-        familiarity,
+        mentions,
+        resonance,
         last_touched_at,
         anchor_chunk_id: anchor,
         fold_override,
@@ -2021,16 +2116,21 @@ fn add_column_if_missing(
     column: &str,
     alter_sql: &str,
 ) -> Result<()> {
-    let exists = {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        stmt.query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(std::result::Result::ok)
-            .any(|name| name == column)
-    };
-    if !exists {
+    if !column_exists(conn, table, column)? {
         conn.execute(alter_sql, [])?;
     }
     Ok(())
+}
+
+/// `true` if `table` has a column named `column`. Used by idempotent
+/// migrations (column adds + the `familiarity → mentions` rename guard).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    Ok(found)
 }
 
 fn row_to_thread_thread_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadThreadLink> {
@@ -2222,7 +2322,8 @@ mod tests {
         ThreadRecord {
             handle: handle(s),
             tension: TensionState::Active,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: now,
             anchor_chunk_id: None,
             fold_override: None,
@@ -2397,16 +2498,22 @@ mod tests {
     }
 
     #[test]
-    fn familiarity_inc_returns_new_value() {
+    fn mentions_and_resonance_increment_independently() {
         let tmp = TempDir::new().unwrap();
         let db = ThreadsDb::open(tmp.path()).unwrap();
         db.upsert_thread(&sample_thread("fam")).unwrap();
-        let v1 = db.increment_familiarity(&handle("fam")).unwrap();
-        let v2 = db.increment_familiarity(&handle("fam")).unwrap();
+        // mentions advance every observation…
+        let v1 = db.increment_mentions(&handle("fam")).unwrap();
+        let v2 = db.increment_mentions(&handle("fam")).unwrap();
         assert_eq!(v1, 1);
         assert_eq!(v2, 2);
+        // …resonance is a separate, gated counter.
+        assert_eq!(db.current_resonance(&handle("fam")).unwrap(), 0);
+        let r1 = db.increment_resonance(&handle("fam")).unwrap();
+        assert_eq!(r1, 1);
         let row = db.get_thread(&handle("fam")).unwrap().unwrap();
-        assert_eq!(row.familiarity, 2);
+        assert_eq!(row.mentions, 2, "mentions tracks raw recurrence");
+        assert_eq!(row.resonance, 1, "resonance tracks gated salience");
     }
 
     #[test]
@@ -2550,7 +2657,7 @@ mod tests {
         let db = ThreadsDb::open_with_sink(tmp.path(), sink.clone()).unwrap();
         db.upsert_thread(&sample_thread("fb")).unwrap();
         let _ = sink.take();
-        db.record_familiarity_batch(vec![(handle("fb"), 3)], 17)
+        db.record_familiarity_batch(vec![(handle("fb"), 3, 1)], 17)
             .unwrap();
         let ev = sink.take();
         assert_eq!(ev.len(), 1);
@@ -2561,7 +2668,8 @@ mod tests {
                 assert_eq!(*turn_seq, 17);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].0, handle("fb"));
-                assert_eq!(entries[0].1, 3);
+                assert_eq!(entries[0].1, 3, "mentions_after");
+                assert_eq!(entries[0].2, 1, "resonance_after");
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -2575,7 +2683,7 @@ mod tests {
 
         // Three mutations chained: thread create + familiarity batch + tension transition.
         db.upsert_thread(&sample_thread("scribe")).unwrap();
-        db.record_familiarity_batch(vec![(handle("scribe"), 7)], 42)
+        db.record_familiarity_batch(vec![(handle("scribe"), 7, 4)], 42)
             .unwrap();
         db.set_tension(&handle("scribe"), TensionState::Slack)
             .unwrap();
@@ -2596,7 +2704,8 @@ mod tests {
                 assert_eq!(*turn_seq, 42);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].0.as_str(), "scribe");
-                assert_eq!(entries[0].1, 7);
+                assert_eq!(entries[0].1, 7, "mentions_after");
+                assert_eq!(entries[0].2, 4, "resonance_after survives disk round-trip");
             }
             other => panic!("expected FamiliarityBatch, got {other:?}"),
         }

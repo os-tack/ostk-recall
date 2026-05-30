@@ -968,22 +968,24 @@ fn print_attention_output(json: bool, value: &serde_json::Value) {
             println!("pages ({}):", pages.len());
             for p in pages {
                 println!(
-                    "  {}: score={:.3} depth={} resonance={:.3} familiarity={}",
+                    "  {}: score={:.3} depth={} resonance={:.3} mentions={} resonance_count={}",
                     p["handle"].as_str().unwrap_or("?"),
                     p["score"].as_f64().unwrap_or(0.0),
                     p["depth"].as_str().unwrap_or("?"),
                     p["why"]["resonance"].as_f64().unwrap_or(0.0),
-                    p["why"]["familiarity"].as_u64().unwrap_or(0),
+                    p["why"]["mentions"].as_u64().unwrap_or(0),
+                    p["why"]["resonance_count"].as_u64().unwrap_or(0),
                 );
             }
         } else if let Some(records) = value.get("records").and_then(|v| v.as_array()) {
             println!("threads ({}):", records.len());
             for r in records {
                 println!(
-                    "  {}: tension={} familiarity={} privacy_tier={}",
+                    "  {}: tension={} mentions={} resonance={} privacy_tier={}",
                     r["handle"].as_str().unwrap_or("?"),
                     r["tension"].as_str().unwrap_or("?"),
-                    r["familiarity"].as_u64().unwrap_or(0),
+                    r["mentions"].as_u64().unwrap_or(0),
+                    r["resonance"].as_u64().unwrap_or(0),
                     r["privacy_tier"].as_str().unwrap_or("?"),
                 );
             }

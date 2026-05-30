@@ -72,8 +72,46 @@ pub const ARCHIVE_THRESHOLD: f32 = 0.1;
 /// embedding more eagerly.
 pub const DEFAULT_ATTENTION_LAMBDA: f32 = 0.3;
 
-/// Familiarity at which decay flattens to `DECAY_RATE_FAMILIAR`.
+/// Familiarity at which decay flattens to `DECAY_RATE_FAMILIAR`, and at
+/// which the resonance-driven floor saturates to 1.0.
 pub const FAMILIARITY_SATURATION: u32 = 20;
+
+// --- salience-vs-familiarity (resonance-gated familiarity) -------------
+// `mentions` is document-frequency in disguise; it no longer buys idle
+// floor. The floor is driven by `resonance` — recurrence that landed in a
+// turn genuinely aligned with the thread's anchor.
+
+/// Cosine (anchor vs the scope's effective attention vector) at/above which
+/// a mention counts as *resonant* and increments the salience counter.
+/// Tuned against the known good/bad set: `north-star` / `cognitive-memory`
+/// should clear it on real work; `top-level` / `no-op` / `non-blocking`
+/// should not on unrelated turns. See `salience-vs-familiarity.md`.
+pub const RESONANCE_GATE: f32 = 0.25;
+
+/// A handle needs at least this many raw `mentions` before the derived
+/// stop-handle classifier will consider it (below this there isn't enough
+/// frequency evidence to call it a stopword).
+pub const STOPWORD_MENTION_MIN: u32 = 50;
+
+/// If a high-`mentions` handle's resonance rate (`resonance / mentions`)
+/// is *below* this, it is a frequency-derived stopword: ubiquitous but
+/// rarely resonant → never mint or promote a thread for it.
+pub const STOPWORD_RATE_MAX: f32 = 0.05;
+
+/// Derived stop-handle classifier (no hand-list): a handle that recurs a
+/// lot (`mentions >= STOPWORD_MENTION_MIN`) but seldom resonates
+/// (`resonance / mentions < STOPWORD_RATE_MAX`) is a generic-vocab
+/// stopword. Gate, don't delete — the thread stays reachable; it just
+/// never gets minted/promoted to buy dominance.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn is_stop_handle(mentions: u32, resonance: u32) -> bool {
+    if mentions < STOPWORD_MENTION_MIN {
+        return false;
+    }
+    let rate = resonance as f32 / mentions as f32;
+    rate < STOPWORD_RATE_MAX
+}
 
 /// Tension below this counts as "dormant enough" for off-diagonal lift.
 pub const OFF_DIAGONAL_TENSION_MAX: f32 = 0.2;
@@ -314,12 +352,34 @@ pub trait AttentionForwardStore: Send + Sync {
         depth: FoldDepth,
     ) -> Result<(), AttentionError>;
 
-    /// Increment familiarity for a handle (called per turn-end).
+    /// Observe a mention of `handle` in the current turn (called per
+    /// turn-end). Increments the raw `mentions` counter unconditionally
+    /// and the resonance-gated salience counter iff the turn resonates
+    /// with the thread anchor (cosine >= [`RESONANCE_GATE`]).
+    ///
+    /// Returns `true` iff the mention was resonant, so the durable layer
+    /// can gate its own `increment_resonance` on the *same* decision the
+    /// in-memory mirror used (one cosine compute, no divergence).
     async fn familiarize(
         &self,
         scope: &AttentionScope,
         handle: &ThreadHandle,
-    ) -> Result<(), AttentionError>;
+    ) -> Result<bool, AttentionError>;
+
+    /// Resonance of `handle` against `scope`'s effective attention vector:
+    /// `cosine(anchor, effective_vec)`, the same quantity
+    /// `compute_score_parts` uses for the resonance term. The anchor is
+    /// resolved to the thread's *true* identity — a non-empty scope-local
+    /// anchor if present, else the corpus-seeded anchor from any scope —
+    /// so the gate measures alignment-to-identity, not alignment-to-now.
+    /// Default `0.0` for stores without per-scope vector state.
+    async fn resonance(
+        &self,
+        _scope: &AttentionScope,
+        _handle: &ThreadHandle,
+    ) -> Result<f32, AttentionError> {
+        Ok(0.0)
+    }
 
     /// Apply an explicit fade factor (multiplies the floor).
     async fn decay(&self, handle: &ThreadHandle, factor: f32) -> Result<(), AttentionError>;
@@ -401,7 +461,15 @@ pub trait AttentionForwardStore: Send + Sync {
 #[derive(Debug, Clone)]
 struct ThreadState {
     tension: f32,
-    familiarity: u32,
+    /// Raw literal-match recurrence (pre-split `familiarity`). Drives the
+    /// decay *rate* (deeply-mentioned threads decay slower) but NOT the
+    /// floor — frequency alone no longer buys idle dominance.
+    mentions: u32,
+    /// Resonance-gated salience counter. Drives `familiarity_floor`: the
+    /// idle floor rises only as the thread genuinely resonates with
+    /// present work. Reset to 0 on migration; re-earned within a turn or
+    /// two by real ideas, never by filler.
+    resonance: u32,
     last_touched_at: DateTime<Utc>,
     depth: FoldDepth,
     /// Operator-applied multiplicative fade (1.0 = no fade).
@@ -584,8 +652,13 @@ fn compute_score_parts(
     let resonance = cosine_similarity(&state.anchor, attention_vec);
     let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
     let dt_days = dt_secs as f32 / 86_400.0;
-    let floor = familiarity_floor(state.familiarity) * state.fade_multiplier;
-    let decay_term = floor * (-decay_rate(state.familiarity) * dt_days).exp();
+    // Floor is driven by the resonance *counter* (salience), not raw
+    // mentions: a thread surfaces at idle only to the extent it has
+    // genuinely resonated. Decay *rate* still tracks mentions (the
+    // decay_rate rework is deferred) so a frequently-seen thread fades
+    // gently — but from a baseline floor, so it can't dominate.
+    let floor = familiarity_floor(state.resonance) * state.fade_multiplier;
+    let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
     let resonance_term = ALPHA * resonance;
     let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
     let score = decay_term + resonance_term + lift_term;
@@ -595,6 +668,50 @@ fn compute_score_parts(
         lift_term,
         dt_secs,
     }
+}
+
+/// Resolve `handle`'s *true* anchor across scopes: prefer a non-empty
+/// anchor in `key`'s own scope, else the first non-empty anchor found in
+/// any other scope (the corpus-seeded anchor lives in the boot `replay`
+/// scope while the live observer runs in the `ambient` scope). Returns an
+/// empty slice's worth of `Vec` if no scope has a non-empty anchor.
+fn resolve_anchor(
+    scopes: &HashMap<ScopeKey, ScopeState>,
+    key: &ScopeKey,
+    handle: &ThreadHandle,
+) -> Vec<f32> {
+    if let Some(t) = scopes.get(key).and_then(|s| s.threads.get(handle)) {
+        if !t.anchor.is_empty() {
+            return t.anchor.clone();
+        }
+    }
+    for (k, s) in scopes {
+        if k == key {
+            continue;
+        }
+        if let Some(t) = s.threads.get(handle) {
+            if !t.anchor.is_empty() {
+                return t.anchor.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Cosine of `handle`'s resolved anchor against `key`-scope's effective
+/// attention vector — the resonance the gate and `resonance()` read.
+/// 0.0 when either side is empty (no anchor / never attended).
+fn resonance_value(
+    scopes: &HashMap<ScopeKey, ScopeState>,
+    key: &ScopeKey,
+    handle: &ThreadHandle,
+) -> f32 {
+    let effective = scopes
+        .get(key)
+        .map(|s| s.effective_vec().to_vec())
+        .unwrap_or_default();
+    let anchor = resolve_anchor(scopes, key, handle);
+    cosine_similarity(&anchor, &effective)
 }
 
 #[derive(Clone)]
@@ -720,7 +837,8 @@ impl InMemoryAttention {
             .and_modify(|t| t.anchor.clone_from(&anchor))
             .or_insert_with(|| ThreadState {
                 tension: 0.0,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: now,
                 depth: FoldDepth::Folded,
                 fade_multiplier: 1.0,
@@ -728,6 +846,46 @@ impl InMemoryAttention {
                 origin: key,
                 origin_was_private: was_private,
             });
+        Ok(())
+    }
+
+    /// Materialise `handle` in `scope` (if absent) and SET its durable
+    /// recurrence counters to the given values. Used by boot chain replay
+    /// to restore the exact `(mentions, resonance)` a `FamiliarityBatch`
+    /// recorded — not an increment, a verbatim restore (last batch per
+    /// handle wins, since chain rows arrive chronologically). The anchor
+    /// is seeded from the scope's transient if the thread is new; the
+    /// boot re-anchor pass overwrites it with the corpus anchor after.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn seed_counters(
+        &self,
+        scope: &AttentionScope,
+        handle: &ThreadHandle,
+        mentions: u32,
+        resonance: u32,
+    ) -> Result<(), AttentionError> {
+        let key = ScopeKey::from(scope);
+        let was_private = scope.privacy_tier == PrivacyTier::T0Private;
+        let now = Utc::now();
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key.clone()).or_default();
+        let anchor_seed = scope_state.transient_vec.clone();
+        let thread = scope_state
+            .threads
+            .entry(handle.clone())
+            .or_insert_with(|| ThreadState {
+                tension: 0.0,
+                mentions: 0,
+                resonance: 0,
+                last_touched_at: now,
+                depth: FoldDepth::Folded,
+                fade_multiplier: 1.0,
+                anchor: anchor_seed,
+                origin: key.clone(),
+                origin_was_private: was_private,
+            });
+        thread.mentions = mentions;
+        thread.resonance = resonance;
         Ok(())
     }
 
@@ -1005,8 +1163,19 @@ impl InMemoryAttention {
                 ReplayEvent::Attend { scope, context } => {
                     self.attend(scope, context).await?;
                 }
-                ReplayEvent::Familiarize { scope, handle } => {
-                    self.familiarize(scope, handle).await?;
+                ReplayEvent::Familiarize {
+                    scope,
+                    handle,
+                    mentions,
+                    resonance,
+                } => {
+                    // Replay SETS the exact post-batch counters from the
+                    // chain rather than re-running the self-gating
+                    // familiarize(): the replay scope has no attention
+                    // vector, so resonance could never be recomputed here.
+                    // The chain carries the durable truth; replay restores it.
+                    self.seed_counters(scope, handle, *mentions, *resonance)
+                        .await?;
                 }
                 ReplayEvent::Decay { handle, factor } => {
                     self.decay(handle, *factor).await?;
@@ -1033,9 +1202,13 @@ pub enum ReplayEvent {
         scope: AttentionScope,
         context: String,
     },
+    /// Restore a thread's durable recurrence counters verbatim from a
+    /// `FamiliarityBatch` chain row (post-batch `mentions` / `resonance`).
     Familiarize {
         scope: AttentionScope,
         handle: ThreadHandle,
+        mentions: u32,
+        resonance: u32,
     },
     Decay {
         handle: ThreadHandle,
@@ -1134,7 +1307,8 @@ impl AttentionForwardStore for InMemoryAttention {
                     why: ScoreAttribution {
                         tension: state.tension,
                         resonance: parts.resonance,
-                        familiarity: state.familiarity,
+                        mentions: state.mentions,
+                        resonance_count: state.resonance,
                         // Already-weighted contribution so attribution
                         // axes sum (within float tolerance) to `score`.
                         off_diagonal_lift: parts.lift_term,
@@ -1173,7 +1347,8 @@ impl AttentionForwardStore for InMemoryAttention {
             .entry(handle.clone())
             .or_insert_with(|| ThreadState {
                 tension: 0.0,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: Utc::now(),
                 depth,
                 fade_multiplier: 1.0,
@@ -1189,11 +1364,13 @@ impl AttentionForwardStore for InMemoryAttention {
         &self,
         scope: &AttentionScope,
         handle: &ThreadHandle,
-    ) -> Result<(), AttentionError> {
+    ) -> Result<bool, AttentionError> {
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let scope_state = inner.scopes.entry(key.clone()).or_default();
-        // Same anchor-seed reasoning as fold(): transient only.
+        // Same anchor-seed reasoning as fold(): transient only. A
+        // brand-new mint anchors on the current turn, so it resonates
+        // with itself (resonance seeded to 1) — "seed resonance=1 on mint".
         let anchor_seed = scope_state.transient_vec.clone();
         let was_private = scope.privacy_tier == PrivacyTier::T0Private;
         let thread = scope_state
@@ -1201,7 +1378,8 @@ impl AttentionForwardStore for InMemoryAttention {
             .entry(handle.clone())
             .or_insert_with(|| ThreadState {
                 tension: 0.0,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: Utc::now(),
                 depth: FoldDepth::Folded,
                 fade_multiplier: 1.0,
@@ -1209,9 +1387,35 @@ impl AttentionForwardStore for InMemoryAttention {
                 origin: key.clone(),
                 origin_was_private: was_private,
             });
-        thread.familiarity = thread.familiarity.saturating_add(1);
+        // mentions advance on every observation (raw recurrence).
+        thread.mentions = thread.mentions.saturating_add(1);
         thread.last_touched_at = Utc::now();
-        Ok(())
+
+        // Resonance is gated: compute cosine(true-anchor, effective_vec)
+        // — resolving the anchor across scopes so the gate sees the
+        // thread's identity, not a transient first-mention vector. The
+        // mutable borrow above ends here; re-borrow immutably to read.
+        let resonant = resonance_value(&inner.scopes, &key, handle) >= RESONANCE_GATE;
+        if resonant {
+            if let Some(t) = inner
+                .scopes
+                .get_mut(&key)
+                .and_then(|s| s.threads.get_mut(handle))
+            {
+                t.resonance = t.resonance.saturating_add(1);
+            }
+        }
+        Ok(resonant)
+    }
+
+    async fn resonance(
+        &self,
+        scope: &AttentionScope,
+        handle: &ThreadHandle,
+    ) -> Result<f32, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let inner = self.inner.read().await;
+        Ok(resonance_value(&inner.scopes, &key, handle))
     }
 
     async fn decay(&self, handle: &ThreadHandle, factor: f32) -> Result<(), AttentionError> {
@@ -1345,7 +1549,11 @@ impl InMemoryAttention {
             handle,
             ThreadState {
                 tension,
-                familiarity,
+                // The historical `familiarity` knob drove the floor; the
+                // floor now keys on `resonance`, so seed both equal to keep
+                // floor-focused tests behaving as written.
+                mentions: familiarity,
+                resonance: familiarity,
                 last_touched_at,
                 depth,
                 fade_multiplier: 1.0,
@@ -1501,13 +1709,20 @@ mod tests {
                 handle: h.clone(),
                 depth: FoldDepth::Half,
             },
+            // Replay SETS counters from post-batch values; two batches in
+            // chronological order, the second (mentions=2, resonance=2)
+            // wins — reconstructing the on-disk counters exactly.
             ReplayEvent::Familiarize {
                 scope: scope.clone(),
                 handle: h.clone(),
+                mentions: 1,
+                resonance: 1,
             },
             ReplayEvent::Familiarize {
                 scope: scope.clone(),
                 handle: h.clone(),
+                mentions: 2,
+                resonance: 2,
             },
         ];
 
@@ -1527,8 +1742,10 @@ mod tests {
             .iter()
             .find(|p| p.handle == "rebuilt-thread")
             .unwrap();
-        assert_eq!(pa.why.familiarity, 2);
-        assert_eq!(pb.why.familiarity, 2);
+        assert_eq!(pa.why.mentions, 2);
+        assert_eq!(pb.why.mentions, 2);
+        assert_eq!(pa.why.resonance_count, 2);
+        assert_eq!(pb.why.resonance_count, 2);
         // Scores depend on Utc::now timing inside surface; familiarity
         // and depth state are the stable invariants the chain replay
         // must reconstruct.
@@ -1571,14 +1788,14 @@ mod tests {
                 decay_term >= -1e-4,
                 "decay term went negative: {decay_term}"
             );
-            let floor = familiarity_floor(p.why.familiarity);
+            let floor = familiarity_floor(p.why.resonance_count);
             assert!(
                 decay_term <= floor + 1e-4,
                 "decay term {decay_term} exceeds floor {floor}"
             );
             // Recompute the full score from attribution and compare.
             let dt_days = p.why.time_since_touch_secs as f32 / 86_400.0;
-            let expected_decay = floor * (-decay_rate(p.why.familiarity) * dt_days).exp();
+            let expected_decay = floor * (-decay_rate(p.why.mentions) * dt_days).exp();
             let expected_total =
                 ALPHA.mul_add(p.why.resonance, expected_decay) + p.why.off_diagonal_lift;
             assert!(
@@ -1715,7 +1932,98 @@ mod tests {
         }
         let pages = store.surface(&scope, 10).await.unwrap();
         let p = pages.iter().find(|p| p.handle == "fam-target").unwrap();
-        assert_eq!(p.why.familiarity, 3);
+        assert_eq!(p.why.mentions, 3);
+    }
+
+    #[test]
+    fn stop_handle_classifier_derives_from_frequency_not_a_list() {
+        // Ubiquitous-but-unresonant (top-level: 1165 mentions, 0 resonance).
+        assert!(is_stop_handle(1165, 0));
+        assert!(is_stop_handle(STOPWORD_MENTION_MIN, 0));
+        // A load-bearing idea: low mentions, but it resonates → never a stopword.
+        assert!(!is_stop_handle(11, 8), "north-star-like: resonant idea");
+        // Below the mention floor there isn't enough evidence to judge.
+        assert!(!is_stop_handle(STOPWORD_MENTION_MIN - 1, 0));
+        // High mentions but a healthy resonance rate clears the bar.
+        assert!(!is_stop_handle(1000, 200), "20% rate is well above STOPWORD_RATE_MAX");
+    }
+
+    #[tokio::test]
+    async fn familiarize_gates_resonance_on_anchor_alignment() {
+        // mentions advance on every observation; the resonance counter
+        // advances ONLY when the mention lands in an aligned turn.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("haystack");
+        store.attend(&scope, "alpha").await.unwrap();
+        let v = stub_embed("alpha"); // == the scope's effective vector
+
+        // Anchor parallel to the turn → resonant.
+        store
+            .seed_anchor(&scope, handle("aligned"), v.clone())
+            .await
+            .unwrap();
+        // Anchor opposite to the turn (cosine = -1) → not resonant.
+        let opp: Vec<f32> = v.iter().map(|x| -x).collect();
+        store
+            .seed_anchor(&scope, handle("opposed"), opp)
+            .await
+            .unwrap();
+
+        let r_aligned = store.familiarize(&scope, &handle("aligned")).await.unwrap();
+        let r_opposed = store.familiarize(&scope, &handle("opposed")).await.unwrap();
+        assert!(r_aligned, "aligned mention must resonate");
+        assert!(!r_opposed, "opposed mention must NOT resonate");
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let aligned = pages.iter().find(|p| p.handle == "aligned").unwrap();
+        // The opposed thread scores below ARCHIVE_THRESHOLD (negative
+        // resonance term) so it may not surface — assert its counters
+        // directly via resonance() + a fresh familiarize is overkill;
+        // the aligned page proves the split.
+        assert_eq!(aligned.why.mentions, 1, "mention counted");
+        assert_eq!(aligned.why.resonance_count, 1, "resonance counted (aligned)");
+    }
+
+    #[tokio::test]
+    async fn floor_is_driven_by_resonance_not_mentions() {
+        // The crux of the fix: a thread with 1000 mentions but ZERO
+        // resonance must NOT out-rank a thread with 1 mention but a
+        // saturated resonance counter. Both anchors are aligned with the
+        // turn so the resonance *term* is identical; only the floor
+        // (driven by the resonance *counter*) differs.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        store
+            .seed_anchor(&scope, handle("filler"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("filler"), 1000, 0)
+            .await
+            .unwrap();
+
+        store
+            .seed_anchor(&scope, handle("idea"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("idea"), 1, 20)
+            .await
+            .unwrap();
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let filler = pages.iter().find(|p| p.handle == "filler").unwrap();
+        let idea = pages.iter().find(|p| p.handle == "idea").unwrap();
+        assert!(
+            idea.score > filler.score,
+            "resonance must drive the floor: idea (1 mention, 20 resonance) \
+             {} should out-rank filler (1000 mentions, 0 resonance) {}",
+            idea.score,
+            filler.score
+        );
     }
 
     #[tokio::test]
@@ -1953,9 +2261,9 @@ mod tests {
             .find(|p| p.handle == h.as_str())
             .expect("thread present");
         assert!(
-            page.why.familiarity >= 2,
-            "familiarity bump must survive seed_anchor replace; got {}",
-            page.why.familiarity
+            page.why.mentions >= 2,
+            "mentions bump must survive seed_anchor replace; got {}",
+            page.why.mentions
         );
     }
 

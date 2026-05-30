@@ -788,7 +788,8 @@ mod attention_bias_tests {
             .upsert_thread(&ThreadRecord {
                 handle: handle.clone(),
                 tension: TensionState::Active,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: now,
                 anchor_chunk_id: Some(anchor_chunk.into()),
                 fold_override: None,

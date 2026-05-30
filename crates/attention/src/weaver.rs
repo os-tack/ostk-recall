@@ -179,11 +179,14 @@ const FADE_DORMANT_IDLE_DAYS: f64 = 60.0;
 /// the same thread under two handles," not "these are related."
 const MERGE_ANCHOR_SIMILARITY: f32 = 0.95;
 
-/// Familiarity stretches the idle-fade windows: a saturated thread tolerates
-/// up to ~2× the idle before fading. Mirrors the `familiarity_floor` curve.
+/// Salience stretches the idle-fade windows: a thread that has resonated
+/// heavily tolerates up to ~2× the idle before fading. Mirrors the
+/// `familiarity_floor` curve. Driven by `resonance` (the salience
+/// counter), NOT raw mentions — a frequently-but-shallowly-mentioned
+/// thread should fade on schedule; a load-bearing idea should persist.
 #[allow(clippy::cast_precision_loss)]
-fn idle_fade_multiplier(familiarity: u32) -> f64 {
-    1.0 + f64::from(familiarity.min(crate::FAMILIARITY_SATURATION))
+fn idle_fade_multiplier(resonance: u32) -> f64 {
+    1.0 + f64::from(resonance.min(crate::FAMILIARITY_SATURATION))
         / f64::from(crate::FAMILIARITY_SATURATION)
 }
 
@@ -414,11 +417,11 @@ impl AutoWeaver {
                 if cosine_similarity(vi, vj) < MERGE_ANCHOR_SIMILARITY {
                     continue;
                 }
-                // Keep the stronger thread (more familiar; tiebreak: older).
+                // Keep the stronger thread (more *resonant*; tiebreak: older).
                 let a = &threads[i];
                 let b = &threads[j];
-                let keep_a = a.familiarity > b.familiarity
-                    || (a.familiarity == b.familiarity && a.created_at <= b.created_at);
+                let keep_a = a.resonance > b.resonance
+                    || (a.resonance == b.resonance && a.created_at <= b.created_at);
                 let (into, from) = if keep_a { (a, b) } else { (b, a) };
                 if self.threads.merge_thread(&from.handle, &into.handle)? {
                     merged_away.insert(from.handle.as_str().to_string());
@@ -441,7 +444,7 @@ impl AutoWeaver {
     fn abstract_stable_threads(&self) -> Result<usize, WeaverError> {
         let mut count = 0usize;
         for t in self.threads.list_threads(None)? {
-            if t.familiarity >= crate::FAMILIARITY_SATURATION
+            if t.resonance >= crate::FAMILIARITY_SATURATION
                 && t.tension == TensionState::Active
                 && t.fold_override != Some(FoldDepth::Folded)
             {
@@ -478,11 +481,23 @@ impl AutoWeaver {
             let Ok(handle) = ThreadHandle::new(&p.proposed_handle) else {
                 continue;
             };
+            // Derived stop-handle gate: if a thread already exists under
+            // this handle and reads as a frequency-derived stopword
+            // (ubiquitous but unresonant), don't re-promote it to Active.
+            // Content-derived `proposed-<hex>` handles are unlikely to be
+            // stopwords, so this is largely a backstop for kebab-handle
+            // proposals — but it keeps the promotion path honest.
+            if let Ok(Some(existing)) = self.threads.get_thread(&handle) {
+                if crate::is_stop_handle(existing.mentions, existing.resonance) {
+                    continue;
+                }
+            }
             let now = Utc::now();
             let rec = ThreadRecord {
                 handle: handle.clone(),
                 tension: TensionState::Active,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: now,
                 anchor_chunk_id: Some(anchor.clone()),
                 fold_override: None,
@@ -507,7 +522,7 @@ impl AutoWeaver {
         let mut faded = 0usize;
         for t in self.threads.list_threads(None)? {
             let idle_days = (now - t.last_touched_at).num_seconds().max(0) as f64 / 86_400.0;
-            let mult = idle_fade_multiplier(t.familiarity);
+            let mult = idle_fade_multiplier(t.resonance);
             let target = if idle_days >= FADE_DORMANT_IDLE_DAYS * mult {
                 TensionState::Dormant
             } else if idle_days >= FADE_SLACK_IDLE_DAYS * mult {
@@ -953,7 +968,8 @@ mod tests {
         ThreadRecord {
             handle: ThreadHandle::new(handle).unwrap(),
             tension: ostk_recall_store::TensionState::Active,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: now,
             anchor_chunk_id: anchor_chunk_id.map(String::from),
             fold_override: None,
@@ -1348,7 +1364,10 @@ mod tests {
         ThreadRecord {
             handle: ThreadHandle::new(handle).unwrap(),
             tension,
-            familiarity: fam,
+            // `fam` is the idle-fade stretch knob; the stretch now keys on
+            // the salience counter (resonance), so seed both equal.
+            mentions: fam,
+            resonance: fam,
             last_touched_at: touched,
             anchor_chunk_id: None,
             fold_override: None,
@@ -1395,6 +1414,32 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn promote_recurring_proposals_rejects_a_derived_stop_handle() {
+        let fx = fixture().await;
+        // An existing thread that reads as a frequency-derived stopword:
+        // ubiquitous (mentions well past the floor) but never resonant.
+        let mut rec = thread("proposed-stopword", None);
+        rec.mentions = crate::STOPWORD_MENTION_MIN + 100;
+        rec.resonance = 0;
+        fx.threads.upsert_thread(&rec).unwrap();
+        // A large + cohesive proposal under the SAME handle would normally
+        // promote — but the stop-handle gate must veto it.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-stopword", 6, 0.95))
+            .unwrap();
+
+        let promoted = weaver(&fx).promote_recurring_proposals().unwrap();
+        assert_eq!(promoted, 0, "a derived stop-handle must not be (re-)promoted");
+        // Gate, don't delete: the thread is still reachable, just unresonant.
+        let t = fx
+            .threads
+            .get_thread(&ThreadHandle::new("proposed-stopword").unwrap())
+            .unwrap()
+            .expect("stop-handle thread still reachable");
+        assert_eq!(t.resonance, 0, "still a stopword");
     }
 
     #[tokio::test]
@@ -1469,7 +1514,7 @@ mod tests {
             .unwrap();
         // `keep` is more familiar → it absorbs `dup`.
         let mut keep = thread("keepthread", Some("anchor-keep"));
-        keep.familiarity = 10;
+        keep.resonance = 10;
         fx.threads.upsert_thread(&keep).unwrap();
         fx.threads
             .upsert_thread(&thread("dupthread", Some("anchor-dup")))
@@ -1522,15 +1567,15 @@ mod tests {
     async fn abstract_stable_threads_folds_only_familiar_active() {
         let fx = fixture().await;
         let mut familiar = thread("familiar-active", None);
-        familiar.familiarity = crate::FAMILIARITY_SATURATION;
+        familiar.resonance = crate::FAMILIARITY_SATURATION;
         fx.threads.upsert_thread(&familiar).unwrap();
 
         let mut casual = thread("casual-active", None);
-        casual.familiarity = 5;
+        casual.resonance = 5;
         fx.threads.upsert_thread(&casual).unwrap();
 
         let mut fam_slack = thread("familiar-slack", None);
-        fam_slack.familiarity = crate::FAMILIARITY_SATURATION;
+        fam_slack.resonance = crate::FAMILIARITY_SATURATION;
         fam_slack.tension = TensionState::Slack;
         fx.threads.upsert_thread(&fam_slack).unwrap();
 

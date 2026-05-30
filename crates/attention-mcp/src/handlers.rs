@@ -251,14 +251,19 @@ pub async fn familiarize(
     let scope = default_scope(&args)?;
     validate_privacy_tier(&scope, d.max_privacy_tier)?;
     let handle = require_handle(&args, "handle")?;
-    d.attention.familiarize(&scope, &handle).await?;
-    // Mirror the on-disk ledger so the caller has a stable counter to
-    // chain off (the AttentionForwardStore::familiarize trait method
-    // returns ()). We swallow `ThreadNotFound` here: the ledger may
-    // legitimately not know the handle yet during cold-start replay,
-    // and the in-memory store will still have ticked the counter.
-    let post = d.threads.increment_familiarity(&handle).ok();
-    Ok(json!({ "familiarity": post }))
+    // `familiarize` returns whether this mention resonated (cosine vs the
+    // thread anchor >= RESONANCE_GATE); gate the durable resonance counter
+    // on the same decision, mirroring the turn observer. We swallow
+    // `ThreadNotFound` on the ledger: the handle may not be persisted yet
+    // during cold-start replay, and the in-memory store still ticked.
+    let resonant = d.attention.familiarize(&scope, &handle).await?;
+    let mentions = d.threads.increment_mentions(&handle).ok();
+    let resonance = if resonant {
+        d.threads.increment_resonance(&handle).ok()
+    } else {
+        d.threads.current_resonance(&handle).ok()
+    };
+    Ok(json!({ "mentions": mentions, "resonance": resonance, "resonant": resonant }))
 }
 
 pub async fn decay(d: &AttentionDispatch, args: Value) -> Result<Value, AttentionHandlersError> {
@@ -315,7 +320,8 @@ pub async fn thread_create(
     let record = ThreadRecord {
         handle,
         tension,
-        familiarity: 0,
+        mentions: 0,
+        resonance: 0,
         last_touched_at: now,
         anchor_chunk_id: input.anchor_chunk_id,
         fold_override: None,
@@ -1082,7 +1088,8 @@ fn thread_record_to_json(r: &ThreadRecord) -> Value {
     json!({
         "handle": r.handle.as_str(),
         "tension": r.tension.as_str(),
-        "familiarity": r.familiarity,
+        "mentions": r.mentions,
+        "resonance": r.resonance,
         "last_touched_at": r.last_touched_at.to_rfc3339(),
         "anchor_chunk_id": r.anchor_chunk_id,
         "fold_override": r.fold_override.map(|d| match d {
@@ -1343,7 +1350,8 @@ mod tests {
             assert!(p["depth"].is_string());
             assert!(p["score"].is_number());
             assert!(p["why"]["resonance"].is_number());
-            assert!(p["why"]["familiarity"].is_number());
+            assert!(p["why"]["mentions"].is_number());
+            assert!(p["why"]["resonance_count"].is_number());
         }
     }
 

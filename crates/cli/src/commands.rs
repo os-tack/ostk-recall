@@ -1359,10 +1359,18 @@ async fn replay_chain_into_attention(
     for ev in events {
         match ev {
             ChainEvent::FamiliarityBatch { entries, .. } => {
-                for (handle, _post) in entries {
+                // Restore both durable counters verbatim. Each entry is
+                // the post-batch (mentions, resonance); replaying them in
+                // chronological order means the final batch per handle
+                // wins, reconstructing the on-disk counters exactly. We
+                // cannot recompute resonance here (the replay scope has no
+                // attention vector), so the chain is the source of truth.
+                for (handle, mentions, resonance) in entries {
                     replay.push(ReplayEvent::Familiarize {
                         scope: scope.clone(),
                         handle,
+                        mentions,
+                        resonance,
                     });
                 }
             }
