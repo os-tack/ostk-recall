@@ -1,0 +1,51 @@
+{
+  "description": "P5 rank-bench query set. The committed set below is the CI-safe SYNTHETIC fixture: it labels relevance against the small deterministic corpus that `crates/cli/examples/rank_bench.rs --fixture` builds in-memory (source_ids listed under each query's `relevant`). Relevance rule: a hit is relevant iff its `source_id` is in `relevant.source_ids` OR its `chunk_id` is in `relevant.chunk_ids`. For a REAL run, the maintainer replaces `queries` with ~50 hand-curated queries labeled against their own corpus (see regenerate.sh) and runs `rank_bench --corpus <lance_dir> --model <id>`.",
+  "schema_version": 1,
+  "queries": [
+    {
+      "id": "auth-redirect-design",
+      "query": "auth redirect design",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": {
+        "source_ids": ["notes/auth-redirect.md", "decisions/d1840.md", "src/redirect.rs"],
+        "chunk_ids": []
+      }
+    },
+    {
+      "id": "retention-policy",
+      "query": "retention policy",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["notes/retention.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "validate-redirect-symbol",
+      "query": "validate_redirect",
+      "category": "entity",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["src/redirect.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "subprocess-discussion",
+      "query": "the discussion about subprocesses",
+      "category": "vague",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["notes/subprocess.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "abi-rename",
+      "query": "ABI rename auth_redirect_v2",
+      "category": "factual",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["decisions/d1840.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "cache-control-url",
+      "query": "cache control header for the reviewed url",
+      "category": "entity",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["src/cache.rs"], "chunk_ids": [] }
+    }
+  ]
+}
