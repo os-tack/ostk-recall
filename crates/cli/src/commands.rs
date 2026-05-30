@@ -501,8 +501,6 @@ pub async fn scan_with_context(
         per_source.push((label, stats));
     }
 
-    ostk_recall_scan::fcp_rust::drain_session_cache();
-
     // Drain ambient daemons FIRST so any synthetic ingests they fire
     // in response to source-loop events (TurnObserver auto-promotion,
     // AutoWeaver evidence linking, etc.) land in the corpus before we
@@ -716,8 +714,6 @@ pub async fn scan_paths_with_context(
     for (_, s) in &per_source {
         totals = totals.merge(*s);
     }
-
-    ostk_recall_scan::fcp_rust::drain_session_cache();
 
     shutdown_ambient_daemons(ambient).await;
 
