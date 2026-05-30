@@ -1286,21 +1286,49 @@ impl AttentionForwardStore for InMemoryAttention {
     ) -> Result<Vec<AttentionPage>, AttentionError> {
         let key = ScopeKey::from(scope);
         let inner = self.inner.read().await;
-        let Some(scope_state) = inner.scopes.get(&key) else {
-            return Ok(vec![]);
-        };
-
         let now = Utc::now();
-        let mut pages: Vec<AttentionPage> = scope_state
-            .threads
-            .iter()
-            .filter(|(_, t)| should_surface_thread(t, &key))
-            .filter_map(|(handle, state)| {
-                let parts = compute_score_parts(state, scope_state.effective_vec(), now);
-                if parts.score < ARCHIVE_THRESHOLD {
-                    return None;
+
+        // Cross-scope surface (frontier-surfacer-scope). Threads are
+        // fragmented across scope keys — boot re-anchor lands corpus
+        // anchors in the `replay` scope, the live observer writes
+        // project-keyed `ambient` scopes, and a hand-authored waypoint's
+        // anchor is wherever it was seeded. A scope-local surface() (the
+        // old behaviour) meant the live attention vector never scored the
+        // corpus-anchored threads, so `attention_surface` returned `[]`
+        // even with a healthy graph. Mirror `score_thread`'s
+        // max-across-scopes: rank EVERY thread against the *query* scope's
+        // effective vector and keep the best-scoring instance per handle.
+        let query_vec: Vec<f32> = inner
+            .scopes
+            .get(&key)
+            .map(|s| s.effective_vec().to_vec())
+            .unwrap_or_default();
+
+        let mut best: HashMap<String, AttentionPage> = HashMap::new();
+        for (sk, scope_state) in &inner.scopes {
+            // Per-project isolation holds: a thread surfaces in the query
+            // scope only if it shares the query's project, OR it lives in
+            // the cross-project `project = None` substrate namespace —
+            // where boot re-anchor lands the durable thread identities
+            // (the corpus-anchored salience threads + hand-authored
+            // waypoints). That `None` namespace is the connective tissue
+            // the lens must see from any project; other projects' threads
+            // stay isolated.
+            let project_visible = sk.project == key.project || sk.project.is_none();
+            if !project_visible {
+                continue;
+            }
+            for (handle, state) in &scope_state.threads {
+                // Privacy isolation is unchanged: a T0Private thread only
+                // surfaces in its origin scope.
+                if !should_surface_thread(state, &key) {
+                    continue;
                 }
-                Some(AttentionPage {
+                let parts = compute_score_parts(state, &query_vec, now);
+                if parts.score < ARCHIVE_THRESHOLD {
+                    continue;
+                }
+                let page = AttentionPage {
                     handle: handle.to_string(),
                     depth: state.depth,
                     score: parts.score,
@@ -1314,10 +1342,19 @@ impl AttentionForwardStore for InMemoryAttention {
                         off_diagonal_lift: parts.lift_term,
                         time_since_touch_secs: parts.dt_secs,
                     },
-                })
-            })
-            .collect();
+                };
+                best
+                    .entry(handle.to_string())
+                    .and_modify(|existing| {
+                        if page.score > existing.score {
+                            *existing = page.clone();
+                        }
+                    })
+                    .or_insert(page);
+            }
+        }
 
+        let mut pages: Vec<AttentionPage> = best.into_values().collect();
         pages.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1656,6 +1693,46 @@ mod tests {
         assert!(
             !pages_b.iter().any(|p| p.handle == "shared-handle"),
             "scope B must not see scope A's threads"
+        );
+    }
+
+    #[tokio::test]
+    async fn substrate_threads_surface_cross_project() {
+        // A `project = None` substrate thread (where boot re-anchor lands
+        // durable identities — corpus-anchored salience threads + hand-
+        // authored waypoints) must surface from ANY project's query scope.
+        // That is the connective tissue the lens reads; project-specific
+        // threads stay isolated (see `scope_isolates_resonance_across_projects`).
+        let store = InMemoryAttention::new();
+        let global = AttentionScope {
+            project: None,
+            session_id: Some("replay".into()),
+            agent: Some("substrate".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        };
+        let project = scope_for("project-x");
+        // The query scope is attended; the global thread is anchored to a
+        // matching vector so the resonance term fires across scopes.
+        store
+            .attend(&project, "surfacer scope fragmentation lens")
+            .await
+            .unwrap();
+        store
+            .__install_thread_for_test(
+                &global,
+                handle("frontier-x"),
+                0.0,
+                5,
+                Utc::now(),
+                FoldDepth::Folded,
+                stub_embed("surfacer scope fragmentation lens"),
+            )
+            .await;
+
+        let pages = store.surface(&project, 10).await.unwrap();
+        assert!(
+            pages.iter().any(|p| p.handle == "frontier-x"),
+            "a project=None substrate thread must surface from a project-keyed scope"
         );
     }
 
