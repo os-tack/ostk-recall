@@ -39,8 +39,8 @@ use ostk_recall_store::{CORPUS_TABLE, CorpusStore};
 use crate::candidate::Candidate;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
-use crate::lanes::{LaneEntry, build_candidates, lane_bm25, lane_dense, rrf_score_normalized};
-use crate::rank::{RankEngine, RankedHit};
+use crate::lanes::{LaneEntry, build_candidates, lane_bm25, lane_dense};
+use crate::rank::RankedHit;
 use crate::rerank::RerankerLike;
 use crate::row::{snippet_of, sql_escape};
 use crate::types::{RecallHit, RecallParams};
@@ -249,10 +249,18 @@ pub async fn recall(
     // land). Engine takes &self → no lock; an Arc<RankEngine> here
     // would be needed once the lens loop shares one with explicit
     // recall, but the explicit path can keep building per-call.
-    let engine = RankEngine::new()
-        .with_fn_feature("rrf", 1.0, |c, _q, _a| {
-            c.rrf_score.map_or(0.0, rrf_score_normalized)
-        });
+    // Build the rank engine from the effective explicit-profile feature
+    // weights (P5). `overrides.weights == None` resolves to the compiled
+    // default `{rrf: 1.0}` — numerically identical to the pre-P5 hardcoded
+    // rrf-only engine, so shipped behavior is unchanged until config / an
+    // MCP arg supplies tuned weights. Under the cross-encoder reranker the
+    // engine score is replaced downstream, so non-rrf weights reshape only
+    // the candidate pool on the explicit path; they are decisive with the
+    // reranker off or in the ambient/lens path.
+    let weights = overrides.weights.clone().unwrap_or_else(|| {
+        ostk_recall_core::default_profile_weights(ostk_recall_core::RankProfile::Explicit)
+    });
+    let engine = crate::rank::build_engine_from_weights(&weights);
     let query_ctx = QueryContext::explicit(query_text, vec.clone());
     let ranked: Vec<RankedHit> = engine
         .rank(candidates, &query_ctx, &AttentionContext::empty())
