@@ -83,7 +83,6 @@ Works today:
 
 Deferred:
 
-- Tree-sitter aware code chunking (line-window fallback today).
 - ChatGPT export scanner (zip layout differs from Claude exports).
 - Per-file offset cursors for incremental scan of `claude_code` and
   `gemini` (append-only JSONL falls back to full-source scan when poked
@@ -228,7 +227,7 @@ make serve
 | kind           | what it ingests                                                  | chunking                                         |
 | -------------- | ---------------------------------------------------------------- | ------------------------------------------------ |
 | `markdown`     | `.md` / `.markdown` trees                                        | split on headings, soft-wrap at ~400 tokens      |
-| `code`         | source files filtered by `extensions = [...]`                    | sliding line window (tree-sitter deferred)       |
+| `code`         | source files filtered by `extensions = [...]`                    | tree-sitter symbol chunks (rs/py/ts/js/go); line-window fallback |
 | `claude_code`  | Claude Code project session logs (`<slug>/*.jsonl`)              | one chunk per user / assistant turn              |
 | `gemini`       | Gemini CLI session JSON (`session-*.json`, walks recursively)    | one chunk per user/gemini exchange pair          |
 | `file_glob`    | arbitrary glob, ingested as plain text                           | paragraph split, soft-wrap at ~400 tokens        |
@@ -475,7 +474,6 @@ full writeups.
 
 ## Roadmap
 
-- Symbol-aware chunking for non-Rust source ([#11](https://github.com/os-tack/ostk-recall/issues/11)). Rust is already done — `code` scanner shells out to `fcp-rust` (rust-analyzer) for symbol-bounded chunks. Python / Go / JS are next; tree-sitter is the likely vehicle.
 - ChatGPT export scanner ([#12](https://github.com/os-tack/ostk-recall/issues/12)). Today's `zip_export` only handles Claude.ai exports; ChatGPT's zip layout differs.
 - Per-file offset cursors so `claude_code` and `gemini` benefit from path-aware incremental scan ([#13](https://github.com/os-tack/ostk-recall/issues/13)). Speed item, not correctness — content-addressed chunk_ids mean today's full re-parse is idempotent, just wasteful.
 - MCP transport diversity — HTTP / SSE per the 2025-06-18 spec ([#14](https://github.com/os-tack/ostk-recall/issues/14)). stdio-only today.

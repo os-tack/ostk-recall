@@ -154,7 +154,7 @@ Chunking rules per kind:
 | kind           | chunking strategy                                                    |
 | -------------- | -------------------------------------------------------------------- |
 | `markdown`     | split on ATX / setext headings, soft-wrap long sections at ~400 tok  |
-| `code`         | sliding line window; `fcp-rust` provides symbol-bounded chunks for `.rs` |
+| `code`         | tree-sitter symbol-bounded chunks (rs/py/ts/js/go); line-window fallback |
 | `claude_code`  | one chunk per user / assistant turn in the `.jsonl` log              |
 | `gemini`       | one chunk per user/gemini exchange pair (`session-*.json`)           |
 | `file_glob`    | paragraph split, soft-wrap at ~400 tokens                            |
