@@ -36,7 +36,7 @@ use ostk_recall_store::corpus::CorpusStore;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
 use crate::lanes::ambient_candidates;
-use crate::rank::{Feature, FeatureAttribution, RankEngine, RankedHit, attention_affinity_score};
+use crate::rank::{FeatureAttribution, RankEngine, RankedHit, attention_affinity_score};
 
 // ---------------------------------------------------------------------
 // Config
@@ -168,7 +168,9 @@ pub async fn build_lens(
     // swaps to an externally-constructed engine that carries the
     // freshness / entity / concept features registered at boot.
     let engine = lens_engine();
-    let ranked = engine.rank(candidates, &QueryContext::Ambient, attn_ctx);
+    let ranked = engine
+        .rank(candidates, &QueryContext::Ambient, attn_ctx)
+        .await?;
 
     let filtered: Vec<RankedHit> = ranked
         .into_iter()
@@ -189,10 +191,8 @@ pub async fn build_lens(
 /// weight 1.0. Built fresh per call because `RankEngine` is `!Clone`
 /// — but it's cheap and stateless, so cost is irrelevant.
 fn lens_engine() -> RankEngine {
-    RankEngine::new().with_feature(Feature {
-        name: "attention_affinity",
-        weight: 1.0,
-        score_fn: Box::new(|c, _q, a| attention_affinity_score(c, a)),
+    RankEngine::new().with_fn_feature("attention_affinity", 1.0, |c, _q, a| {
+        attention_affinity_score(c, a)
     })
 }
 

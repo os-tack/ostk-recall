@@ -38,7 +38,9 @@ pub use ostk_recall_core::{
 };
 pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
-pub use rank::{Feature, FeatureAttribution, RankEngine, RankedHit, ScoreFn};
+pub use rank::{
+    FeatureAttribution, FnFactory, RankEngine, RankFeatureFactory, RankFeatureInstance, RankedHit,
+};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
 pub use rerank::{RerankerError, RerankerLike};

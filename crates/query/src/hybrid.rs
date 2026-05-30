@@ -40,7 +40,7 @@ use crate::candidate::Candidate;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
 use crate::lanes::{LaneEntry, build_candidates, lane_bm25, lane_dense, rrf_score_normalized};
-use crate::rank::{Feature, RankEngine, RankedHit};
+use crate::rank::{RankEngine, RankedHit};
 use crate::rerank::RerankerLike;
 use crate::row::{snippet_of, sql_escape};
 use crate::types::{RecallHit, RecallParams};
@@ -249,13 +249,14 @@ pub async fn recall(
     // land). Engine takes &self → no lock; an Arc<RankEngine> here
     // would be needed once the lens loop shares one with explicit
     // recall, but the explicit path can keep building per-call.
-    let engine = RankEngine::new().with_feature(Feature {
-        name: "rrf",
-        weight: 1.0,
-        score_fn: Box::new(|c, _q, _a| c.rrf_score.map_or(0.0, rrf_score_normalized)),
-    });
+    let engine = RankEngine::new()
+        .with_fn_feature("rrf", 1.0, |c, _q, _a| {
+            c.rrf_score.map_or(0.0, rrf_score_normalized)
+        });
     let query_ctx = QueryContext::explicit(query_text, vec.clone());
-    let ranked: Vec<RankedHit> = engine.rank(candidates, &query_ctx, &AttentionContext::empty());
+    let ranked: Vec<RankedHit> = engine
+        .rank(candidates, &query_ctx, &AttentionContext::empty())
+        .await?;
 
     // Convert to RecallHit for the existing post-rank stages. The
     // top-N for rerank is `fetch_limit`; rerank truncates further.
