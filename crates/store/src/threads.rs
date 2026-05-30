@@ -987,7 +987,6 @@ CREATE TABLE IF NOT EXISTS threads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_tension ON threads(tension);
-CREATE INDEX IF NOT EXISTS idx_threads_resonance ON threads(resonance);
 CREATE INDEX IF NOT EXISTS idx_threads_anchor ON threads(anchor_chunk_id)
     WHERE anchor_chunk_id IS NOT NULL;
 
@@ -1103,6 +1102,14 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             "threads",
             "resonance",
             "ALTER TABLE threads ADD COLUMN resonance INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Index on the floor driver. Created here, AFTER the column add,
+        // because on a pre-split DB the `resonance` column doesn't exist
+        // until the ALTER above runs (it can't live in the CREATE-TABLE
+        // batch, which is a no-op when the table already exists).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_threads_resonance ON threads(resonance)",
+            [],
         )?;
         Ok(())
     }
@@ -2495,6 +2502,53 @@ mod tests {
 
         db.delete_thread(&handle("alpha-thread")).unwrap();
         assert!(db.get_thread(&handle("alpha-thread")).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "manual: set MIG_TEST_ROOT to a dir holding a COPY of a pre-split \
+                threads.sqlite (familiarity column). Exercises the real \
+                familiarity->mentions rename + resonance backfill on live data."]
+    fn migration_on_live_copy_preserves_mentions_resets_resonance() {
+        let root = std::env::var("MIG_TEST_ROOT").expect("set MIG_TEST_ROOT");
+        let root = std::path::Path::new(&root);
+        // Capture a couple of known dominators before-state via raw sqlite.
+        let probe = |handle: &str| -> i64 {
+            let conn = Connection::open(root.join("threads.sqlite")).unwrap();
+            // Column may be `familiarity` (pre) or `mentions` (post) — try both.
+            conn.query_row(
+                "SELECT COALESCE(\
+                   (SELECT mentions FROM threads WHERE handle=?1),\
+                   0)",
+                params![handle],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        };
+
+        // open() runs migrate(): rename familiarity->mentions, add resonance=0.
+        let db = ThreadsDb::open(root).unwrap();
+        let tl = db
+            .get_thread(&ThreadHandle::new("top-level").unwrap())
+            .unwrap()
+            .expect("top-level present in live copy");
+        assert!(
+            tl.mentions >= 1000,
+            "raw recurrence carried over verbatim (got mentions={})",
+            tl.mentions
+        );
+        assert_eq!(tl.resonance, 0, "resonance backfilled to baseline (the reset)");
+        let mentions_after_first = probe("top-level");
+        assert_eq!(mentions_after_first, tl.mentions as i64);
+
+        // Idempotent: re-open is a no-op (no double-rename, counters stable).
+        drop(db);
+        let db2 = ThreadsDb::open(root).unwrap();
+        let tl2 = db2
+            .get_thread(&ThreadHandle::new("top-level").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(tl2.mentions, tl.mentions, "re-open must not change mentions");
+        assert_eq!(tl2.resonance, 0, "re-open must not change resonance");
     }
 
     #[test]
