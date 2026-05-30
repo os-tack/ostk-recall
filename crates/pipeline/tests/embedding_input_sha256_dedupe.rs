@@ -83,6 +83,7 @@ fn make_cfg(fixtures_dir: &Path, facets_override: &[(&str, &[&str])]) -> SourceC
         reranker: None,
         watch: None,
         runtime: None,
+        ranking: None,
         lens: None,
         record_rules: None,
         weaver: None,
