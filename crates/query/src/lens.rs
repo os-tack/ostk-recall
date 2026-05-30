@@ -25,18 +25,22 @@
 //! daemon, and lets the loop reason about state transitions without
 //! reaching into Lance.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use ostk_recall_core::{FacetSet, facets};
+use ostk_recall_core::{FacetSet, RankProfile, default_profile_weights, facets};
 use ostk_recall_store::corpus::CorpusStore;
+use ostk_recall_store::{AccessKind, ChainLogReader};
 
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
 use crate::lanes::ambient_candidates;
-use crate::rank::{FeatureAttribution, RankEngine, RankedHit, attention_affinity_score};
+use crate::rank::{
+    FeatureAttribution, RankEngine, RankedHit, build_engine_from_weights, cosine_similarity,
+};
 
 // ---------------------------------------------------------------------
 // Config
@@ -77,6 +81,15 @@ pub struct LensConfig {
     /// fraction of total score. A feature with weighted contribution
     /// below this share is not considered dominant in its slot.
     pub dominance_threshold: f32,
+    /// Refractory decay time-constant in seconds (P9b-full). A chunk
+    /// included in a recent lens is penalized by
+    /// `refractory_weight * Σ exp(-Δt / refractory_tau_secs)` over its
+    /// recent `LensIncluded` events, suppressing immediate repeats so the
+    /// lens rotates. Default ~1h.
+    pub refractory_tau_secs: u64,
+    /// Peak refractory penalty (subtracted from `total_score` for a chunk
+    /// surfaced just now). `0.0` disables the refractory stage. P9b-full.
+    pub refractory_weight: f32,
 }
 
 impl Default for LensConfig {
@@ -97,6 +110,10 @@ impl Default for LensConfig {
             ],
             candidate_k_per_lane: 32,
             dominance_threshold: 0.30,
+            // Keep in sync with `ostk_recall_core::config::LensSettings`
+            // defaults; the CLI guard test pins them together.
+            refractory_tau_secs: 3600,
+            refractory_weight: 0.5,
         }
     }
 }
@@ -139,17 +156,21 @@ pub struct LensEntry {
 // Builder
 // ---------------------------------------------------------------------
 
-/// Build a lens for the current `AttentionContext`.
+/// Build a lens for the current `AttentionContext` (P9b-full).
 ///
-/// P9b-min path:
 ///   1. Generate ambient candidates from the corpus against
 ///      `attn_ctx.scope_vector` (dense lane only — BM25 is off in
 ///      ambient mode by invariant).
-///   2. Rank with an internally-constructed engine whose only
-///      registered feature is `attention_affinity` at weight 1.0.
-///   3. Filter the denylist facets.
-///   4. Allocate the attention slot (up to 2 entries) honoring the
-///      dominance check and the token budget.
+///   2. Rank with the lens engine (attention_affinity + freshness in
+///      P9b-full; entity_salience / concept_support join when P7/P8
+///      register them, with no change here). Commit 5 hoists the engine to
+///      `serve` boot so `[ranking.weights.lens]` overrides apply; today it
+///      is built per-call from the compiled Lens-profile defaults.
+///   3. Apply the refractory penalty (decay recently lens-included chunks)
+///      when an access-ledger reader is wired into `attn_ctx.chain_log`.
+///   4. Filter the denylist facets.
+///   5. Allocate the default portfolio (attention ×2, freshness, entity,
+///      concept, diversity_jump) honoring dominance + the token budget.
 ///
 /// Returns an empty lens when there are no candidates — the loop
 /// will still call `emit_resource_updated`, but the rendered
@@ -163,117 +184,227 @@ pub async fn build_lens(
     let candidates =
         ambient_candidates(corpus, attn_ctx, None, config.candidate_k_per_lane).await?;
 
-    // P9b-min owns its own engine — there is exactly one feature in
-    // play (attention_affinity) and no async prepare(). P9b-full
-    // swaps to an externally-constructed engine that carries the
-    // freshness / entity / concept features registered at boot.
     let engine = lens_engine();
     let ranked = engine
         .rank(candidates, &QueryContext::Ambient, attn_ctx)
         .await?;
+
+    // Refractory: decay chunks surfaced in a recent lens so the portfolio
+    // rotates. Reads `LensIncluded` events from the same access ledger the
+    // freshness feature uses. No reader (explicit path / empty ledger) → no
+    // penalty.
+    let ranked = match attn_ctx.chain_log.as_ref() {
+        Some(reader) => apply_refractory(
+            ranked,
+            reader.as_ref(),
+            config.refractory_tau_secs,
+            config.refractory_weight,
+        ),
+        None => ranked,
+    };
 
     let filtered: Vec<RankedHit> = ranked
         .into_iter()
         .filter(|h| !has_denylist_facet(&h.candidate.chunk.facets, &config.exclude_facets))
         .collect();
 
-    let entries = allocate_attention_portfolio(&filtered, config);
+    let entries = allocate_portfolio(&filtered, &default_slots(), config);
 
     Ok(Lens {
         entries,
         generated_at: Utc::now(),
         drift_basis: "rolling".into(),
-        pinned: attn_ctx.pinned(),
+        pinned: attn_ctx.pinned,
     })
 }
 
-/// The P9b-min rank engine: a single attention-affinity feature at
-/// weight 1.0. Built fresh per call because `RankEngine` is `!Clone`
-/// — but it's cheap and stateless, so cost is irrelevant.
+/// The P9b-full lens rank engine: the compiled `RankProfile::Lens` defaults
+/// (`attention_affinity` + `freshness`) built through the single
+/// `build_engine_from_weights` builder. Built per call here; Commit 5 hoists
+/// this to `serve` boot and passes an `Arc<RankEngine>` in, so
+/// `[ranking.weights.lens]` overrides take effect. Cheap + stateless.
 fn lens_engine() -> RankEngine {
-    RankEngine::new().with_fn_feature("attention_affinity", 1.0, |c, _q, a| {
-        attention_affinity_score(c, a)
-    })
+    build_engine_from_weights(&default_profile_weights(RankProfile::Lens))
 }
 
 // ---------------------------------------------------------------------
-// Allocator (P9b-min: attention slot only)
+// Portfolio allocator (P9b-full)
 // ---------------------------------------------------------------------
 
-/// Allocate up to 2 attention-dominant entries, honoring the token
-/// budget. P9b-min is intentionally narrow: no freshness/entity/
-/// concept/diversity slots, no refractory.
-fn allocate_attention_portfolio(ranked: &[RankedHit], config: &LensConfig) -> Vec<LensEntry> {
-    const SLOT: &str = "attention";
-    const FEATURE: &str = "attention_affinity";
-    const COUNT: usize = 2;
+/// One portfolio slot. The allocator iterates slots in canonical order and
+/// the first slot whose check a chunk passes claims it (first-match wins).
+pub struct SlotDef {
+    name: &'static str,
+    kind: SlotKind,
+    count: usize,
+}
 
+enum SlotKind {
+    /// Fill from candidates where `feature` contributes ≥ the configured
+    /// dominance share of total score (weighted contribution, not raw). A
+    /// feature absent from the engine (e.g. `entity_salience` /
+    /// `concept_support` before P7/P8) never produces an attribution, so
+    /// the slot simply finds no dominant candidate and skips cleanly.
+    Dominance { feature: &'static str },
+    /// Lateral-context slot: pick the candidate most dissimilar to the
+    /// already-selected set (maximal marginal diversity). No dominance gate.
+    Jump,
+}
+
+/// The default P9b-full portfolio. Canonical iteration order; the first
+/// matching slot wins a chunk. Entity/concept slots are wired but **dormant**
+/// — their features are unregistered until P7/P8 ship, so they skip cleanly
+/// today and activate with zero allocator changes once registered.
+#[must_use]
+pub fn default_slots() -> Vec<SlotDef> {
+    vec![
+        SlotDef {
+            name: "attention",
+            kind: SlotKind::Dominance {
+                feature: "attention_affinity",
+            },
+            count: 2,
+        },
+        SlotDef {
+            name: "freshness",
+            kind: SlotKind::Dominance {
+                feature: "freshness",
+            },
+            count: 1,
+        },
+        SlotDef {
+            name: "entity",
+            kind: SlotKind::Dominance {
+                feature: "entity_salience",
+            },
+            count: 1,
+        },
+        SlotDef {
+            name: "concept",
+            kind: SlotKind::Dominance {
+                feature: "concept_support",
+            },
+            count: 1,
+        },
+        SlotDef {
+            name: "diversity_jump",
+            kind: SlotKind::Jump,
+            count: 1,
+        },
+    ]
+}
+
+/// Allocate the portfolio: iterate `slots` in order, filling up to each
+/// slot's `count`. A chunk is taken by the first slot whose check it passes
+/// (deduped by chunk_id AND content sha256). Honors the token budget with the
+/// min-excerpt floor — a slot is skipped, not padded, when even the floor
+/// won't fit, and once the floor won't fit at all the allocation stops.
+#[must_use]
+pub fn allocate_portfolio(
+    ranked: &[RankedHit],
+    slots: &[SlotDef],
+    config: &LensConfig,
+) -> Vec<LensEntry> {
     let mut entries: Vec<LensEntry> = Vec::new();
     let mut tokens_used = 0_usize;
     let mut selected: HashSet<String> = HashSet::new();
     // Dedup by *content* (sha256), not only chunk_id: two distinct
-    // observations of byte-identical text must not both take a slot — the
-    // lens reflects distinct information, not repeated strikes of the same.
+    // observations of byte-identical text must not both take a slot.
     let mut selected_content: HashSet<String> = HashSet::new();
+    // Embeddings of selected entries, for the diversity-jump metric.
+    let mut selected_embeddings: Vec<Vec<f32>> = Vec::new();
 
-    for _seat in 0..COUNT {
-        // Pick the highest-scoring unselected hit where attention is
-        // dominant. Without the dominance gate the slot would fill
-        // with random high-RRF hits whose attention contribution was
-        // accidental.
-        let pick = ranked
-            .iter()
-            .filter(|h| !selected.contains(&h.candidate.chunk.chunk_id))
-            .filter(|h| !selected_content.contains(&h.candidate.chunk.sha256))
-            .filter(|h| is_attention_dominant(h, FEATURE, config.dominance_threshold))
-            .max_by(|a, b| {
-                let aa = attention_contribution(a, FEATURE);
-                let bb = attention_contribution(b, FEATURE);
-                aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
+    'slots: for slot in slots {
+        for _seat in 0..slot.count {
+            // Once even the floor won't fit, no further slot can be filled.
+            if config.token_budget.saturating_sub(tokens_used) < config.min_excerpt_tokens {
+                break 'slots;
+            }
+
+            let pick = match &slot.kind {
+                SlotKind::Dominance { feature } => ranked
+                    .iter()
+                    .filter(|h| !selected.contains(&h.candidate.chunk.chunk_id))
+                    .filter(|h| !selected_content.contains(&h.candidate.chunk.sha256))
+                    .filter(|h| is_feature_dominant(h, feature, config.dominance_threshold))
+                    // Rank by post-refractory total so a penalized chunk loses
+                    // its seat to a fresher alternative. Tie → lower chunk_id.
+                    .max_by(|a, b| {
+                        a.total
+                            .partial_cmp(&b.total)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| {
+                                b.candidate.chunk.chunk_id.cmp(&a.candidate.chunk.chunk_id)
+                            })
+                    }),
+                SlotKind::Jump => ranked
+                    .iter()
+                    .filter(|h| !selected.contains(&h.candidate.chunk.chunk_id))
+                    .filter(|h| !selected_content.contains(&h.candidate.chunk.sha256))
+                    .filter(|h| h.candidate.dense_embedding.is_some())
+                    .max_by(|a, b| {
+                        diversity_score(a, &selected_embeddings)
+                            .partial_cmp(&diversity_score(b, &selected_embeddings))
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| {
+                                b.candidate.chunk.chunk_id.cmp(&a.candidate.chunk.chunk_id)
+                            })
+                    }),
+            };
+            let Some(hit) = pick else {
+                break; // no candidate for this slot category; try the next slot
+            };
+
+            let remaining = config.token_budget.saturating_sub(tokens_used);
+            let target = approximate_token_count(&hit.candidate.chunk.text).min(remaining);
+            let excerpt = excerpt_centered_on_best_sentence(&hit.candidate.chunk.text, target);
+            let actual = approximate_token_count(&excerpt);
+            tokens_used += actual;
+            let truncated = actual < approximate_token_count(&hit.candidate.chunk.text);
+
+            entries.push(LensEntry {
+                chunk_id: hit.candidate.chunk.chunk_id.clone(),
+                source_kind: hit.candidate.chunk.source.as_str().to_string(),
+                source_id: hit.candidate.chunk.source_id.clone(),
+                slot_name: slot.name,
+                slot_reason: slot_reason(slot, hit),
+                text_excerpt: excerpt,
+                feature_breakdown: hit.features.clone(),
+                total_score: hit.total,
+                truncated,
             });
-        let Some(hit) = pick else {
-            break;
-        };
-
-        let remaining = config.token_budget.saturating_sub(tokens_used);
-        if remaining < config.min_excerpt_tokens {
-            break;
+            selected.insert(hit.candidate.chunk.chunk_id.clone());
+            selected_content.insert(hit.candidate.chunk.sha256.clone());
+            if let Some(emb) = &hit.candidate.dense_embedding {
+                selected_embeddings.push(emb.clone());
+            }
         }
-        let target = approximate_token_count(&hit.candidate.chunk.text).min(remaining);
-        let excerpt = excerpt_centered_on_best_sentence(&hit.candidate.chunk.text, target);
-        let actual = approximate_token_count(&excerpt);
-        tokens_used += actual;
-
-        let reason = if let Some(attr) = hit.features.get(FEATURE) {
-            format!(
-                "aligned with current focus (attention raw={:.2}, contribution={:.2})",
-                attr.raw, attr.contribution
-            )
-        } else {
-            "aligned with current focus".to_string()
-        };
-
-        let truncated = actual < approximate_token_count(&hit.candidate.chunk.text);
-
-        entries.push(LensEntry {
-            chunk_id: hit.candidate.chunk.chunk_id.clone(),
-            source_kind: hit.candidate.chunk.source.as_str().to_string(),
-            source_id: hit.candidate.chunk.source_id.clone(),
-            slot_name: SLOT,
-            slot_reason: reason,
-            text_excerpt: excerpt,
-            feature_breakdown: hit.features.clone(),
-            total_score: hit.total,
-            truncated,
-        });
-        selected.insert(hit.candidate.chunk.chunk_id.clone());
-        selected_content.insert(hit.candidate.chunk.sha256.clone());
     }
 
     entries
 }
 
-fn is_attention_dominant(h: &RankedHit, feature: &str, threshold: f32) -> bool {
+/// Human-readable slot reason for the rendered lens + `lens show`.
+fn slot_reason(slot: &SlotDef, hit: &RankedHit) -> String {
+    match &slot.kind {
+        SlotKind::Dominance { feature } => hit.features.get(*feature).map_or_else(
+            || format!("{feature} dominant"),
+            |attr| {
+                format!(
+                    "{feature} dominant (raw={:.2}, contribution={:.2})",
+                    attr.raw, attr.contribution
+                )
+            },
+        ),
+        SlotKind::Jump => "lateral context".to_string(),
+    }
+}
+
+/// True when `feature` contributes ≥ `threshold` share of `h.total`
+/// (weighted contribution, not raw). Zero/negative totals never dominate,
+/// so a refractory-penalized chunk whose total drops to/below zero is
+/// excluded from every slot.
+fn is_feature_dominant(h: &RankedHit, feature: &str, threshold: f32) -> bool {
     if h.total <= f32::EPSILON {
         return false;
     }
@@ -283,11 +414,90 @@ fn is_attention_dominant(h: &RankedHit, feature: &str, threshold: f32) -> bool {
     (attr.contribution / h.total) >= threshold
 }
 
-fn attention_contribution(h: &RankedHit, feature: &str) -> f32 {
-    h.features
-        .get(feature)
-        .map(|a| a.contribution)
-        .unwrap_or(0.0)
+/// Diversity of `h` against the already-selected embeddings: `1 - max cosine`.
+/// Higher = more lateral. No embedding ⇒ 0 (can't be placed laterally); an
+/// empty selected set ⇒ 1 (nothing to differ from yet).
+fn diversity_score(h: &RankedHit, selected: &[Vec<f32>]) -> f32 {
+    let Some(emb) = h.candidate.dense_embedding.as_deref() else {
+        return 0.0;
+    };
+    if selected.is_empty() {
+        return 1.0;
+    }
+    let max_sim = selected
+        .iter()
+        .map(|s| cosine_similarity(s, emb).max(0.0))
+        .fold(0.0_f32, f32::max);
+    1.0 - max_sim
+}
+
+// ---------------------------------------------------------------------
+// Refractory penalty (P9b-full)
+// ---------------------------------------------------------------------
+
+/// Decay chunks surfaced in a recent lens so the portfolio doesn't repeat
+/// itself. For each candidate, sum `exp(-Δt / τ)` over its `LensIncluded`
+/// events in the recent window, scale by `weight`, and subtract from `total`
+/// as an attributed negative `refractory` feature row (preserving the
+/// `total = Σ contribution` invariant). Re-sorts descending by adjusted
+/// total. `weight <= 0` or `tau == 0` is a no-op; a ledger read error
+/// degrades to no penalty (best-effort — the lens never fails on this).
+#[must_use]
+pub fn apply_refractory(
+    mut ranked: Vec<RankedHit>,
+    reader: &dyn ChainLogReader,
+    tau_secs: u64,
+    weight: f32,
+) -> Vec<RankedHit> {
+    if weight <= 0.0 || tau_secs == 0 || ranked.is_empty() {
+        return ranked;
+    }
+    let now = Utc::now();
+    // The penalty is negligible beyond ~5τ; bound the ledger scan there.
+    let lookback = i64::try_from(tau_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(5)
+        .max(1);
+    let since = now - Duration::seconds(lookback);
+    let ids: Vec<String> = ranked
+        .iter()
+        .map(|h| h.candidate.chunk.chunk_id.clone())
+        .collect();
+    let Ok(history) = reader.access_history(&ids, since) else {
+        return ranked; // best-effort: a ledger read error means no penalty
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let tau = tau_secs as f32;
+    for h in &mut ranked {
+        let Some(events) = history.get(&h.candidate.chunk.chunk_id) else {
+            continue;
+        };
+        let decay: f32 = events
+            .iter()
+            .filter(|(kind, _)| matches!(kind, AccessKind::LensIncluded))
+            .map(|(_, ts)| {
+                #[allow(clippy::cast_precision_loss)]
+                let dt = (now - *ts).num_seconds().max(0) as f32;
+                (-dt / tau).exp()
+            })
+            .sum();
+        let penalty = decay * weight;
+        if penalty > 0.0 {
+            // Attributed negative row (mirrors Frontier B's self-reference
+            // dampener): raw carries the negative so contribution = -penalty
+            // at weight 1.0, and `total = Σ contribution` still holds.
+            h.total -= penalty;
+            h.features
+                .insert("refractory", FeatureAttribution::new(-penalty, 1.0));
+        }
+    }
+    ranked.sort_by(|a, b| {
+        b.total
+            .partial_cmp(&a.total)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.candidate.chunk.chunk_id.cmp(&b.candidate.chunk.chunk_id))
+    });
+    ranked
 }
 
 // ---------------------------------------------------------------------
@@ -384,29 +594,6 @@ impl Lens {
             }
         }
         out
-    }
-}
-
-// ---------------------------------------------------------------------
-// AttentionContext convenience
-// ---------------------------------------------------------------------
-
-impl AttentionContext {
-    /// Convenience: did the upstream lens loop see a pinned focus?
-    /// The lens module wants a single bool for the rendered metadata;
-    /// the loop owns the actual `effective_vec()` resolution.
-    ///
-    /// P9b-min approximation: any time `scope_vector` differs from
-    /// `rolling_vec` (or rolling_vec is None while scope_vector is
-    /// Some), a pin is driving ranking. P9b-full replaces this with
-    /// an explicit `pinned` field carried in the snapshot.
-    #[must_use]
-    pub fn pinned(&self) -> bool {
-        match (&self.scope_vector, &self.rolling_vec) {
-            (Some(sv), Some(rv)) => sv != rv,
-            (Some(_), None) => true,
-            _ => false,
-        }
     }
 }
 
@@ -524,7 +711,7 @@ mod tests {
             total: 1.0,
             features,
         };
-        assert!(!is_attention_dominant(&h, "attention_affinity", 0.30));
+        assert!(!is_feature_dominant(&h, "attention_affinity", 0.30));
     }
 
     #[test]
@@ -537,7 +724,7 @@ mod tests {
             total: 0.9,
             features,
         };
-        assert!(is_attention_dominant(&h, "attention_affinity", 0.30));
+        assert!(is_feature_dominant(&h, "attention_affinity", 0.30));
     }
 
     #[test]
@@ -553,7 +740,20 @@ mod tests {
             total: 0.0,
             features,
         };
-        assert!(!is_attention_dominant(&h, "attention_affinity", 0.30));
+        assert!(!is_feature_dominant(&h, "attention_affinity", 0.30));
+    }
+
+    /// An attention-only slot list (2 seats) — preserves the P9b-min
+    /// allocator behavior these unit tests assert, without the diversity /
+    /// freshness / entity / concept slots of `default_slots()`.
+    fn attention_only_slots() -> Vec<SlotDef> {
+        vec![SlotDef {
+            name: "attention",
+            kind: SlotKind::Dominance {
+                feature: "attention_affinity",
+            },
+            count: 2,
+        }]
     }
 
     fn ranked_hit(id: &str, text: &str, raw: f32) -> RankedHit {
@@ -576,12 +776,12 @@ mod tests {
             ranked_hit("c2", "bravo content two", 0.9),
             ranked_hit("c3", "charlie content three", 0.7),
         ];
-        let entries = allocate_attention_portfolio(&hits, &LensConfig::default());
+        let entries = allocate_portfolio(&hits, &attention_only_slots(), &LensConfig::default());
         let ids: Vec<&str> = entries.iter().map(|e| e.chunk_id.as_str()).collect();
-        assert_eq!(ids, vec!["c2", "c3"], "highest two by contribution");
+        assert_eq!(ids, vec!["c2", "c3"], "highest two by total");
         for entry in &entries {
             assert_eq!(entry.slot_name, "attention");
-            assert!(entry.slot_reason.contains("aligned"));
+            assert!(entry.slot_reason.contains("attention_affinity"));
         }
     }
 
@@ -594,7 +794,8 @@ mod tests {
         let mut h2 = ranked_hit("c2", "same body text", 0.8);
         h1.candidate.chunk.sha256 = "dup-sha".to_string();
         h2.candidate.chunk.sha256 = "dup-sha".to_string();
-        let entries = allocate_attention_portfolio(&[h1, h2], &LensConfig::default());
+        let entries =
+            allocate_portfolio(&[h1, h2], &attention_only_slots(), &LensConfig::default());
         assert_eq!(entries.len(), 1, "second byte-identical candidate dropped");
         assert_eq!(entries[0].chunk_id, "c1", "highest-scoring kept");
     }
@@ -617,14 +818,15 @@ mod tests {
             min_excerpt_tokens: 200,
             ..LensConfig::default()
         };
-        let entries = allocate_attention_portfolio(&hits, &config);
+        let entries = allocate_portfolio(&hits, &attention_only_slots(), &config);
         assert_eq!(entries.len(), 1, "second slot skipped under budget floor");
     }
 
     #[test]
     fn render_markdown_includes_metadata_and_entries() {
         let entries = vec![ranked_hit("c1", "alpha bravo charlie", 0.9)];
-        let allocated = allocate_attention_portfolio(&entries, &LensConfig::default());
+        let allocated =
+            allocate_portfolio(&entries, &attention_only_slots(), &LensConfig::default());
         let lens = Lens {
             entries: allocated,
             generated_at: Utc::now(),
@@ -649,22 +851,5 @@ mod tests {
         };
         let md = lens.to_markdown();
         assert!(md.contains("No attended content"));
-    }
-
-    #[test]
-    fn pinned_helper_detects_divergence() {
-        let mut ctx = AttentionContext::empty();
-        ctx.scope_vector = Some(vec![1.0, 0.0]);
-        ctx.rolling_vec = Some(vec![0.0, 1.0]);
-        assert!(ctx.pinned(), "scope ≠ rolling → pin is driving");
-
-        ctx.rolling_vec = Some(vec![1.0, 0.0]);
-        assert!(!ctx.pinned(), "scope == rolling → no pin");
-
-        ctx.rolling_vec = None;
-        assert!(ctx.pinned(), "scope set, rolling None → pin newly placed");
-
-        ctx.scope_vector = None;
-        assert!(!ctx.pinned(), "empty mind → no pin");
     }
 }

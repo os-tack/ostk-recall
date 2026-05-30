@@ -958,6 +958,8 @@ fn resolve_lens_config(settings: Option<&LensSettings>) -> LensConfig {
         exclude_facets: l.exclude_facets.clone(),
         candidate_k_per_lane: l.candidate_k_per_lane,
         dominance_threshold: l.dominance_threshold,
+        refractory_tau_secs: l.refractory_tau_secs,
+        refractory_weight: l.refractory_weight,
     })
 }
 
@@ -2675,6 +2677,8 @@ mod lens_config_tests {
         assert_eq!(mapped.exclude_facets, dflt.exclude_facets);
         assert_eq!(mapped.candidate_k_per_lane, dflt.candidate_k_per_lane);
         assert!((mapped.dominance_threshold - dflt.dominance_threshold).abs() < f32::EPSILON);
+        assert_eq!(mapped.refractory_tau_secs, dflt.refractory_tau_secs);
+        assert!((mapped.refractory_weight - dflt.refractory_weight).abs() < f32::EPSILON);
     }
 
     /// Absent `[lens]` block resolves to the daemon default verbatim.
