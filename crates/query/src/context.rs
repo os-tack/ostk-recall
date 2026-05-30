@@ -86,6 +86,25 @@ pub struct AttentionContext {
     /// reader; the Freshness feature degrades to `chunk.ts`-only
     /// (creation-recency) base activation when absent.
     pub chain_log: Option<Arc<dyn ChainLogReader>>,
+    /// P9b-full — `true` when an operator pin is driving ranking. The lens
+    /// loop sets this explicitly from its pin-fingerprint detection;
+    /// [`crate::lens`]'s `pinned()` heuristic (scope ≠ rolling) is the
+    /// fallback used only by the P9b-min direct-build path.
+    pub pinned: bool,
+    /// P9b-full (dormant) — entity handles in recent attention, fed to
+    /// pseudo-query construction. Empty until P6/P7 wire the entity ring;
+    /// an empty list contributes nothing to `pseudo_query` or the
+    /// entity-dominant slot.
+    pub recent_entities: Vec<String>,
+    /// P9b-full (dormant) — the dominant concept label for the current
+    /// scope. `None` until P8 (concept overlay) lands; feeds the
+    /// concept-dominant slot and the pseudo-query.
+    pub dominant_concept_label: Option<String>,
+    /// P9b-full (dormant) — synthetic query built from `recent_entities` +
+    /// `dominant_concept_label`, consumed ONLY by the MaxSim (P4) rank
+    /// feature. `None` when both inputs are empty (today's steady state),
+    /// in which case MaxSim returns 0 for every candidate.
+    pub pseudo_query: Option<String>,
 }
 
 // Hand-written: `Arc<dyn ChainLogReader>` is not `Debug`, so the struct
@@ -100,6 +119,10 @@ impl std::fmt::Debug for AttentionContext {
                 "chain_log",
                 &self.chain_log.as_ref().map_or("none", |_| "set"),
             )
+            .field("pinned", &self.pinned)
+            .field("recent_entities", &self.recent_entities)
+            .field("dominant_concept_label", &self.dominant_concept_label)
+            .field("pseudo_query", &self.pseudo_query)
             .finish()
     }
 }
@@ -111,6 +134,10 @@ impl AttentionContext {
             scope_vector: None,
             rolling_vec: None,
             chain_log: None,
+            pinned: false,
+            recent_entities: Vec::new(),
+            dominant_concept_label: None,
+            pseudo_query: None,
         }
     }
 
@@ -118,8 +145,7 @@ impl AttentionContext {
     pub fn with_scope_vector(vec: Vec<f32>) -> Self {
         Self {
             scope_vector: Some(vec),
-            rolling_vec: None,
-            chain_log: None,
+            ..Self::empty()
         }
     }
 
@@ -153,5 +179,59 @@ impl AttentionContext {
         }
         self.rolling_vec = Some(rolling);
         self
+    }
+
+    /// Phase-B lens enrichment (P9b-full, two-phase snapshot). The lens
+    /// loop captures the attention vectors + pin state under the read
+    /// guard (Phase A, sync, microseconds), drops the guard, then calls
+    /// this to attach the access-ledger reader, set the explicit `pinned`
+    /// flag, and build the pseudo-query. `async` honors the two-phase
+    /// contract and reserves the seam for P8's async concept lookup;
+    /// today it awaits nothing (entities/concept arrive empty), so
+    /// `pseudo_query` is `None` and the MaxSim (P4) feature contributes 0.
+    #[must_use]
+    #[allow(clippy::unused_async)] // async reserves the P8 concept-lookup seam
+    pub async fn enrich_for_lens(
+        scope_vector: Option<Vec<f32>>,
+        rolling_vec: Option<Vec<f32>>,
+        pinned: bool,
+        chain_log: Option<Arc<dyn ChainLogReader>>,
+        recent_entities: Vec<String>,
+        dominant_concept_label: Option<String>,
+    ) -> Self {
+        let pseudo_query =
+            build_pseudo_query(&recent_entities, dominant_concept_label.as_deref());
+        Self {
+            scope_vector,
+            rolling_vec,
+            chain_log,
+            pinned,
+            recent_entities,
+            dominant_concept_label,
+            pseudo_query,
+        }
+    }
+}
+
+/// Build the synthetic pseudo-query the MaxSim (P4) rank feature consumes
+/// from the dominant concept label + recent entity handles. Returns `None`
+/// when there is no signal (both inputs empty), so MaxSim degrades to a
+/// zero contribution rather than ranking on an empty string.
+fn build_pseudo_query(entities: &[String], concept: Option<&str>) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(c) = concept {
+        if !c.is_empty() {
+            parts.push(c);
+        }
+    }
+    for e in entities {
+        if !e.is_empty() {
+            parts.push(e.as_str());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
     }
 }

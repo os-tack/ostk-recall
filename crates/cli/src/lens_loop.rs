@@ -190,6 +190,9 @@ impl LensTickSnapshot {
             // when the freshness slot lands; the attention-only P9b-min
             // lens has no freshness feature, so None is correct here.
             chain_log: None,
+            // P9b-full enrichment fields default here; the loop's
+            // enrich_for_lens path (Commit 5) supersedes this helper.
+            ..Default::default()
         }
     }
 }
