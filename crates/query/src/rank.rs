@@ -341,6 +341,42 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
+/// `RankFeatureFactory` wrapper around [`attention_affinity_score`] (P9b-full).
+///
+/// `attention_affinity` is stateless — the score is a pure cosine over the
+/// candidate embedding and the attention scope vector, with no pool-level
+/// `prepare()` I/O. P9b-min registered it via the anonymous [`FnFactory`]
+/// adapter; P9b-full promotes it to a named factory so the lens engine's
+/// feature set reads as first-class types alongside the stateful
+/// [`crate::freshness::FreshnessFactory`], and so a future `prepare()`
+/// (e.g. bulk embedding projection) has a home. Behaviorally identical to
+/// the `with_fn_feature("attention_affinity", …)` registration it replaces.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionAffinityFactory;
+
+impl RankFeatureFactory for AttentionAffinityFactory {
+    fn name(&self) -> &'static str {
+        "attention_affinity"
+    }
+    fn build_instance(&self) -> Box<dyn RankFeatureInstance> {
+        Box::new(AttentionAffinityInstance)
+    }
+}
+
+/// Per-query instance for [`AttentionAffinityFactory`]. Holds no state —
+/// inherits the trait's default no-op `prepare()`.
+struct AttentionAffinityInstance;
+
+#[async_trait]
+impl RankFeatureInstance for AttentionAffinityInstance {
+    fn name(&self) -> &'static str {
+        "attention_affinity"
+    }
+    fn score(&self, candidate: &Candidate, _query: &QueryContext, attn: &AttentionContext) -> f32 {
+        attention_affinity_score(candidate, attn)
+    }
+}
+
 // ---- config-driven engine construction (P5) ---------------------------
 
 /// Build a [`RankEngine`] from a profile weight map (P5).
@@ -378,9 +414,7 @@ pub fn build_engine_from_weights(weights: &BTreeMap<String, f32>) -> RankEngine 
                     .map_or(0.0, |s| s / (s + crate::hybrid::K_BM25))
             }),
             "attention_affinity" => {
-                engine.with_fn_feature("attention_affinity", weight, |c, _q, a| {
-                    attention_affinity_score(c, a)
-                })
+                engine.with_factory(Arc::new(AttentionAffinityFactory), weight)
             }
             "freshness" => engine.with_factory(
                 Arc::new(crate::freshness::FreshnessFactory::default()),
