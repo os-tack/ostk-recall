@@ -108,39 +108,45 @@ of this and replaces the score — see the frame note in the gate decision).
   membrane 40 · ostk_memory 3.
 - **Query set**: 15 queries (`tests/fixtures/bench/queries.corpus.json`),
   `source_id`-labeled from live recall. Categories: topical ×9, entity ×4,
-  vague ×2. (`--iters` defaulted to 5 — a known harness arg-parse nit, see
-  below; affects latency sample count only, not quality.)
+  vague ×2. `--iters 20` (latency sample count).
 
 **Quality (explicit profile, reranker off)**
 
 | Config | MRR@10 | Success@10 | Recall@10* |
 |---|---|---|---|
-| C1 rrf=1.0 | 0.581 | 0.733 | 0.430 |
-| C4 rrf=1.0 + bm25=0.5 | 0.581 | 0.733 | 0.430 |
+| C1 rrf=1.0 | 0.774 | 1.000 | 2.067 |
+| C4 rrf=1.0 + bm25=0.5 | 0.763 | 1.000 | 2.167 |
 
-Adding bm25 as an additive rank feature at 0.5 changes nothing vs rrf-only.
+Success@10 = 1.000: every query surfaces a labeled `source_id` in its top-10.
+Adding bm25 as an additive rank feature at 0.5 nudges MRR slightly *down*
+(0.774→0.763). *Recall@10 reads >1 because a labeled `source_id` matches
+multiple chunks (each counted), while the denominator is the labeled-marker
+count — it's a relative concentration signal, not a true [0,1] recall; treat
+MRR@10 + Success@10 as the real quality axes.
 
-**Latency (µs, p50/p95/p99 — release, 120k chunks)**
+**Latency (µs, p50/p95/p99 — release, 120k chunks, iters=20)**
 
 | Config | candidate-gen | rank | post-rank† | end-to-end |
 |---|---|---|---|---|
-| C1 | 215,897 / 229,466 / 231,736 | 38 / 43 / 47 | 76,333 / 87,798 / 92,667 | 295,748 / 313,749 / 320,995 |
-| C4 | 218,905 / 238,139 / 239,408 | 41 / 47 / 52 | 73,716 / 89,008 / 97,462 | 293,344 / 315,937 / 320,464 |
+| C1 | 35,972 / 39,052 / 43,933 | 16 / 19 / 21 | 15,358 / 18,772 / 23,116 | 51,392 / 56,450 / 61,762 |
+| C4 | 35,784 / 38,746 / 41,863 | 16 / 20 / 25 | 15,128 / 20,267 / 23,503 | 50,949 / 57,156 / 59,702 |
 
-- **candidate-gen (Lance I/O) dominates** end-to-end (~216 ms of ~296 ms p50).
-- **The rank engine is ~free** (38 µs p50). This empirically validates the P5
+- **candidate-gen (Lance I/O) dominates** end-to-end (~36 ms of ~51 ms p50).
+- **The rank engine is ~free** (16 µs p50). This empirically validates the P5
   frame: feature weights cost nothing; the latency budget is all retrieval I/O.
-- post-rank (76 ms) is the derived remainder absorbing run-to-run Lance
+- post-rank (~15 ms) is the derived remainder absorbing run-to-run Lance
   variance; with no reranker loaded the real in-memory stages are microseconds.
 
 **Sensitivity sweep (MRR@10 vs weight)**
 
-- **bm25**: 0→0.559, 0.25→**0.581**, 0.5→0.581, 1→0.559, 2→0.503. A tiny bump at
-  0.25–0.5, then it *regresses* at weight ≥1 (the additive bm25 term starts
-  out-voting rrf's fused ordering on some queries).
-- **rrf**: 0→**0.000** (total collapse), 0.25→0.581, 0.5→0.581, 1→0.581,
-  2→0.581. RRF is load-bearing and **saturating** — any weight ≥0.25 is
-  identical; magnitude past that is irrelevant.
+- **bm25**: 0→0.774, 0.25→**0.778**, 0.5→0.763, 1→0.760, 2→0.756. A negligible
+  +0.5% bump at 0.25, then it *regresses* as the additive bm25 term starts
+  out-voting rrf's fused ordering — never near the +10% bar.
+- **rrf**: 0→0.435, 0.25→0.774, 0.5→0.774, 1→0.774, 2→0.774. RRF is the
+  load-bearing, **saturating** feature — any weight ≥0.25 is identical; magnitude
+  past that is irrelevant. (At rrf=0 the engine totals collapse to 0 and ordering
+  falls to the chunk_id tiebreak, which still lands a relevant hit for enough
+  queries to score 0.435 over this label-rich pool.)
 
 **Lens rotation (ambient, 8 turns)**: repeated-chunk rate 0.129, rotation rate
 **0.871** — the attention-only ambient path rotates well on the real corpus.
@@ -151,9 +157,8 @@ Per `p5-bench.md`'s pre-registered criteria, a config must beat baseline by ≥1
 relative MRR@10 (or Recall@10 with no >5% regression elsewhere). **No config
 clears the bar:**
 
-- bm25 as an additive rank feature is at best **+0.0** (it's within noise at low
-  weight) and **regresses** at weight ≥1 — not a 10% improvement under any
-  setting.
+- bm25 as an additive rank feature peaks at **+0.5%** (0.778 vs 0.774 at
+  weight 0.25) and **regresses** above that — not within reach of the +10% bar.
 - rrf saturates at ≥0.25; there's no weight magnitude that improves on the
   `rrf=1.0` default.
 
@@ -182,9 +187,9 @@ experiment deferred; P4 not started).
 
 ### Known harness nits (follow-ups, non-blocking)
 
-- `--iters N` is dropped (arg-parse advances the index twice for valued flags),
-  so latency used the default 5 samples. Fix: don't double-increment in valued
-  arms. Quality is unaffected.
-- Peak RSS prints `n/a` on macOS (Linux-only `/proc` path). Expected.
+- Peak RSS prints `n/a` on macOS (Linux-only `/proc` path). Expected; the
+  meaningful memory figure is a Linux run.
 - The reranker is not wired into the example (config 2 shows skipped). Wiring it
   would let the bench measure the full production explicit stack.
+- `Recall@10` can read >1 (see quality note); rename to a "relevant-density"
+  metric or cap at the distinct-source level in a future harness pass.
