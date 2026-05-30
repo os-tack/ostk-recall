@@ -35,7 +35,9 @@ use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
-use ostk_recall_store::{ChainSink, CorpusStore, EventsDb, IngestDb, SqliteChainSink, ThreadsDb};
+use ostk_recall_store::{
+    ChainLogReader, ChainSink, CorpusStore, EventsDb, IngestDb, SqliteChainSink, ThreadsDb,
+};
 use tokio_util::sync::CancellationToken;
 
 use fs4::FileExt;
@@ -1221,6 +1223,17 @@ pub async fn serve(
         let attention = Arc::clone(&ctx.attention);
         let corpus = Arc::clone(engine.store());
         let chain_sink_clone: Arc<dyn ChainSink> = ctx.threads.chain_sink();
+        // Read handle on the same ledger for the freshness feature + refractory
+        // penalty. ThreadsDb implements both ChainSink (write) and
+        // ChainLogReader (read); the reader is a fresh-handle clone of the Arc.
+        let chain_reader: Arc<dyn ChainLogReader> = ctx.threads.clone();
+        // Lens rank engine, built ONCE from the Lens-profile weights
+        // (attention_affinity + freshness, overlaid by [ranking.weights.lens])
+        // and shared across ticks via Arc — concurrent recall + lens never
+        // serialize on it (RankEngine::rank is &self).
+        let lens_engine = Arc::new(ostk_recall_query::build_engine_from_weights(
+            &cfg.effective_ranking_weights(ostk_recall_core::RankProfile::Lens),
+        ));
         let registry = Arc::clone(&lens_registry);
         let resource = Arc::clone(&lens_resource);
         let cancel = serve_cancel.clone();
@@ -1236,6 +1249,8 @@ pub async fn serve(
                 registry,
                 resource,
                 chain_sink_clone,
+                chain_reader,
+                lens_engine,
                 lens_config,
                 scope,
                 state_dir,

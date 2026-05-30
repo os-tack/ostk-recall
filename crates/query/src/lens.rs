@@ -31,16 +31,14 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use ostk_recall_core::{FacetSet, RankProfile, default_profile_weights, facets};
+use ostk_recall_core::{FacetSet, facets};
 use ostk_recall_store::corpus::CorpusStore;
 use ostk_recall_store::{AccessKind, ChainLogReader};
 
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
 use crate::lanes::ambient_candidates;
-use crate::rank::{
-    FeatureAttribution, RankEngine, RankedHit, build_engine_from_weights, cosine_similarity,
-};
+use crate::rank::{FeatureAttribution, RankEngine, RankedHit, cosine_similarity};
 
 // ---------------------------------------------------------------------
 // Config
@@ -161,11 +159,10 @@ pub struct LensEntry {
 ///   1. Generate ambient candidates from the corpus against
 ///      `attn_ctx.scope_vector` (dense lane only — BM25 is off in
 ///      ambient mode by invariant).
-///   2. Rank with the lens engine (attention_affinity + freshness in
+///   2. Rank with the lens `engine` (attention_affinity + freshness in
 ///      P9b-full; entity_salience / concept_support join when P7/P8
-///      register them, with no change here). Commit 5 hoists the engine to
-///      `serve` boot so `[ranking.weights.lens]` overrides apply; today it
-///      is built per-call from the compiled Lens-profile defaults.
+///      register them, with no change here). The engine is built once at
+///      `serve` boot from `[ranking.weights.lens]` and shared via `Arc`.
 ///   3. Apply the refractory penalty (decay recently lens-included chunks)
 ///      when an access-ledger reader is wired into `attn_ctx.chain_log`.
 ///   4. Filter the denylist facets.
@@ -178,13 +175,13 @@ pub struct LensEntry {
 /// empty lenses should check `entries.is_empty()`.
 pub async fn build_lens(
     attn_ctx: &AttentionContext,
+    engine: &RankEngine,
     corpus: &CorpusStore,
     config: &LensConfig,
 ) -> Result<Lens> {
     let candidates =
         ambient_candidates(corpus, attn_ctx, None, config.candidate_k_per_lane).await?;
 
-    let engine = lens_engine();
     let ranked = engine
         .rank(candidates, &QueryContext::Ambient, attn_ctx)
         .await?;
@@ -216,15 +213,6 @@ pub async fn build_lens(
         drift_basis: "rolling".into(),
         pinned: attn_ctx.pinned,
     })
-}
-
-/// The P9b-full lens rank engine: the compiled `RankProfile::Lens` defaults
-/// (`attention_affinity` + `freshness`) built through the single
-/// `build_engine_from_weights` builder. Built per call here; Commit 5 hoists
-/// this to `serve` boot and passes an `Arc<RankEngine>` in, so
-/// `[ranking.weights.lens]` overrides take effect. Cheap + stateless.
-fn lens_engine() -> RankEngine {
-    build_engine_from_weights(&default_profile_weights(RankProfile::Lens))
 }
 
 // ---------------------------------------------------------------------
