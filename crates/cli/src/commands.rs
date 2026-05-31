@@ -2340,9 +2340,11 @@ const NOISE_PATH_SEGMENTS: &[&str] = &[
     ".git",
     "target",
     "node_modules",
+    ".pnpm",
     ".ostk",
     ".worktrees",
     ".next",
+    ".turbo",
     "dist",
     "build",
 ];
