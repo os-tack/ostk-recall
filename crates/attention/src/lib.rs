@@ -1327,68 +1327,108 @@ impl AttentionForwardStore for InMemoryAttention {
         // even with a healthy graph. Mirror `score_thread`'s
         // max-across-scopes: rank EVERY thread against the *query* scope's
         // effective vector and keep the best-scoring instance per handle.
-        let query_vec: Vec<f32> = inner
-            .scopes
-            .get(&key)
+        // Score EVERY visible thread against `query_vec`, keeping the
+        // best-scoring instance per handle, sorted descending. Factored into
+        // a closure so the pin-as-lens path below can score twice: once
+        // against the (possibly pinned) effective vector, and once against
+        // the un-pinned ambient vector.
+        let score_against = |query_vec: &[f32]| -> Vec<AttentionPage> {
+            let mut best: HashMap<String, AttentionPage> = HashMap::new();
+            for (sk, scope_state) in &inner.scopes {
+                // Per-project isolation holds: a thread surfaces in the query
+                // scope only if it shares the query's project, OR it lives in
+                // the cross-project `project = None` substrate namespace —
+                // where boot re-anchor lands the durable thread identities
+                // (the corpus-anchored salience threads + hand-authored
+                // waypoints). That `None` namespace is the connective tissue
+                // the lens must see from any project; other projects' threads
+                // stay isolated.
+                let project_visible = sk.project == key.project || sk.project.is_none();
+                if !project_visible {
+                    continue;
+                }
+                for (handle, state) in &scope_state.threads {
+                    // Privacy isolation is unchanged: a T0Private thread only
+                    // surfaces in its origin scope.
+                    if !should_surface_thread(state, &key) {
+                        continue;
+                    }
+                    let parts = compute_score_parts(state, query_vec, now);
+                    if parts.score < ARCHIVE_THRESHOLD {
+                        continue;
+                    }
+                    let page = AttentionPage {
+                        handle: handle.to_string(),
+                        depth: state.depth,
+                        score: parts.score,
+                        why: ScoreAttribution {
+                            tension: state.tension,
+                            resonance: parts.resonance,
+                            mentions: state.mentions,
+                            resonance_count: state.resonance,
+                            // Already-weighted contribution so attribution
+                            // axes sum (within float tolerance) to `score`.
+                            off_diagonal_lift: parts.lift_term,
+                            time_since_touch_secs: parts.dt_secs,
+                        },
+                    };
+                    best
+                        .entry(handle.to_string())
+                        .and_modify(|existing| {
+                            if page.score > existing.score {
+                                *existing = page.clone();
+                            }
+                        })
+                        .or_insert(page);
+                }
+            }
+            let mut pages: Vec<AttentionPage> = best.into_values().collect();
+            pages.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            pages
+        };
+
+        let query_state = inner.scopes.get(&key);
+        let query_vec: Vec<f32> = query_state
             .map(|s| s.effective_vec().to_vec())
             .unwrap_or_default();
+        let mut pages = score_against(&query_vec);
 
-        let mut best: HashMap<String, AttentionPage> = HashMap::new();
-        for (sk, scope_state) in &inner.scopes {
-            // Per-project isolation holds: a thread surfaces in the query
-            // scope only if it shares the query's project, OR it lives in
-            // the cross-project `project = None` substrate namespace —
-            // where boot re-anchor lands the durable thread identities
-            // (the corpus-anchored salience threads + hand-authored
-            // waypoints). That `None` namespace is the connective tissue
-            // the lens must see from any project; other projects' threads
-            // stay isolated.
-            let project_visible = sk.project == key.project || sk.project.is_none();
-            if !project_visible {
-                continue;
-            }
-            for (handle, state) in &scope_state.threads {
-                // Privacy isolation is unchanged: a T0Private thread only
-                // surfaces in its origin scope.
-                if !should_surface_thread(state, &key) {
+        // Pin = lens, not blinders (membrane-connector-gap finding #2). While
+        // a pin is set, `effective_vec()` (hence `query_vec`) is the pinned
+        // vector verbatim, so a scope-wide surface would be BLIND to a live
+        // bridge that resonates with the un-pinned conversational signal —
+        // exactly the stale-pin hazard that masks a fresh session. Reserve a
+        // slice of the surface for threads ranked against the un-pinned
+        // ambient vector (rolling → transient), so a focus BIASES what
+        // surfaces without blinding it. Strictly additive: a no-op when
+        // unpinned, or when the ambient vector is empty or equals the pin.
+        let ambient_vec: Vec<f32> = query_state
+            .filter(|s| s.pinned_focus.is_some())
+            .map(|s| match &s.rolling_vec {
+                Some(rv) if !rv.is_empty() => rv.clone(),
+                _ => s.transient_vec.clone(),
+            })
+            .unwrap_or_default();
+
+        if limit > 1 && !ambient_vec.is_empty() && ambient_vec != query_vec {
+            let reserve = (limit / 4).max(1);
+            pages.truncate(limit.saturating_sub(reserve));
+            for page in score_against(&ambient_vec) {
+                if pages.len() >= limit {
+                    break;
+                }
+                if pages.iter().any(|kept| kept.handle == page.handle) {
                     continue;
                 }
-                let parts = compute_score_parts(state, &query_vec, now);
-                if parts.score < ARCHIVE_THRESHOLD {
-                    continue;
-                }
-                let page = AttentionPage {
-                    handle: handle.to_string(),
-                    depth: state.depth,
-                    score: parts.score,
-                    why: ScoreAttribution {
-                        tension: state.tension,
-                        resonance: parts.resonance,
-                        mentions: state.mentions,
-                        resonance_count: state.resonance,
-                        // Already-weighted contribution so attribution
-                        // axes sum (within float tolerance) to `score`.
-                        off_diagonal_lift: parts.lift_term,
-                        time_since_touch_secs: parts.dt_secs,
-                    },
-                };
-                best
-                    .entry(handle.to_string())
-                    .and_modify(|existing| {
-                        if page.score > existing.score {
-                            *existing = page.clone();
-                        }
-                    })
-                    .or_insert(page);
+                pages.push(page);
             }
+            return Ok(pages);
         }
 
-        let mut pages: Vec<AttentionPage> = best.into_values().collect();
-        pages.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
         pages.truncate(limit);
         Ok(pages)
     }
@@ -2581,6 +2621,69 @@ mod tests {
         assert!(
             !st.transient_active,
             "with a pin set, transient_active must be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_surface_reserves_ambient_slots() {
+        // Pin = lens, not blinders (membrane-connector-gap finding #2). The
+        // pin points one way; the un-pinned conversational signal (rolling)
+        // points elsewhere, at a live bridge. Without reserved ambient slots
+        // the pin would blind the surface to that bridge; with them, the
+        // bridge still surfaces within `limit`.
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("pin-lens");
+
+        // Orthogonal directions: pin looks at axis 0, live attention at axis 1.
+        let pin_dir = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ambient_dir = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Five threads aligned with the pin — enough to fill every slot of a
+        // limit-4 surface on the pinned ranking alone.
+        for i in 0..5 {
+            store
+                .seed_anchor(&scope, handle(&format!("pinned-{i}")), pin_dir.clone())
+                .await
+                .unwrap();
+        }
+        // One dormant thread that only resonates with the live (un-pinned)
+        // signal — the bridge a stale pin would hide.
+        store
+            .seed_anchor(&scope, handle("live-bridge"), ambient_dir.clone())
+            .await
+            .unwrap();
+
+        // Install the pin verbatim (the boot-replay path avoids the embedder,
+        // so the pinned vector is exactly `pin_dir`), and seed the rolling
+        // channel to the orthogonal live direction.
+        store
+            .apply_focus_set_from_chain(
+                &scope,
+                Some("pinned focus".into()),
+                Some(pin_dir.clone()),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .seed_rolling_vec(&scope, ambient_dir.clone())
+            .await
+            .unwrap();
+
+        let st = store.focus_status(&scope).await.unwrap();
+        assert!(st.pinned.is_some(), "pin must be set");
+
+        let pages = store.surface(&scope, 4).await.unwrap();
+        // The pin still leads: at least one pinned-aligned thread present.
+        assert!(
+            pages.iter().any(|p| p.handle.starts_with("pinned-")),
+            "pinned focus must still bias the surface; got {pages:?}"
+        );
+        // ...but the live bridge is NOT blinded: it claims a reserved slot
+        // despite ranking below all five pinned threads on the pinned vector.
+        assert!(
+            pages.iter().any(|p| p.handle == "live-bridge"),
+            "reserved ambient slot must surface the live bridge under a pin; got {pages:?}"
         );
     }
 
