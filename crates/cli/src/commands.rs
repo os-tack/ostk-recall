@@ -1718,7 +1718,9 @@ async fn run_mcp_listener(path: &Path, server: Arc<Server>) -> Result<()> {
                     let server = Arc::clone(&server);
                     tokio::spawn(async move {
                         let (rd, wr) = stream.into_split();
-                        if let Err(e) = server.serve_with_client(ClientId::network(id), rd, wr).await
+                        if let Err(e) = server
+                            .serve_with_client(ClientId::network(id), rd, wr)
+                            .await
                         {
                             tracing::warn!(client = id, error = %e, "mcp connection ended with error");
                         }
@@ -1753,7 +1755,9 @@ async fn run_mcp_listener(path: &Path, server: Arc<Server>) -> Result<()> {
                     let server = Arc::clone(&server);
                     tokio::spawn(async move {
                         let (rd, wr) = tokio::io::split(connected);
-                        if let Err(e) = server.serve_with_client(ClientId::network(id), rd, wr).await
+                        if let Err(e) = server
+                            .serve_with_client(ClientId::network(id), rd, wr)
+                            .await
                         {
                             tracing::warn!(client = id, error = %e, "mcp connection ended with error");
                         }
@@ -2070,7 +2074,13 @@ async fn dispatch_scan_trigger(
             embedder,
             ctx,
         } => {
-            spawn_scan_trigger(scan_lock, config_path, embedder, frame.to_vec(), ctx.clone());
+            spawn_scan_trigger(
+                scan_lock,
+                config_path,
+                embedder,
+                frame.to_vec(),
+                ctx.clone(),
+            );
             Ok(())
         }
     }

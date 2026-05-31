@@ -82,7 +82,12 @@ fn access_events_persist_and_iter_chain_round_trips() {
     for ev in access_events() {
         sink.append(&ev).unwrap();
     }
-    let kinds: Vec<&str> = db.iter_chain().unwrap().iter().map(ChainEvent::kind_str).collect();
+    let kinds: Vec<&str> = db
+        .iter_chain()
+        .unwrap()
+        .iter()
+        .map(ChainEvent::kind_str)
+        .collect();
     assert_eq!(
         kinds,
         vec!["explicit_recall", "recall_fault", "operator_selected"],

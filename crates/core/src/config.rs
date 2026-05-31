@@ -1246,7 +1246,10 @@ freshness = 0.3
 "#;
         let cfg: Config = toml::from_str(body).unwrap();
         let r = cfg.ranking.as_ref().unwrap();
-        assert_eq!(r.weights.ambient.get("attention_affinity").copied(), Some(0.8));
+        assert_eq!(
+            r.weights.ambient.get("attention_affinity").copied(),
+            Some(0.8)
+        );
         assert_eq!(r.weights.ambient.get("freshness").copied(), Some(0.3));
         // Re-serialize and re-parse: stable.
         let toml_out = toml::to_string(&cfg).unwrap();

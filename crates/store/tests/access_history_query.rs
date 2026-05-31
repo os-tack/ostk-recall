@@ -59,10 +59,7 @@ fn access_history_filters_by_since_kind_and_id() {
     .unwrap();
 
     let hist = db
-        .access_history(
-            &["A".into(), "B".into(), "C".into(), "Z".into()],
-            since,
-        )
+        .access_history(&["A".into(), "B".into(), "C".into(), "Z".into()], since)
         .unwrap();
 
     // A: ExplicitRecall + 2× LensIncluded (the t2 and t3 ones), all in window.
@@ -70,7 +67,9 @@ fn access_history_filters_by_since_kind_and_id() {
     assert_eq!(a.len(), 3, "A: 1 ExplicitRecall + 2 LensIncluded");
     assert!(a.iter().any(|(k, _)| *k == AccessKind::ExplicitRecall));
     assert_eq!(
-        a.iter().filter(|(k, _)| *k == AccessKind::LensIncluded).count(),
+        a.iter()
+            .filter(|(k, _)| *k == AccessKind::LensIncluded)
+            .count(),
         2
     );
 

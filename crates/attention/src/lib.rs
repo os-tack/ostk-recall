@@ -287,7 +287,8 @@ pub fn off_diagonal_lift(tension: f32, resonance: f32, resonance_count: u32, is_
     {
         return 0.0;
     }
-    ((resonance - OFF_DIAGONAL_RESONANCE_FLOOR) / (1.0 - OFF_DIAGONAL_RESONANCE_FLOOR)).clamp(0.0, 1.0)
+    ((resonance - OFF_DIAGONAL_RESONANCE_FLOOR) / (1.0 - OFF_DIAGONAL_RESONANCE_FLOOR))
+        .clamp(0.0, 1.0)
 }
 
 // --- errors ------------------------------------------------------------
@@ -1452,8 +1453,7 @@ impl AttentionForwardStore for InMemoryAttention {
                             time_since_touch_secs: parts.dt_secs,
                         },
                     };
-                    best
-                        .entry(handle.to_string())
+                    best.entry(handle.to_string())
                         .and_modify(|existing| {
                             if page.score > existing.score {
                                 *existing = page.clone();
@@ -2243,7 +2243,10 @@ mod tests {
         // Below the mention floor there isn't enough evidence to judge.
         assert!(!is_stop_handle(STOPWORD_MENTION_MIN - 1, 0));
         // High mentions but a healthy resonance rate clears the bar.
-        assert!(!is_stop_handle(1000, 200), "20% rate is well above STOPWORD_RATE_MAX");
+        assert!(
+            !is_stop_handle(1000, 200),
+            "20% rate is well above STOPWORD_RATE_MAX"
+        );
     }
 
     #[tokio::test]
@@ -2279,7 +2282,10 @@ mod tests {
         // directly via resonance() + a fresh familiarize is overkill;
         // the aligned page proves the split.
         assert_eq!(aligned.why.mentions, 1, "mention counted");
-        assert_eq!(aligned.why.resonance_count, 1, "resonance counted (aligned)");
+        assert_eq!(
+            aligned.why.resonance_count, 1,
+            "resonance counted (aligned)"
+        );
     }
 
     #[tokio::test]
@@ -2438,7 +2444,11 @@ mod tests {
         assert!(approx_eq(edge_touch_floor(9), 1.0, 1e-6));
         assert!(approx_eq(edge_touch_floor(40), 1.0, 1e-6));
         assert!(approx_eq(edge_decay_rate(1), EDGE_DECAY_RATE_BASE, 1e-6));
-        assert!(approx_eq(edge_decay_rate(9), EDGE_DECAY_RATE_FAMILIAR, 1e-6));
+        assert!(approx_eq(
+            edge_decay_rate(9),
+            EDGE_DECAY_RATE_FAMILIAR,
+            1e-6
+        ));
         // More touches → slower decay.
         assert!(edge_decay_rate(2) > edge_decay_rate(6));
     }
@@ -2449,7 +2459,10 @@ mod tests {
         // outscores a once-touched edge that has gone idle for a month.
         let warm = edge_activation(0.8, 30.0, 0.0, 5);
         let idle = edge_activation(0.8, 30.0, 30.0, 1);
-        assert!(warm > idle, "re-touched edge ({warm}) must beat idle ({idle})");
+        assert!(
+            warm > idle,
+            "re-touched edge ({warm}) must beat idle ({idle})"
+        );
     }
 
     #[test]
@@ -2483,7 +2496,10 @@ mod tests {
         let fresh = edge_activation(0.8, 10.0, 0.0, 1);
         let abandoned = edge_activation(0.8, 10.0, 365.0, 1);
         assert!(abandoned < fresh);
-        assert!(abandoned < 0.01, "year-idle single-touch edge nearly vanishes: {abandoned}");
+        assert!(
+            abandoned < 0.01,
+            "year-idle single-touch edge nearly vanishes: {abandoned}"
+        );
     }
 
     // ---- Phase A: real-embedder path ---------------------------------

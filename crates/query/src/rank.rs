@@ -413,9 +413,7 @@ pub fn build_engine_from_weights(weights: &BTreeMap<String, f32>) -> RankEngine 
                 c.bm25_score
                     .map_or(0.0, |s| s / (s + crate::hybrid::K_BM25))
             }),
-            "attention_affinity" => {
-                engine.with_factory(Arc::new(AttentionAffinityFactory), weight)
-            }
+            "attention_affinity" => engine.with_factory(Arc::new(AttentionAffinityFactory), weight),
             "freshness" => engine.with_factory(
                 Arc::new(crate::freshness::FreshnessFactory::default()),
                 weight,

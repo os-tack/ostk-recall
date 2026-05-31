@@ -128,7 +128,10 @@ async fn lens_engine_wires_freshness_and_refractory_rows() {
     .await;
 
     let lens = expect_refresh(decision);
-    assert!(!lens.entries.is_empty(), "lens surfaced attention-aligned chunks");
+    assert!(
+        !lens.entries.is_empty(),
+        "lens surfaced attention-aligned chunks"
+    );
     // Freshness feature registered in the Lens engine ⇒ every entry carries a
     // freshness attribution row. Proves the engine wiring is live.
     assert!(
@@ -148,7 +151,10 @@ async fn lens_engine_wires_freshness_and_refractory_rows() {
         .feature_breakdown
         .get("refractory")
         .expect("recently-included chunk carries a refractory row");
-    assert!(refr.contribution < 0.0, "refractory contribution is negative");
+    assert!(
+        refr.contribution < 0.0,
+        "refractory contribution is negative"
+    );
 }
 
 #[tokio::test]
@@ -172,7 +178,11 @@ async fn refractory_demotes_recently_included_chunk_end_to_end() {
     .await;
 
     let lens = expect_refresh(decision);
-    assert_eq!(lens.entries.len(), 2, "both aligned chunks in the portfolio");
+    assert_eq!(
+        lens.entries.len(),
+        2,
+        "both aligned chunks in the portfolio"
+    );
     let stale = lens.entries.iter().find(|e| e.chunk_id == "stale").unwrap();
     let fresh = lens.entries.iter().find(|e| e.chunk_id == "fresh").unwrap();
     assert!(

@@ -596,7 +596,14 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 8).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            &corpus,
+            &config,
+        ));
         assert!(matches!(d, LensRefreshDecision::EmptyMind));
     }
 
@@ -621,7 +628,14 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 8).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            &corpus,
+            &config,
+        ));
         assert!(matches!(d, LensRefreshDecision::NoTrigger), "got {d:?}");
     }
 
@@ -644,7 +658,14 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            &corpus,
+            &config,
+        ));
         assert!(
             matches!(d, LensRefreshDecision::Refresh { .. }),
             "got {d:?}"
@@ -674,7 +695,14 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            &corpus,
+            &config,
+        ));
         assert!(matches!(d, LensRefreshDecision::NoTrigger), "got {d:?}");
     }
 
@@ -699,7 +727,14 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            &corpus,
+            &config,
+        ));
         // Empty corpus → empty lens → Refresh (UnchangedContent
         // requires a prior fingerprint that matches).
         assert!(

@@ -14,13 +14,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ostk_recall_core::error::Result as CoreResult;
 use ostk_recall_core::{
     Chunk, CompiledRecordRules, Config, RecordRule, RuleAction, RuleMatch, Scanner, Source,
     SourceConfig, SourceItem, SourceKind, default_record_rules,
 };
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline};
 use ostk_recall_store::{CorpusStore, IngestDb};
-use ostk_recall_core::error::Result as CoreResult;
 use tempfile::TempDir;
 
 const DIM: usize = 16;
@@ -64,8 +64,7 @@ async fn make_pipeline(
     let counter = Arc::new(CountingEmbedder::new());
     let emb: Arc<dyn ChunkEmbedder> = counter.clone();
     let compiled = Arc::new(CompiledRecordRules::build(rules).expect("rules compile"));
-    let pipeline =
-        Pipeline::new(Arc::clone(&store), ingest, emb).with_record_rules(compiled);
+    let pipeline = Pipeline::new(Arc::clone(&store), ingest, emb).with_record_rules(compiled);
     (pipeline, counter, store)
 }
 
@@ -157,11 +156,7 @@ async fn tag_rule_sets_record_kind_and_reembeds() {
 async fn drop_rule_purges_previously_ingested_chunk() {
     let fixtures = TempDir::new().unwrap();
     let corpus = TempDir::new().unwrap();
-    std::fs::write(
-        fixtures.path().join("a.md"),
-        "<apparatus> machine noise\n",
-    )
-    .unwrap();
+    std::fs::write(fixtures.path().join("a.md"), "<apparatus> machine noise\n").unwrap();
     let scanner = ostk_recall_scan::markdown::MarkdownScanner;
     let cfg = markdown_cfg(fixtures.path());
 
@@ -179,7 +174,10 @@ async fn drop_rule_purges_previously_ingested_chunk() {
     let (p2, _, store2) = make_pipeline(corpus.path(), &[drop_rule("<apparatus>")]).await;
     let s2 = p2.ingest_source(&scanner, &cfg).await;
     assert_eq!(s2.chunks_dropped_by_rule, 1, "rule should drop the chunk");
-    assert_eq!(s2.chunks_purged, 1, "previously-ingested row must be purged");
+    assert_eq!(
+        s2.chunks_purged, 1,
+        "previously-ingested row must be purged"
+    );
     let after = store2.count_active("true").await.unwrap();
     assert_eq!(after, 0, "corpus must no longer contain the dropped chunk");
 }

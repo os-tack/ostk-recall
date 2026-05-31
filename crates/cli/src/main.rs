@@ -579,8 +579,7 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             let embedder = resolve_embedder(cli.config.as_ref())?;
             let since = since.as_deref().map(parse_since_duration).transpose()?;
             if consolidate {
-                let out =
-                    commands::consolidate(&config_path, embedder, since, epoch_size).await?;
+                let out = commands::consolidate(&config_path, embedder, since, epoch_size).await?;
                 let w = &out.window;
                 println!(
                     "consolidate summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_threads={} proposals_pruned={} | bridges_written={} bridges_touched={} proposals_promoted={} threads_merged={} threads_abstracted={} threads_faded={}",

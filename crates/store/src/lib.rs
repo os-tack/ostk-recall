@@ -15,7 +15,7 @@ pub use ingest::{IngestChunkRow, IngestDb};
 pub use manifest::rebuild_ingest_manifest;
 pub use schema::{CORPUS_TABLE, corpus_schema};
 pub use threads::{
-    AccessKind, AccessWeights, AssociationType, ChainEvent, ChainLogReader, ChainSink, EvidenceLink,
-    NoopChainSink, ProposedThreadRecord, RelationState, SqliteChainSink, TensionState, ThreadRecord,
-    ThreadThreadLink, ThreadsDb,
+    AccessKind, AccessWeights, AssociationType, ChainEvent, ChainLogReader, ChainSink,
+    EvidenceLink, NoopChainSink, ProposedThreadRecord, RelationState, SqliteChainSink,
+    TensionState, ThreadRecord, ThreadThreadLink, ThreadsDb,
 };

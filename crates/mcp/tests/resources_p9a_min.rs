@@ -622,12 +622,18 @@ async fn daemon_fans_out_resource_update_to_two_network_clients() {
     registry.register(Arc::new(FakeResource::new("ostk://memory-lens", "body")));
     let server = Arc::new(server);
 
-    let (mut r1, w1, h1) =
-        connect_and_subscribe(Arc::clone(&server), ClientId::network(1), "ostk://memory-lens")
-            .await;
-    let (mut r2, _w2, _h2) =
-        connect_and_subscribe(Arc::clone(&server), ClientId::network(2), "ostk://memory-lens")
-            .await;
+    let (mut r1, w1, h1) = connect_and_subscribe(
+        Arc::clone(&server),
+        ClientId::network(1),
+        "ostk://memory-lens",
+    )
+    .await;
+    let (mut r2, _w2, _h2) = connect_and_subscribe(
+        Arc::clone(&server),
+        ClientId::network(2),
+        "ostk://memory-lens",
+    )
+    .await;
 
     assert_eq!(
         registry.subscribers_for("ostk://memory-lens").len(),

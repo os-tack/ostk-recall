@@ -40,7 +40,9 @@ async fn concept_and_entities_compose_into_pseudo_query() {
         Some("auth-overhaul".to_string()),
     )
     .await;
-    let pq = ctx.pseudo_query.expect("concept + entities ⇒ Some pseudo_query");
+    let pq = ctx
+        .pseudo_query
+        .expect("concept + entities ⇒ Some pseudo_query");
     // Concept label leads, entity handles follow (construction order).
     assert!(pq.contains("auth-overhaul"), "concept label present: {pq}");
     assert!(pq.contains("path:auth.rs"), "entity present: {pq}");
@@ -78,6 +80,9 @@ async fn enrich_sets_pinned_and_carries_vectors() {
     )
     .await;
     assert!(ctx.pinned, "explicit pin flag carried through enrich");
-    assert_eq!(ctx.scope_vector.as_deref(), Some([1.0, 2.0, 3.0].as_slice()));
+    assert_eq!(
+        ctx.scope_vector.as_deref(),
+        Some([1.0, 2.0, 3.0].as_slice())
+    );
     assert_eq!(ctx.rolling_vec.as_deref(), Some([0.5, 0.5, 0.0].as_slice()));
 }

@@ -87,8 +87,14 @@ fn recently_lens_included_chunk_is_penalized_and_demoted() {
     let ranked = vec![hit("c_stale", 0.8), hit("c_fresh", 0.8)];
     let out = apply_refractory(ranked, &ledger, 3600, 0.5);
 
-    assert_eq!(out[0].candidate.chunk.chunk_id, "c_fresh", "fresh ranks first");
-    assert_eq!(out[1].candidate.chunk.chunk_id, "c_stale", "penalized sinks");
+    assert_eq!(
+        out[0].candidate.chunk.chunk_id, "c_fresh",
+        "fresh ranks first"
+    );
+    assert_eq!(
+        out[1].candidate.chunk.chunk_id, "c_stale",
+        "penalized sinks"
+    );
 
     let stale = out
         .iter()
@@ -98,7 +104,10 @@ fn recently_lens_included_chunk_is_penalized_and_demoted() {
         .features
         .get("refractory")
         .expect("penalized chunk carries an attributed refractory row");
-    assert!(refr.contribution < 0.0, "refractory contribution is negative");
+    assert!(
+        refr.contribution < 0.0,
+        "refractory contribution is negative"
+    );
     assert!(stale.total < 0.8, "total visibly reduced: {}", stale.total);
     // Σ-contribution invariant survives the post-rank adjustment.
     let sum: f32 = stale.features.values().map(|a| a.contribution).sum();
@@ -133,9 +142,20 @@ fn more_recent_inclusion_decays_harder() {
     );
     let ledger = MockLedger { events };
 
-    let out = apply_refractory(vec![hit("recent", 0.9), hit("older", 0.9)], &ledger, 3600, 0.5);
-    let recent = out.iter().find(|h| h.candidate.chunk.chunk_id == "recent").unwrap();
-    let older = out.iter().find(|h| h.candidate.chunk.chunk_id == "older").unwrap();
+    let out = apply_refractory(
+        vec![hit("recent", 0.9), hit("older", 0.9)],
+        &ledger,
+        3600,
+        0.5,
+    );
+    let recent = out
+        .iter()
+        .find(|h| h.candidate.chunk.chunk_id == "recent")
+        .unwrap();
+    let older = out
+        .iter()
+        .find(|h| h.candidate.chunk.chunk_id == "older")
+        .unwrap();
     assert!(
         recent.total < older.total,
         "more-recent inclusion decays harder: recent {} should be < older {}",
@@ -148,10 +168,7 @@ fn more_recent_inclusion_decays_harder() {
 fn zero_weight_is_a_noop() {
     let now = Utc::now();
     let mut events = HashMap::new();
-    events.insert(
-        "c1".to_string(),
-        vec![(AccessKind::LensIncluded, now)],
-    );
+    events.insert("c1".to_string(), vec![(AccessKind::LensIncluded, now)]);
     let ledger = MockLedger { events };
     let out = apply_refractory(vec![hit("c1", 0.5)], &ledger, 3600, 0.0);
     assert!(

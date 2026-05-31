@@ -32,7 +32,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ostk_recall_core::{Chunk, FacetSet, Links, RankProfile, RankingOverrides, RecallParams, Source};
+use ostk_recall_core::{
+    Chunk, FacetSet, Links, RankProfile, RankingOverrides, RecallParams, Source,
+};
 use ostk_recall_embed::Embedder;
 use ostk_recall_pipeline::ChunkEmbedder;
 use ostk_recall_query::lanes::{build_candidates, lane_bm25, lane_dense};
@@ -189,7 +191,9 @@ fn build_chunk(idx: u32, source: Source, source_id: &str, text: &str) -> Chunk {
     }
 }
 
-async fn build_fixture_store(embedder: &dyn ChunkEmbedder) -> Result<(tempfile::TempDir, CorpusStore)> {
+async fn build_fixture_store(
+    embedder: &dyn ChunkEmbedder,
+) -> Result<(tempfile::TempDir, CorpusStore)> {
     let tmp = tempfile::TempDir::new()?;
     let store = CorpusStore::open_or_create(tmp.path(), embedder.dim()).await?;
     let chunks: Vec<Chunk> = synthetic_corpus()
@@ -197,7 +201,8 @@ async fn build_fixture_store(embedder: &dyn ChunkEmbedder) -> Result<(tempfile::
         .enumerate()
         .map(|(i, (s, sid, txt))| build_chunk(i as u32, s, sid, txt))
         .collect();
-    let embeddings = embedder.encode_batch(&chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>());
+    let embeddings =
+        embedder.encode_batch(&chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>());
     store.upsert(&chunks, &embeddings).await?;
     store.ensure_fts_index().await?;
     Ok((tmp, store))
@@ -399,7 +404,9 @@ async fn run_explicit_config(
             let engine = build_engine_from_weights(weights);
             let qctx = QueryContext::explicit(&q.query, qvec.clone());
             let t1 = Instant::now();
-            let _ranked = engine.rank(cands, &qctx, &AttentionContext::empty()).await?;
+            let _ranked = engine
+                .rank(cands, &qctx, &AttentionContext::empty())
+                .await?;
             lat.rank.push(t1.elapsed().as_secs_f64() * 1e6);
 
             // end-to-end
@@ -433,8 +440,7 @@ async fn lens_rotation(
     embedder: &dyn ChunkEmbedder,
     turns: &[LensTurn],
 ) -> Result<RotationResult> {
-    let ambient_weights =
-        ostk_recall_core::default_profile_weights(RankProfile::Ambient);
+    let ambient_weights = ostk_recall_core::default_profile_weights(RankProfile::Ambient);
     let engine = build_engine_from_weights(&ambient_weights);
     let mut prev: Option<Vec<String>> = None;
     let mut repeat_sum = 0.0;
@@ -449,9 +455,7 @@ async fn lens_rotation(
             .unwrap_or_default();
         let attn = AttentionContext::with_scope_vector(scope);
         let cands = ambient_candidates(store, &attn, None, K).await?;
-        let ranked = engine
-            .rank(cands, &QueryContext::Ambient, &attn)
-            .await?;
+        let ranked = engine.rank(cands, &QueryContext::Ambient, &attn).await?;
         let ids: Vec<String> = ranked
             .iter()
             .take(K)
@@ -534,7 +538,14 @@ fn render_report(
         for v in [&mut cg, &mut rk, &mut pr, &mut e2] {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         }
-        let col = |v: &[f64]| format!("{:.0}/{:.0}/{:.0}", pctl(v, 50.0), pctl(v, 95.0), pctl(v, 99.0));
+        let col = |v: &[f64]| {
+            format!(
+                "{:.0}/{:.0}/{:.0}",
+                pctl(v, 50.0),
+                pctl(v, 95.0),
+                pctl(v, 99.0)
+            )
+        };
         let _ = writeln!(
             s,
             "| {} | {} | {} | {} | {} |",
@@ -553,7 +564,11 @@ fn render_report(
     );
     match rss {
         Some(b) => {
-            let _ = writeln!(s, "Peak process RSS (best-effort, getrusage): {} MiB.\n", b / (1024 * 1024));
+            let _ = writeln!(
+                s,
+                "Peak process RSS (best-effort, getrusage): {} MiB.\n",
+                b / (1024 * 1024)
+            );
         }
         None => {
             let _ = writeln!(s, "Peak process RSS: n/a on this platform.\n");
@@ -580,9 +595,18 @@ fn render_report(
     );
 
     let _ = writeln!(s, "## Skipped configurations\n");
-    let _ = writeln!(s, "- **+rerank (configs 2/7)**: cross-encoder needs a model download — skipped in fixture mode; run `--corpus` with a reranker to measure.");
-    let _ = writeln!(s, "- **multivector (configs 6/7)**: `skipped: multivector unavailable` — P4 not started.");
-    let _ = writeln!(s, "- **header-format (config 8)**: deferred to its own phase (needs an embed-header change + full corpus re-embed).");
+    let _ = writeln!(
+        s,
+        "- **+rerank (configs 2/7)**: cross-encoder needs a model download — skipped in fixture mode; run `--corpus` with a reranker to measure."
+    );
+    let _ = writeln!(
+        s,
+        "- **multivector (configs 6/7)**: `skipped: multivector unavailable` — P4 not started."
+    );
+    let _ = writeln!(
+        s,
+        "- **header-format (config 8)**: deferred to its own phase (needs an embed-header change + full corpus re-embed)."
+    );
 
     s
 }
@@ -594,8 +618,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut corpus: Option<PathBuf> = None;
     let mut model: Option<String> = None;
-    let mut queries_path =
-        PathBuf::from("tests/fixtures/bench/queries.json");
+    let mut queries_path = PathBuf::from("tests/fixtures/bench/queries.json");
     let mut lens_path = PathBuf::from("tests/fixtures/bench/lens_turns.jsonl");
     let mut out: Option<PathBuf> = None;
     let mut iters = 20usize;
@@ -693,8 +716,7 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
-    let tuned: BTreeMap<String, f32> =
-        [("rrf".to_string(), 1.0), ("bm25".to_string(), 0.5)].into();
+    let tuned: BTreeMap<String, f32> = [("rrf".to_string(), 1.0), ("bm25".to_string(), 0.5)].into();
     configs.push(
         run_explicit_config(
             "C4 rrf=1.0+bm25=0.5 (no rerank)",
@@ -712,8 +734,7 @@ async fn main() -> Result<()> {
     for feat in ["bm25", "rrf"] {
         let mut points = Vec::new();
         for &w in &SWEEP_GRID {
-            let mut weights: BTreeMap<String, f32> =
-                [("rrf".to_string(), 1.0)].into();
+            let mut weights: BTreeMap<String, f32> = [("rrf".to_string(), 1.0)].into();
             weights.insert(feat.to_string(), w);
             let r = run_explicit_config(
                 &format!("sweep:{feat}={w}"),

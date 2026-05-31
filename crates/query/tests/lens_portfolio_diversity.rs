@@ -79,7 +79,9 @@ fn default_portfolio_fills_attention_and_freshness_skips_entity_concept() {
         "canonical slot order; entity/concept produce no entries"
     );
     assert!(
-        entries.iter().all(|e| e.slot_name != "entity" && e.slot_name != "concept"),
+        entries
+            .iter()
+            .all(|e| e.slot_name != "entity" && e.slot_name != "concept"),
         "entity/concept slots skip cleanly when their features are unregistered"
     );
 

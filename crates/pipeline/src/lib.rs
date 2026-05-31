@@ -281,12 +281,10 @@ impl Pipeline {
     /// and watch/scan_paths) — before `apply_p1_overlay` — so a tag is visible
     /// to the operator-override merge and the embedding-input hash.
     fn apply_record_rules(&self, chunk: &mut Chunk, cfg: &SourceConfig) -> RuleOutcome {
-        match self.record_rules.decide(
-            &chunk.text,
-            chunk.source,
-            chunk.role.as_deref(),
-            cfg.kind,
-        ) {
+        match self
+            .record_rules
+            .decide(&chunk.text, chunk.source, chunk.role.as_deref(), cfg.kind)
+        {
             RuleDecision::Drop => RuleOutcome::Drop,
             RuleDecision::Tag(record_kind) => {
                 merge_override(&mut chunk.facets, "record_kind", vec![record_kind]);

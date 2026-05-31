@@ -157,7 +157,12 @@ pub fn find_clusters_with(
         // RT-5 idempotency.
         let mut scored: Vec<(String, f32)> = members
             .iter()
-            .map(|&i| (chunks[i].0.clone(), cosine_similarity(&chunks[i].1, &centroid)))
+            .map(|&i| {
+                (
+                    chunks[i].0.clone(),
+                    cosine_similarity(&chunks[i].1, &centroid),
+                )
+            })
             .collect();
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -344,8 +349,9 @@ mod tests {
         // distinct-content gate must reject it (this is the 509× class).
         let dim = 16;
         let dup = near_axis(0, dim, 0.001);
-        let chunks: Vec<(String, Vec<f32>)> =
-            (0..6).map(|i| v(&format!("dup-{i}"), dup.clone())).collect();
+        let chunks: Vec<(String, Vec<f32>)> = (0..6)
+            .map(|i| v(&format!("dup-{i}"), dup.clone()))
+            .collect();
         let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
         assert!(
             clusters.is_empty(),
@@ -431,7 +437,11 @@ mod tests {
             v("m-edge", vec![0.98, 0.0, 0.2]),
         ];
         let clusters = find_clusters_with(&chunks, 0.82, 3, 2);
-        assert_eq!(clusters.len(), 1, "the three tight vectors form one cluster");
+        assert_eq!(
+            clusters.len(),
+            1,
+            "the three tight vectors form one cluster"
+        );
         let c = &clusters[0];
         assert_eq!(
             c.chunk_ids[0], "z-center",

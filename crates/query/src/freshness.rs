@@ -103,7 +103,10 @@ impl RankFeatureInstance for FreshnessInstance {
     ) -> Result<()> {
         let now = Utc::now();
         let since = now - self.window;
-        let ids: Vec<String> = candidates.iter().map(|c| c.chunk.chunk_id.clone()).collect();
+        let ids: Vec<String> = candidates
+            .iter()
+            .map(|c| c.chunk.chunk_id.clone())
+            .collect();
 
         // Pull retrieval history once for the whole pool. Absent reader
         // (explicit recall today) → empty history → creation-recency only.

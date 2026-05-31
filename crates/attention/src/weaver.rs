@@ -402,10 +402,7 @@ impl AutoWeaver {
     /// older) absorbs the other, so the consolidated map keeps the
     /// load-bearing handle. Operates over the snapshot but mutates the DB;
     /// merged-away handles are skipped for the rest of the pass.
-    fn merge_near_duplicate_threads(
-        &self,
-        snap: &AnchorSnapshot,
-    ) -> Result<usize, WeaverError> {
+    fn merge_near_duplicate_threads(&self, snap: &AnchorSnapshot) -> Result<usize, WeaverError> {
         let threads = &snap.threads;
         let mut merged_away: HashSet<String> = HashSet::new();
         let mut count = 0usize;
@@ -932,8 +929,14 @@ mod tests {
         // NOT (it is a lens-only exclusion; excluding it from weaving would be
         // a deliberate, opt-in thread-graph change).
         let default = default_weaver_exclude_facets();
-        assert_eq!(default, vec!["record_kind:harness_orchestration".to_string()]);
-        assert!(has_excluded_facet(&facets_with("harness_orchestration"), &default));
+        assert_eq!(
+            default,
+            vec!["record_kind:harness_orchestration".to_string()]
+        );
+        assert!(has_excluded_facet(
+            &facets_with("harness_orchestration"),
+            &default
+        ));
         assert!(
             !has_excluded_facet(&facets_with("audit_significant"), &default),
             "audit_significant must NOT be excluded from weaving by default"
@@ -970,7 +973,10 @@ mod tests {
             "commit that please, the os builds the os",
             &json!({ "block_kind": "user" })
         ));
-        assert!(!is_structural_apparatus("plain text, no extra", &json!(null)));
+        assert!(!is_structural_apparatus(
+            "plain text, no extra",
+            &json!(null)
+        ));
     }
 
     #[test]
@@ -980,8 +986,14 @@ mod tests {
             "record_kind:harness_orchestration".to_string(),
             "record_kind:audit_significant".to_string(),
         ];
-        assert!(has_excluded_facet(&facets_with("audit_significant"), &exclude));
-        assert!(has_excluded_facet(&facets_with("harness_orchestration"), &exclude));
+        assert!(has_excluded_facet(
+            &facets_with("audit_significant"),
+            &exclude
+        ));
+        assert!(has_excluded_facet(
+            &facets_with("harness_orchestration"),
+            &exclude
+        ));
         assert!(!has_excluded_facet(&facets_with("normal"), &exclude));
     }
 
@@ -1421,7 +1433,12 @@ mod tests {
         }
     }
 
-    fn thread_touched(handle: &str, tension: TensionState, days_idle: i64, fam: u32) -> ThreadRecord {
+    fn thread_touched(
+        handle: &str,
+        tension: TensionState,
+        days_idle: i64,
+        fam: u32,
+    ) -> ThreadRecord {
         let touched = Utc::now() - chrono::Duration::days(days_idle);
         ThreadRecord {
             handle: ThreadHandle::new(handle).unwrap(),
@@ -1464,7 +1481,10 @@ mod tests {
             .get_thread(&ThreadHandle::new("proposed-bigcohesive").unwrap())
             .unwrap()
             .expect("promoted thread exists");
-        assert_eq!(t.anchor_chunk_id.as_deref(), Some("proposed-bigcohesive-c0"));
+        assert_eq!(
+            t.anchor_chunk_id.as_deref(),
+            Some("proposed-bigcohesive-c0")
+        );
         // … and the proposal row is marked promoted (won't re-promote).
         let again = weaver(&fx).promote_recurring_proposals().unwrap();
         assert_eq!(again, 0, "already-promoted proposals are skipped");
@@ -1494,7 +1514,10 @@ mod tests {
             .unwrap();
 
         let promoted = weaver(&fx).promote_recurring_proposals().unwrap();
-        assert_eq!(promoted, 0, "a derived stop-handle must not be (re-)promoted");
+        assert_eq!(
+            promoted, 0,
+            "a derived stop-handle must not be (re-)promoted"
+        );
         // Gate, don't delete: the thread is still reachable, just unresonant.
         let t = fx
             .threads
@@ -1551,7 +1574,12 @@ mod tests {
         // A Dormant thread that is fresh must NOT be reanimated by the
         // offline fade — that's the live curator's job.
         fx.threads
-            .upsert_thread(&thread_touched("dormant-fresh", TensionState::Dormant, 0, 0))
+            .upsert_thread(&thread_touched(
+                "dormant-fresh",
+                TensionState::Dormant,
+                0,
+                0,
+            ))
             .unwrap();
         let faded = weaver(&fx).fade_idle_threads().unwrap();
         assert_eq!(faded, 0);
@@ -1571,7 +1599,10 @@ mod tests {
         // Two threads with byte-identical anchor embeddings (cosine 1.0).
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         fx.corpus
-            .upsert(&[chunk("anchor-keep"), chunk("anchor-dup")], &[v.clone(), v])
+            .upsert(
+                &[chunk("anchor-keep"), chunk("anchor-dup")],
+                &[v.clone(), v],
+            )
             .await
             .unwrap();
         // `keep` is more familiar → it absorbs `dup`.
@@ -1670,7 +1701,10 @@ mod tests {
             vec!["harness_orchestration".to_string()],
         );
         fx.corpus
-            .upsert(&[chunk("anchor-1"), good, appar], &[v.clone(), v.clone(), v.clone()])
+            .upsert(
+                &[chunk("anchor-1"), good, appar],
+                &[v.clone(), v.clone(), v.clone()],
+            )
             .await
             .unwrap();
         fx.threads

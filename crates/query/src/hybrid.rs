@@ -1095,10 +1095,10 @@ mod tests {
     fn self_reference_recency_weight_ramps() {
         let now = Utc::now();
         assert!((self_reference_recency_weight(Some(now), now) - 1.0).abs() < 1e-6);
-        let half = now - chrono::Duration::hours((SELF_REFERENCE_RECENCY_WINDOW_HOURS / 2.0) as i64);
+        let half =
+            now - chrono::Duration::hours((SELF_REFERENCE_RECENCY_WINDOW_HOURS / 2.0) as i64);
         assert!((self_reference_recency_weight(Some(half), now) - 0.5).abs() < 0.05);
-        let old =
-            now - chrono::Duration::hours(SELF_REFERENCE_RECENCY_WINDOW_HOURS as i64 + 1);
+        let old = now - chrono::Duration::hours(SELF_REFERENCE_RECENCY_WINDOW_HOURS as i64 + 1);
         assert_eq!(self_reference_recency_weight(Some(old), now), 0.0);
         // No creation time → no penalty (safe default).
         assert_eq!(self_reference_recency_weight(None, now), 0.0);
@@ -1122,7 +1122,11 @@ mod tests {
         let mem = out.iter().find(|h| h.chunk_id == "mem").unwrap();
         // Invariant: score == Σ contribution (rerank 3.0 + self_reference −2.0).
         let sum: f32 = mem.match_features.values().map(|m| m.contribution).sum();
-        assert!((mem.score - sum).abs() < 1e-5, "score {} != Σ {sum}", mem.score);
+        assert!(
+            (mem.score - sum).abs() < 1e-5,
+            "score {} != Σ {sum}",
+            mem.score
+        );
         let sr = mem
             .match_features
             .get("self_reference")

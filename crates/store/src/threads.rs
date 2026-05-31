@@ -352,17 +352,11 @@ pub enum ChainEvent {
         ts: DateTime<Utc>,
     },
     /// P7b — a chunk was retrieved by a `recall_fault` synthesis pass.
-    RecallFault {
-        chunk_id: String,
-        ts: DateTime<Utc>,
-    },
+    RecallFault { chunk_id: String, ts: DateTime<Utc> },
     /// P7b — an operator explicitly selected a chunk from a surface.
     /// Variant + ledger support ship now; no producer yet (no
     /// operator-select surface exists). Strongest "proven-useful" signal.
-    OperatorSelected {
-        chunk_id: String,
-        ts: DateTime<Utc>,
-    },
+    OperatorSelected { chunk_id: String, ts: DateTime<Utc> },
 }
 
 /// Sink for substrate chain rows.
@@ -671,22 +665,19 @@ impl ChainEvent {
                                 source: None,
                             })
                         })?;
-                    let mentions = pair
-                        .get(1)
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| {
-                            StoreError::Lance(lancedb::Error::Other {
-                                message: "familiarity entry missing count".into(),
-                                source: None,
-                            })
-                        })?;
+                    let mentions =
+                        pair.get(1)
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| {
+                                StoreError::Lance(lancedb::Error::Other {
+                                    message: "familiarity entry missing count".into(),
+                                    source: None,
+                                })
+                            })?;
                     // Pre-split rows are 2-element `[handle, mentions]`;
                     // the third slot is the resonance counter (default 0
                     // for legacy rows, which is the intended salience reset).
-                    let resonance = pair
-                        .get(2)
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
+                    let resonance = pair.get(2).and_then(serde_json::Value::as_u64).unwrap_or(0);
                     let h = ThreadHandle::new(h_s).map_err(|e| {
                         StoreError::Lance(lancedb::Error::Other {
                             message: format!("familiarity entry bad handle: {e}"),
@@ -1316,7 +1307,10 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         if column_exists(conn, "threads", "familiarity")?
             && !column_exists(conn, "threads", "mentions")?
         {
-            conn.execute("ALTER TABLE threads RENAME COLUMN familiarity TO mentions", [])?;
+            conn.execute(
+                "ALTER TABLE threads RENAME COLUMN familiarity TO mentions",
+                [],
+            )?;
         }
         add_column_if_missing(
             conn,
@@ -2560,8 +2554,8 @@ mod tests {
         let now = Utc::now();
         let old = now - chrono::Duration::days(30);
 
-        let mk = |handle: &str, created: DateTime<Utc>, promoted: Option<&str>| {
-            ProposedThreadRecord {
+        let mk =
+            |handle: &str, created: DateTime<Utc>, promoted: Option<&str>| ProposedThreadRecord {
                 id: 0,
                 proposed_handle: handle.to_string(),
                 chunk_ids: vec![format!("{handle}-chunk")],
@@ -2569,8 +2563,7 @@ mod tests {
                 cohesion: 0.9,
                 created_at: created,
                 promoted_to: promoted.map(str::to_string),
-            }
-        };
+            };
 
         db.insert_proposed_thread(&mk("stale-unpromoted", old, None))
             .unwrap();
@@ -2737,10 +2730,16 @@ mod tests {
             .iter()
             .find(|i| i.handle.as_str() == "durable-anchor")
             .expect("thread must appear in reanchor_inputs");
-        let got = found.anchor_vec.clone().expect("anchor_vec must be present");
+        let got = found
+            .anchor_vec
+            .clone()
+            .expect("anchor_vec must be present");
         assert_eq!(got.len(), vec.len(), "anchor_vec length preserved");
         for (a, b) in got.iter().zip(vec.iter()) {
-            assert!((a - b).abs() < 1e-6, "anchor_vec element mismatch: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "anchor_vec element mismatch: {a} vs {b}"
+            );
         }
         assert_eq!(found.anchor_chunk_id.as_deref(), Some("chunk-xyz"));
     }
@@ -2879,7 +2878,10 @@ mod tests {
             "raw recurrence carried over verbatim (got mentions={})",
             tl.mentions
         );
-        assert_eq!(tl.resonance, 0, "resonance backfilled to baseline (the reset)");
+        assert_eq!(
+            tl.resonance, 0,
+            "resonance backfilled to baseline (the reset)"
+        );
         let mentions_after_first = probe("top-level");
         assert_eq!(mentions_after_first, tl.mentions as i64);
 
@@ -2890,7 +2892,10 @@ mod tests {
             .get_thread(&ThreadHandle::new("top-level").unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(tl2.mentions, tl.mentions, "re-open must not change mentions");
+        assert_eq!(
+            tl2.mentions, tl.mentions,
+            "re-open must not change mentions"
+        );
         assert_eq!(tl2.resonance, 0, "re-open must not change resonance");
     }
 

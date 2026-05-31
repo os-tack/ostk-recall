@@ -160,22 +160,20 @@ fn resolve_record_rules() -> Result<(Arc<CompiledRecordRules>, &'static str)> {
     let rules: Vec<RecordRule>;
     let provenance: &'static str;
     match ostk_recall_cli::commands::default_config_path() {
-        Ok(path) if path.exists() => {
-            match ostk_recall_core::Config::load(&path) {
-                Ok(cfg) => {
-                    rules = cfg.effective_record_rules();
-                    provenance = "config.effective_record_rules()";
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: config at {} failed to load ({e}); using default_record_rules()",
-                        path.display()
-                    );
-                    rules = default_record_rules();
-                    provenance = "default_record_rules() (config load failed)";
-                }
+        Ok(path) if path.exists() => match ostk_recall_core::Config::load(&path) {
+            Ok(cfg) => {
+                rules = cfg.effective_record_rules();
+                provenance = "config.effective_record_rules()";
             }
-        }
+            Err(e) => {
+                eprintln!(
+                    "warning: config at {} failed to load ({e}); using default_record_rules()",
+                    path.display()
+                );
+                rules = default_record_rules();
+                provenance = "default_record_rules() (config load failed)";
+            }
+        },
         _ => {
             rules = default_record_rules();
             provenance = "default_record_rules() (no config file)";
@@ -360,9 +358,7 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("opening corpus {}", corpus.display()))?,
         );
-        let ingest = Arc::new(
-            IngestDb::open(&corpus).map_err(|e| anyhow!("open ingest db: {e}"))?,
-        );
+        let ingest = Arc::new(IngestDb::open(&corpus).map_err(|e| anyhow!("open ingest db: {e}"))?);
         // We apply record-rules ourselves above, so the pipeline overlay is
         // left empty (no `.with_record_rules`).
         let pipeline = Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder));
@@ -396,7 +392,14 @@ async fn main() -> Result<()> {
 
     // --- final report -------------------------------------------------------
     println!("\n=== corpus_recover summary ===");
-    println!("mode:           {}", if dry_run { "DRY-RUN (no embed/no write)" } else { "INGEST" });
+    println!(
+        "mode:           {}",
+        if dry_run {
+            "DRY-RUN (no embed/no write)"
+        } else {
+            "INGEST"
+        }
+    );
     println!("lines read:     {}", counts.read);
     println!("parse errors:   {}", counts.parse_errors);
     println!("dropped (rules):{}", counts.dropped);

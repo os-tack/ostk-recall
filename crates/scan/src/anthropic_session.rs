@@ -879,12 +879,16 @@ mod tests {
         assert_eq!(tagged.len(), 2, "nothing is dropped — tag, don't delete");
         let facets0 = ostk_recall_core::to_list(&tagged[0].facets);
         assert!(
-            facets0.iter().any(|f| f == "record_kind:harness_orchestration"),
+            facets0
+                .iter()
+                .any(|f| f == "record_kind:harness_orchestration"),
             "the <teammate-message> envelope is tagged: {facets0:?}"
         );
         let facets1 = ostk_recall_core::to_list(&tagged[1].facets);
         assert!(
-            !facets1.iter().any(|f| f == "record_kind:harness_orchestration"),
+            !facets1
+                .iter()
+                .any(|f| f == "record_kind:harness_orchestration"),
             "prose that merely mentions team-lead is untouched: {facets1:?}"
         );
     }

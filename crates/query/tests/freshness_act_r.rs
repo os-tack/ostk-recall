@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use ostk_recall_core::{Chunk, FacetSet, Links, Source};
-use ostk_recall_store::{AccessKind, AccessWeights, ChainLogReader};
 use ostk_recall_query::{
     AttentionContext, Candidate, FreshnessFactory, QueryContext, RankFeatureFactory,
 };
+use ostk_recall_store::{AccessKind, AccessWeights, ChainLogReader};
 
 /// A `ChainLogReader` that returns a fixed, pre-baked history regardless
 /// of `since` (the test controls ages directly via the event timestamps).
@@ -110,9 +110,21 @@ async fn freshness_normalizes_act_r_activation_across_pool() {
     let b_cold = (1.1_f32).ln();
     let norm = |b: f32| (b - b_cold) / (b_hot - b_cold);
 
-    assert!((scores["hot"] - norm(b_hot)).abs() < 1e-4, "hot={}", scores["hot"]);
-    assert!((scores["warm"] - norm(b_warm)).abs() < 1e-4, "warm={}", scores["warm"]);
-    assert!((scores["cold"] - norm(b_cold)).abs() < 1e-4, "cold={}", scores["cold"]);
+    assert!(
+        (scores["hot"] - norm(b_hot)).abs() < 1e-4,
+        "hot={}",
+        scores["hot"]
+    );
+    assert!(
+        (scores["warm"] - norm(b_warm)).abs() < 1e-4,
+        "warm={}",
+        scores["warm"]
+    );
+    assert!(
+        (scores["cold"] - norm(b_cold)).abs() < 1e-4,
+        "cold={}",
+        scores["cold"]
+    );
     // Endpoints: most-active → 1.0, least → 0.0.
     assert!((scores["hot"] - 1.0).abs() < 1e-4);
     assert!(scores["cold"].abs() < 1e-4);
@@ -145,7 +157,11 @@ async fn freshness_no_ts_no_events_is_pool_floor() {
     ];
     let scores = run(cands, HashMap::new()).await;
     assert!(scores["ghost"].abs() < 1e-6, "ghost={}", scores["ghost"]);
-    assert!((scores["real"] - 1.0).abs() < 1e-6, "real={}", scores["real"]);
+    assert!(
+        (scores["real"] - 1.0).abs() < 1e-6,
+        "real={}",
+        scores["real"]
+    );
 }
 
 #[tokio::test]

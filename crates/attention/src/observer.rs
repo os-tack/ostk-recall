@@ -342,8 +342,7 @@ impl TurnObserver {
             // `familiarize` returns that gate decision so the durable
             // `increment_resonance` is gated on the *same* cosine — one
             // compute, no divergence between the tiers.
-            let mut entries: Vec<(ThreadHandle, u32, u32)> =
-                Vec::with_capacity(mentioned.len());
+            let mut entries: Vec<(ThreadHandle, u32, u32)> = Vec::with_capacity(mentioned.len());
             for handle in &mentioned {
                 // Durable `mentions` first; this also filters cache-drift
                 // handles (increment errors for handles not yet in the

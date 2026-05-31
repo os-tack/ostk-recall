@@ -346,7 +346,9 @@ pub async fn thread_create(
     // recovers it on the next start) and reports `seeded_anchor: false`.
     let mut seeded_anchor = false;
     if let (Some(chunk_id), Some(corpus)) = (record.anchor_chunk_id.as_ref(), d.corpus.as_ref()) {
-        let embeddings = corpus.fetch_embeddings(std::slice::from_ref(chunk_id)).await?;
+        let embeddings = corpus
+            .fetch_embeddings(std::slice::from_ref(chunk_id))
+            .await?;
         if let Some(vec) = embeddings.get(chunk_id) {
             let scope = AttentionScope {
                 project: None,
@@ -2124,12 +2126,9 @@ mod tests {
         // No corpus handle on the dispatch → no live seed possible.
         // The durable row is created regardless.
         let (_tmp, d) = build_dispatch();
-        let out = thread_create(
-            &d,
-            json!({"handle": "no-corpus", "anchor_chunk_id": "a-0"}),
-        )
-        .await
-        .unwrap();
+        let out = thread_create(&d, json!({"handle": "no-corpus", "anchor_chunk_id": "a-0"}))
+            .await
+            .unwrap();
         assert_eq!(out["seeded_anchor"].as_bool(), Some(false));
         assert_eq!(out["record"]["handle"], "no-corpus");
     }

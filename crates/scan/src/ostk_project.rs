@@ -39,8 +39,8 @@ use serde::Deserialize;
 // `drop_tool_blocks` is structural and stays.
 use crate::anthropic_session::{drop_tool_blocks, parse_session_file};
 use crate::code::walk_and_window;
-use crate::tree_sitter;
 use crate::markdown::split_markdown;
+use crate::tree_sitter;
 use crate::walk::walk_filtered;
 
 /// Code extensions the composite scanner sweeps from each project's `src/`.
@@ -794,7 +794,11 @@ fn build_significant_chunk(
     // recall-able. `record_kind` is embedding-allowlisted, so it also
     // separates these in embedding space. (gate, don't delete)
     let mut facets = FacetSet::new();
-    merge_override(&mut facets, "record_kind", vec!["audit_significant".to_string()]);
+    merge_override(
+        &mut facets,
+        "record_kind",
+        vec!["audit_significant".to_string()],
+    );
     Chunk {
         chunk_id,
         source: Source::OstkAuditSignificant,

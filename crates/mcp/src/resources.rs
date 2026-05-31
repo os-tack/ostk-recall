@@ -394,7 +394,10 @@ impl ResourceRegistry {
         // (unbounded channel) but the lock discipline keeps the
         // "collect under lock, send after" contract.
         let txs: Vec<UnboundedSender<String>> = match self.outbound.lock() {
-            Ok(g) => subscribers.iter().filter_map(|c| g.get(c).cloned()).collect(),
+            Ok(g) => subscribers
+                .iter()
+                .filter_map(|c| g.get(c).cloned())
+                .collect(),
             Err(p) => p
                 .into_inner()
                 .iter()

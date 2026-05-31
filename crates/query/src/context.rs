@@ -199,8 +199,7 @@ impl AttentionContext {
         recent_entities: Vec<String>,
         dominant_concept_label: Option<String>,
     ) -> Self {
-        let pseudo_query =
-            build_pseudo_query(&recent_entities, dominant_concept_label.as_deref());
+        let pseudo_query = build_pseudo_query(&recent_entities, dominant_concept_label.as_deref());
         Self {
             scope_vector,
             rolling_vec,

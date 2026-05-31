@@ -471,11 +471,26 @@ mod tests {
                 Some("tree-sitter")
             );
         }
-        let headers: Vec<&str> = chunks.iter().map(|c| c.text.lines().next().unwrap()).collect();
-        assert!(headers.iter().any(|h| h.starts_with("// struct Widget")), "{headers:?}");
-        assert!(headers.iter().any(|h| h.starts_with("// impl Widget")), "{headers:?}");
-        assert!(headers.iter().any(|h| h.starts_with("// fn new")), "{headers:?}");
-        assert!(headers.iter().any(|h| h.starts_with("// fn bump")), "{headers:?}");
+        let headers: Vec<&str> = chunks
+            .iter()
+            .map(|c| c.text.lines().next().unwrap())
+            .collect();
+        assert!(
+            headers.iter().any(|h| h.starts_with("// struct Widget")),
+            "{headers:?}"
+        );
+        assert!(
+            headers.iter().any(|h| h.starts_with("// impl Widget")),
+            "{headers:?}"
+        );
+        assert!(
+            headers.iter().any(|h| h.starts_with("// fn new")),
+            "{headers:?}"
+        );
+        assert!(
+            headers.iter().any(|h| h.starts_with("// fn bump")),
+            "{headers:?}"
+        );
         // Leading doc comment is captured on the struct chunk.
         let struct_chunk = chunks
             .iter()

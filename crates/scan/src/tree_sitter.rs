@@ -192,7 +192,11 @@ pub fn chunk_code_file(
         )?);
     }
 
-    if chunks.is_empty() { None } else { Some(chunks) }
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks)
+    }
 }
 
 /// Construct one [`Chunk`] with the shared layout. `symbols` is the list
@@ -609,8 +613,16 @@ mod tests {
         assert!(mh.text.contains("Module docs."));
         assert!(mh.text.contains("→ needle ref."));
 
-        assert!(has_header(&chunks, "// struct Widget"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// impl Widget"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// struct Widget"),
+            "{:?}",
+            headers(&chunks)
+        );
+        assert!(
+            has_header(&chunks, "// impl Widget"),
+            "{:?}",
+            headers(&chunks)
+        );
         assert!(has_header(&chunks, "// fn new"), "{:?}", headers(&chunks));
         assert!(has_header(&chunks, "// fn bump"), "{:?}", headers(&chunks));
 
@@ -620,10 +632,22 @@ mod tests {
             .find(|c| c.text.starts_with("// struct Widget"))
             .unwrap();
         assert!(struct_c.text.contains("/// A widget."));
-        let ls = struct_c.extra.get("line_start").and_then(|v| v.as_u64()).unwrap();
-        let le = struct_c.extra.get("line_end").and_then(|v| v.as_u64()).unwrap();
+        let ls = struct_c
+            .extra
+            .get("line_start")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        let le = struct_c
+            .extra
+            .get("line_end")
+            .and_then(|v| v.as_u64())
+            .unwrap();
         assert!(ls >= 1 && le >= ls);
-        let syms = struct_c.extra.get("symbols").and_then(|v| v.as_array()).unwrap();
+        let syms = struct_c
+            .extra
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(syms[0].as_str(), Some("Widget"));
     }
 
@@ -642,10 +666,22 @@ mod tests {
     fn python_class_methods_and_decorated_fn() {
         let src = "# leading comment\nclass Greeter:\n    \"\"\"docstring\"\"\"\n    def __init__(self, name):\n        self.name = name\n\n    def greet(self):\n        return self.name\n\n@decorator\ndef standalone():\n    return 1\n";
         let chunks = chunks_for("g.py", src);
-        assert!(has_header(&chunks, "// class Greeter"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// fn __init__"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// class Greeter"),
+            "{:?}",
+            headers(&chunks)
+        );
+        assert!(
+            has_header(&chunks, "// fn __init__"),
+            "{:?}",
+            headers(&chunks)
+        );
         assert!(has_header(&chunks, "// fn greet"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// fn standalone"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// fn standalone"),
+            "{:?}",
+            headers(&chunks)
+        );
         // The decorator is part of the chunk body (range covers the wrapper).
         let standalone = chunks
             .iter()
@@ -659,9 +695,17 @@ mod tests {
         let src = "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nexport class Box {\n  v: number = 0;\n  reset(): void { this.v = 0; }\n}\n\ninterface Shape {\n  area(): number;\n}\n";
         let chunks = chunks_for("m.ts", src);
         assert!(has_header(&chunks, "// fn add"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// class Box"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// class Box"),
+            "{:?}",
+            headers(&chunks)
+        );
         assert!(has_header(&chunks, "// fn reset"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// interface Shape"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// interface Shape"),
+            "{:?}",
+            headers(&chunks)
+        );
     }
 
     #[test]
@@ -669,27 +713,40 @@ mod tests {
         let src = "package main\n\n// Greet returns a greeting.\nfunc Greet(name string) string {\n\treturn \"hi \" + name\n}\n\ntype Server struct {\n\tport int\n}\n\nfunc (s *Server) Port() int {\n\treturn s.port\n}\n\nconst MaxConns = 100\n";
         let chunks = chunks_for("srv.go", src);
         assert!(has_header(&chunks, "// fn Greet"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// type Server"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// type Server"),
+            "{:?}",
+            headers(&chunks)
+        );
         assert!(has_header(&chunks, "// fn Port"), "{:?}", headers(&chunks));
-        assert!(has_header(&chunks, "// const MaxConns"), "{:?}", headers(&chunks));
+        assert!(
+            has_header(&chunks, "// const MaxConns"),
+            "{:?}",
+            headers(&chunks)
+        );
         // Go doc-comment captured above the func.
-        let greet = chunks.iter().find(|c| c.text.starts_with("// fn Greet")).unwrap();
+        let greet = chunks
+            .iter()
+            .find(|c| c.text.starts_with("// fn Greet"))
+            .unwrap();
         assert!(greet.text.contains("// Greet returns a greeting."));
     }
 
     #[test]
     fn no_items_returns_none() {
         // A file of only statements / comments has no top-level items.
-        assert!(chunk_code_file(
-            Path::new("x.go"),
-            "package main\n",
-            Source::Code,
-            "sid",
-            None,
-            "cfg",
-            None,
-            "/abs",
-        )
-        .is_none());
+        assert!(
+            chunk_code_file(
+                Path::new("x.go"),
+                "package main\n",
+                Source::Code,
+                "sid",
+                None,
+                "cfg",
+                None,
+                "/abs",
+            )
+            .is_none()
+        );
     }
 }

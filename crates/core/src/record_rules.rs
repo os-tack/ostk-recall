@@ -551,23 +551,27 @@ mod tests {
 
     #[test]
     fn build_rejects_unknown_source_kind_and_source() {
-        assert!(CompiledRecordRules::build(&[RecordRule {
-            r#match: RuleMatch {
-                prefix: Some("x".to_string()),
-                source_kind: Some(vec!["not_a_kind".to_string()]),
-                ..Default::default()
-            },
-            action: RuleAction::Drop,
-        }])
-        .is_err());
-        assert!(CompiledRecordRules::build(&[RecordRule {
-            r#match: RuleMatch {
-                source: Some("not_a_source".to_string()),
-                ..Default::default()
-            },
-            action: RuleAction::Drop,
-        }])
-        .is_err());
+        assert!(
+            CompiledRecordRules::build(&[RecordRule {
+                r#match: RuleMatch {
+                    prefix: Some("x".to_string()),
+                    source_kind: Some(vec!["not_a_kind".to_string()]),
+                    ..Default::default()
+                },
+                action: RuleAction::Drop,
+            }])
+            .is_err()
+        );
+        assert!(
+            CompiledRecordRules::build(&[RecordRule {
+                r#match: RuleMatch {
+                    source: Some("not_a_source".to_string()),
+                    ..Default::default()
+                },
+                action: RuleAction::Drop,
+            }])
+            .is_err()
+        );
     }
 
     #[test]
