@@ -39,8 +39,8 @@ use ostk_recall_store::{CORPUS_TABLE, CorpusStore};
 use crate::candidate::Candidate;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
-use crate::lanes::{LaneEntry, build_candidates, lane_bm25, lane_dense, rrf_score_normalized};
-use crate::rank::{Feature, RankEngine, RankedHit};
+use crate::lanes::{LaneEntry, build_candidates, lane_bm25, lane_dense};
+use crate::rank::RankedHit;
 use crate::rerank::RerankerLike;
 use crate::row::{snippet_of, sql_escape};
 use crate::types::{RecallHit, RecallParams};
@@ -91,6 +91,34 @@ pub const IDENTIFIER_CODE_BOOST: f32 = 3.0;
 /// the eventual tuner can vary it without code edits.
 pub const K_BM25: f32 = 10.0;
 
+/// Full-strength penalty subtracted from a freshly self-authored chunk
+/// in the post-rerank salience layer (`dampen_self_reference_recency`).
+///
+/// The membrane captures the present by design — but its own
+/// freshly-written narration then dominates an explicit `recall` of the
+/// very topic it describes (the live "this session's own output tops
+/// recall of its own topic" regression). The cross-encoder owns
+/// *relevance*; this is the *salience* axis layered on top: self-authored
+/// narration of the present is anti-salient when retrieving the corpus it
+/// narrates. On the cross-encoder's score scale (≈ identifier boost's
+/// +3.0); `0.0` disables via `RankingOverrides::self_reference_penalty`.
+///
+/// **Forward-compat (P7b):** this is the explicit-path debut of the
+/// salience axis. When the P7b access ledger lands, the crude
+/// `source==membrane` + `ts`-recency proxy should become a principled
+/// creation-vs-access term — penalize creation-only-recency, but never a
+/// chunk with `ExplicitRecall`/`OperatorSelected` history (proven-useful
+/// memory). The application point (post-rerank, additive, attributed)
+/// stays; only the signal source upgrades.
+pub const SELF_REFERENCE_PENALTY: f32 = 2.0;
+
+/// Hours over which the self-reference penalty decays linearly to zero.
+/// A just-created membrane chunk takes the full penalty; one older than
+/// this window is untouched (legitimate historical recognition). Keyed
+/// on `chunk.ts` (creation) until the P7b ledger provides true access
+/// history.
+pub const SELF_REFERENCE_RECENCY_WINDOW_HOURS: f32 = 24.0;
+
 /// Execute a hybrid recall against the corpus table.
 ///
 /// Pipeline:
@@ -135,6 +163,9 @@ pub async fn recall(
         .identifier_code_boost
         .unwrap_or(IDENTIFIER_CODE_BOOST);
     let _k_bm25 = overrides.k_bm25.unwrap_or(K_BM25); // wired when Bm25 feature lands
+    let self_reference_penalty = overrides
+        .self_reference_penalty
+        .unwrap_or(SELF_REFERENCE_PENALTY);
 
     let vec = embedder
         .encode_batch(&[query_text])
@@ -218,13 +249,22 @@ pub async fn recall(
     // land). Engine takes &self → no lock; an Arc<RankEngine> here
     // would be needed once the lens loop shares one with explicit
     // recall, but the explicit path can keep building per-call.
-    let engine = RankEngine::new().with_feature(Feature {
-        name: "rrf",
-        weight: 1.0,
-        score_fn: Box::new(|c, _q, _a| c.rrf_score.map_or(0.0, rrf_score_normalized)),
+    // Build the rank engine from the effective explicit-profile feature
+    // weights (P5). `overrides.weights == None` resolves to the compiled
+    // default `{rrf: 1.0}` — numerically identical to the pre-P5 hardcoded
+    // rrf-only engine, so shipped behavior is unchanged until config / an
+    // MCP arg supplies tuned weights. Under the cross-encoder reranker the
+    // engine score is replaced downstream, so non-rrf weights reshape only
+    // the candidate pool on the explicit path; they are decisive with the
+    // reranker off or in the ambient/lens path.
+    let weights = overrides.weights.clone().unwrap_or_else(|| {
+        ostk_recall_core::default_profile_weights(ostk_recall_core::RankProfile::Explicit)
     });
+    let engine = crate::rank::build_engine_from_weights(&weights);
     let query_ctx = QueryContext::explicit(query_text, vec.clone());
-    let ranked: Vec<RankedHit> = engine.rank(candidates, &query_ctx, &AttentionContext::empty());
+    let ranked: Vec<RankedHit> = engine
+        .rank(candidates, &query_ctx, &AttentionContext::empty())
+        .await?;
 
     // Convert to RecallHit for the existing post-rank stages. The
     // top-N for rerank is `fetch_limit`; rerank truncates further.
@@ -248,7 +288,79 @@ pub async fn recall(
     // row on the MCP response so the boost is auditable.
     let hits = boost_code_for_identifier_queries(query_text, hits, identifier_boost);
 
+    // Post-rerank salience layer: demote freshly self-authored narration
+    // (membrane + recent creation `ts`) so the substrate's own present-tense
+    // output doesn't crowd out the corpus it narrates. Additive + attributed
+    // on the cross-encoder scale; re-sorts. Runs before diversify so a
+    // demoted self-ref chunk can fall out of the truncated top-K.
+    let hits = dampen_self_reference_recency(hits, self_reference_penalty, Utc::now());
+
     Ok(diversify_by_source_id(hits, limit, max_per_source_id))
+}
+
+/// Recency weight for a self-authored chunk: `1.0` at creation, decaying
+/// linearly to `0.0` at [`SELF_REFERENCE_RECENCY_WINDOW_HOURS`]. A `None`
+/// `ts` yields `0.0` — without a creation time we can't tell if it's fresh,
+/// and "no penalty" is the safe default.
+fn self_reference_recency_weight(ts: Option<DateTime<Utc>>, now: DateTime<Utc>) -> f32 {
+    let Some(ts) = ts else { return 0.0 };
+    #[allow(clippy::cast_precision_loss)]
+    let age_hours = (now - ts).num_seconds().max(0) as f32 / 3600.0;
+    (1.0 - age_hours / SELF_REFERENCE_RECENCY_WINDOW_HOURS).clamp(0.0, 1.0)
+}
+
+/// Post-rerank salience stage: subtract a recency-scaled penalty from
+/// freshly self-authored chunks (currently `source == "membrane"`), then
+/// re-sort by descending score. The penalty is `penalty * recency_weight(ts)`,
+/// recorded as a `self_reference` match-feature row with a **negative**
+/// contribution so the `score = Σ contribution` invariant holds and the
+/// demotion is auditable in the MCP response. `penalty == 0.0` is a no-op
+/// (override-disabled).
+///
+/// Scoped narrowly to `membrane` — the substrate's own narration — so it
+/// structurally cannot demote real corpus content; it only stops the
+/// membrane quoting its own fresh output back over the corpus it narrates.
+/// See [`SELF_REFERENCE_PENALTY`] for the P7b forward-compat plan (swap the
+/// `ts`-recency proxy for the access ledger's creation-vs-access signal).
+fn dampen_self_reference_recency(
+    mut hits: Vec<RecallHit>,
+    penalty: f32,
+    now: DateTime<Utc>,
+) -> Vec<RecallHit> {
+    if penalty == 0.0 {
+        return hits;
+    }
+    let membrane = Source::Membrane.as_str();
+    let mut touched = false;
+    for hit in &mut hits {
+        if hit.source != membrane {
+            continue;
+        }
+        let recency = self_reference_recency_weight(hit.ts, now);
+        if recency <= 0.0 {
+            continue;
+        }
+        let contribution = -(penalty * recency);
+        hit.score += contribution;
+        hit.match_features.insert(
+            "self_reference".to_string(),
+            ostk_recall_core::MatchFeature {
+                raw: recency,
+                weight: -penalty,
+                contribution,
+            },
+        );
+        touched = true;
+    }
+    if touched {
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+    }
+    hits
 }
 
 /// Convert a `RankedHit` to the public `RecallHit` shape.
@@ -940,5 +1052,108 @@ mod tests {
         assert_eq!(out[0].chunk_id, "conv1");
         assert!((out[0].score - 5.0).abs() < f32::EPSILON);
         assert!((out[1].score - 4.0).abs() < f32::EPSILON);
+    }
+
+    /// Build a post-rerank-shaped hit: a single `rerank` match-feature
+    /// whose contribution equals the score (the state `rerank_candidates`
+    /// produces), so the `score = Σ contribution` invariant is testable
+    /// through the self-reference stage.
+    fn hit_full(chunk_id: &str, source: &str, score: f32, ts: Option<DateTime<Utc>>) -> RecallHit {
+        let mut mf = std::collections::BTreeMap::new();
+        mf.insert(
+            "rerank".to_string(),
+            ostk_recall_core::MatchFeature {
+                raw: score,
+                weight: 1.0,
+                contribution: score,
+            },
+        );
+        RecallHit {
+            chunk_id: chunk_id.to_string(),
+            project: None,
+            source: source.to_string(),
+            source_id: chunk_id.to_string(),
+            ts,
+            snippet: String::new(),
+            score,
+            links: Links::default(),
+            extra: serde_json::Value::Null,
+            stale: false,
+            role: None,
+            base_score: None,
+            thread_score: None,
+            embedding_score: None,
+            thread_weight: None,
+            embedding_weight: None,
+            attention_score: None,
+            attention_weight: None,
+            match_features: mf,
+        }
+    }
+
+    #[test]
+    fn self_reference_recency_weight_ramps() {
+        let now = Utc::now();
+        assert!((self_reference_recency_weight(Some(now), now) - 1.0).abs() < 1e-6);
+        let half = now - chrono::Duration::hours((SELF_REFERENCE_RECENCY_WINDOW_HOURS / 2.0) as i64);
+        assert!((self_reference_recency_weight(Some(half), now) - 0.5).abs() < 0.05);
+        let old =
+            now - chrono::Duration::hours(SELF_REFERENCE_RECENCY_WINDOW_HOURS as i64 + 1);
+        assert_eq!(self_reference_recency_weight(Some(old), now), 0.0);
+        // No creation time → no penalty (safe default).
+        assert_eq!(self_reference_recency_weight(None, now), 0.0);
+    }
+
+    #[test]
+    fn self_reference_demotes_fresh_membrane() {
+        // A fresh membrane chunk out-scoring a corpus chunk pre-stage
+        // (the live "membrane narration tops recall of its own topic"
+        // regression) must fall below the corpus chunk after the penalty.
+        let now = Utc::now();
+        let hits = vec![
+            hit_full("mem", Source::Membrane.as_str(), 3.0, Some(now)),
+            hit_full("corpus", "markdown", 2.0, Some(now)),
+        ];
+        let out = dampen_self_reference_recency(hits, SELF_REFERENCE_PENALTY, now);
+        assert_eq!(
+            out[0].chunk_id, "corpus",
+            "fresh membrane narration must fall below substantive corpus"
+        );
+        let mem = out.iter().find(|h| h.chunk_id == "mem").unwrap();
+        // Invariant: score == Σ contribution (rerank 3.0 + self_reference −2.0).
+        let sum: f32 = mem.match_features.values().map(|m| m.contribution).sum();
+        assert!((mem.score - sum).abs() < 1e-5, "score {} != Σ {sum}", mem.score);
+        let sr = mem
+            .match_features
+            .get("self_reference")
+            .expect("self_reference attribution row present");
+        assert!(sr.contribution < 0.0, "self-reference is a penalty");
+    }
+
+    #[test]
+    fn self_reference_spares_old_membrane() {
+        // A membrane chunk older than the recency window is legitimate
+        // historical recognition — untouched.
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(SELF_REFERENCE_RECENCY_WINDOW_HOURS as i64 + 5);
+        let hits = vec![hit_full("mem", Source::Membrane.as_str(), 3.0, Some(old))];
+        let out = dampen_self_reference_recency(hits, SELF_REFERENCE_PENALTY, now);
+        assert!((out[0].score - 3.0).abs() < 1e-6, "old membrane untouched");
+        assert!(!out[0].match_features.contains_key("self_reference"));
+    }
+
+    #[test]
+    fn self_reference_ignores_non_membrane_and_zero_disables() {
+        let now = Utc::now();
+        // Non-membrane fresh chunk: untouched (cannot demote real corpus).
+        let hits = vec![hit_full("doc", "markdown", 3.0, Some(now))];
+        let out = dampen_self_reference_recency(hits, SELF_REFERENCE_PENALTY, now);
+        assert!((out[0].score - 3.0).abs() < 1e-6);
+        assert!(!out[0].match_features.contains_key("self_reference"));
+        // penalty == 0.0 disables even for a fresh membrane chunk.
+        let hits2 = vec![hit_full("mem", Source::Membrane.as_str(), 3.0, Some(now))];
+        let out2 = dampen_self_reference_recency(hits2, 0.0, now);
+        assert!((out2[0].score - 3.0).abs() < 1e-6);
+        assert!(!out2[0].match_features.contains_key("self_reference"));
     }
 }

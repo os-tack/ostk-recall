@@ -12,15 +12,17 @@
 //! broadcast channel is observed and skipped (not fatal). The pipeline
 //! never blocks on us — the broadcast publisher is always non-blocking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use ostk_recall_core::attention::{FoldDepth, PrivacyTier};
 use ostk_recall_core::{IngestOrigin, SourceKind, ThreadHandle};
 use ostk_recall_pipeline::{IngestEvent, Pipeline};
 use ostk_recall_store::{
-    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, ThreadRecord, ThreadsDb,
+    AssociationType, CorpusStore, EvidenceLink, RelationState, StoreError, TensionState,
+    ThreadRecord, ThreadsDb,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -92,6 +94,10 @@ pub struct WeaverOutcome {
     /// event. Idempotent collisions (already-written edges) do not
     /// count.
     pub evidence_links_written: usize,
+    /// Count of existing edges re-touched (touch_count bumped) because a
+    /// chunk re-resonated with an anchor it had already linked. The
+    /// future→past curation signal (P11b-full).
+    pub evidence_links_touched: usize,
     /// Per-chunk groupings the weaver detected but did not write —
     /// the caller decides whether to surface them as candidate threads.
     pub proposed_weaves: Vec<ProposedWeave>,
@@ -111,10 +117,125 @@ pub struct WeaveWindowOutcome {
     /// Count of newly inserted `evidence_links` rows. Existing links are
     /// idempotent no-ops and are not counted here.
     pub evidence_links_written: usize,
+    /// Count of existing edges re-touched (strengthened) across the pass.
+    pub evidence_links_touched: usize,
     /// Count of detected chunk-to-multiple-anchor groupings.
     pub proposed_weaves: usize,
     /// Count of new `threads_proposed` rows.
     pub proposed_threads_written: usize,
+    /// Count of stale, unpromoted proposals pruned at the end of the pass
+    /// (the consolidation counterweight; promoted proposals are kept).
+    pub proposals_pruned: usize,
+}
+
+/// Aggregate result from a coarse `consolidate` pass — the P11b-full
+/// consolidation cycle layered on top of `weave_window`.
+#[derive(Debug, Default)]
+pub struct ConsolidateOutcome {
+    /// The deep re-weave of the window (binds recent arrivals, re-touches
+    /// edges, prunes stale proposals).
+    pub window: WeaveWindowOutcome,
+    /// New anchor↔thread bridge edges written by the anchor re-weave.
+    pub anchor_bridges_written: usize,
+    /// Existing anchor↔thread bridges re-touched (strengthened) this pass.
+    pub anchor_bridges_touched: usize,
+    /// Recurring, high-cohesion proposals promoted to durable threads.
+    pub proposals_promoted: usize,
+    /// Near-duplicate threads merged away (anchors near-identical).
+    pub threads_merged: usize,
+    /// Deeply-familiar stable threads folded to a sparse summary depth.
+    pub threads_abstracted: usize,
+    /// Threads down-transitioned (Active→Slack→Dormant) by the idle fade.
+    pub threads_faded: usize,
+}
+
+/// Unpromoted emergent proposals older than this are pruned at the end of a
+/// `weave_window` pass. Generous enough to leave recent proposals for
+/// operator review; the content-based handle prevents re-accumulation, so
+/// this only clears the genuinely stale tail.
+const PROPOSED_PRUNE_AGE_DAYS: i64 = 14;
+
+// --- consolidation tunables (P11b-full) -----------------------------------
+
+/// Cosine cut-off for the anchor↔anchor bridge re-weave in a consolidation
+/// pass. High on purpose: a consolidated thread only bridges to another
+/// when their anchors genuinely resonate (a canyon-spanning link, not
+/// same-day adjacency).
+const ANCHOR_BRIDGE_THRESHOLD: f32 = 0.85;
+/// A proposal is auto-promoted to a real thread only when its
+/// distinct-content cluster is at least this large …
+const PROMOTE_MIN_DISTINCT_SIZE: usize = 5;
+/// … and at least this cohesive. Auto-promotion writes a durable thread,
+/// so the bar is "clearly a real, recurring unit," not a passing cluster.
+const PROMOTE_MIN_COHESION: f32 = 0.9;
+/// Base idle days after which an `Active` thread fades to `Slack`. Scaled
+/// up by familiarity (see `idle_fade_multiplier`) so deeply-familiar threads
+/// persist longer — the present curates which past stays load-bearing.
+const FADE_SLACK_IDLE_DAYS: f64 = 14.0;
+/// Base idle days after which a thread fades to `Dormant`.
+const FADE_DORMANT_IDLE_DAYS: f64 = 60.0;
+/// Anchor cosine at/above which two threads are near-duplicates and merge.
+/// Deliberately strict — merging deletes a thread, so the bar is "these are
+/// the same thread under two handles," not "these are related."
+const MERGE_ANCHOR_SIMILARITY: f32 = 0.95;
+
+/// Salience stretches the idle-fade windows: a thread that has resonated
+/// heavily tolerates up to ~2× the idle before fading. Mirrors the
+/// `familiarity_floor` curve. Driven by `resonance` (the salience
+/// counter), NOT raw mentions — a frequently-but-shallowly-mentioned
+/// thread should fade on schedule; a load-bearing idea should persist.
+#[allow(clippy::cast_precision_loss)]
+fn idle_fade_multiplier(resonance: u32) -> f64 {
+    1.0 + f64::from(resonance.min(crate::FAMILIARITY_SATURATION))
+        / f64::from(crate::FAMILIARITY_SATURATION)
+}
+
+/// Coarseness ranking for tension, so the offline fade only ever
+/// *down*-transitions (Active → Slack → Dormant); reanimation is the live
+/// curator's job (it has the resonance signal the offline pass lacks).
+const fn tension_rank(t: TensionState) -> u8 {
+    match t {
+        TensionState::Active => 2,
+        TensionState::Slack => 1,
+        TensionState::Dormant => 0,
+    }
+}
+
+/// The default weaver facet denylist (P12). Preserves pre-P12 behavior: only
+/// `record_kind:harness_orchestration` (RT-7) is treated as apparatus. NOTE:
+/// `record_kind:audit_significant` is attenuated from the *lens* by default but
+/// is intentionally NOT excluded from weaving — adding it here is a deliberate
+/// thread-graph policy change the operator opts into via `[weaver]`.
+#[must_use]
+pub fn default_weaver_exclude_facets() -> Vec<String> {
+    vec!["record_kind:harness_orchestration".to_string()]
+}
+
+/// True if any of a chunk's facets is in the weaver's configured exclude set
+/// (P12, generalizing the former hardcoded RT-7 `is_harness_apparatus` check):
+/// such chunks are excluded from anchor-matching and emergent proposals so they
+/// never form threads, mirroring the lens denylist.
+fn has_excluded_facet(facets: &ostk_recall_core::FacetSet, exclude: &[String]) -> bool {
+    ostk_recall_core::to_list(facets)
+        .iter()
+        .any(|f| exclude.iter().any(|e| e == f))
+}
+
+/// Structural apparatus that must never anchor or seed emergent threads,
+/// independent of the facet denylist: Claude Code tool-call envelopes
+/// (`block_kind` of `tool_use` / `tool_result`) and `<task-notification>`
+/// monitor events. These are high-volume templated scaffolding — left ungated
+/// they cluster into degenerate high-cohesion proposals (post-recovery they
+/// dominated the proposal pool). The gate is weave-only: such chunks stay in
+/// the corpus and remain recall-able (cf. `CorpusStore::mark_tool_blocks_stale`,
+/// which instead drops them from recall entirely) — they just don't drive
+/// cognition. `block_kind` lives in `Chunk::extra`, and task-notifications are
+/// `block_kind=user`, so neither is expressible as a `[weaver] exclude_facets`
+/// entry; this is the structural counterpart to that facet denylist.
+fn is_structural_apparatus(text: &str, extra: &serde_json::Value) -> bool {
+    let block_kind = extra.get("block_kind").and_then(serde_json::Value::as_str);
+    matches!(block_kind, Some("tool_use" | "tool_result"))
+        || text.trim_start().starts_with("<task-notification>")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,11 +256,16 @@ pub struct AutoWeaver {
     threads: Arc<ThreadsDb>,
     corpus: Arc<CorpusStore>,
     thresholds: WeaverThresholds,
+    /// Facet denylist (P12): chunks carrying any of these are treated as
+    /// apparatus and skipped for anchor-matching + proposal seeding. Defaults
+    /// to [`default_weaver_exclude_facets`]; production wires `[weaver]
+    /// exclude_facets` via [`AutoWeaver::with_exclude_facets`].
+    exclude_facets: Vec<String>,
 }
 
 impl AutoWeaver {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         threads: Arc<ThreadsDb>,
         corpus: Arc<CorpusStore>,
         thresholds: WeaverThresholds,
@@ -148,7 +274,16 @@ impl AutoWeaver {
             threads,
             corpus,
             thresholds,
+            exclude_facets: default_weaver_exclude_facets(),
         }
+    }
+
+    /// Override the weaver facet denylist (P12). Production passes
+    /// `Config::weaver` (`WeaverSettings::resolve(...).exclude_facets`).
+    #[must_use]
+    pub fn with_exclude_facets(mut self, exclude_facets: Vec<String>) -> Self {
+        self.exclude_facets = exclude_facets;
+        self
     }
 
     /// Weave an explicit corpus window without weakening the live
@@ -194,10 +329,233 @@ impl AutoWeaver {
                 .await?;
             aggregate.batches_processed += 1;
             aggregate.evidence_links_written += outcome.evidence_links_written;
+            aggregate.evidence_links_touched += outcome.evidence_links_touched;
             aggregate.proposed_weaves += outcome.proposed_weaves.len();
             aggregate.proposed_threads_written += outcome.proposed_threads_written;
         }
+        // Consolidation counterweight: fade the stale, unpromoted tail.
+        aggregate.proposals_pruned = self
+            .threads
+            .prune_proposed_threads_older_than(chrono::Duration::days(PROPOSED_PRUNE_AGE_DAYS))?;
         Ok(aggregate)
+    }
+
+    /// Run a coarse **consolidation cycle** over a temporal window — the
+    /// P11b-full layer that goes beyond capture. Where `weave_window` only
+    /// binds and proposes, `consolidate` also: deep-re-weaves recent arrivals,
+    /// bridges consolidated threads across canyons, promotes recurring
+    /// high-quality proposals into durable threads, and fades idle threads so
+    /// the surfaced past stays load-bearing without drowning the present.
+    ///
+    /// Offline by design: the operator schedules it via `weave --consolidate`
+    /// under cron/launchd, never `serve`. It does not make bulk content look
+    /// like live TurnEnds — it invokes the processing primitives directly.
+    pub async fn consolidate(
+        &self,
+        since: Option<chrono::Duration>,
+        epoch_size: usize,
+    ) -> Result<ConsolidateOutcome, WeaverError> {
+        let mut out = ConsolidateOutcome::default();
+
+        // 1. Deep re-weave: bind recent arrivals to the anchor set, re-touch
+        //    edges that re-resonate, prune the stale proposal tail.
+        out.window = self.weave_window(since, epoch_size).await?;
+
+        // 2. Anchor↔anchor re-weave: cross-link consolidated threads whose
+        //    anchors genuinely resonate (canyon-spanning bridges). Feeding the
+        //    anchor set as both candidates and anchors reuses the matched-
+        //    anchor pass; self-links are skipped (anchor_id == chunk_id guard).
+        let snap = self.load_anchor_snapshot().await?;
+        if !snap.anchor_embeds.is_empty() {
+            let pass = self.match_against_anchors(
+                &snap.anchor_embeds,
+                &snap.threads,
+                &snap.anchor_embeds,
+                ANCHOR_BRIDGE_THRESHOLD,
+                "bridge",
+            )?;
+            out.anchor_bridges_written = pass.links_written;
+            out.anchor_bridges_touched = pass.links_touched;
+        }
+
+        // 3. Merge near-duplicate threads (same thread under two handles).
+        //    Uses the same anchor snapshot; safe because it mutates the DB,
+        //    not the snapshot, and later steps re-query fresh.
+        out.threads_merged = self.merge_near_duplicate_threads(&snap)?;
+
+        // 4. Promote recurring, high-cohesion proposals to durable threads.
+        out.proposals_promoted = self.promote_recurring_proposals()?;
+
+        // 5. Abstract deeply-familiar stable threads to a sparse summary fold.
+        out.threads_abstracted = self.abstract_stable_threads()?;
+
+        // 6. Fade idle threads (the present curates the past). Down-only; the
+        //    live curator owns reanimation (it has the resonance signal this
+        //    offline pass lacks).
+        out.threads_faded = self.fade_idle_threads()?;
+
+        Ok(out)
+    }
+
+    /// Merge near-duplicate threads — pairs whose anchors are near-identical
+    /// (`MERGE_ANCHOR_SIMILARITY`). Greedy: the more-familiar thread (tiebreak:
+    /// older) absorbs the other, so the consolidated map keeps the
+    /// load-bearing handle. Operates over the snapshot but mutates the DB;
+    /// merged-away handles are skipped for the rest of the pass.
+    fn merge_near_duplicate_threads(
+        &self,
+        snap: &AnchorSnapshot,
+    ) -> Result<usize, WeaverError> {
+        let threads = &snap.threads;
+        let mut merged_away: HashSet<String> = HashSet::new();
+        let mut count = 0usize;
+        for i in 0..threads.len() {
+            if merged_away.contains(threads[i].handle.as_str()) {
+                continue;
+            }
+            let Some(vi) = threads[i]
+                .anchor_chunk_id
+                .as_ref()
+                .and_then(|id| snap.anchor_embeds.get(id))
+            else {
+                continue;
+            };
+            for j in (i + 1)..threads.len() {
+                if merged_away.contains(threads[j].handle.as_str()) {
+                    continue;
+                }
+                let Some(vj) = threads[j]
+                    .anchor_chunk_id
+                    .as_ref()
+                    .and_then(|id| snap.anchor_embeds.get(id))
+                else {
+                    continue;
+                };
+                if cosine_similarity(vi, vj) < MERGE_ANCHOR_SIMILARITY {
+                    continue;
+                }
+                // Keep the stronger thread (more *resonant*; tiebreak: older).
+                let a = &threads[i];
+                let b = &threads[j];
+                let keep_a = a.resonance > b.resonance
+                    || (a.resonance == b.resonance && a.created_at <= b.created_at);
+                let (into, from) = if keep_a { (a, b) } else { (b, a) };
+                if self.threads.merge_thread(&from.handle, &into.handle)? {
+                    merged_away.insert(from.handle.as_str().to_string());
+                    count += 1;
+                    // If the outer thread was merged away, stop pairing it.
+                    if from.handle == threads[i].handle {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Fold deeply-familiar, stable (`Active`) threads to the most-collapsed
+    /// summary depth so the lens surfaces them sparsely — structural
+    /// abstraction via the existing `fold_override` primitive (no text
+    /// generation; the anchor already names the thread). Idempotent: threads
+    /// already folded are skipped.
+    fn abstract_stable_threads(&self) -> Result<usize, WeaverError> {
+        let mut count = 0usize;
+        for t in self.threads.list_threads(None)? {
+            if t.resonance >= crate::FAMILIARITY_SATURATION
+                && t.tension == TensionState::Active
+                && t.fold_override != Some(FoldDepth::Folded)
+            {
+                self.threads
+                    .set_fold_override(&t.handle, Some(FoldDepth::Folded))?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Promote proposals whose distinct-content cluster is large and cohesive
+    /// enough to be a real, recurring unit. A *surviving* proposal is recurring
+    /// by construction: the date-free handle (RT-5) means the weaver re-proposes
+    /// a still-live cluster idempotently rather than re-creating it, and stale
+    /// proposals are pruned — so a proposal that is still present and clears the
+    /// size/cohesion bar has recurred across passes. The new thread anchors on
+    /// `chunk_ids[0]`, which `cluster.rs` orders to be the **centroid-nearest**
+    /// (most-representative) chunk — not an arbitrary first chunk — so the
+    /// anchor resonates with the idea (anchor quality gates the off-diagonal
+    /// bridge). Idempotent: already-promoted rows are skipped.
+    fn promote_recurring_proposals(&self) -> Result<usize, WeaverError> {
+        let proposals = self.threads.list_proposed_threads()?;
+        let mut promoted = 0usize;
+        for p in proposals {
+            if p.promoted_to.is_some()
+                || p.chunk_ids.len() < PROMOTE_MIN_DISTINCT_SIZE
+                || p.cohesion < PROMOTE_MIN_COHESION
+            {
+                continue;
+            }
+            let Some(anchor) = p.chunk_ids.first() else {
+                continue;
+            };
+            // The proposed handle is already a content-derived `proposed-<hex>`
+            // string; reuse it as the thread handle so the lineage is explicit.
+            let Ok(handle) = ThreadHandle::new(&p.proposed_handle) else {
+                continue;
+            };
+            // Derived stop-handle gate: if a thread already exists under
+            // this handle and reads as a frequency-derived stopword
+            // (ubiquitous but unresonant), don't re-promote it to Active.
+            // Content-derived `proposed-<hex>` handles are unlikely to be
+            // stopwords, so this is largely a backstop for kebab-handle
+            // proposals — but it keeps the promotion path honest.
+            if let Ok(Some(existing)) = self.threads.get_thread(&handle) {
+                if crate::is_stop_handle(existing.mentions, existing.resonance) {
+                    continue;
+                }
+            }
+            let now = Utc::now();
+            let rec = ThreadRecord {
+                handle: handle.clone(),
+                tension: TensionState::Active,
+                mentions: 0,
+                resonance: 0,
+                last_touched_at: now,
+                anchor_chunk_id: Some(anchor.clone()),
+                fold_override: None,
+                created_at: now,
+                created_scope_key: None,
+                privacy_tier: PrivacyTier::T1Project,
+            };
+            self.threads.upsert_thread(&rec)?;
+            self.threads
+                .mark_proposed_thread_promoted(&p.proposed_handle, &handle)?;
+            promoted += 1;
+        }
+        Ok(promoted)
+    }
+
+    /// Fade threads that have gone idle, down-transitioning tension by time
+    /// since `last_touched_at`. Familiarity stretches the windows so deeply-
+    /// familiar threads persist longer. Down-only — never reanimates.
+    #[allow(clippy::cast_precision_loss)]
+    fn fade_idle_threads(&self) -> Result<usize, WeaverError> {
+        let now = Utc::now();
+        let mut faded = 0usize;
+        for t in self.threads.list_threads(None)? {
+            let idle_days = (now - t.last_touched_at).num_seconds().max(0) as f64 / 86_400.0;
+            let mult = idle_fade_multiplier(t.resonance);
+            let target = if idle_days >= FADE_DORMANT_IDLE_DAYS * mult {
+                TensionState::Dormant
+            } else if idle_days >= FADE_SLACK_IDLE_DAYS * mult {
+                TensionState::Slack
+            } else {
+                continue;
+            };
+            if tension_rank(target) < tension_rank(t.tension) {
+                self.threads.set_tension(&t.handle, target)?;
+                faded += 1;
+            }
+        }
+        Ok(faded)
     }
 
     /// Subscribe to `pipeline` and drive the weaver until `cancel`
@@ -270,20 +628,35 @@ impl AutoWeaver {
             return Ok(WeaverOutcome {
                 event_seen: event,
                 evidence_links_written: 0,
+                evidence_links_touched: 0,
                 proposed_weaves: vec![],
                 proposed_threads_written: 0,
             });
         }
 
-        let new_embeds = self
+        // Fetch chunks (not just embeddings) so we can gate apparatus by
+        // facet: RT-7 harness-orchestration envelopes must not anchor or seed
+        // emergent proposals (that is how the `team-lead`/`teammate-message`
+        // degenerate threads formed). They stay in the corpus + recall; they
+        // just don't drive cognition.
+        let fetched = self
             .corpus
-            .fetch_embeddings(&event.chunk_ids_upserted)
+            .fetch_chunks_by_ids(&event.chunk_ids_upserted)
             .await?;
+        let new_embeds: HashMap<String, Vec<f32>> = fetched
+            .into_iter()
+            .filter(|(_, (chunk, _))| {
+                !has_excluded_facet(&chunk.facets, &self.exclude_facets)
+                    && !is_structural_apparatus(&chunk.text, &chunk.extra)
+            })
+            .filter_map(|(id, (_, emb))| emb.map(|e| (id, e)))
+            .collect();
         let threshold = self.thresholds.for_source(event.source);
         let category = source_kind_to_category(event.source);
 
         let MatchPassOutcome {
             links_written,
+            links_touched,
             chunk_to_anchors,
             matched_chunks,
         } = self.match_against_anchors(
@@ -325,6 +698,7 @@ impl AutoWeaver {
         Ok(WeaverOutcome {
             event_seen: event,
             evidence_links_written: links_written,
+            evidence_links_touched: links_touched,
             proposed_weaves,
             proposed_threads_written,
         })
@@ -393,6 +767,8 @@ impl AutoWeaver {
                     similarity: Some(sim),
                     created_at: now,
                     updated_at: now,
+                    touch_count: 1,
+                    last_touched_at: now,
                 };
                 match self.threads.add_evidence_link(&link) {
                     Ok(_) => {
@@ -403,13 +779,27 @@ impl AutoWeaver {
                             .push(thread.handle.clone());
                     }
                     Err(StoreError::UniqueViolation { .. }) => {
-                        // The (thread, path, category) edge was written
-                        // in a prior batch. Idempotent no-op.
-                        tracing::trace!(
-                            thread = %thread.handle,
-                            chunk = %chunk_id,
-                            "auto-weaver: evidence link already exists",
-                        );
+                        // The (thread, path, category) edge already exists.
+                        // A re-resonance is the future→past curation signal
+                        // (P11b-full): bump touch_count + last_touched_at so
+                        // recurring canyon edges strengthen instead of the
+                        // signal being dropped. Counts as a link touched.
+                        match self.threads.touch_evidence_link(
+                            &thread.handle,
+                            &link.original_path,
+                            &link.category,
+                            now,
+                        ) {
+                            Ok(true) => out.links_touched += 1,
+                            Ok(false) => {
+                                tracing::trace!(
+                                    thread = %thread.handle,
+                                    chunk = %chunk_id,
+                                    "auto-weaver: re-touch found no matching edge",
+                                );
+                            }
+                            Err(err) => return Err(WeaverError::from(err)),
+                        }
                     }
                     Err(err) => return Err(WeaverError::from(err)),
                 }
@@ -431,7 +821,7 @@ impl AutoWeaver {
         let now = Utc::now();
         let mut written = 0usize;
         for cluster in clusters {
-            let handle = generate_proposed_handle(&cluster.chunk_ids, now);
+            let handle = generate_proposed_handle(&cluster.chunk_ids);
             let rec = ostk_recall_store::ProposedThreadRecord {
                 id: 0,
                 proposed_handle: handle,
@@ -464,6 +854,7 @@ impl AutoWeaver {
 #[derive(Debug, Default)]
 struct MatchPassOutcome {
     links_written: usize,
+    links_touched: usize,
     chunk_to_anchors: HashMap<String, Vec<ThreadHandle>>,
     matched_chunks: std::collections::HashSet<String>,
 }
@@ -475,21 +866,29 @@ struct AnchorSnapshot {
 }
 
 /// Build a kebab-case proposed-thread handle from a cluster's member
-/// chunks. Format: `proposed-<8 hex chars>` — deterministic enough that
-/// repeated scans of the same cluster collapse to one row (the unique
-/// constraint absorbs the duplicate), short enough to fit
-/// `ThreadHandle`'s 64-char / 4-hyphen budget.
-pub(crate) fn generate_proposed_handle(chunk_ids: &[String], ts: chrono::DateTime<Utc>) -> String {
+/// chunks. Format: `proposed-<8 hex chars>` — a pure function of the
+/// (sorted) member set, short enough to fit `ThreadHandle`'s 64-char /
+/// 4-hyphen budget.
+///
+/// Content-based, with no timestamp: the same cluster re-surfaced on any
+/// later weave collapses to the same handle and the UNIQUE constraint
+/// absorbs it (idempotent). Previously the handle mixed in the date, so an
+/// identical cluster re-proposed every day — the main driver of unbounded
+/// proposal accumulation.
+pub(crate) fn generate_proposed_handle(chunk_ids: &[String]) -> String {
     use sha2::{Digest, Sha256};
+    // Hash a *sorted* copy so the handle is canonical (RT-5 idempotency):
+    // independent of member order, so reordering chunk_ids to put the
+    // centroid-nearest representative first (cluster.rs) never changes the
+    // handle. Identical to the prior hash for existing proposals, whose ids
+    // were already lexically sorted.
+    let mut sorted: Vec<&String> = chunk_ids.iter().collect();
+    sorted.sort();
     let mut hasher = Sha256::new();
-    for id in chunk_ids {
+    for id in sorted {
         hasher.update(id.as_bytes());
         hasher.update(b"\n");
     }
-    // Include the date (not the full ts) so the same cluster surfaced
-    // in two scans on the same day collides; a different day yields a
-    // new proposal (which the operator can still merge).
-    hasher.update(ts.format("%Y%m%d").to_string().as_bytes());
     let digest = hasher.finalize();
     let short = hex::encode(&digest[..4]);
     format!("proposed-{short}")
@@ -513,10 +912,78 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use ostk_recall_core::{Chunk, Links, PrivacyTier, Source};
-    use ostk_recall_store::{CorpusStore, ThreadRecord, ThreadsDb};
+    use ostk_recall_store::{
+        CorpusStore, ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb,
+    };
     use tempfile::TempDir;
 
     const DIM: usize = 4;
+
+    fn facets_with(record_kind: &str) -> ostk_recall_core::FacetSet {
+        let mut f = ostk_recall_core::FacetSet::new();
+        ostk_recall_core::merge_override(&mut f, "record_kind", vec![record_kind.to_string()]);
+        f
+    }
+
+    #[test]
+    fn default_weaver_excludes_only_harness_orchestration() {
+        // P12 review finding 8: the default weaver denylist preserves pre-P12
+        // behavior — harness_orchestration is excluded, audit_significant is
+        // NOT (it is a lens-only exclusion; excluding it from weaving would be
+        // a deliberate, opt-in thread-graph change).
+        let default = default_weaver_exclude_facets();
+        assert_eq!(default, vec!["record_kind:harness_orchestration".to_string()]);
+        assert!(has_excluded_facet(&facets_with("harness_orchestration"), &default));
+        assert!(
+            !has_excluded_facet(&facets_with("audit_significant"), &default),
+            "audit_significant must NOT be excluded from weaving by default"
+        );
+        assert!(!has_excluded_facet(&facets_with("anything_else"), &default));
+    }
+
+    #[test]
+    fn structural_apparatus_is_excluded_but_real_content_is_not() {
+        use serde_json::json;
+        // Tool-call envelopes and task-notifications are structural apparatus,
+        // gated regardless of facets so they never seed degenerate threads.
+        assert!(is_structural_apparatus(
+            "[tool_use Read: {\"file_path\":\"src/main.rs\"}]",
+            &json!({ "block_kind": "tool_use" })
+        ));
+        assert!(is_structural_apparatus(
+            "[tool_result: 1\t2026-05-12 claim id=os-builds-os]",
+            &json!({ "block_kind": "tool_result" })
+        ));
+        // task-notifications are block_kind=user, caught by the text prefix
+        // (with leading whitespace tolerated).
+        assert!(is_structural_apparatus(
+            "\n<task-notification>\n<task-id>bwl7bzhhn</task-id>",
+            &json!({ "block_kind": "user" })
+        ));
+        // Real cognition must pass: assistant prose, genuine user turns, and
+        // chunks with no `extra` are all woven.
+        assert!(!is_structural_apparatus(
+            "The kernel survives.",
+            &json!({ "block_kind": "assistant_text" })
+        ));
+        assert!(!is_structural_apparatus(
+            "commit that please, the os builds the os",
+            &json!({ "block_kind": "user" })
+        ));
+        assert!(!is_structural_apparatus("plain text, no extra", &json!(null)));
+    }
+
+    #[test]
+    fn configured_extra_weaver_exclude_facet_is_honored() {
+        // An operator who opts audit_significant into the weaver denylist gets it.
+        let exclude = vec![
+            "record_kind:harness_orchestration".to_string(),
+            "record_kind:audit_significant".to_string(),
+        ];
+        assert!(has_excluded_facet(&facets_with("audit_significant"), &exclude));
+        assert!(has_excluded_facet(&facets_with("harness_orchestration"), &exclude));
+        assert!(!has_excluded_facet(&facets_with("normal"), &exclude));
+    }
 
     struct Fixture {
         _tmp: TempDir,
@@ -563,7 +1030,8 @@ mod tests {
         ThreadRecord {
             handle: ThreadHandle::new(handle).unwrap(),
             tension: ostk_recall_store::TensionState::Active,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: now,
             anchor_chunk_id: anchor_chunk_id.map(String::from),
             fold_override: None,
@@ -647,6 +1115,53 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].association_type, AssociationType::Derived);
         assert!(evidence[0].similarity.unwrap() > 0.99);
+    }
+
+    #[tokio::test]
+    async fn re_resonance_touches_existing_edge() {
+        // First pass writes the edge; a second pass over the same chunk
+        // re-resonates with the same anchor → the edge is re-touched
+        // (touch_count bumps, last_touched_at advances), not duplicated.
+        // This is the P11b-full future→past curation loop.
+        let fx = fixture().await;
+        let anchor_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        fx.corpus
+            .upsert(
+                &[chunk("anchor-1"), chunk("new-1")],
+                &[anchor_vec.clone(), anchor_vec.clone()],
+            )
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor-1")))
+            .unwrap();
+
+        let first = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["new-1"]))
+            .await
+            .unwrap();
+        assert_eq!(first.evidence_links_written, 1);
+        assert_eq!(first.evidence_links_touched, 0);
+
+        let second = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["new-1"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.evidence_links_written, 0,
+            "the edge already exists; no new row"
+        );
+        assert_eq!(
+            second.evidence_links_touched, 1,
+            "the re-resonance strengthens the existing edge"
+        );
+
+        let evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("t1").unwrap())
+            .unwrap();
+        assert_eq!(evidence.len(), 1, "re-touch must not duplicate the row");
+        assert_eq!(evidence[0].touch_count, 2);
     }
 
     #[tokio::test]
@@ -892,5 +1407,293 @@ mod tests {
         assert!((t.for_source(SourceKind::Gemini) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::ZipExport) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::FileGlob) - 0.80).abs() < 1e-6);
+    }
+
+    fn proposal(handle: &str, n_chunks: usize, cohesion: f32) -> ProposedThreadRecord {
+        ProposedThreadRecord {
+            id: 0,
+            proposed_handle: handle.to_string(),
+            chunk_ids: (0..n_chunks).map(|i| format!("{handle}-c{i}")).collect(),
+            centroid_vec: vec![1.0, 0.0, 0.0, 0.0],
+            cohesion,
+            created_at: Utc::now(),
+            promoted_to: None,
+        }
+    }
+
+    fn thread_touched(handle: &str, tension: TensionState, days_idle: i64, fam: u32) -> ThreadRecord {
+        let touched = Utc::now() - chrono::Duration::days(days_idle);
+        ThreadRecord {
+            handle: ThreadHandle::new(handle).unwrap(),
+            tension,
+            // `fam` is the idle-fade stretch knob; the stretch now keys on
+            // the salience counter (resonance), so seed both equal.
+            mentions: fam,
+            resonance: fam,
+            last_touched_at: touched,
+            anchor_chunk_id: None,
+            fold_override: None,
+            created_at: touched,
+            created_scope_key: None,
+            privacy_tier: PrivacyTier::T1Project,
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_recurring_proposals_gates_on_size_and_cohesion() {
+        let fx = fixture().await;
+        // Passing: large + cohesive.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-bigcohesive", 6, 0.95))
+            .unwrap();
+        // Failing: too small.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-small", 2, 0.99))
+            .unwrap();
+        // Failing: too loose.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-loose", 8, 0.5))
+            .unwrap();
+
+        let promoted = weaver(&fx).promote_recurring_proposals().unwrap();
+        assert_eq!(promoted, 1, "only the large+cohesive proposal promotes");
+
+        // The promoted proposal became a real, anchored thread …
+        let t = fx
+            .threads
+            .get_thread(&ThreadHandle::new("proposed-bigcohesive").unwrap())
+            .unwrap()
+            .expect("promoted thread exists");
+        assert_eq!(t.anchor_chunk_id.as_deref(), Some("proposed-bigcohesive-c0"));
+        // … and the proposal row is marked promoted (won't re-promote).
+        let again = weaver(&fx).promote_recurring_proposals().unwrap();
+        assert_eq!(again, 0, "already-promoted proposals are skipped");
+
+        // The rejected ones did not become threads.
+        assert!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("proposed-loose").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_recurring_proposals_rejects_a_derived_stop_handle() {
+        let fx = fixture().await;
+        // An existing thread that reads as a frequency-derived stopword:
+        // ubiquitous (mentions well past the floor) but never resonant.
+        let mut rec = thread("proposed-stopword", None);
+        rec.mentions = crate::STOPWORD_MENTION_MIN + 100;
+        rec.resonance = 0;
+        fx.threads.upsert_thread(&rec).unwrap();
+        // A large + cohesive proposal under the SAME handle would normally
+        // promote — but the stop-handle gate must veto it.
+        fx.threads
+            .insert_proposed_thread(&proposal("proposed-stopword", 6, 0.95))
+            .unwrap();
+
+        let promoted = weaver(&fx).promote_recurring_proposals().unwrap();
+        assert_eq!(promoted, 0, "a derived stop-handle must not be (re-)promoted");
+        // Gate, don't delete: the thread is still reachable, just unresonant.
+        let t = fx
+            .threads
+            .get_thread(&ThreadHandle::new("proposed-stopword").unwrap())
+            .unwrap()
+            .expect("stop-handle thread still reachable");
+        assert_eq!(t.resonance, 0, "still a stopword");
+    }
+
+    #[tokio::test]
+    async fn fade_idle_threads_down_transitions_by_idle_time() {
+        let fx = fixture().await;
+        // Fresh → stays Active (idle below the slack window).
+        fx.threads
+            .upsert_thread(&thread_touched("fresh", TensionState::Active, 1, 0))
+            .unwrap();
+        // 20 days idle, familiarity 0 → past the 14d slack window → Slack.
+        fx.threads
+            .upsert_thread(&thread_touched("idle-slack", TensionState::Active, 20, 0))
+            .unwrap();
+        // 90 days idle → past the 60d dormant window → Dormant.
+        fx.threads
+            .upsert_thread(&thread_touched("idle-dormant", TensionState::Active, 90, 0))
+            .unwrap();
+        // 20 days idle but saturated familiarity (×2 window = 28d slack) →
+        // still within tolerance → stays Active.
+        fx.threads
+            .upsert_thread(&thread_touched("familiar", TensionState::Active, 20, 20))
+            .unwrap();
+
+        let faded = weaver(&fx).fade_idle_threads().unwrap();
+        assert_eq!(faded, 2, "idle-slack and idle-dormant fade; others hold");
+
+        let get = |h: &str| {
+            fx.threads
+                .get_thread(&ThreadHandle::new(h).unwrap())
+                .unwrap()
+                .unwrap()
+                .tension
+        };
+        assert_eq!(get("fresh"), TensionState::Active);
+        assert_eq!(get("idle-slack"), TensionState::Slack);
+        assert_eq!(get("idle-dormant"), TensionState::Dormant);
+        assert_eq!(
+            get("familiar"),
+            TensionState::Active,
+            "familiarity stretches the idle window"
+        );
+    }
+
+    #[tokio::test]
+    async fn fade_idle_threads_never_up_transitions() {
+        let fx = fixture().await;
+        // A Dormant thread that is fresh must NOT be reanimated by the
+        // offline fade — that's the live curator's job.
+        fx.threads
+            .upsert_thread(&thread_touched("dormant-fresh", TensionState::Dormant, 0, 0))
+            .unwrap();
+        let faded = weaver(&fx).fade_idle_threads().unwrap();
+        assert_eq!(faded, 0);
+        assert_eq!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("dormant-fresh").unwrap())
+                .unwrap()
+                .unwrap()
+                .tension,
+            TensionState::Dormant
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_near_duplicate_threads_absorbs_into_stronger() {
+        let fx = fixture().await;
+        // Two threads with byte-identical anchor embeddings (cosine 1.0).
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        fx.corpus
+            .upsert(&[chunk("anchor-keep"), chunk("anchor-dup")], &[v.clone(), v])
+            .await
+            .unwrap();
+        // `keep` is more familiar → it absorbs `dup`.
+        let mut keep = thread("keepthread", Some("anchor-keep"));
+        keep.resonance = 10;
+        fx.threads.upsert_thread(&keep).unwrap();
+        fx.threads
+            .upsert_thread(&thread("dupthread", Some("anchor-dup")))
+            .unwrap();
+        // An evidence row on the soon-to-be-merged-away thread.
+        let now = Utc::now();
+        fx.threads
+            .add_evidence_link(&EvidenceLink {
+                id: 0,
+                thread_handle: ThreadHandle::new("dupthread").unwrap(),
+                original_path: PathBuf::from("evidence-1"),
+                current_path: None,
+                content_hash: None,
+                last_resolved_chunk_id: None,
+                relation_state: RelationState::Active,
+                association_type: AssociationType::Derived,
+                category: "doc".into(),
+                similarity: Some(0.9),
+                created_at: now,
+                updated_at: now,
+                touch_count: 1,
+                last_touched_at: now,
+            })
+            .unwrap();
+
+        let snap = weaver(&fx).load_anchor_snapshot().await.unwrap();
+        let merged = weaver(&fx).merge_near_duplicate_threads(&snap).unwrap();
+        assert_eq!(merged, 1);
+
+        // `dup` is gone; `keep` remains and inherited the evidence row.
+        assert!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("dupthread").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let kept_evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("keepthread").unwrap())
+            .unwrap();
+        assert!(
+            kept_evidence
+                .iter()
+                .any(|e| e.original_path == PathBuf::from("evidence-1")),
+            "merged-away thread's evidence is re-pointed onto the survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn abstract_stable_threads_folds_only_familiar_active() {
+        let fx = fixture().await;
+        let mut familiar = thread("familiar-active", None);
+        familiar.resonance = crate::FAMILIARITY_SATURATION;
+        fx.threads.upsert_thread(&familiar).unwrap();
+
+        let mut casual = thread("casual-active", None);
+        casual.resonance = 5;
+        fx.threads.upsert_thread(&casual).unwrap();
+
+        let mut fam_slack = thread("familiar-slack", None);
+        fam_slack.resonance = crate::FAMILIARITY_SATURATION;
+        fam_slack.tension = TensionState::Slack;
+        fx.threads.upsert_thread(&fam_slack).unwrap();
+
+        let n = weaver(&fx).abstract_stable_threads().unwrap();
+        assert_eq!(n, 1, "only the deeply-familiar Active thread folds");
+        assert_eq!(
+            fx.threads
+                .get_thread(&ThreadHandle::new("familiar-active").unwrap())
+                .unwrap()
+                .unwrap()
+                .fold_override,
+            Some(FoldDepth::Folded)
+        );
+        // Idempotent: a second pass folds nothing new.
+        assert_eq!(weaver(&fx).abstract_stable_threads().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn harness_apparatus_chunks_do_not_weave() {
+        // A harness-orchestration-tagged chunk must not anchor-match or seed
+        // proposals, even when it resonates perfectly — that is how the
+        // team-lead / teammate-message degenerate threads formed (RT-7).
+        let fx = fixture().await;
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let good = chunk("good");
+        let mut appar = chunk("appar");
+        ostk_recall_core::merge_override(
+            &mut appar.facets,
+            "record_kind",
+            vec!["harness_orchestration".to_string()],
+        );
+        fx.corpus
+            .upsert(&[chunk("anchor-1"), good, appar], &[v.clone(), v.clone(), v.clone()])
+            .await
+            .unwrap();
+        fx.threads
+            .upsert_thread(&thread("t1", Some("anchor-1")))
+            .unwrap();
+
+        let out = weaver(&fx)
+            .process_event(event(SourceKind::Markdown, &["good", "appar"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evidence_links_written, 1,
+            "only the non-apparatus chunk links to the anchor"
+        );
+        let evidence = fx
+            .threads
+            .list_evidence(&ThreadHandle::new("t1").unwrap())
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].original_path,
+            std::path::PathBuf::from("good"),
+            "the apparatus chunk is excluded from weaving"
+        );
     }
 }

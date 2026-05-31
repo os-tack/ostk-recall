@@ -118,8 +118,13 @@ pub fn find_clusters_with(
             continue;
         }
 
-        let mut ids: Vec<String> = members.iter().map(|&i| chunks[i].0.clone()).collect();
-        ids.sort();
+        // Resonance is weighted by distinct information, not raw count: a
+        // cluster that is mostly the same content repeated (identical
+        // embeddings) is redundancy, not an emergent theme. Require enough
+        // *distinct* embeddings to clear the size floor before proposing.
+        if distinct_embedding_count(chunks, &members) < min_cluster_size {
+            continue;
+        }
 
         let dim = chunks[members[0]].1.len();
         let mut centroid = vec![0.0_f32; dim];
@@ -141,6 +146,26 @@ pub fn find_clusters_with(
             *slot *= inv;
         }
 
+        // Order members by similarity to the centroid (nearest first) so
+        // `chunk_ids[0]` is the cluster's most-representative chunk — the
+        // anchor the weaver promotes. Anchor quality is the binding constraint
+        // on whether the off-diagonal bridge can fire: an arbitrary first-chunk
+        // anchor (e.g. a bare `struct`) resonates poorly, while the
+        // centroid-nearest chunk best represents the idea. Tiebreak lexically
+        // for determinism. The proposed handle hashes a *sorted* copy
+        // (`generate_proposed_handle`), so this display order never affects
+        // RT-5 idempotency.
+        let mut scored: Vec<(String, f32)> = members
+            .iter()
+            .map(|&i| (chunks[i].0.clone(), cosine_similarity(&chunks[i].1, &centroid)))
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let ids: Vec<String> = scored.into_iter().map(|(id, _)| id).collect();
+
         let cohesion = average_pairwise_cosine(chunks, &members);
 
         clusters.push(EmergentCluster {
@@ -150,7 +175,10 @@ pub fn find_clusters_with(
         });
     }
 
-    clusters.sort_by(|a, b| a.chunk_ids[0].cmp(&b.chunk_ids[0]));
+    // Deterministic cluster order by the lexically-smallest member id.
+    // `chunk_ids[0]` is now the centroid-nearest representative (not the
+    // lex-min), so sort on the canonical min rather than the first element.
+    clusters.sort_by(|a, b| a.chunk_ids.iter().min().cmp(&b.chunk_ids.iter().min()));
     clusters
 }
 
@@ -190,7 +218,12 @@ pub fn mean_pairwise_cosine(embeddings: &[Vec<f32>]) -> f32 {
     if pairs == 0 {
         return 0.0;
     }
-    total / f32::from(u16::try_from(pairs).unwrap_or(u16::MAX))
+    // `pairs` is N(N-1)/2 and can exceed u16::MAX for large clusters (N>362);
+    // the old `u16::try_from(...).unwrap_or(u16::MAX)` capped the divisor and
+    // inflated cohesion above 1.0. Divide by the true pair count.
+    #[allow(clippy::cast_precision_loss)] // display metric; precision loss negligible
+    let denom = pairs as f32;
+    total / denom
 }
 
 fn average_pairwise_cosine(chunks: &[(String, Vec<f32>)], members: &[usize]) -> f32 {
@@ -208,7 +241,30 @@ fn average_pairwise_cosine(chunks: &[(String, Vec<f32>)], members: &[usize]) -> 
     if pairs == 0 {
         return 0.0;
     }
-    total / f32::from(u16::try_from(pairs).unwrap_or(u16::MAX))
+    #[allow(clippy::cast_precision_loss)] // display metric; precision loss negligible
+    let denom = pairs as f32;
+    total / denom
+}
+
+/// Count distinct embeddings among a cluster's members.
+///
+/// Identical content produces an identical (deterministic) embedding, so
+/// this is the resonance-layer proxy for distinct *information*: a cluster
+/// of 509 byte-identical chunks has distinct-count 1. We hash the f32 bit
+/// patterns; an astronomically-unlikely collision would only undercount,
+/// which is the conservative direction (treats more as redundant).
+fn distinct_embedding_count(chunks: &[(String, Vec<f32>)], members: &[usize]) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut seen: HashSet<u64> = HashSet::new();
+    for &i in members {
+        let mut h = DefaultHasher::new();
+        for x in &chunks[i].1 {
+            x.to_bits().hash(&mut h);
+        }
+        seen.insert(h.finish());
+    }
+    seen.len()
 }
 
 // -----------------------------------------------------------------------
@@ -282,6 +338,43 @@ mod tests {
     }
 
     #[test]
+    fn identical_content_cluster_rejected_as_redundancy() {
+        // Six byte-identical embeddings: dense and tight, but distinct
+        // information is 1 — redundancy, not an emergent theme. The
+        // distinct-content gate must reject it (this is the 509× class).
+        let dim = 16;
+        let dup = near_axis(0, dim, 0.001);
+        let chunks: Vec<(String, Vec<f32>)> =
+            (0..6).map(|i| v(&format!("dup-{i}"), dup.clone())).collect();
+        let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
+        assert!(
+            clusters.is_empty(),
+            "identical-content cluster must be rejected by the distinct-count gate"
+        );
+    }
+
+    #[test]
+    fn cohesion_does_not_overflow_for_large_cluster() {
+        // >362 distinct members → pair count exceeds u16::MAX. The old
+        // divisor cap inflated cohesion above 1.0; it must stay a valid
+        // similarity in [0, 1].
+        let dim = 16;
+        let chunks: Vec<(String, Vec<f32>)> = (0..400)
+            .map(|i| {
+                let jitter = (i as f32).mul_add(1e-5, 0.001);
+                v(&format!("hot-{i:04}"), near_axis(0, dim, jitter))
+            })
+            .collect();
+        let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
+        assert_eq!(clusters.len(), 1, "400 near-axis vectors form one cluster");
+        assert!(
+            clusters[0].cohesion <= 1.0 && clusters[0].cohesion > 0.9,
+            "cohesion must be a valid similarity, got {}",
+            clusters[0].cohesion
+        );
+    }
+
+    #[test]
     fn no_clusters_when_batch_below_min_size() {
         let chunks = vec![v("a", near_axis(0, 4, 0.01)), v("b", near_axis(0, 4, 0.01))];
         let clusters = find_clusters(&chunks, EMERGENT_THRESHOLD);
@@ -323,5 +416,28 @@ mod tests {
         assert_eq!(clusters.len(), 2);
         assert!(clusters[0].chunk_ids[0].starts_with("alpha-"));
         assert!(clusters[1].chunk_ids[0].starts_with("zeta-"));
+    }
+
+    #[test]
+    fn chunk_ids_lead_with_centroid_nearest_representative() {
+        // Anchor quality (M4): chunk_ids[0] must be the centroid-nearest
+        // (most-representative) member, NOT the lexicographically-smallest, so
+        // the weaver promotes a representative anchor instead of an arbitrary
+        // chunk. The center vector here is lexically LAST, so passing proves
+        // ordering by centroid similarity rather than by id.
+        let chunks = vec![
+            v("z-center", vec![1.0, 0.0, 0.0]),
+            v("a-edge", vec![0.98, 0.2, 0.0]),
+            v("m-edge", vec![0.98, 0.0, 0.2]),
+        ];
+        let clusters = find_clusters_with(&chunks, 0.82, 3, 2);
+        assert_eq!(clusters.len(), 1, "the three tight vectors form one cluster");
+        let c = &clusters[0];
+        assert_eq!(
+            c.chunk_ids[0], "z-center",
+            "chunk_ids[0] must be the centroid-nearest member, not the lex-min; got {:?}",
+            c.chunk_ids
+        );
+        assert_eq!(c.chunk_ids.len(), 3);
     }
 }

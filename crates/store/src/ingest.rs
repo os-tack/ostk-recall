@@ -389,6 +389,21 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
         Ok(ids)
     }
 
+    /// Delete every `ingest_sources` cursor (mtime/size/overlay metadata)
+    /// for a given `source_config_id`. Used by `--reingest`: deleting the
+    /// chunk rows alone is not enough, because the Tier-1 metadata check in
+    /// `ingest_source` would then see each file as unchanged and skip
+    /// re-parsing — leaving the project under-filled after the rescan.
+    /// Clearing the cursors forces a full re-parse. Returns rows deleted.
+    pub fn clear_source_metadata(&self, source_config_id: &str) -> Result<u64> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "DELETE FROM ingest_sources WHERE source_config_id = ?",
+            params![source_config_id],
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn delete_by_chunk_ids(&self, chunk_ids: &[String]) -> Result<u64> {
         if chunk_ids.is_empty() {
             return Ok(0);
@@ -439,6 +454,35 @@ mod tests {
         assert!(db.content_already_ingested("abc", "deadbeef").unwrap());
         assert!(!db.content_already_ingested("abc", "other").unwrap());
         assert_eq!(db.count_by_source().unwrap(), vec![("markdown".into(), 1)]);
+    }
+
+    #[test]
+    fn clear_source_metadata_resets_cursors_for_config() {
+        let tmp = TempDir::new().unwrap();
+        let db = IngestDb::open(tmp.path()).unwrap();
+        // Two configs; clearing one must not touch the other.
+        db.update_source_metadata("claude_code", "cfg-a", "f1.jsonl", 1, 2, "", "run-1")
+            .unwrap();
+        db.update_source_metadata("claude_code", "cfg-a", "f2.jsonl", 1, 2, "", "run-1")
+            .unwrap();
+        db.update_source_metadata("markdown", "cfg-b", "n.md", 1, 2, "", "run-1")
+            .unwrap();
+
+        let cleared = db.clear_source_metadata("cfg-a").unwrap();
+        assert_eq!(cleared, 2, "both cfg-a cursors cleared");
+
+        // cfg-a cursors gone → Tier-1 would now re-parse those files.
+        assert!(
+            db.get_source_metadata("claude_code", "cfg-a", "f1.jsonl")
+                .unwrap()
+                .is_none()
+        );
+        // cfg-b untouched.
+        assert!(
+            db.get_source_metadata("markdown", "cfg-b", "n.md")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

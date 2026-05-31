@@ -1,25 +1,16 @@
 //! Source-code scanner.
 //!
 //! Walks every file matching configured `extensions` under configured
-//! `paths`. Output strategy depends on the file extension and tooling:
+//! `paths`. Output strategy depends on the file extension:
 //!
-//! * `.rs` files in a Cargo workspace, when `fcp-rust` is on `$PATH`:
-//!   delegated to [`crate::fcp_rust::chunk_rust_file`] for symbol-
-//!   bounded chunking. Each top-level item (fn, struct, enum, trait,
-//!   impl, mod, const) becomes one chunk that includes the preceding
-//!   ~5 lines (catches doc comments and attribute macros) and a
-//!   synthetic header `// <kind> <name>` so BM25 surfaces symbol-name
-//!   queries. The fcp-rust session cache is module-level in
-//!   `fcp_rust.rs` so every `.rs` file in a given Cargo workspace
-//!   reuses the same rust-analyzer subprocess regardless of which
-//!   scanner (`code` or `ostk_project`) is walking.
-//! * Other extensions (and `.rs` fallback paths): 200-line windows with
-//!   20-line overlap.
-//!
-//! TODO(phase-J): integrate `fcp-python`, `fcp-go`, `fcp-js` adapters
-//! analogously. The line-window fallback stays in place for languages
-//! without a semantic adapter, plus standalone `.rs` files outside any
-//! Cargo workspace.
+//! * Files with a tree-sitter grammar ([`crate::tree_sitter`]: Rust,
+//!   Python, TypeScript, JavaScript, Go): per-file structural parse →
+//!   one chunk per top-level item (and per method/member of `impl` /
+//!   `class` containers). Each chunk includes its leading doc/comment
+//!   block and a synthetic header `// <kind> <name>` so BM25 surfaces
+//!   symbol-name queries. No subprocess, no workspace re-index.
+//! * Other extensions (e.g. `.md`), parse failures, or files with no
+//!   recognizable items: 200-line windows with 20-line overlap.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +19,7 @@ use ostk_recall_core::{
     Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
 };
 
-use crate::fcp_rust::{self, RustSymbol};
+use crate::tree_sitter;
 use crate::walk::walk_filtered;
 
 /// Lines per window (line-window fallback strategy).
@@ -36,27 +27,24 @@ pub const WINDOW_LINES: usize = 200;
 /// Line overlap between adjacent windows.
 pub const OVERLAP_LINES: usize = 20;
 
-/// Legacy re-export kept so existing call sites (tests, external
-/// scanners) continue to compile.
-///
-/// Production chunking uses `fcp_rust::slice_symbol_with_docs`, which
-/// walks the doc block backward until it hits code instead of using a
-/// fixed window.
-#[allow(dead_code)]
-pub const SYMBOL_LEADING_CONTEXT_LINES: u32 = 5;
-
-/// Scanner for source-code trees.
-///
-/// The fcp-rust session cache is module-level in [`crate::fcp_rust`],
-/// shared with `ostk_project`, so this type is effectively stateless —
-/// it's kept as a struct for trait-object reuse and future per-run
-/// configuration.
+/// Scanner for source-code trees. Stateless — kept as a struct for
+/// trait-object reuse and future per-run configuration.
 #[derive(Default, Debug)]
 pub struct CodeScanner;
 
 impl Scanner for CodeScanner {
     fn kind(&self) -> SourceKind {
         SourceKind::Code
+    }
+
+    /// Bumped 0 → 1 for the tree-sitter chunker swap (issue #11): the
+    /// emitted-chunk set for `Source::Code` chunks changed (rust-analyzer
+    /// symbol chunking → tree-sitter structural chunking, plus symbol-
+    /// aware chunking for previously line-windowed py/ts/js/go). Folded
+    /// into the Tier-1 freshness key (`cfg_overlay_hash`) so the first
+    /// post-swap scan re-parses already-ingested `code` sources.
+    fn parse_version(&self) -> u32 {
+        1
     }
 
     fn discover<'a>(
@@ -152,30 +140,23 @@ impl Scanner for CodeScanner {
             .to_string_lossy()
             .into_owned();
 
-        // Rust path: try fcp-rust first; on any failure, fall through to
-        // the line-window strategy below. The shared helper handles
-        // session caching, PATH probing, and workspace discovery.
-        let is_rust = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
-        if is_rust {
-            if let Some(chunks) = fcp_rust::chunk_rust_file(
-                path,
-                &text,
-                Source::Code,
-                &item.source_id,
-                item.project.as_deref(),
-                &item.source_config_id,
-                mtime,
-                &abs_path,
-            ) {
-                return Ok(chunks);
-            }
+        // Symbol-aware path: try tree-sitter for any language with a
+        // grammar. On unsupported extension, parse failure, or a file
+        // with no recognizable items, fall through to line-windows.
+        if let Some(chunks) = tree_sitter::chunk_code_file(
+            path,
+            &text,
+            Source::Code,
+            &item.source_id,
+            item.project.as_deref(),
+            &item.source_config_id,
+            mtime,
+            &abs_path,
+        ) {
+            return Ok(chunks);
         }
 
-        // TODO(phase-J): wire fcp-python / fcp-go / fcp-js here. Until
-        // then, every non-Rust extension uses the line-window chunker.
+        // Fallback: line-window chunker for `.md` and unparseable files.
         let windows = walk_and_window(&text, WINDOW_LINES, OVERLAP_LINES);
         let mut chunks = Vec::with_capacity(windows.len());
         for (idx, window) in windows.into_iter().enumerate() {
@@ -215,17 +196,6 @@ impl Scanner for CodeScanner {
         }
         Ok(chunks)
     }
-}
-
-/// Build the chunk body for a single symbol: pull `[line_start - leading,
-/// line_end]` from `lines`, clamping to file bounds.
-///
-/// Thin wrapper over [`crate::fcp_rust::slice_symbol`] kept for API
-/// stability — the canonical implementation now lives alongside the
-/// rest of the shared Rust-chunking code.
-#[must_use]
-pub fn slice_for_symbol(lines: &[&str], sym: &RustSymbol, leading: u32) -> String {
-    fcp_rust::slice_symbol(lines, sym, leading)
 }
 
 fn extension_matches(path: &Path, exts: &[String]) -> bool {
@@ -429,9 +399,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_short_rust_file_one_chunk() {
-        // Standalone .rs file outside any Cargo workspace → fcp-rust path
-        // declines, falls through to line-window strategy → one chunk.
+    fn parse_rust_file_symbol_chunks() {
+        // Tree-sitter parses the two top-level fns into one chunk each,
+        // tagged chunker=tree-sitter — no subprocess, no PATH dependency.
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("main.rs");
         std::fs::write(&file, "fn main() {}\nfn other() {}\n").unwrap();
@@ -439,22 +409,25 @@ mod tests {
         let cfg = cfg_with(tmp.path(), &["rs"]);
         let item = scanner.discover(&cfg).next().unwrap().unwrap();
         let chunks = scanner.parse(item).unwrap();
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.len(), 2, "expected one chunk per fn");
         assert_eq!(chunks[0].chunk_index, 0);
-        assert!(
-            chunks[0]
-                .links
-                .file_path
-                .as_deref()
-                .unwrap()
-                .ends_with("main.rs")
-        );
+        assert_eq!(chunks[1].chunk_index, 1);
+        assert!(chunks[0].text.starts_with("// fn main"));
+        assert!(chunks[1].text.starts_with("// fn other"));
+        for c in &chunks {
+            assert_eq!(
+                c.extra.get("chunker").and_then(|v| v.as_str()),
+                Some("tree-sitter")
+            );
+            assert!(c.links.file_path.as_deref().unwrap().ends_with("main.rs"));
+        }
     }
 
     #[test]
     fn parse_400_line_rust_file_two_chunks_via_window() {
-        // 400 line-noise file outside any Cargo workspace exercises the
-        // line-window fallback path and proves the strategy still works.
+        // An all-comment file has no tree-sitter items → chunk_code_file
+        // returns None → line-window fallback. Proves the strategy still
+        // works and that empty parses degrade gracefully.
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("big.rs");
         let mut body = String::new();
@@ -475,77 +448,39 @@ mod tests {
         assert_eq!(chunks[1].chunk_index, 1);
     }
 
+    /// Deterministic integration: a struct + impl yields a struct chunk,
+    /// an impl-header chunk, and a per-method chunk — all tagged
+    /// chunker=tree-sitter, no PATH dependency.
     #[test]
-    fn slice_for_symbol_clamps_to_file() {
-        let body = "a\nb\nc\nd\ne\nf\n";
-        let lines: Vec<&str> = body.split_inclusive('\n').collect();
-        // symbol on line 4 with leading=2 → start at line 2 (b)
-        let sym = RustSymbol {
-            name: "x".into(),
-            kind: "fn".into(),
-            line_start: 4,
-            line_end: 5,
-        };
-        let s = slice_for_symbol(&lines, &sym, 2);
-        assert_eq!(s, "b\nc\nd\ne\n");
-    }
-
-    #[test]
-    fn slice_for_symbol_handles_oversized_end() {
-        let body = "a\nb\nc\n";
-        let lines: Vec<&str> = body.split_inclusive('\n').collect();
-        let sym = RustSymbol {
-            name: "x".into(),
-            kind: "fn".into(),
-            line_start: 2,
-            line_end: u32::MAX,
-        };
-        let s = slice_for_symbol(&lines, &sym, 0);
-        assert_eq!(s, "b\nc\n");
-    }
-
-    /// Live integration: when `fcp-rust` is on PATH, parsing a real
-    /// Rust file inside the ostk-recall workspace should yield multiple
-    /// symbol-bounded chunks (not one line-window chunk).
-    #[test]
-    fn parse_rust_file_uses_fcp_rust_when_available() {
-        if which::which("fcp-rust").is_err() {
-            eprintln!("skipping: fcp-rust not on PATH");
-            return;
-        }
-        // Test from inside this workspace so find_cargo_workspace succeeds.
-        let cwd = std::env::current_dir().unwrap();
-        let ws = fcp_rust::find_cargo_workspace(&cwd).unwrap_or(cwd);
-        let target = ws.join("crates/scan/src/code.rs");
-        if !target.exists() {
-            eprintln!("skipping: fixture file missing");
-            return;
-        }
+    fn parse_rust_struct_and_impl_methods() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("widget.rs");
+        std::fs::write(
+            &file,
+            "/// A widget.\npub struct Widget {\n    n: u32,\n}\n\nimpl Widget {\n    /// Make one.\n    pub fn new() -> Self {\n        Self { n: 0 }\n    }\n    pub fn bump(&mut self) {\n        self.n += 1;\n    }\n}\n",
+        )
+        .unwrap();
         let scanner = CodeScanner;
-        let item = SourceItem {
-            source_id: "crates/scan/src/code.rs".into(),
-            path: Some(target),
-            project: Some("test".into()),
-            bytes: None,
-            ignore: Vec::new(),
-            source_config_id: "test-cfg".into(),
-        };
+        let cfg = cfg_with(tmp.path(), &["rs"]);
+        let item = scanner.discover(&cfg).next().unwrap().unwrap();
         let chunks = scanner.parse(item).expect("parse failed");
-        assert!(
-            chunks.len() >= 3,
-            "expected multiple symbol chunks, got {}",
-            chunks.len()
-        );
-        // At least one chunk should carry the synthetic header for CodeScanner.
-        let has_header = chunks.iter().any(|c| {
-            c.text.starts_with("// struct CodeScanner") || c.text.contains("// struct CodeScanner")
-        });
-        assert!(has_header, "expected CodeScanner symbol header");
-        // Extra metadata should be populated.
-        let with_extra = chunks
+
+        for c in &chunks {
+            assert_eq!(
+                c.extra.get("chunker").and_then(|v| v.as_str()),
+                Some("tree-sitter")
+            );
+        }
+        let headers: Vec<&str> = chunks.iter().map(|c| c.text.lines().next().unwrap()).collect();
+        assert!(headers.iter().any(|h| h.starts_with("// struct Widget")), "{headers:?}");
+        assert!(headers.iter().any(|h| h.starts_with("// impl Widget")), "{headers:?}");
+        assert!(headers.iter().any(|h| h.starts_with("// fn new")), "{headers:?}");
+        assert!(headers.iter().any(|h| h.starts_with("// fn bump")), "{headers:?}");
+        // Leading doc comment is captured on the struct chunk.
+        let struct_chunk = chunks
             .iter()
-            .find(|c| c.extra.get("chunker").and_then(|v| v.as_str()) == Some("fcp-rust"))
-            .expect("expected at least one chunk tagged chunker=fcp-rust");
-        assert!(with_extra.extra.get("symbols").is_some());
+            .find(|c| c.text.starts_with("// struct Widget"))
+            .unwrap();
+        assert!(struct_chunk.text.contains("/// A widget."));
     }
 }

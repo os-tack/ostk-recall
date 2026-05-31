@@ -15,6 +15,7 @@ ostk-recall-core = { workspace = true }
 ostk-recall-store = { workspace = true }
 ostk-recall-embed = { workspace = true }
 ostk-recall-pipeline = { workspace = true }
+async-trait = { workspace = true }
 lancedb = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

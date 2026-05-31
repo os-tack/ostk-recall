@@ -34,7 +34,8 @@ pub use query::{
     ThreadQueryParams, ThreadQueryReport, run_query,
 };
 pub use weaver::{
-    AutoWeaver, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome, WeaverThresholds,
+    AutoWeaver, ConsolidateOutcome, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome,
+    WeaverThresholds,
 };
 
 use std::collections::HashMap;
@@ -71,13 +72,86 @@ pub const ARCHIVE_THRESHOLD: f32 = 0.1;
 /// embedding more eagerly.
 pub const DEFAULT_ATTENTION_LAMBDA: f32 = 0.3;
 
-/// Familiarity at which decay flattens to `DECAY_RATE_FAMILIAR`.
+/// Familiarity at which decay flattens to `DECAY_RATE_FAMILIAR`, and at
+/// which the resonance-driven floor saturates to 1.0.
 pub const FAMILIARITY_SATURATION: u32 = 20;
+
+// --- salience-vs-familiarity (resonance-gated familiarity) -------------
+// `mentions` is document-frequency in disguise; it no longer buys idle
+// floor. The floor is driven by `resonance` — recurrence that landed in a
+// turn genuinely aligned with the thread's anchor.
+
+/// Cosine (anchor vs the scope's effective attention vector) at/above which
+/// a mention counts as *resonant* and increments the salience counter.
+/// Tuned against the known good/bad set: `north-star` / `cognitive-memory`
+/// should clear it on real work; `top-level` / `no-op` / `non-blocking`
+/// should not on unrelated turns. See `salience-vs-familiarity.md`.
+pub const RESONANCE_GATE: f32 = 0.25;
+
+/// A handle needs at least this many raw `mentions` before the derived
+/// stop-handle classifier will consider it (below this there isn't enough
+/// frequency evidence to call it a stopword).
+pub const STOPWORD_MENTION_MIN: u32 = 50;
+
+/// If a high-`mentions` handle's resonance rate (`resonance / mentions`)
+/// is *below* this, it is a frequency-derived stopword: ubiquitous but
+/// rarely resonant → never mint or promote a thread for it.
+pub const STOPWORD_RATE_MAX: f32 = 0.05;
+
+/// Derived stop-handle classifier (no hand-list): a handle that recurs a
+/// lot (`mentions >= STOPWORD_MENTION_MIN`) but seldom resonates
+/// (`resonance / mentions < STOPWORD_RATE_MAX`) is a generic-vocab
+/// stopword. Gate, don't delete — the thread stays reachable; it just
+/// never gets minted/promoted to buy dominance.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn is_stop_handle(mentions: u32, resonance: u32) -> bool {
+    if mentions < STOPWORD_MENTION_MIN {
+        return false;
+    }
+    let rate = resonance as f32 / mentions as f32;
+    rate < STOPWORD_RATE_MAX
+}
 
 /// Tension below this counts as "dormant enough" for off-diagonal lift.
 pub const OFF_DIAGONAL_TENSION_MAX: f32 = 0.2;
-/// Resonance above this counts as "resonant enough" for off-diagonal lift.
-pub const OFF_DIAGONAL_RESONANCE_MIN: f32 = 0.7;
+/// `resonance_count` at/below which a thread is "rarely established" and thus
+/// eligible for the off-diagonal *surprise* lift. This is the discriminator
+/// that keeps broad attractors out: live observation (membrane-connector-gap
+/// + session-meta-log) shows central concepts like `cognitive-memory` /
+/// `cross-scope` sit at 8–15 resonant turns while genuine dormant bridges sit
+/// at 0–3. A thread that has resonated many times is *established*, not a
+/// surprise. (Config-exposure via a `[attention]` section is a follow-up; this
+/// mirrors the other module-level scoring consts.)
+pub const OFF_DIAGONAL_ESTABLISHED_MAX: u32 = 5;
+/// Absolute resonance floor below which nothing is "surprising enough" to lift,
+/// regardless of dormancy — keeps embedding noise (~0.2) out. Real on-topic
+/// resonance against good anchors reaches ~0.3–0.53 (the old absolute gate of
+/// 0.7 was unreachable in the wild — see membrane-connector-gap finding #1).
+pub const OFF_DIAGONAL_RESONANCE_FLOOR: f32 = 0.30;
+
+// --- edge activation (P11b-full) ------------------------------------------
+// Componentized activation for evidence edges, per the ratified
+// p11-temporal-consolidation decision: f(similarity, time-distance,
+// last_touched_at, touch_count) with decay. Edges saturate faster than
+// threads — a handful of re-resonances is already a strong "this bridge
+// keeps mattering" signal — so the touch curve uses its own saturation.
+
+/// `touch_count` at which an edge's activation floor / slow-decay flattens.
+pub const EDGE_TOUCH_SATURATION: u32 = 8;
+/// Idle-decay per day for a single-touch edge.
+pub const EDGE_DECAY_RATE_BASE: f32 = 0.08;
+/// Idle-decay per day for a saturated (heavily re-touched) edge.
+pub const EDGE_DECAY_RATE_FAMILIAR: f32 = 0.01;
+/// Similarity at/above which the time-distance bridge bonus applies. Below
+/// it, age does NOT rescue a weak match (ratified decision #2: time
+/// distance upweights high-similarity bridges, it does not rescue weak
+/// semantic matches).
+pub const EDGE_BRIDGE_SIMILARITY_MIN: f32 = 0.7;
+/// Max multiplicative bridge bonus for a maximally long-range, high-sim edge.
+pub const EDGE_BRIDGE_GAIN: f32 = 0.5;
+/// Age (days) at which the bridge bonus reaches its cap.
+pub const EDGE_BRIDGE_AGE_REF_DAYS: f32 = 365.0;
 
 /// Linear interpolation between BASE and FAMILIAR over F in `[0, FAMILIARITY_SATURATION]`.
 #[must_use]
@@ -98,6 +172,61 @@ pub fn familiarity_floor(familiarity: u32) -> f32 {
         (familiarity as f32 / FAMILIARITY_SATURATION as f32).min(1.0),
         0.1,
     )
+}
+
+/// Edge activation floor, rising 0.1 → 1.0 as `touch_count` climbs to
+/// `EDGE_TOUCH_SATURATION`. Analogous to `familiarity_floor` but on the
+/// faster edge-touch curve.
+#[must_use]
+// A fresh edge has touch_count 1 (one resonance), so the curve is keyed
+// on `touch_count - 1`: a single-touch edge sits at the baseline (lowest
+// floor, fastest decay) and saturates after `EDGE_TOUCH_SATURATION`
+// *additional* touches.
+#[allow(clippy::cast_precision_loss)]
+pub fn edge_touch_floor(touch_count: u32) -> f32 {
+    0.9f32.mul_add(
+        (touch_count.saturating_sub(1) as f32 / EDGE_TOUCH_SATURATION as f32).min(1.0),
+        0.1,
+    )
+}
+
+/// Per-day idle decay for an edge, interpolating BASE → FAMILIAR as
+/// `touch_count` saturates. Heavily re-touched edges decay slower.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn edge_decay_rate(touch_count: u32) -> f32 {
+    let t = (touch_count.saturating_sub(1) as f32 / EDGE_TOUCH_SATURATION as f32).min(1.0);
+    (EDGE_DECAY_RATE_FAMILIAR - EDGE_DECAY_RATE_BASE).mul_add(t, EDGE_DECAY_RATE_BASE)
+}
+
+/// Componentized edge activation `f(similarity, age_days, idle_days, touch_count)`.
+///
+/// Two components, combined multiplicatively so that activation **decays to
+/// zero if the edge is never re-touched** (ratified decision #2 — the lens
+/// must not become a hairball), while the durable row is never deleted:
+///
+/// - **recency gate** = `edge_touch_floor(tc) · exp(-edge_decay_rate(tc) · idle_days)`.
+///   `idle_days` is time since `last_touched_at`. Touches raise the floor and
+///   slow the decay, so a bridge that keeps re-resonating stays warm.
+/// - **bridge factor** = `similarity · (1 + bonus)`, where the time-distance
+///   `bonus` upweights *high-similarity* long-range edges (`age_days` since
+///   creation) — a canyon-spanning resonance is worth more than same-day
+///   context. Below `EDGE_BRIDGE_SIMILARITY_MIN` the bonus is 0: age does not
+///   rescue a weak match.
+///
+/// Result is `>= 0` (bounded by ~`1.0 * (1 + EDGE_BRIDGE_GAIN)`).
+#[must_use]
+pub fn edge_activation(similarity: f32, age_days: f32, idle_days: f32, touch_count: u32) -> f32 {
+    let idle = idle_days.max(0.0);
+    let recency = edge_touch_floor(touch_count) * (-edge_decay_rate(touch_count) * idle).exp();
+    let sim = similarity.clamp(0.0, 1.0);
+    let bonus = if sim >= EDGE_BRIDGE_SIMILARITY_MIN {
+        let frac = (age_days.max(0.0).ln_1p() / EDGE_BRIDGE_AGE_REF_DAYS.ln_1p()).min(1.0);
+        EDGE_BRIDGE_GAIN * frac
+    } else {
+        0.0
+    };
+    recency * sim * (1.0 + bonus)
 }
 
 /// Cosine similarity. Returns 0.0 if either vector is zero-norm or empty,
@@ -122,20 +251,43 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Gate for the off-diagonal "surprising discovery" quadrant.
+/// Off-diagonal "surprising discovery" lift — the north-star associative
+/// bridge: an *old, rarely-resonant* idea that *acutely* resonates with
+/// current work.
 ///
-/// Returns 1.0 when both `tension < OFF_DIAGONAL_TENSION_MAX` and
-/// `resonance > OFF_DIAGONAL_RESONANCE_MIN`; 0.0 otherwise. The score
-/// formula multiplies this gate by `BETA`, and the attribution carries
-/// that already-weighted value so attribution rows sum to `score`
-/// cleanly.
+/// The old gate fired on `resonance > 0.7` absolute, which never happened in
+/// the wild (real resonance tops out ~0.5) and — worse — high *raw* resonance
+/// favours broad attractors that resonate with everything, the opposite of a
+/// surprise. This is now a **graded, multi-signal surprise gate** keyed on
+/// existing state (no new schema):
+///
+/// - `tension < OFF_DIAGONAL_TENSION_MAX` — the idea is dormant; AND
+/// - `resonance_count <= OFF_DIAGONAL_ESTABLISHED_MAX` and not a stop-handle —
+///   it is *rarely established* (this is what excludes broad attractors, which
+///   carry high resonance counts); AND
+/// - `resonance >= OFF_DIAGONAL_RESONANCE_FLOOR` — it is *acutely* resonating
+///   now, above the embedding-noise floor.
+///
+/// Returns a value in `[0, 1]`, **graded** by how far `resonance` clears the
+/// floor toward 1.0 so the strongest surprise leads (the old binary 0/1 is the
+/// degenerate case at `resonance = 1.0`, which still yields 1.0). The score
+/// formula multiplies this by `BETA`, and the attribution carries that
+/// already-weighted value so rows sum to `score` cleanly.
+///
+/// NOTE: the additive lift alone cannot surface a dormant low-count thread
+/// above an *established* one — the latter's `familiarity_floor` gap exceeds
+/// the max lift `BETA`. `surface()` therefore also reserves a *bridge slot*
+/// for the strongest-lift thread; this graded value ranks candidates for it.
 #[must_use]
-pub fn off_diagonal_lift_gate(tension: f32, resonance: f32) -> f32 {
-    if tension < OFF_DIAGONAL_TENSION_MAX && resonance > OFF_DIAGONAL_RESONANCE_MIN {
-        1.0
-    } else {
-        0.0
+pub fn off_diagonal_lift(tension: f32, resonance: f32, resonance_count: u32, is_stop: bool) -> f32 {
+    if tension >= OFF_DIAGONAL_TENSION_MAX
+        || is_stop
+        || resonance_count > OFF_DIAGONAL_ESTABLISHED_MAX
+        || resonance < OFF_DIAGONAL_RESONANCE_FLOOR
+    {
+        return 0.0;
     }
+    ((resonance - OFF_DIAGONAL_RESONANCE_FLOOR) / (1.0 - OFF_DIAGONAL_RESONANCE_FLOOR)).clamp(0.0, 1.0)
 }
 
 // --- errors ------------------------------------------------------------
@@ -235,12 +387,51 @@ pub trait AttentionForwardStore: Send + Sync {
         depth: FoldDepth,
     ) -> Result<(), AttentionError>;
 
-    /// Increment familiarity for a handle (called per turn-end).
+    /// Observe a mention of `handle` in the current turn (called per
+    /// turn-end). Increments the raw `mentions` counter unconditionally
+    /// and the resonance-gated salience counter iff the turn resonates
+    /// with the thread anchor (cosine >= [`RESONANCE_GATE`]).
+    ///
+    /// Returns `true` iff the mention was resonant, so the durable layer
+    /// can gate its own `increment_resonance` on the *same* decision the
+    /// in-memory mirror used (one cosine compute, no divergence).
     async fn familiarize(
         &self,
         scope: &AttentionScope,
         handle: &ThreadHandle,
-    ) -> Result<(), AttentionError>;
+    ) -> Result<bool, AttentionError>;
+
+    /// Resonance of `handle` against `scope`'s effective attention vector:
+    /// `cosine(anchor, effective_vec)`, the same quantity
+    /// `compute_score_parts` uses for the resonance term. The anchor is
+    /// resolved to the thread's *true* identity — a non-empty scope-local
+    /// anchor if present, else the corpus-seeded anchor from any scope —
+    /// so the gate measures alignment-to-identity, not alignment-to-now.
+    /// Default `0.0` for stores without per-scope vector state.
+    async fn resonance(
+        &self,
+        _scope: &AttentionScope,
+        _handle: &ThreadHandle,
+    ) -> Result<f32, AttentionError> {
+        Ok(0.0)
+    }
+
+    /// Install or replace a thread's anchor vector in `scope`.
+    ///
+    /// Used by the boot-time re-anchoring pass (`cli::commands::serve`)
+    /// and by `thread_create`'s live-seed path to pull a thread's
+    /// persistent `anchor_chunk_id` embedding from the corpus and seed
+    /// its in-memory anchor — so a freshly created waypoint resonates
+    /// without waiting for the next `serve` boot. Stores without
+    /// per-scope vector state no-op (default).
+    async fn seed_anchor(
+        &self,
+        _scope: &AttentionScope,
+        _handle: ThreadHandle,
+        _anchor: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        Ok(())
+    }
 
     /// Apply an explicit fade factor (multiplies the floor).
     async fn decay(&self, handle: &ThreadHandle, factor: f32) -> Result<(), AttentionError>;
@@ -322,7 +513,15 @@ pub trait AttentionForwardStore: Send + Sync {
 #[derive(Debug, Clone)]
 struct ThreadState {
     tension: f32,
-    familiarity: u32,
+    /// Raw literal-match recurrence (pre-split `familiarity`). Drives the
+    /// decay *rate* (deeply-mentioned threads decay slower) but NOT the
+    /// floor — frequency alone no longer buys idle dominance.
+    mentions: u32,
+    /// Resonance-gated salience counter. Drives `familiarity_floor`: the
+    /// idle floor rises only as the thread genuinely resonates with
+    /// present work. Reset to 0 on migration; re-earned within a turn or
+    /// two by real ideas, never by filler.
+    resonance: u32,
     last_touched_at: DateTime<Utc>,
     depth: FoldDepth,
     /// Operator-applied multiplicative fade (1.0 = no fade).
@@ -505,10 +704,40 @@ fn compute_score_parts(
     let resonance = cosine_similarity(&state.anchor, attention_vec);
     let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
     let dt_days = dt_secs as f32 / 86_400.0;
-    let floor = familiarity_floor(state.familiarity) * state.fade_multiplier;
-    let decay_term = floor * (-decay_rate(state.familiarity) * dt_days).exp();
+    // Floor is driven by the resonance *counter* (salience), not raw
+    // mentions: a thread surfaces at idle only to the extent it has
+    // genuinely resonated. Decay *rate* still tracks mentions (the
+    // decay_rate rework is deferred) so a frequently-seen thread fades
+    // gently — but from a baseline floor, so it can't dominate.
+    //
+    // Context-diversity gate (frontier-resonance-gate-tuning): a
+    // frequency-derived stop-handle (high mentions, low resonance rate
+    // — `is_stop_handle`) has its resonance *diluted* across ubiquitous
+    // co-occurrence. The raw `resonance` count is then a poor salience
+    // proxy: `top-level` resonated 11 times across 1177 mentions
+    // (rate 0.009) — enough to lift its floor a hair above a real idea
+    // like `cognitive-memory` (11/22, rate 0.5). The resonance/mentions
+    // rate is the durable, already-tracked proxy for resonance *spread*
+    // (11 hits in 1177 contexts is narrow; 11 in 22 is concentrated), so
+    // a stop-handle is weighted down to the unresonant baseline floor.
+    // Gate, don't delete: the durable row and `recall` / `thread_list`
+    // reachability are untouched; only the proactive surfacer floor is
+    // clamped, so diluted resonance never buys idle dominance.
+    let resonance_floor = if is_stop_handle(state.mentions, state.resonance) {
+        familiarity_floor(0)
+    } else {
+        familiarity_floor(state.resonance)
+    };
+    let floor = resonance_floor * state.fade_multiplier;
+    let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
     let resonance_term = ALPHA * resonance;
-    let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
+    let lift_term = BETA
+        * off_diagonal_lift(
+            state.tension,
+            resonance,
+            state.resonance,
+            is_stop_handle(state.mentions, state.resonance),
+        );
     let score = decay_term + resonance_term + lift_term;
     ScoreParts {
         score,
@@ -516,6 +745,89 @@ fn compute_score_parts(
         lift_term,
         dt_secs,
     }
+}
+
+/// Reserve a "bridge slot" for the strongest off-diagonal surprise.
+///
+/// An additive `off_diagonal_lift` cannot, on its own, surface a dormant
+/// low-`resonance_count` thread above an *established* one: the established
+/// thread's `familiarity_floor` advantage exceeds the maximum lift (`BETA`),
+/// so even a perfectly-calibrated lift leaves the bridge buried (membrane-
+/// connector-gap session finding M5). This guarantees the single highest-lift
+/// thread a seat within `limit` — taking the last slot when it would otherwise
+/// fall outside — mirroring the reserved-ambient slot and the lens portfolio's
+/// diversity-jump. `pages` must already be sorted by score descending.
+fn reserve_bridge_slot(pages: &mut Vec<AttentionPage>, limit: usize) {
+    if limit == 0 {
+        pages.clear();
+        return;
+    }
+    let bridge_idx = pages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.why.off_diagonal_lift > 0.0)
+        .max_by(|(_, a), (_, b)| {
+            a.why
+                .off_diagonal_lift
+                .partial_cmp(&b.why.off_diagonal_lift)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i);
+    match bridge_idx {
+        // The strongest surprise would be truncated away — reserve it the last
+        // seat, keeping the top `limit - 1` by score.
+        Some(bi) if bi >= limit => {
+            let bridge = pages.remove(bi);
+            pages.truncate(limit - 1);
+            pages.push(bridge);
+        }
+        // Bridge already within `limit`, or no surprise present.
+        _ => pages.truncate(limit),
+    }
+}
+
+/// Resolve `handle`'s *true* anchor across scopes: prefer a non-empty
+/// anchor in `key`'s own scope, else the first non-empty anchor found in
+/// any other scope (the corpus-seeded anchor lives in the boot `replay`
+/// scope while the live observer runs in the `ambient` scope). Returns an
+/// empty slice's worth of `Vec` if no scope has a non-empty anchor.
+fn resolve_anchor(
+    scopes: &HashMap<ScopeKey, ScopeState>,
+    key: &ScopeKey,
+    handle: &ThreadHandle,
+) -> Vec<f32> {
+    if let Some(t) = scopes.get(key).and_then(|s| s.threads.get(handle)) {
+        if !t.anchor.is_empty() {
+            return t.anchor.clone();
+        }
+    }
+    for (k, s) in scopes {
+        if k == key {
+            continue;
+        }
+        if let Some(t) = s.threads.get(handle) {
+            if !t.anchor.is_empty() {
+                return t.anchor.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Cosine of `handle`'s resolved anchor against `key`-scope's effective
+/// attention vector — the resonance the gate and `resonance()` read.
+/// 0.0 when either side is empty (no anchor / never attended).
+fn resonance_value(
+    scopes: &HashMap<ScopeKey, ScopeState>,
+    key: &ScopeKey,
+    handle: &ThreadHandle,
+) -> f32 {
+    let effective = scopes
+        .get(key)
+        .map(|s| s.effective_vec().to_vec())
+        .unwrap_or_default();
+    let anchor = resolve_anchor(scopes, key, handle);
+    cosine_similarity(&anchor, &effective)
 }
 
 #[derive(Clone)]
@@ -607,48 +919,43 @@ impl InMemoryAttention {
         self.embedder.as_ref().map(|e| e.dim())
     }
 
-    /// Install or replace a thread's anchor vector. Used by the
-    /// boot-time re-anchoring pass in `cli::commands::serve` to
-    /// pull each thread's persistent `anchor_chunk_id` from the
-    /// corpus and seed its in-memory anchor with the real
-    /// embedder's vector. Without this, threads materialised by
-    /// chain replay carry empty anchors (resonance = 0) until
-    /// they're touched by a fresh `familiarize` or `fold` — and
-    /// even then, the anchor would only reflect the scope's
-    /// current attention vector, not the thread's persistent
-    /// identity in the corpus.
-    ///
-    /// The corresponding scope is implied by the caller (replay
-    /// scope today; could be the thread's `created_scope_key`
-    /// once that's plumbed through). If the thread already has
-    /// in-memory state, only the anchor is replaced — tension,
-    /// familiarity, last_touched_at, and depth are preserved.
+    /// Materialise `handle` in `scope` (if absent) and SET its durable
+    /// recurrence counters to the given values. Used by boot chain replay
+    /// to restore the exact `(mentions, resonance)` a `FamiliarityBatch`
+    /// recorded — not an increment, a verbatim restore (last batch per
+    /// handle wins, since chain rows arrive chronologically). The anchor
+    /// is seeded from the scope's transient if the thread is new; the
+    /// boot re-anchor pass overwrites it with the corpus anchor after.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn seed_anchor(
+    pub async fn seed_counters(
         &self,
         scope: &AttentionScope,
-        handle: ThreadHandle,
-        anchor: Vec<f32>,
+        handle: &ThreadHandle,
+        mentions: u32,
+        resonance: u32,
     ) -> Result<(), AttentionError> {
         let key = ScopeKey::from(scope);
         let was_private = scope.privacy_tier == PrivacyTier::T0Private;
         let now = Utc::now();
         let mut inner = self.inner.write().await;
         let scope_state = inner.scopes.entry(key.clone()).or_default();
-        scope_state
+        let anchor_seed = scope_state.transient_vec.clone();
+        let thread = scope_state
             .threads
-            .entry(handle)
-            .and_modify(|t| t.anchor.clone_from(&anchor))
+            .entry(handle.clone())
             .or_insert_with(|| ThreadState {
                 tension: 0.0,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: now,
                 depth: FoldDepth::Folded,
                 fade_multiplier: 1.0,
-                anchor,
-                origin: key,
+                anchor: anchor_seed,
+                origin: key.clone(),
                 origin_was_private: was_private,
             });
+        thread.mentions = mentions;
+        thread.resonance = resonance;
         Ok(())
     }
 
@@ -926,8 +1233,19 @@ impl InMemoryAttention {
                 ReplayEvent::Attend { scope, context } => {
                     self.attend(scope, context).await?;
                 }
-                ReplayEvent::Familiarize { scope, handle } => {
-                    self.familiarize(scope, handle).await?;
+                ReplayEvent::Familiarize {
+                    scope,
+                    handle,
+                    mentions,
+                    resonance,
+                } => {
+                    // Replay SETS the exact post-batch counters from the
+                    // chain rather than re-running the self-gating
+                    // familiarize(): the replay scope has no attention
+                    // vector, so resonance could never be recomputed here.
+                    // The chain carries the durable truth; replay restores it.
+                    self.seed_counters(scope, handle, *mentions, *resonance)
+                        .await?;
                 }
                 ReplayEvent::Decay { handle, factor } => {
                     self.decay(handle, *factor).await?;
@@ -954,9 +1272,13 @@ pub enum ReplayEvent {
         scope: AttentionScope,
         context: String,
     },
+    /// Restore a thread's durable recurrence counters verbatim from a
+    /// `FamiliarityBatch` chain row (post-batch `mentions` / `resonance`).
     Familiarize {
         scope: AttentionScope,
         handle: ThreadHandle,
+        mentions: u32,
+        resonance: u32,
     },
     Decay {
         handle: ThreadHandle,
@@ -1027,6 +1349,45 @@ impl AttentionForwardStore for InMemoryAttention {
         })
     }
 
+    /// Install or replace a thread's anchor vector in `scope`.
+    ///
+    /// Without this, threads materialised by chain replay carry empty
+    /// anchors (resonance = 0) until touched by a fresh `familiarize`
+    /// or `fold` — and even then, the anchor would only reflect the
+    /// scope's current attention vector, not the thread's persistent
+    /// identity in the corpus. If the thread already has in-memory
+    /// state, only the anchor is replaced — tension, familiarity,
+    /// last_touched_at, and depth are preserved.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn seed_anchor(
+        &self,
+        scope: &AttentionScope,
+        handle: ThreadHandle,
+        anchor: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        let key = ScopeKey::from(scope);
+        let was_private = scope.privacy_tier == PrivacyTier::T0Private;
+        let now = Utc::now();
+        let mut inner = self.inner.write().await;
+        let scope_state = inner.scopes.entry(key.clone()).or_default();
+        scope_state
+            .threads
+            .entry(handle)
+            .and_modify(|t| t.anchor.clone_from(&anchor))
+            .or_insert_with(|| ThreadState {
+                tension: 0.0,
+                mentions: 0,
+                resonance: 0,
+                last_touched_at: now,
+                depth: FoldDepth::Folded,
+                fade_multiplier: 1.0,
+                anchor,
+                origin: key,
+                origin_was_private: was_private,
+            });
+        Ok(())
+    }
+
     async fn surface(
         &self,
         scope: &AttentionScope,
@@ -1034,43 +1395,124 @@ impl AttentionForwardStore for InMemoryAttention {
     ) -> Result<Vec<AttentionPage>, AttentionError> {
         let key = ScopeKey::from(scope);
         let inner = self.inner.read().await;
-        let Some(scope_state) = inner.scopes.get(&key) else {
-            return Ok(vec![]);
+        let now = Utc::now();
+
+        // Cross-scope surface (frontier-surfacer-scope). Threads are
+        // fragmented across scope keys — boot re-anchor lands corpus
+        // anchors in the `replay` scope, the live observer writes
+        // project-keyed `ambient` scopes, and a hand-authored waypoint's
+        // anchor is wherever it was seeded. A scope-local surface() (the
+        // old behaviour) meant the live attention vector never scored the
+        // corpus-anchored threads, so `attention_surface` returned `[]`
+        // even with a healthy graph. Mirror `score_thread`'s
+        // max-across-scopes: rank EVERY thread against the *query* scope's
+        // effective vector and keep the best-scoring instance per handle.
+        // Score EVERY visible thread against `query_vec`, keeping the
+        // best-scoring instance per handle, sorted descending. Factored into
+        // a closure so the pin-as-lens path below can score twice: once
+        // against the (possibly pinned) effective vector, and once against
+        // the un-pinned ambient vector.
+        let score_against = |query_vec: &[f32]| -> Vec<AttentionPage> {
+            let mut best: HashMap<String, AttentionPage> = HashMap::new();
+            for (sk, scope_state) in &inner.scopes {
+                // Per-project isolation holds: a thread surfaces in the query
+                // scope only if it shares the query's project, OR it lives in
+                // the cross-project `project = None` substrate namespace —
+                // where boot re-anchor lands the durable thread identities
+                // (the corpus-anchored salience threads + hand-authored
+                // waypoints). That `None` namespace is the connective tissue
+                // the lens must see from any project; other projects' threads
+                // stay isolated.
+                let project_visible = sk.project == key.project || sk.project.is_none();
+                if !project_visible {
+                    continue;
+                }
+                for (handle, state) in &scope_state.threads {
+                    // Privacy isolation is unchanged: a T0Private thread only
+                    // surfaces in its origin scope.
+                    if !should_surface_thread(state, &key) {
+                        continue;
+                    }
+                    let parts = compute_score_parts(state, query_vec, now);
+                    if parts.score < ARCHIVE_THRESHOLD {
+                        continue;
+                    }
+                    let page = AttentionPage {
+                        handle: handle.to_string(),
+                        depth: state.depth,
+                        score: parts.score,
+                        why: ScoreAttribution {
+                            tension: state.tension,
+                            resonance: parts.resonance,
+                            mentions: state.mentions,
+                            resonance_count: state.resonance,
+                            // Already-weighted contribution so attribution
+                            // axes sum (within float tolerance) to `score`.
+                            off_diagonal_lift: parts.lift_term,
+                            time_since_touch_secs: parts.dt_secs,
+                        },
+                    };
+                    best
+                        .entry(handle.to_string())
+                        .and_modify(|existing| {
+                            if page.score > existing.score {
+                                *existing = page.clone();
+                            }
+                        })
+                        .or_insert(page);
+                }
+            }
+            let mut pages: Vec<AttentionPage> = best.into_values().collect();
+            pages.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            pages
         };
 
-        let now = Utc::now();
-        let mut pages: Vec<AttentionPage> = scope_state
-            .threads
-            .iter()
-            .filter(|(_, t)| should_surface_thread(t, &key))
-            .filter_map(|(handle, state)| {
-                let parts = compute_score_parts(state, scope_state.effective_vec(), now);
-                if parts.score < ARCHIVE_THRESHOLD {
-                    return None;
-                }
-                Some(AttentionPage {
-                    handle: handle.to_string(),
-                    depth: state.depth,
-                    score: parts.score,
-                    why: ScoreAttribution {
-                        tension: state.tension,
-                        resonance: parts.resonance,
-                        familiarity: state.familiarity,
-                        // Already-weighted contribution so attribution
-                        // axes sum (within float tolerance) to `score`.
-                        off_diagonal_lift: parts.lift_term,
-                        time_since_touch_secs: parts.dt_secs,
-                    },
-                })
-            })
-            .collect();
+        let query_state = inner.scopes.get(&key);
+        let query_vec: Vec<f32> = query_state
+            .map(|s| s.effective_vec().to_vec())
+            .unwrap_or_default();
+        let mut pages = score_against(&query_vec);
 
-        pages.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        pages.truncate(limit);
+        // Pin = lens, not blinders (membrane-connector-gap finding #2). While
+        // a pin is set, `effective_vec()` (hence `query_vec`) is the pinned
+        // vector verbatim, so a scope-wide surface would be BLIND to a live
+        // bridge that resonates with the un-pinned conversational signal —
+        // exactly the stale-pin hazard that masks a fresh session. Reserve a
+        // slice of the surface for threads ranked against the un-pinned
+        // ambient vector (rolling → transient), so a focus BIASES what
+        // surfaces without blinding it. Strictly additive: a no-op when
+        // unpinned, or when the ambient vector is empty or equals the pin.
+        let ambient_vec: Vec<f32> = query_state
+            .filter(|s| s.pinned_focus.is_some())
+            .map(|s| match &s.rolling_vec {
+                Some(rv) if !rv.is_empty() => rv.clone(),
+                _ => s.transient_vec.clone(),
+            })
+            .unwrap_or_default();
+
+        if limit > 1 && !ambient_vec.is_empty() && ambient_vec != query_vec {
+            let reserve = (limit / 4).max(1);
+            pages.truncate(limit.saturating_sub(reserve));
+            for page in score_against(&ambient_vec) {
+                if pages.len() >= limit {
+                    break;
+                }
+                if pages.iter().any(|kept| kept.handle == page.handle) {
+                    continue;
+                }
+                pages.push(page);
+            }
+            return Ok(pages);
+        }
+
+        // Reserved bridge slot (off-diagonal calibration, membrane-connector-gap
+        // finding #1 + M5): the strongest off-diagonal surprise is guaranteed a
+        // seat even when an established thread's familiarity floor would bury it.
+        reserve_bridge_slot(&mut pages, limit);
         Ok(pages)
     }
 
@@ -1094,7 +1536,8 @@ impl AttentionForwardStore for InMemoryAttention {
             .entry(handle.clone())
             .or_insert_with(|| ThreadState {
                 tension: 0.0,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: Utc::now(),
                 depth,
                 fade_multiplier: 1.0,
@@ -1110,11 +1553,13 @@ impl AttentionForwardStore for InMemoryAttention {
         &self,
         scope: &AttentionScope,
         handle: &ThreadHandle,
-    ) -> Result<(), AttentionError> {
+    ) -> Result<bool, AttentionError> {
         let key = ScopeKey::from(scope);
         let mut inner = self.inner.write().await;
         let scope_state = inner.scopes.entry(key.clone()).or_default();
-        // Same anchor-seed reasoning as fold(): transient only.
+        // Same anchor-seed reasoning as fold(): transient only. A
+        // brand-new mint anchors on the current turn, so it resonates
+        // with itself (resonance seeded to 1) — "seed resonance=1 on mint".
         let anchor_seed = scope_state.transient_vec.clone();
         let was_private = scope.privacy_tier == PrivacyTier::T0Private;
         let thread = scope_state
@@ -1122,7 +1567,8 @@ impl AttentionForwardStore for InMemoryAttention {
             .entry(handle.clone())
             .or_insert_with(|| ThreadState {
                 tension: 0.0,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: Utc::now(),
                 depth: FoldDepth::Folded,
                 fade_multiplier: 1.0,
@@ -1130,9 +1576,35 @@ impl AttentionForwardStore for InMemoryAttention {
                 origin: key.clone(),
                 origin_was_private: was_private,
             });
-        thread.familiarity = thread.familiarity.saturating_add(1);
+        // mentions advance on every observation (raw recurrence).
+        thread.mentions = thread.mentions.saturating_add(1);
         thread.last_touched_at = Utc::now();
-        Ok(())
+
+        // Resonance is gated: compute cosine(true-anchor, effective_vec)
+        // — resolving the anchor across scopes so the gate sees the
+        // thread's identity, not a transient first-mention vector. The
+        // mutable borrow above ends here; re-borrow immutably to read.
+        let resonant = resonance_value(&inner.scopes, &key, handle) >= RESONANCE_GATE;
+        if resonant {
+            if let Some(t) = inner
+                .scopes
+                .get_mut(&key)
+                .and_then(|s| s.threads.get_mut(handle))
+            {
+                t.resonance = t.resonance.saturating_add(1);
+            }
+        }
+        Ok(resonant)
+    }
+
+    async fn resonance(
+        &self,
+        scope: &AttentionScope,
+        handle: &ThreadHandle,
+    ) -> Result<f32, AttentionError> {
+        let key = ScopeKey::from(scope);
+        let inner = self.inner.read().await;
+        Ok(resonance_value(&inner.scopes, &key, handle))
     }
 
     async fn decay(&self, handle: &ThreadHandle, factor: f32) -> Result<(), AttentionError> {
@@ -1266,7 +1738,11 @@ impl InMemoryAttention {
             handle,
             ThreadState {
                 tension,
-                familiarity,
+                // The historical `familiarity` knob drove the floor; the
+                // floor now keys on `resonance`, so seed both equal to keep
+                // floor-focused tests behaving as written.
+                mentions: familiarity,
+                resonance: familiarity,
                 last_touched_at,
                 depth,
                 fade_multiplier: 1.0,
@@ -1373,6 +1849,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn substrate_threads_surface_cross_project() {
+        // A `project = None` substrate thread (where boot re-anchor lands
+        // durable identities — corpus-anchored salience threads + hand-
+        // authored waypoints) must surface from ANY project's query scope.
+        // That is the connective tissue the lens reads; project-specific
+        // threads stay isolated (see `scope_isolates_resonance_across_projects`).
+        let store = InMemoryAttention::new();
+        let global = AttentionScope {
+            project: None,
+            session_id: Some("replay".into()),
+            agent: Some("substrate".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        };
+        let project = scope_for("project-x");
+        // The query scope is attended; the global thread is anchored to a
+        // matching vector so the resonance term fires across scopes.
+        store
+            .attend(&project, "surfacer scope fragmentation lens")
+            .await
+            .unwrap();
+        store
+            .__install_thread_for_test(
+                &global,
+                handle("frontier-x"),
+                0.0,
+                5,
+                Utc::now(),
+                FoldDepth::Folded,
+                stub_embed("surfacer scope fragmentation lens"),
+            )
+            .await;
+
+        let pages = store.surface(&project, 10).await.unwrap();
+        assert!(
+            pages.iter().any(|p| p.handle == "frontier-x"),
+            "a project=None substrate thread must surface from a project-keyed scope"
+        );
+    }
+
+    #[tokio::test]
     async fn privacy_tier_t0_never_surfaces_cross_scope() {
         let store = InMemoryAttention::new();
         let mut scope_a_private = scope_for("project-a");
@@ -1422,13 +1938,20 @@ mod tests {
                 handle: h.clone(),
                 depth: FoldDepth::Half,
             },
+            // Replay SETS counters from post-batch values; two batches in
+            // chronological order, the second (mentions=2, resonance=2)
+            // wins — reconstructing the on-disk counters exactly.
             ReplayEvent::Familiarize {
                 scope: scope.clone(),
                 handle: h.clone(),
+                mentions: 1,
+                resonance: 1,
             },
             ReplayEvent::Familiarize {
                 scope: scope.clone(),
                 handle: h.clone(),
+                mentions: 2,
+                resonance: 2,
             },
         ];
 
@@ -1448,8 +1971,10 @@ mod tests {
             .iter()
             .find(|p| p.handle == "rebuilt-thread")
             .unwrap();
-        assert_eq!(pa.why.familiarity, 2);
-        assert_eq!(pb.why.familiarity, 2);
+        assert_eq!(pa.why.mentions, 2);
+        assert_eq!(pb.why.mentions, 2);
+        assert_eq!(pa.why.resonance_count, 2);
+        assert_eq!(pb.why.resonance_count, 2);
         // Scores depend on Utc::now timing inside surface; familiarity
         // and depth state are the stable invariants the chain replay
         // must reconstruct.
@@ -1492,14 +2017,14 @@ mod tests {
                 decay_term >= -1e-4,
                 "decay term went negative: {decay_term}"
             );
-            let floor = familiarity_floor(p.why.familiarity);
+            let floor = familiarity_floor(p.why.resonance_count);
             assert!(
                 decay_term <= floor + 1e-4,
                 "decay term {decay_term} exceeds floor {floor}"
             );
             // Recompute the full score from attribution and compare.
             let dt_days = p.why.time_since_touch_secs as f32 / 86_400.0;
-            let expected_decay = floor * (-decay_rate(p.why.familiarity) * dt_days).exp();
+            let expected_decay = floor * (-decay_rate(p.why.mentions) * dt_days).exp();
             let expected_total =
                 ALPHA.mul_add(p.why.resonance, expected_decay) + p.why.off_diagonal_lift;
             assert!(
@@ -1589,6 +2114,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_bridge_slot_surfaces_buried_surprise() {
+        // M5: an additive lift cannot lift a dormant low-count bridge above an
+        // *established* thread, because the established thread's familiarity
+        // floor (resonance_count -> floor) outweighs the max lift. The reserved
+        // bridge slot guarantees the strongest surprise a seat anyway.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("bridge-slot");
+        store
+            .attend(&scope, "the surprising off-diagonal bridge topic")
+            .await
+            .unwrap();
+        let anchor = stub_embed("the surprising off-diagonal bridge topic");
+
+        // Five established threads: high resonance_count -> high familiarity
+        // floor (they dominate raw score) and (count > ESTABLISHED_MAX) get no
+        // lift. Same anchor, so they resonate identically — only the floor and
+        // the surprise-eligibility differ.
+        for i in 0..5 {
+            store
+                .__install_thread_for_test(
+                    &scope,
+                    handle(&format!("established-{i}")),
+                    0.0,
+                    15,
+                    Utc::now(),
+                    FoldDepth::Folded,
+                    anchor.clone(),
+                )
+                .await;
+        }
+        // One dormant, rarely-resonant thread: a low floor buries it on raw
+        // score, but it is the only off-diagonal surprise.
+        store
+            .__install_thread_for_test(
+                &scope,
+                handle("surprise-bridge"),
+                0.05,
+                1,
+                Utc::now() - Duration::days(7),
+                FoldDepth::Folded,
+                anchor.clone(),
+            )
+            .await;
+
+        // Only four seats — fewer than the five established threads, so the
+        // surprise would be truncated away without the reserved bridge slot.
+        let pages = store.surface(&scope, 4).await.unwrap();
+        let surprise = pages.iter().find(|p| p.handle == "surprise-bridge");
+        assert!(
+            surprise.is_some(),
+            "reserved bridge slot must surface the buried surprise; got {:?}",
+            pages.iter().map(|p| &p.handle).collect::<Vec<_>>()
+        );
+        assert!(
+            surprise.unwrap().why.off_diagonal_lift > 0.0,
+            "the surprise must carry a positive off-diagonal lift"
+        );
+        // Established threads still lead and get NO lift (resonance_count > max).
+        let est = pages
+            .iter()
+            .find(|p| p.handle.starts_with("established-"))
+            .expect("established threads must still hold the top seats");
+        assert_eq!(
+            est.why.off_diagonal_lift, 0.0,
+            "an established (high resonance_count) thread must not receive lift"
+        );
+    }
+
+    #[tokio::test]
     async fn decay_lowers_score() {
         let store = InMemoryAttention::new();
         let scope = scope_for("haystack");
@@ -1636,7 +2230,146 @@ mod tests {
         }
         let pages = store.surface(&scope, 10).await.unwrap();
         let p = pages.iter().find(|p| p.handle == "fam-target").unwrap();
-        assert_eq!(p.why.familiarity, 3);
+        assert_eq!(p.why.mentions, 3);
+    }
+
+    #[test]
+    fn stop_handle_classifier_derives_from_frequency_not_a_list() {
+        // Ubiquitous-but-unresonant (top-level: 1165 mentions, 0 resonance).
+        assert!(is_stop_handle(1165, 0));
+        assert!(is_stop_handle(STOPWORD_MENTION_MIN, 0));
+        // A load-bearing idea: low mentions, but it resonates → never a stopword.
+        assert!(!is_stop_handle(11, 8), "north-star-like: resonant idea");
+        // Below the mention floor there isn't enough evidence to judge.
+        assert!(!is_stop_handle(STOPWORD_MENTION_MIN - 1, 0));
+        // High mentions but a healthy resonance rate clears the bar.
+        assert!(!is_stop_handle(1000, 200), "20% rate is well above STOPWORD_RATE_MAX");
+    }
+
+    #[tokio::test]
+    async fn familiarize_gates_resonance_on_anchor_alignment() {
+        // mentions advance on every observation; the resonance counter
+        // advances ONLY when the mention lands in an aligned turn.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("haystack");
+        store.attend(&scope, "alpha").await.unwrap();
+        let v = stub_embed("alpha"); // == the scope's effective vector
+
+        // Anchor parallel to the turn → resonant.
+        store
+            .seed_anchor(&scope, handle("aligned"), v.clone())
+            .await
+            .unwrap();
+        // Anchor opposite to the turn (cosine = -1) → not resonant.
+        let opp: Vec<f32> = v.iter().map(|x| -x).collect();
+        store
+            .seed_anchor(&scope, handle("opposed"), opp)
+            .await
+            .unwrap();
+
+        let r_aligned = store.familiarize(&scope, &handle("aligned")).await.unwrap();
+        let r_opposed = store.familiarize(&scope, &handle("opposed")).await.unwrap();
+        assert!(r_aligned, "aligned mention must resonate");
+        assert!(!r_opposed, "opposed mention must NOT resonate");
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let aligned = pages.iter().find(|p| p.handle == "aligned").unwrap();
+        // The opposed thread scores below ARCHIVE_THRESHOLD (negative
+        // resonance term) so it may not surface — assert its counters
+        // directly via resonance() + a fresh familiarize is overkill;
+        // the aligned page proves the split.
+        assert_eq!(aligned.why.mentions, 1, "mention counted");
+        assert_eq!(aligned.why.resonance_count, 1, "resonance counted (aligned)");
+    }
+
+    #[tokio::test]
+    async fn floor_is_driven_by_resonance_not_mentions() {
+        // The crux of the fix: a thread with 1000 mentions but ZERO
+        // resonance must NOT out-rank a thread with 1 mention but a
+        // saturated resonance counter. Both anchors are aligned with the
+        // turn so the resonance *term* is identical; only the floor
+        // (driven by the resonance *counter*) differs.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        store
+            .seed_anchor(&scope, handle("filler"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("filler"), 1000, 0)
+            .await
+            .unwrap();
+
+        store
+            .seed_anchor(&scope, handle("idea"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("idea"), 1, 20)
+            .await
+            .unwrap();
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let filler = pages.iter().find(|p| p.handle == "filler").unwrap();
+        let idea = pages.iter().find(|p| p.handle == "idea").unwrap();
+        assert!(
+            idea.score > filler.score,
+            "resonance must drive the floor: idea (1 mention, 20 resonance) \
+             {} should out-rank filler (1000 mentions, 0 resonance) {}",
+            idea.score,
+            filler.score
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_handle_floor_clamped_by_context_diversity() {
+        // frontier-resonance-gate-tuning: two threads with the SAME
+        // resonance counter (11) and identically-aligned anchors — so
+        // the live resonance *term* is equal. They differ only in
+        // mentions: `topword` is a frequency-derived stop-handle
+        // (1177 mentions, rate 0.009 ≪ STOPWORD_RATE_MAX — the real
+        // `top-level` numbers), `idea` is a genuine concept (22/11,
+        // rate 0.5 — the real `cognitive-memory` numbers). Pre-gate
+        // their floors were equal (familiarity_floor(11) ≈ 0.595); the
+        // context-diversity gate clamps the diluted-resonance
+        // stop-handle to the unresonant baseline so the concentrated
+        // idea out-ranks it.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        store
+            .seed_anchor(&scope, handle("topword"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("topword"), 1177, 11)
+            .await
+            .unwrap();
+
+        store
+            .seed_anchor(&scope, handle("idea"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("idea"), 22, 11)
+            .await
+            .unwrap();
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let topword = pages.iter().find(|p| p.handle == "topword").unwrap();
+        let idea = pages.iter().find(|p| p.handle == "idea").unwrap();
+        assert!(
+            idea.score > topword.score,
+            "diluted-resonance stop-handle (1177/11) must not tie a \
+             concentrated idea (22/11): idea {} vs topword {}",
+            idea.score,
+            topword.score
+        );
     }
 
     #[tokio::test]
@@ -1695,6 +2428,62 @@ mod tests {
         assert!(approx_eq(familiarity_floor(0), 0.1, 1e-6));
         assert!(approx_eq(familiarity_floor(20), 1.0, 1e-6));
         assert!(approx_eq(familiarity_floor(40), 1.0, 1e-6));
+    }
+
+    #[test]
+    fn edge_touch_floor_and_decay_saturate() {
+        // A fresh single-touch edge is the baseline; saturation is reached
+        // after EDGE_TOUCH_SATURATION (8) additional touches, i.e. at 9.
+        assert!(approx_eq(edge_touch_floor(1), 0.1, 1e-6));
+        assert!(approx_eq(edge_touch_floor(9), 1.0, 1e-6));
+        assert!(approx_eq(edge_touch_floor(40), 1.0, 1e-6));
+        assert!(approx_eq(edge_decay_rate(1), EDGE_DECAY_RATE_BASE, 1e-6));
+        assert!(approx_eq(edge_decay_rate(9), EDGE_DECAY_RATE_FAMILIAR, 1e-6));
+        // More touches → slower decay.
+        assert!(edge_decay_rate(2) > edge_decay_rate(6));
+    }
+
+    #[test]
+    fn edge_activation_re_touch_beats_idle() {
+        // Same similarity/age; a recently re-touched, well-worn edge
+        // outscores a once-touched edge that has gone idle for a month.
+        let warm = edge_activation(0.8, 30.0, 0.0, 5);
+        let idle = edge_activation(0.8, 30.0, 30.0, 1);
+        assert!(warm > idle, "re-touched edge ({warm}) must beat idle ({idle})");
+    }
+
+    #[test]
+    fn edge_activation_long_range_high_sim_beats_same_day() {
+        // Equal similarity / idle / touch: the canyon-spanning (old) edge
+        // earns the time-distance bridge bonus the same-day one does not.
+        let bridge = edge_activation(0.9, 300.0, 1.0, 2);
+        let same_day = edge_activation(0.9, 1.0, 1.0, 2);
+        assert!(
+            bridge > same_day,
+            "long-range high-sim edge ({bridge}) must beat same-day ({same_day})"
+        );
+    }
+
+    #[test]
+    fn edge_activation_age_does_not_rescue_weak_match() {
+        // Below the similarity floor, age confers no bonus — a weak match
+        // is not rescued by being old.
+        let old_weak = edge_activation(0.5, 300.0, 0.0, 1);
+        let new_weak = edge_activation(0.5, 1.0, 0.0, 1);
+        assert!(
+            approx_eq(old_weak, new_weak, 1e-6),
+            "weak matches get no time-distance bonus: {old_weak} vs {new_weak}"
+        );
+    }
+
+    #[test]
+    fn edge_activation_decays_toward_zero_when_abandoned() {
+        // An un-re-touched edge fades far below a fresh one — the gate that
+        // keeps the lens from becoming a hairball.
+        let fresh = edge_activation(0.8, 10.0, 0.0, 1);
+        let abandoned = edge_activation(0.8, 10.0, 365.0, 1);
+        assert!(abandoned < fresh);
+        assert!(abandoned < 0.01, "year-idle single-touch edge nearly vanishes: {abandoned}");
     }
 
     // ---- Phase A: real-embedder path ---------------------------------
@@ -1818,9 +2607,9 @@ mod tests {
             .find(|p| p.handle == h.as_str())
             .expect("thread present");
         assert!(
-            page.why.familiarity >= 2,
-            "familiarity bump must survive seed_anchor replace; got {}",
-            page.why.familiarity
+            page.why.mentions >= 2,
+            "mentions bump must survive seed_anchor replace; got {}",
+            page.why.mentions
         );
     }
 
@@ -1984,6 +2773,69 @@ mod tests {
         assert!(
             !st.transient_active,
             "with a pin set, transient_active must be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_surface_reserves_ambient_slots() {
+        // Pin = lens, not blinders (membrane-connector-gap finding #2). The
+        // pin points one way; the un-pinned conversational signal (rolling)
+        // points elsewhere, at a live bridge. Without reserved ambient slots
+        // the pin would blind the surface to that bridge; with them, the
+        // bridge still surfaces within `limit`.
+        let store = InMemoryAttention::with_embedder(Arc::new(FakeEmbedder { dim: 8 }));
+        let scope = scope_for("pin-lens");
+
+        // Orthogonal directions: pin looks at axis 0, live attention at axis 1.
+        let pin_dir = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ambient_dir = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Five threads aligned with the pin — enough to fill every slot of a
+        // limit-4 surface on the pinned ranking alone.
+        for i in 0..5 {
+            store
+                .seed_anchor(&scope, handle(&format!("pinned-{i}")), pin_dir.clone())
+                .await
+                .unwrap();
+        }
+        // One dormant thread that only resonates with the live (un-pinned)
+        // signal — the bridge a stale pin would hide.
+        store
+            .seed_anchor(&scope, handle("live-bridge"), ambient_dir.clone())
+            .await
+            .unwrap();
+
+        // Install the pin verbatim (the boot-replay path avoids the embedder,
+        // so the pinned vector is exactly `pin_dir`), and seed the rolling
+        // channel to the orthogonal live direction.
+        store
+            .apply_focus_set_from_chain(
+                &scope,
+                Some("pinned focus".into()),
+                Some(pin_dir.clone()),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .seed_rolling_vec(&scope, ambient_dir.clone())
+            .await
+            .unwrap();
+
+        let st = store.focus_status(&scope).await.unwrap();
+        assert!(st.pinned.is_some(), "pin must be set");
+
+        let pages = store.surface(&scope, 4).await.unwrap();
+        // The pin still leads: at least one pinned-aligned thread present.
+        assert!(
+            pages.iter().any(|p| p.handle.starts_with("pinned-")),
+            "pinned focus must still bias the surface; got {pages:?}"
+        );
+        // ...but the live bridge is NOT blinded: it claims a reserved slot
+        // despite ranking below all five pinned threads on the pinned vector.
+        assert!(
+            pages.iter().any(|p| p.handle == "live-bridge"),
+            "reserved ambient slot must surface the live bridge under a pin; got {pages:?}"
         );
     }
 

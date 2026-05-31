@@ -17,9 +17,10 @@ use ostk_recall_attention::{
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
-    Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode,
+    CompiledRecordRules, Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind,
+    WatchMode, WeaverSettings,
 };
-use ostk_recall_mcp::{ResourceRegistry, Server};
+use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
 use ostk_recall_query::lens::LensConfig;
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
@@ -34,7 +35,9 @@ use ostk_recall_scan::markdown::MarkdownScanner;
 use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
-use ostk_recall_store::{ChainSink, CorpusStore, EventsDb, IngestDb, SqliteChainSink, ThreadsDb};
+use ostk_recall_store::{
+    ChainLogReader, ChainSink, CorpusStore, EventsDb, IngestDb, SqliteChainSink, ThreadsDb,
+};
 use tokio_util::sync::CancellationToken;
 
 use fs4::FileExt;
@@ -101,6 +104,7 @@ pub struct VerifyOutcome {
 }
 
 pub type WeaveOutcome = ostk_recall_attention::WeaveWindowOutcome;
+pub type ConsolidateOutcome = ostk_recall_attention::ConsolidateOutcome;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
@@ -313,11 +317,21 @@ type AmbientHandles = (
     tokio::task::JoinHandle<()>,
 );
 
+/// Compile the effective record rules (P12) from config into the pipeline
+/// overlay. Surfaces config-level rule errors (bad regex, unknown
+/// `source_kind`/`source`, no-predicate rule) as a load-time failure.
+fn compile_record_rules(cfg: &Config) -> Result<Arc<CompiledRecordRules>> {
+    CompiledRecordRules::build(&cfg.effective_record_rules())
+        .map(Arc::new)
+        .map_err(|e| anyhow!("record rules: {e}"))
+}
+
 fn spawn_ambient_daemons(
     pipeline: &Arc<Pipeline>,
     corpus: &Arc<CorpusStore>,
     threads: &Arc<ThreadsDb>,
     attention: Option<Arc<dyn AttentionForwardStore>>,
+    weaver_exclude_facets: Vec<String>,
 ) -> AmbientHandles {
     let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads));
     if let Some(attn) = attention {
@@ -331,11 +345,14 @@ fn spawn_ambient_daemons(
     // already `Arc`-shared, so this is a clone of a pointer.
     observer = observer.with_chain_sink(threads.chain_sink());
     let observer = Arc::new(observer);
-    let weaver = Arc::new(AutoWeaver::new(
-        Arc::clone(threads),
-        Arc::clone(corpus),
-        WeaverThresholds::default(),
-    ));
+    let weaver = Arc::new(
+        AutoWeaver::new(
+            Arc::clone(threads),
+            Arc::clone(corpus),
+            WeaverThresholds::default(),
+        )
+        .with_exclude_facets(weaver_exclude_facets),
+    );
     let cancel = CancellationToken::new();
 
     let observer_handle = {
@@ -409,15 +426,23 @@ pub async fn scan_with_context(
     ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
-        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
+        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder))
+            .with_dry_run(dry_run)
+            .with_record_rules(compile_record_rules(&cfg)?),
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db
-        .as_ref()
-        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
+    let ambient = threads_db.as_ref().map(|threads| {
+        spawn_ambient_daemons(
+            &pipeline,
+            &store,
+            threads,
+            attention_dyn.clone(),
+            WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+        )
+    });
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -478,8 +503,6 @@ pub async fn scan_with_context(
         per_source.push((label, stats));
     }
 
-    ostk_recall_scan::fcp_rust::drain_session_cache();
-
     // Drain ambient daemons FIRST so any synthetic ingests they fire
     // in response to source-loop events (TurnObserver auto-promotion,
     // AutoWeaver evidence linking, etc.) land in the corpus before we
@@ -535,7 +558,8 @@ pub async fn weave(
             .map_err(|e| anyhow!("open corpus store: {e}"))?,
     );
     let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
-    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default());
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default())
+        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets);
     let since = since
         .map(chrono::Duration::from_std)
         .transpose()
@@ -544,6 +568,37 @@ pub async fn weave(
         .weave_window(since, epoch_size.max(1))
         .await
         .map_err(|e| anyhow!("weave_window: {e}"))
+}
+
+/// Run a coarse consolidation cycle (`weave --consolidate`). Same setup as
+/// [`weave`], but invokes [`AutoWeaver::consolidate`]: deep re-weave + anchor
+/// bridging + proposal promotion + idle fade. Offline operator policy.
+pub async fn consolidate(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    since: Option<Duration>,
+    epoch_size: usize,
+) -> Result<ConsolidateOutcome> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    std::fs::create_dir_all(&root)?;
+    let store = Arc::new(
+        CorpusStore::open_or_create(&root, embedder.dim())
+            .await
+            .map_err(|e| anyhow!("open corpus store: {e}"))?,
+    );
+    let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
+    let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default())
+        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets);
+    let since = since
+        .map(chrono::Duration::from_std)
+        .transpose()
+        .map_err(|_| anyhow!("--since duration is too large for chrono"))?;
+    weaver
+        .consolidate(since, epoch_size.max(1))
+        .await
+        .map_err(|e| anyhow!("consolidate: {e}"))
 }
 
 /// Path-aware sibling of [`scan`].
@@ -586,15 +641,23 @@ pub async fn scan_paths_with_context(
     ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
-        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder)).with_dry_run(dry_run),
+        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder))
+            .with_dry_run(dry_run)
+            .with_record_rules(compile_record_rules(&cfg)?),
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
     let attention_dyn: Option<Arc<dyn AttentionForwardStore>> =
         ctx.map(|c| c.attention.clone() as Arc<dyn AttentionForwardStore>);
-    let ambient = threads_db
-        .as_ref()
-        .map(|threads| spawn_ambient_daemons(&pipeline, &store, threads, attention_dyn.clone()));
+    let ambient = threads_db.as_ref().map(|threads| {
+        spawn_ambient_daemons(
+            &pipeline,
+            &store,
+            threads,
+            attention_dyn.clone(),
+            WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+        )
+    });
 
     let markdown = MarkdownScanner;
     let code = CodeScanner;
@@ -654,8 +717,6 @@ pub async fn scan_paths_with_context(
         totals = totals.merge(*s);
     }
 
-    ostk_recall_scan::fcp_rust::drain_session_cache();
-
     shutdown_ambient_daemons(ambient).await;
 
     Ok(ScanOutcome {
@@ -695,8 +756,22 @@ pub async fn scan_reingest(
         .delete_by_chunk_ids(&ids)
         .map_err(|e| anyhow!("delete_by_chunk_ids: {e}"))?;
 
+    // Clear the per-file cursors too. Deleting chunk rows alone is not
+    // enough: the Tier-1 metadata check in `ingest_source` would then see
+    // every file as unchanged and skip re-parsing, leaving the project
+    // under-filled. Clearing cursors for the project's sources forces the
+    // follow-up scan to re-read everything from scratch.
+    let mut cursors_cleared = 0u64;
+    for source_cfg in &cfg.sources {
+        if source_cfg.project.as_deref() == Some(reingest_project) {
+            cursors_cleared += ingest
+                .clear_source_metadata(&source_cfg.source_config_id)
+                .map_err(|e| anyhow!("clear_source_metadata: {e}"))?;
+        }
+    }
+
     println!(
-        "reingest {reingest_project}: deleted {lance_deleted} corpus rows, {ingest_deleted} ingest rows"
+        "reingest {reingest_project}: deleted {lance_deleted} corpus rows, {ingest_deleted} ingest rows, cleared {cursors_cleared} source cursors"
     );
 
     drop(store);
@@ -885,6 +960,8 @@ fn resolve_lens_config(settings: Option<&LensSettings>) -> LensConfig {
         exclude_facets: l.exclude_facets.clone(),
         candidate_k_per_lane: l.candidate_k_per_lane,
         dominance_threshold: l.dominance_threshold,
+        refractory_tau_secs: l.refractory_tau_secs,
+        refractory_weight: l.refractory_weight,
     })
 }
 
@@ -893,14 +970,9 @@ pub async fn serve(
     config_path: &Path,
     embedder: Arc<dyn ChunkEmbedder>,
     stdio: bool,
+    watch: bool,
 ) -> Result<()> {
     use std::io::Write as _;
-
-    if !stdio {
-        return Err(anyhow!(
-            "only stdio transport is currently supported; pass --stdio"
-        ));
-    }
 
     // Singleton guard: only one `serve` per corpus root.
     //
@@ -1074,17 +1146,50 @@ pub async fn serve(
         Arc::new(dispatch)
     });
 
+    // Single scan-in-flight mutex shared by the socket listener and the
+    // in-process `--watch` watcher, so a watcher-driven scan and an
+    // external socket poke never run concurrently on the single-writer
+    // corpus.
+    let scan_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+
     // Spawn background scan trigger listener
     let config_path_for_bg = config_path.to_path_buf();
     let embedder_for_bg = Arc::clone(&embedder);
     let ctx_for_bg = serve_ctx.clone();
+    let scan_lock_for_bg = Arc::clone(&scan_lock);
     tokio::spawn(async move {
-        if let Err(e) =
-            run_socket_listener(&sock_path, config_path_for_bg, embedder_for_bg, ctx_for_bg).await
+        if let Err(e) = run_socket_listener(
+            &sock_path,
+            config_path_for_bg,
+            embedder_for_bg,
+            ctx_for_bg,
+            scan_lock_for_bg,
+        )
+        .await
         {
             tracing::error!(error = %e, "background socket listener failed");
         }
     });
+
+    // `serve --watch`: run the filesystem watcher in-process and deliver
+    // debounced batches straight to the scan path (no socket loopback),
+    // sharing `scan_lock` with the socket listener so a watcher-driven
+    // scan and an external poke never overlap. The watcher is best-effort:
+    // if `[watch]` is misconfigured it logs and the daemon carries on.
+    if watch {
+        let config_path_for_watch = config_path.to_path_buf();
+        let sink = ScanTriggerSink::InProcess {
+            scan_lock: Arc::clone(&scan_lock),
+            embedder: Arc::clone(&embedder),
+            ctx: serve_ctx.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = run_watcher(&config_path_for_watch, sink).await {
+                tracing::warn!(error = %e, "in-process watcher exited; daemon continues without it");
+            }
+        });
+        tracing::info!("in-process watcher enabled (serve --watch)");
+    }
 
     // P9b-min — construct the memory-lens registry + resource and,
     // when the attention substrate is online, spawn the background
@@ -1118,6 +1223,17 @@ pub async fn serve(
         let attention = Arc::clone(&ctx.attention);
         let corpus = Arc::clone(engine.store());
         let chain_sink_clone: Arc<dyn ChainSink> = ctx.threads.chain_sink();
+        // Read handle on the same ledger for the freshness feature + refractory
+        // penalty. ThreadsDb implements both ChainSink (write) and
+        // ChainLogReader (read); the reader is a fresh-handle clone of the Arc.
+        let chain_reader: Arc<dyn ChainLogReader> = ctx.threads.clone();
+        // Lens rank engine, built ONCE from the Lens-profile weights
+        // (attention_affinity + freshness, overlaid by [ranking.weights.lens])
+        // and shared across ticks via Arc — concurrent recall + lens never
+        // serialize on it (RankEngine::rank is &self).
+        let lens_engine = Arc::new(ostk_recall_query::build_engine_from_weights(
+            &cfg.effective_ranking_weights(ostk_recall_core::RankProfile::Lens),
+        ));
         let registry = Arc::clone(&lens_registry);
         let resource = Arc::clone(&lens_resource);
         let cancel = serve_cancel.clone();
@@ -1133,6 +1249,8 @@ pub async fn serve(
                 registry,
                 resource,
                 chain_sink_clone,
+                chain_reader,
+                lens_engine,
                 lens_config,
                 scope,
                 state_dir,
@@ -1151,20 +1269,49 @@ pub async fn serve(
         dim = engine.store().dim(),
         audit = engine.has_audit(),
         attention = dispatch.is_some(),
-        "mcp serve --stdio starting"
+        stdio,
+        "ostk-recall serve starting"
     );
     let server_base = match dispatch {
         Some(d) => Server::new(engine).with_attention(d),
         None => Server::new(engine),
     };
     let server = server_base.with_resources(lens_registry);
-    server
-        .run_stdio()
-        .await
-        .map_err(|e| anyhow!("mcp stdio: {e}"))?;
-    // Cancel the curator on a clean exit so the tokio runtime can drain.
+    if stdio {
+        // Direct stdio transport: this process IS the MCP server, talking
+        // JSON-RPC over its own stdin/stdout. Used by a client that spawns
+        // `serve --stdio` directly (and by the `connect` bridge's fallback).
+        server
+            .run_stdio()
+            .await
+            .map_err(|e| anyhow!("mcp stdio: {e}"))?;
+    } else {
+        // Standalone daemon: serve MCP to many clients over the
+        // cross-platform local endpoint while the background scan-trigger
+        // listener, idle curator, and memory-lens loop keep the corpus
+        // fresh. All connections share this one read-only engine + lens
+        // registry, so lens `resources/updated` notifications fan out to
+        // every subscribed client. Block until a shutdown signal so the
+        // background tasks stay alive; the `.serve.lock` flock releases on
+        // exit regardless.
+        let server = Arc::new(server);
+        let mcp_sock = mcp_endpoint_path(&root);
+        let mcp_server = Arc::clone(&server);
+        tokio::spawn(async move {
+            if let Err(e) = run_mcp_listener(&mcp_sock, mcp_server).await {
+                tracing::error!(error = %e, "mcp listener exited with error");
+            }
+        });
+        tracing::info!(
+            "daemon mode: MCP listener + background freshening online; waiting for shutdown signal (Ctrl-C)"
+        );
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to listen for Ctrl-C; shutting down daemon");
+        }
+    }
+    // Cancel the curator/lens on a clean exit so the tokio runtime can drain.
     serve_cancel.cancel();
-    tracing::info!("mcp serve exited cleanly");
+    tracing::info!(stdio, "ostk-recall serve exited cleanly");
     Ok(())
 }
 
@@ -1229,10 +1376,18 @@ async fn replay_chain_into_attention(
     for ev in events {
         match ev {
             ChainEvent::FamiliarityBatch { entries, .. } => {
-                for (handle, _post) in entries {
+                // Restore both durable counters verbatim. Each entry is
+                // the post-batch (mentions, resonance); replaying them in
+                // chronological order means the final batch per handle
+                // wins, reconstructing the on-disk counters exactly. We
+                // cannot recompute resonance here (the replay scope has no
+                // attention vector), so the chain is the source of truth.
+                for (handle, mentions, resonance) in entries {
                     replay.push(ReplayEvent::Familiarize {
                         scope: scope.clone(),
                         handle,
+                        mentions,
+                        resonance,
                     });
                 }
             }
@@ -1273,7 +1428,13 @@ async fn replay_chain_into_attention(
             // P9b-full but replay does not restore any in-memory
             // state. last_portfolio_chunk_ids is carried in
             // lens_state.json instead.
-            | ChainEvent::LensIncluded { .. } => {}
+            | ChainEvent::LensIncluded { .. }
+            // P7b: access-ledger events are audit-only on replay — the
+            // ledger is read on demand by `ChainLogReader::access_history`
+            // (for ACT-R freshness), never replayed into in-memory state.
+            | ChainEvent::ExplicitRecall { .. }
+            | ChainEvent::RecallFault { .. }
+            | ChainEvent::OperatorSelected { .. } => {}
         }
     }
 
@@ -1328,47 +1489,75 @@ async fn re_anchor_threads_from_corpus(
     corpus: &Arc<CorpusStore>,
     attention: &InMemoryAttention,
 ) -> Result<usize> {
-    let records = threads
-        .list_threads(None)
-        .map_err(|e| anyhow!("list_threads: {e}"))?;
-    let with_anchors: Vec<(ostk_recall_core::ThreadHandle, PrivacyTier, String)> = records
-        .into_iter()
-        .filter_map(|r| r.anchor_chunk_id.map(|id| (r.handle, r.privacy_tier, id)))
-        .collect();
-    if with_anchors.is_empty() {
+    let inputs = threads
+        .reanchor_inputs()
+        .map_err(|e| anyhow!("reanchor_inputs: {e}"))?;
+    if inputs.is_empty() {
         return Ok(0);
     }
-    let chunk_ids: Vec<String> = with_anchors.iter().map(|(_, _, id)| id.clone()).collect();
-    let embeddings = corpus
-        .fetch_embeddings(&chunk_ids)
+    // Only threads without a cached anchor_vec need a corpus lookup; the rest
+    // are restored from their durable embedding, independent of corpus churn.
+    let need_fetch: Vec<String> = inputs
+        .iter()
+        .filter(|i| i.anchor_vec.is_none())
+        .filter_map(|i| i.anchor_chunk_id.clone())
+        .collect();
+    let fetched = corpus
+        .fetch_embeddings(&need_fetch)
         .await
         .map_err(|e| anyhow!("fetch_embeddings for re-anchor: {e}"))?;
+
     let mut seeded = 0usize;
-    for (handle, tier, id) in with_anchors {
-        let Some(vec) = embeddings.get(&id) else {
-            // anchor_chunk_id points outside the current corpus
-            // table (stale or deleted chunk) — skip silently. The
-            // thread row is still on disk; an operator can reassign
-            // or delete it.
-            continue;
-        };
-        // Use the same single "replay" scope shape as
-        // `replay_chain_into_attention`. Re-anchoring lands in that
-        // scope so the boot-time materialised threads are visible
-        // to subsequent queries against the replay scope. Carrying
-        // the thread's `privacy_tier` keeps origin-private threads
-        // origin-restricted.
+    let mut orphaned: Vec<String> = Vec::new();
+    for input in inputs {
+        // Same single "replay"/"substrate" scope shape as
+        // `replay_chain_into_attention`, so boot-materialised threads are
+        // visible to cross-scope `surface()`. Carrying `privacy_tier` keeps
+        // origin-private threads origin-restricted.
         let scope = AttentionScope {
             project: None,
             session_id: Some("replay".into()),
             agent: Some("substrate".into()),
-            privacy_tier: tier,
+            privacy_tier: input.privacy_tier,
         };
-        attention
-            .seed_anchor(&scope, handle, vec.clone())
-            .await
-            .map_err(|e| anyhow!("seed_anchor: {e}"))?;
-        seeded += 1;
+        // Prefer the cached, corpus-independent anchor vector.
+        if let Some(vec) = input.anchor_vec {
+            attention
+                .seed_anchor(&scope, input.handle, vec)
+                .await
+                .map_err(|e| anyhow!("seed_anchor: {e}"))?;
+            seeded += 1;
+            continue;
+        }
+        // Fall back to the corpus chunk; backfill anchor_vec so the next boot
+        // no longer depends on the (content-hash, churnable) chunk id.
+        if let Some(vec) = input
+            .anchor_chunk_id
+            .as_ref()
+            .and_then(|id| fetched.get(id))
+        {
+            attention
+                .seed_anchor(&scope, input.handle.clone(), vec.clone())
+                .await
+                .map_err(|e| anyhow!("seed_anchor: {e}"))?;
+            if let Err(e) = threads.set_anchor_vec(&input.handle, vec) {
+                tracing::warn!(handle = %input.handle.as_str(), error = %e, "anchor_vec backfill failed");
+            }
+            seeded += 1;
+            continue;
+        }
+        // Neither a cached vector nor a resolvable chunk: the anchor is
+        // orphaned (its chunk's content changed before anchor_vec was cached).
+        // Surface it instead of silently dropping it.
+        orphaned.push(input.handle.as_str().to_string());
+    }
+    if !orphaned.is_empty() {
+        tracing::warn!(
+            count = orphaned.len(),
+            handles = %orphaned.join(", "),
+            "threads with unresolved anchors (chunk id not in corpus and no cached anchor_vec); \
+             re-anchor with `thread create --anchor <chunk_id>`"
+        );
     }
     Ok(seeded)
 }
@@ -1410,10 +1599,8 @@ async fn run_socket_listener(
     config_path: PathBuf,
     embedder: Arc<dyn ChunkEmbedder>,
     ctx: Option<ServeContext>,
+    scan_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<()> {
-    use tokio::sync::Mutex;
-    let scan_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-
     #[cfg(unix)]
     {
         use tokio::net::UnixListener;
@@ -1472,6 +1659,214 @@ async fn run_socket_listener(
             }
         }
     }
+}
+
+/// Filesystem path of the daemon's MCP endpoint, distinct from the
+/// scan-trigger socket (`recall.sock`). On Unix this is the `AF_UNIX`
+/// path that [`run_mcp_listener`] binds and the `connect` bridge
+/// dials; on Windows it only seeds a distinct named-pipe name via
+/// [`pipe_name_for`] (the file itself is never created on disk).
+fn mcp_endpoint_path(root: &Path) -> PathBuf {
+    root.join("recall-mcp.sock")
+}
+
+/// Derive the Windows named-pipe name for a local IPC endpoint from
+/// its socket `path`. Unix binds `path` directly as an `AF_UNIX`
+/// socket; Windows has no filesystem sockets, so the path's file stem
+/// seeds a pipe name instead. The MCP listener and the `connect`
+/// bridge both route through this so the two sides agree on the name.
+#[cfg(windows)]
+fn pipe_name_for(path: &Path, fallback_stem: &str) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(fallback_stem);
+    format!(r"\\.\pipe\ostk-recall-{stem}")
+}
+
+/// Accept MCP client connections on the daemon's cross-platform local
+/// endpoint and serve each one as an independent JSON-RPC session.
+///
+/// Mirrors [`run_socket_listener`]'s transport split (`AF_UNIX` on
+/// Unix, named pipe on Windows) but, instead of reading a one-shot
+/// trigger frame, hands each accepted connection's read/write halves
+/// to [`Server::serve_with_client`] with a fresh [`ClientId::network`]
+/// id. The single `Arc<Server>` is shared across all connections —
+/// every connection reads through the same read-only `QueryEngine` and
+/// the same lens `ResourceRegistry`, so memory-lens
+/// `resources/updated` notifications fan out to every subscribed
+/// client. Each connection runs in its own task, so a slow or stuck
+/// client can't block the accept loop or its peers.
+async fn run_mcp_listener(path: &Path, server: Arc<Server>) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let next_id = AtomicU64::new(1);
+
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixListener;
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("binding MCP socket {}", path.display()))?;
+        tracing::info!(path = %path.display(), "listening for MCP clients (unix socket)");
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let server = Arc::clone(&server);
+                    tokio::spawn(async move {
+                        let (rd, wr) = stream.into_split();
+                        if let Err(e) = server.serve_with_client(ClientId::network(id), rd, wr).await
+                        {
+                            tracing::warn!(client = id, error = %e, "mcp connection ended with error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mcp socket accept failed");
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let pipe_name = pipe_name_for(path, "mcp");
+        // first_pipe_instance(true) on the FIRST create only; each accepted
+        // connect consumes the current instance, so spin up the next one
+        // before serving the connected pipe — that's what lets multiple
+        // MCP clients connect simultaneously.
+        let mut pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
+        tracing::info!(pipe = %pipe_name, "listening for MCP clients (named pipe)");
+
+        loop {
+            match pipe.connect().await {
+                Ok(()) => {
+                    let connected = pipe;
+                    pipe = ServerOptions::new().create(&pipe_name)?;
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let server = Arc::clone(&server);
+                    tokio::spawn(async move {
+                        let (rd, wr) = tokio::io::split(connected);
+                        if let Err(e) = server.serve_with_client(ClientId::network(id), rd, wr).await
+                        {
+                            tracing::warn!(client = id, error = %e, "mcp connection ended with error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mcp named pipe connect failed");
+                    // Re-create the listener so a transient error doesn't
+                    // wedge the loop on a half-broken instance.
+                    pipe = ServerOptions::new().create(&pipe_name)?;
+                }
+            }
+        }
+    }
+}
+
+/// Bridge this process's stdin/stdout to a running daemon's MCP
+/// endpoint (the `connect` command). A dumb byte pump: it opens no
+/// engine, takes no corpus lock, and runs no scan — it just splices
+/// bytes so a stdio-only MCP client reaches the shared daemon.
+///
+/// Fails with an actionable hint when no daemon is listening rather
+/// than silently spawning one (a second writer would be refused by the
+/// `.serve.lock` singleton guard anyway).
+pub async fn connect(config_path: &Path) -> Result<()> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
+    let root = cfg.expanded_root().context("resolving corpus.root")?;
+    let endpoint = mcp_endpoint_path(&root);
+
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixStream;
+        let stream = UnixStream::connect(&endpoint).await.map_err(|e| {
+            anyhow!(
+                "connecting to ostk-recall MCP daemon at {}: {e}\n\
+                 is a daemon running? start one with `ostk-recall serve --watch`",
+                endpoint.display()
+            )
+        })?;
+        let (mut sock_r, mut sock_w) = stream.into_split();
+        bridge_stdio(&mut sock_r, &mut sock_w).await
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe_name = pipe_name_for(&endpoint, "mcp");
+        let client = ClientOptions::new().open(&pipe_name).map_err(|e| {
+            anyhow!(
+                "connecting to ostk-recall MCP daemon pipe {pipe_name}: {e}\n\
+                 is a daemon running? start one with `ostk-recall serve --watch`"
+            )
+        })?;
+        let (mut sock_r, mut sock_w) = tokio::io::split(client);
+        bridge_stdio(&mut sock_r, &mut sock_w).await
+    }
+}
+
+/// Bidirectional splice for [`connect`]: copy stdin → socket and
+/// socket → stdout concurrently, each running to completion. When
+/// stdin hits EOF the socket write half is shut down so the daemon
+/// sees the client disconnect (and closes its side, ending the
+/// socket→stdout copy); when the daemon closes first, the stdout copy
+/// ends and the stdin copy unblocks once the client closes stdin.
+/// Neither direction is cut off early, so trailing JSON-RPC frames are
+/// not dropped.
+async fn bridge_stdio<R, W>(sock_r: &mut R, sock_w: &mut W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    splice_bidirectional(
+        sock_r,
+        sock_w,
+        &mut tokio::io::stdin(),
+        &mut tokio::io::stdout(),
+    )
+    .await
+}
+
+/// Core of [`bridge_stdio`]: copy `input` → `sock_w` and `sock_r` →
+/// `output` concurrently, each running to completion. When `input`
+/// hits EOF the socket write half is shut down so the daemon's reader
+/// sees the disconnect; the reverse copy ends when the daemon closes
+/// its side. Neither direction is cut off early, so trailing JSON-RPC
+/// frames survive. Split out from the stdin/stdout wiring so it can be
+/// driven over in-memory pipes in tests.
+async fn splice_bidirectional<R, W, In, Out>(
+    sock_r: &mut R,
+    sock_w: &mut W,
+    input: &mut In,
+    output: &mut Out,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    In: tokio::io::AsyncRead + Unpin,
+    Out: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncWriteExt, copy};
+
+    let to_sock = async {
+        let _ = copy(input, sock_w).await;
+        // Half-close the write side so the daemon's reader sees EOF.
+        let _ = sock_w.shutdown().await;
+    };
+    let to_output = async {
+        let _ = copy(sock_r, output).await;
+        let _ = output.flush().await;
+    };
+    tokio::join!(to_sock, to_output);
+    Ok(())
 }
 
 /// Maximum trigger frame size in bytes. Frames larger than this log a
@@ -1636,8 +2031,62 @@ fn source_label(source: &SourceConfig) -> String {
         .unwrap_or_else(|| source.kind.as_str().to_string())
 }
 
-#[allow(clippy::too_many_lines)]
+/// Where a watcher delivers a debounced scan-trigger batch.
+///
+/// The standalone `watch` command writes to the daemon's scan-trigger
+/// socket ([`ScanTriggerSink::Socket`]); `serve --watch` runs the same
+/// loop in-process and hands batches straight to [`spawn_scan_trigger`]
+/// ([`ScanTriggerSink::InProcess`]), skipping the socket loopback and
+/// sharing the daemon's scan mutex so the two never scan at once.
+enum ScanTriggerSink {
+    Socket,
+    InProcess {
+        scan_lock: Arc<tokio::sync::Mutex<()>>,
+        embedder: Arc<dyn ChunkEmbedder>,
+        ctx: Option<ServeContext>,
+    },
+}
+
+impl ScanTriggerSink {
+    const fn is_in_process(&self) -> bool {
+        matches!(self, Self::InProcess { .. })
+    }
+}
+
+/// Deliver one debounced `frame` to the configured sink. The socket
+/// arm awaits the kick (and can fail on a transient socket error); the
+/// in-process arm fires [`spawn_scan_trigger`] and returns immediately
+/// (the spawned task drops itself if the shared scan lock is held).
+async fn dispatch_scan_trigger(
+    sink: &ScanTriggerSink,
+    socket_path: &Path,
+    config_path: &Path,
+    frame: &[PathBuf],
+) -> Result<()> {
+    match sink {
+        ScanTriggerSink::Socket => kick_trigger_socket(socket_path, frame).await,
+        ScanTriggerSink::InProcess {
+            scan_lock,
+            embedder,
+            ctx,
+        } => {
+            spawn_scan_trigger(scan_lock, config_path, embedder, frame.to_vec(), ctx.clone());
+            Ok(())
+        }
+    }
+}
+
+/// Standalone `watch` command: drive [`run_watcher`] delivering pokes
+/// over the scan-trigger socket to a separately-running `serve`.
 pub async fn watch(config_path: &Path) -> Result<()> {
+    run_watcher(config_path, ScanTriggerSink::Socket).await
+}
+
+/// Filesystem-watch loop shared by the standalone `watch` command and
+/// the in-process watcher spawned by `serve --watch`. `sink` selects
+/// socket delivery (separate process) vs. direct in-process scans.
+#[allow(clippy::too_many_lines)]
+async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
     use std::time::Duration;
 
     use notify_debouncer_full::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
@@ -1737,6 +2186,7 @@ pub async fn watch(config_path: &Path) -> Result<()> {
         socket = %socket_path.display(),
         debounce_ms = watch_cfg.debounce_ms,
         roots = watched_roots.len(),
+        in_process = sink.is_in_process(),
         "scan-trigger watcher started"
     );
 
@@ -1806,7 +2256,10 @@ pub async fn watch(config_path: &Path) -> Result<()> {
                                     WatchMode::Legacy => &[],
                                     WatchMode::Incremental => &to_send,
                                 };
-                                if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
+                                if let Err(e) =
+                                    dispatch_scan_trigger(&sink, &socket_path, config_path, frame)
+                                        .await
+                                {
                                     tracing::warn!(
                                         socket = %socket_path.display(),
                                         label = %label,
@@ -1841,7 +2294,9 @@ pub async fn watch(config_path: &Path) -> Result<()> {
                         WatchMode::Legacy => &[],
                         WatchMode::Incremental => &to_send,
                     };
-                    if let Err(e) = kick_trigger_socket(&socket_path, frame).await {
+                    if let Err(e) =
+                        dispatch_scan_trigger(&sink, &socket_path, config_path, frame).await
+                    {
                         tracing::warn!(
                             socket = %socket_path.display(),
                             label = %label,
@@ -2265,6 +2720,8 @@ mod lens_config_tests {
         assert_eq!(mapped.exclude_facets, dflt.exclude_facets);
         assert_eq!(mapped.candidate_k_per_lane, dflt.candidate_k_per_lane);
         assert!((mapped.dominance_threshold - dflt.dominance_threshold).abs() < f32::EPSILON);
+        assert_eq!(mapped.refractory_tau_secs, dflt.refractory_tau_secs);
+        assert!((mapped.refractory_weight - dflt.refractory_weight).abs() < f32::EPSILON);
     }
 
     /// Absent `[lens]` block resolves to the daemon default verbatim.
@@ -2321,5 +2778,70 @@ mod force_wipe_tests {
         for f in files {
             assert!(!root.join(f).exists(), "{f} should have been removed");
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_transport_tests {
+    use super::{mcp_endpoint_path, splice_bidirectional};
+    use std::path::Path;
+
+    /// The daemon's MCP endpoint must not collide with the scan-trigger
+    /// socket: they're two independent listeners on the same corpus
+    /// root, and on Windows the distinct file stems seed distinct named
+    /// pipes. A collision would wedge one listener on the other's bind.
+    #[test]
+    fn mcp_endpoint_distinct_from_trigger_socket() {
+        let root = Path::new("/tmp/ostk-corpus");
+        let mcp = mcp_endpoint_path(root);
+        assert_eq!(mcp, root.join("recall-mcp.sock"));
+        assert_ne!(
+            mcp,
+            root.join("recall.sock"),
+            "MCP endpoint must differ from the scan-trigger socket"
+        );
+    }
+
+    /// The `connect` bridge core must pump bytes in BOTH directions and
+    /// not drop the daemon's reply: client stdin → socket, and the
+    /// daemon's response → client stdout.
+    #[tokio::test]
+    async fn splice_bidirectional_pumps_both_directions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Stand-in for the daemon socket: a duplex whose far end is the
+        // "daemon" task.
+        let (sock_client, daemon_end) = tokio::io::duplex(1024);
+        let (mut sock_r, mut sock_w) = tokio::io::split(sock_client);
+        let (mut daemon_r, mut daemon_w) = tokio::io::split(daemon_end);
+
+        // Client "stdin": test writes a request, then EOF (drop).
+        let (mut stdin_w, mut stdin_r) = tokio::io::duplex(1024);
+        // Client "stdout": splice writes here, test reads it back.
+        let (mut stdout_w, mut stdout_r) = tokio::io::duplex(1024);
+
+        // Daemon: read the request, echo a reply, then close its side.
+        let daemon = tokio::spawn(async move {
+            let mut buf = vec![0u8; 5];
+            daemon_r.read_exact(&mut buf).await.unwrap();
+            daemon_w.write_all(b"pong\n").await.unwrap();
+            buf
+            // daemon_r / daemon_w drop here → socket EOF to the client.
+        });
+
+        stdin_w.write_all(b"ping\n").await.unwrap();
+        drop(stdin_w);
+
+        splice_bidirectional(&mut sock_r, &mut sock_w, &mut stdin_r, &mut stdout_w)
+            .await
+            .unwrap();
+
+        assert_eq!(&daemon.await.unwrap(), b"ping\n", "request reached daemon");
+
+        // Close the write side so read_to_end on the client stdout sees EOF.
+        drop(stdout_w);
+        let mut got = Vec::new();
+        stdout_r.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"pong\n", "daemon reply reached client stdout");
     }
 }

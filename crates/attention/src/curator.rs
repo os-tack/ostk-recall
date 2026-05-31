@@ -324,7 +324,8 @@ mod tests {
             let rec = ThreadRecord {
                 handle: h.clone(),
                 tension,
-                familiarity,
+                mentions: familiarity,
+                resonance: familiarity,
                 last_touched_at,
                 anchor_chunk_id: None,
                 fold_override: None,

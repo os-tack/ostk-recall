@@ -38,6 +38,18 @@ pub trait Scanner: Send + Sync {
 
     fn parse(&self, item: SourceItem) -> Result<Vec<Chunk>>;
 
+    /// Structural parse-logic version (P12). Folded into the Tier-1 freshness
+    /// key (`cfg_overlay_hash`) so a change to *structural* parse behavior the
+    /// config record-rules can't express — chunk boundaries, wire-format block
+    /// handling — forces a one-time re-parse of already-ingested, otherwise
+    /// unchanged files. Bump when a scanner's emitted-chunk set changes for
+    /// reasons other than the config rule overlay. Defaults to `0`
+    /// ("unversioned"); content/semantic apparatus changes ride the
+    /// record-rule digest instead.
+    fn parse_version(&self) -> u32 {
+        0
+    }
+
     /// Path-filtered discovery. Yields only items whose `path` is in
     /// `paths`. Default impl walks the full `discover()` output and
     /// filters — correct but no faster than full scan. Per-scanner

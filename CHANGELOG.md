@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-31
+
+### Added
+
+- **Structural weave-apparatus gate — tool-call envelopes + `<task-notification>`
+  can't seed threads.** Generalizing RT-7 beyond facets: the weaver now treats
+  Claude Code tool-call blocks (`block_kind` `tool_use` / `tool_result`) and
+  `<task-notification>` monitor events as *structural* apparatus and skips them
+  for anchor-matching + emergent proposals, so they can't form degenerate
+  high-cohesion threads (post-recovery they dominated the proposal pool).
+  `block_kind`/content properties aren't facets, so this is the structural
+  counterpart to `[weaver] exclude_facets` (`is_structural_apparatus`).
+  Weave-only — the chunks stay in the corpus and remain recall-able (cf.
+  `CorpusStore::mark_tool_blocks_stale` to drop them from recall entirely).
+
+- **RT-7 — demux Claude Code multi-agent orchestration off the content
+  channel.** `<teammate-message>` envelopes are harness apparatus (the same
+  class as `<system-reminder>`): being templated they formed degenerate
+  high-familiarity threads (`team-lead`, `teammate-message`) and surfaced in
+  the ambient lens. `tag_harness_orchestration` (claude_code parse) now stamps
+  them `record_kind=harness_orchestration` — **tag, don't drop**, since they
+  carry task-description history; the lens denylist
+  (`config::default_lens_exclude_facets`) keeps them out of ambient surfacing
+  and the weaver skips them as anchor/proposal candidates, so they can't form
+  threads. New `ostk-recall thread delete <handle>` verb (chains `ThreadDelete`)
+  to prune apparatus / frequency-promoted threads without forgetting any chunk.
+
+### Fixed
+
+- **`scan --reingest <project>` no longer under-fills the project.** It
+  deleted the corpus + `ingest_chunks` rows but left the `ingest_sources`
+  cursors, so the follow-up rescan saw every file as unchanged (Tier-1
+  metadata check) and skipped re-parsing — restoring only files that had
+  changed since the last scan. `scan_reingest` now clears the per-config
+  cursors (`IngestDb::clear_source_metadata`) for the project's sources, so
+  the rescan re-reads everything from scratch. (Surfaced while completing
+  RT-6's `<system-reminder>` purge, which is exactly a "parser changed,
+  files unchanged" reingest.)
+
+### Added
+
+- **P11b-full — temporal consolidation: the past weaves the future.** The
+  weaver previously only *captured* (wrote evidence, proposed clusters);
+  this adds the reverse direction — recency re-strengthens which past stays
+  load-bearing, and the unreferenced fades.
+  - **Edge activation.** `evidence_links` gains `touch_count` +
+    `last_touched_at` (idempotent migration + backfill). `edge_activation(
+    similarity, age_days, idle_days, touch_count)` is a derived, componentized
+    score: a recency gate (decays toward zero if never re-touched — so the
+    lens cannot become a hairball) times a similarity bridge (time-distance
+    upweights high-similarity long-range edges; weak matches are not rescued).
+    The weaver re-touches an edge on each re-resonance instead of dropping the
+    signal. Durable rows are never deleted as activation fades.
+  - **`ostk-recall weave --consolidate`.** A coarse consolidation cycle over a
+    `--since` window: deep re-weave → anchor↔anchor bridging across canyons →
+    near-duplicate thread merge → promotion of recurring high-cohesion
+    proposals to durable threads → structural abstraction of deeply-familiar
+    stable threads (fold) → idle-time thread fade. Offline operator policy
+    (cron/launchd), never coupled to `serve`. See the README "Consolidation
+    cadence" section for the scheduling shape.
+
+## [0.6.0-alpha.4] - 2026-05-29
+
+Daemon transport milestone: `serve` becomes a real standalone daemon
+that serves MCP to many clients over a cross-platform local socket /
+named pipe, with a thin `connect` bridge for stdio clients and an
+in-process `--watch`. Fixes the long-standing "only stdio transport is
+currently supported" failure (surfaced on Windows).
+
+### Fixed
+
+- **`ostk-recall serve` (no `--stdio`) now actually runs.** It previously
+  errored with "only stdio transport is currently supported" on every
+  platform — the standalone daemon mode the README documented was never
+  wired. (Surfaced on Windows, where nothing else incidentally bound the
+  scan-trigger pipe.) `serve` now runs as a long-lived daemon and blocks
+  on Ctrl-C (`tokio` gains the `signal` feature).
+
+### Added
+
+- **Single daemon, many clients.** The standalone daemon serves MCP to
+  any number of clients over a cross-platform local endpoint (`AF_UNIX`
+  socket / Windows named pipe). The MCP resource-notification layer is
+  now genuinely multi-client: `ClientId::Network`, per-connection
+  outbound channels, lens `resources/updated` fan-out to all subscribers,
+  and subscription pruning on disconnect.
+- **`ostk-recall connect`** — a thin stdio↔socket bridge (no engine, no
+  lock, no scan) so a stdio-only MCP client reaches a running daemon
+  instead of spawning its own `serve`.
+- **`ostk-recall serve --watch`** — runs the filesystem watcher
+  in-process, delivering debounced batches straight to the scan path
+  (no socket loopback) and sharing one scan mutex with the trigger
+  socket so scans never overlap on the single-writer corpus. The
+  standalone `ostk-recall watch` process is retained for the decoupled
+  case.
+
 ## [0.6.0-alpha.3] - 2026-05-28
 
 The cognitive-memory substrate milestone. ostk-recall gains an ambient,

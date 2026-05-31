@@ -150,17 +150,21 @@ pub fn to_list(facets: &FacetSet) -> Vec<String> {
     out
 }
 
-/// Hash the operator overlay state for Tier-1 cache invalidation (P1).
+/// Hash the per-source overlay state for Tier-1 cache invalidation.
 ///
-/// Includes legacy `project` + the operator `facets` override. When the
-/// operator edits any facet (allowlisted or not), the hash flips and the
-/// pipeline forces a re-parse for affected sources. Re-parsing then
-/// recomputes `embedding_input_sha256`; the Tier-2 check decides whether
-/// to actually re-embed.
+/// Includes legacy `project` + the operator `facets` override (P1), plus an
+/// `extra_digest` (P12) that carries the per-source-kind record-rule digest
+/// and the scanner's `parse_version`. When the operator edits any facet, edits
+/// a record rule that can match this source, or a scanner bumps its parse
+/// version, the hash flips and the pipeline forces a re-parse for the affected
+/// sources. Re-parsing then recomputes `embedding_input_sha256`; the Tier-2
+/// check decides whether to actually re-embed. Passing `""` for `extra_digest`
+/// reproduces the pre-P12 P1-only hash.
 #[must_use]
 pub fn cfg_overlay_hash(
     legacy_project: Option<&str>,
     facets_override: &BTreeMap<String, Vec<String>>,
+    extra_digest: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -178,6 +182,14 @@ pub fn cfg_overlay_hash(
             h.update(b",");
         }
         h.update(b"|");
+    }
+    // IMPORTANT: only mix in the extra section when non-empty, so a source
+    // with no applicable record rules + parse_version 0 hashes
+    // byte-identically to the pre-P12 (P1-only) value and keeps Tier-1
+    // skipping — otherwise adding P12 would force a full-corpus re-parse.
+    if !extra_digest.is_empty() {
+        h.update(b"|extra:");
+        h.update(extra_digest.as_bytes());
     }
     hex::encode(&h.finalize()[..16])
 }

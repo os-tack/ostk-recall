@@ -28,9 +28,10 @@ use ostk_recall_core::attention::AttentionScope;
 use ostk_recall_mcp::{Resource, ResourceContent, ResourceError, ResourceRegistry};
 use ostk_recall_query::context::AttentionContext;
 use ostk_recall_query::lens::{Lens, LensConfig, build_lens};
-use ostk_recall_store::ChainEvent;
+use ostk_recall_query::rank::RankEngine;
 use ostk_recall_store::corpus::CorpusStore;
 use ostk_recall_store::threads::ChainSink;
+use ostk_recall_store::{ChainEvent, ChainLogReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -178,17 +179,9 @@ pub struct LensTickSnapshot {
     pub pin_fingerprint: Option<Vec<u8>>,
 }
 
-impl LensTickSnapshot {
-    /// Build an `AttentionContext` mirroring the snapshot's vectors.
-    /// `scope_vector` reflects the effective vector (pin precedence
-    /// already applied upstream); `rolling_vec` is raw.
-    fn to_attention_context(&self) -> AttentionContext {
-        AttentionContext {
-            scope_vector: self.scope_vector.clone(),
-            rolling_vec: self.rolling_vec.clone(),
-        }
-    }
-}
+// The snapshot → `AttentionContext` conversion now lives in the loop via
+// `AttentionContext::enrich_for_lens` (Phase B), which also attaches the
+// access-ledger reader and sets the explicit `pinned` flag.
 
 /// Compute the lens-refresh decision for a single tick.
 ///
@@ -207,6 +200,8 @@ impl LensTickSnapshot {
 pub async fn try_refresh_lens(
     snapshot: &LensTickSnapshot,
     last_state: &LensState,
+    engine: &RankEngine,
+    chain_reader: Option<Arc<dyn ChainLogReader>>,
     corpus: &CorpusStore,
     config: &LensConfig,
 ) -> LensRefreshDecision {
@@ -242,8 +237,22 @@ pub async fn try_refresh_lens(
 
     // 4. Build the lens. Errors return BuildFailed without
     //    touching last_state — next poll retries.
-    let attn = snapshot.to_attention_context();
-    let lens = match build_lens(&attn, corpus, config).await {
+    //
+    //    Phase B of the two-phase snapshot: the vectors + pin state were
+    //    captured under the read guard upstream; enrich_for_lens attaches
+    //    the access-ledger reader (so the freshness feature + refractory
+    //    penalty see retrieval history) and the explicit pin flag.
+    //    recent_entities / dominant_concept stay empty until P6/P7/P8.
+    let attn = AttentionContext::enrich_for_lens(
+        snapshot.scope_vector.clone(),
+        snapshot.rolling_vec.clone(),
+        pinned,
+        chain_reader,
+        Vec::new(),
+        None,
+    )
+    .await;
+    let lens = match build_lens(&attn, engine, corpus, config).await {
         Ok(l) => l,
         Err(e) => return LensRefreshDecision::BuildFailed(e.to_string()),
     };
@@ -376,6 +385,8 @@ pub async fn run_lens_loop(
     registry: Arc<ResourceRegistry>,
     resource: Arc<MemoryLensResource>,
     chain_sink: Arc<dyn ChainSink>,
+    chain_reader: Arc<dyn ChainLogReader>,
+    engine: Arc<RankEngine>,
     config: LensConfig,
     scope: AttentionScope,
     state_dir: PathBuf,
@@ -399,7 +410,15 @@ pub async fn run_lens_loop(
             }
             _ = interval.tick() => {
                 let snapshot = snapshot_attention(&attention, &scope).await;
-                let decision = try_refresh_lens(&snapshot, &state, &corpus, &config).await;
+                let decision = try_refresh_lens(
+                    &snapshot,
+                    &state,
+                    &engine,
+                    Some(Arc::clone(&chain_reader)),
+                    &corpus,
+                    &config,
+                )
+                .await;
                 apply_decision(
                     decision,
                     &mut state,
@@ -577,7 +596,7 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 8).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
         assert!(matches!(d, LensRefreshDecision::EmptyMind));
     }
 
@@ -602,7 +621,7 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 8).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
         assert!(matches!(d, LensRefreshDecision::NoTrigger), "got {d:?}");
     }
 
@@ -625,7 +644,7 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
         assert!(
             matches!(d, LensRefreshDecision::Refresh { .. }),
             "got {d:?}"
@@ -655,7 +674,7 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
         assert!(matches!(d, LensRefreshDecision::NoTrigger), "got {d:?}");
     }
 
@@ -680,7 +699,7 @@ mod tests {
             .unwrap();
         let corpus =
             rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
-        let d = rt.block_on(try_refresh_lens(&snap, &state, &corpus, &config));
+        let d = rt.block_on(try_refresh_lens(&snap, &state, &RankEngine::new(), None, &corpus, &config));
         // Empty corpus → empty lens → Refresh (UnchangedContent
         // requires a prior fingerprint that matches).
         assert!(

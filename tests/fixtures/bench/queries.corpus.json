@@ -1,0 +1,111 @@
+{
+  "description": "P5 rank-bench REAL query set, labeled against the maintainer's live corpus (~120k chunks, minishlab/potion-retrieval-32M). Relevance markers are stable `source_id` paths harvested from live recall (reranked top hits). The bench runs reranker-OFF (RRF + rank-engine only), so these are an honest target for the rank path P5 tunes. Relevance rule: a hit is relevant iff its `source_id` is in `relevant.source_ids`. Bare filenames are avoided (the bench matches source_id without project, so they'd collide across projects). Run: cargo run --release -p ostk-recall --example rank_bench -- --corpus ~/.local/share/ostk-recall --model minishlab/potion-retrieval-32M --queries tests/fixtures/bench/queries.corpus.json --iters 20 --out docs/rank-bench-results.md",
+  "schema_version": 1,
+  "queries": [
+    {
+      "id": "rrf-hybrid",
+      "query": "reciprocal rank fusion hybrid retrieval",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/query/src/lanes.rs", "crates/query/src/hybrid.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "fuse-rrf-symbol",
+      "query": "fuse_rrf",
+      "category": "entity",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/query/src/lanes.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "cross-encoder-rerank",
+      "query": "cross encoder reranker jina",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/query/src/rerank.rs", "crates/query/src/hybrid.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "with-reranker-symbol",
+      "query": "with_reranker",
+      "category": "entity",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/query/src/lib.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "five-laws",
+      "query": "five laws invisible write ephemeral optimistic concurrency microkernel",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["docs/spec/runtime-primitives.md", "docs/spec/bail.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "demand-paged-tools",
+      "query": "demand paged tool loading syscall surface",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["docs/spec/kernel-syscall-surface.md", "docs/spec/fcp-llm.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "firecracker-microvm",
+      "query": "firecracker microvm sandbox isolation",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["docs/draft/firecracker-microvm.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "isolation-tier-symbol",
+      "query": "IsolationTier",
+      "category": "entity",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["src/agentfile/parser.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "rolling-attention-ema",
+      "query": "rolling attention vector EMA scope",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/query/src/context.rs", "crates/attention/tests/scope_vector_priority.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "attention-context-symbol",
+      "query": "AttentionContext snapshot rank",
+      "category": "entity",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/query/src/context.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "tree-sitter-chunker",
+      "query": "tree-sitter code chunker",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/scan/src/tree_sitter.rs"], "chunk_ids": [] }
+    },
+    {
+      "id": "corpus-store-lance",
+      "query": "lance corpus store open table embedding column",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["crates/store/src/corpus.rs", "docs/lance-probe-results.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "lens-portfolio",
+      "query": "memory lens portfolio allocator diversity slots refractory",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["serialized-prancing-acorn.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "unix-mapping",
+      "query": "unix to ostk one to one primitive mapping",
+      "category": "topical",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["docs/spec/unix-to-haystack.md"], "chunk_ids": [] }
+    },
+    {
+      "id": "pitchfork-hybrid",
+      "query": "pitchfork layered hybrid search BM25 dense fusion over sources",
+      "category": "vague",
+      "profile": "explicit",
+      "relevant": { "source_ids": ["docs/draft/roundtable/pitchfork-l3/opus-ext.md", "docs/spec/semantic-pitchfork.md"], "chunk_ids": [] }
+    }
+  ]
+}

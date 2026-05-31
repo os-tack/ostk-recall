@@ -24,7 +24,10 @@ use ostk_recall_core::{
 };
 use walkdir::WalkDir;
 
-use crate::anthropic_session::{drop_local_command_wrappers, drop_tool_blocks, parse_session_file};
+// `drop_tool_blocks` is structural (wire-format `block_kind`) and stays here;
+// the text-apparatus filters (system-reminder / local-command / teammate-message)
+// moved to the config record-rule overlay (P12) — applied pipeline-side.
+use crate::anthropic_session::{drop_tool_blocks, parse_session_file};
 
 /// Scanner for Claude Code session logs.
 #[derive(Debug, Default)]
@@ -33,6 +36,14 @@ pub struct ClaudeCodeScanner;
 impl Scanner for ClaudeCodeScanner {
     fn kind(&self) -> SourceKind {
         SourceKind::ClaudeCode
+    }
+
+    // P12: bumped to 1 because the emitted-chunk set changes when the
+    // hardcoded apparatus filters move out of `parse` into the config
+    // record-rule overlay (P12-B). Folded into the Tier-1 freshness key so the
+    // first post-P12 scan re-parses already-ingested transcripts.
+    fn parse_version(&self) -> u32 {
+        1
     }
 
     fn discover<'a>(
@@ -93,7 +104,6 @@ impl Scanner for ClaudeCodeScanner {
             mtime,
         )
         .map(drop_tool_blocks)
-        .map(drop_local_command_wrappers)
     }
 }
 

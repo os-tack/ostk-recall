@@ -16,6 +16,7 @@ pub mod audit;
 pub mod candidate;
 pub mod context;
 pub mod error;
+pub mod freshness;
 pub mod hybrid;
 pub mod lanes;
 pub mod lens;
@@ -30,6 +31,7 @@ pub mod types;
 pub use candidate::Candidate;
 pub use context::{AttentionContext, QueryContext};
 pub use error::{QueryError, Result};
+pub use freshness::{FreshnessFactory, FreshnessInstance};
 pub use hybrid::recall;
 pub use lanes::{ambient_candidates, explicit_candidates};
 pub use ostk_recall_core::{
@@ -38,7 +40,10 @@ pub use ostk_recall_core::{
 };
 pub use ostk_recall_pipeline::ChunkEmbedder;
 pub use ostk_recall_store::CorpusStore;
-pub use rank::{Feature, FeatureAttribution, RankEngine, RankedHit, ScoreFn};
+pub use rank::{
+    FeatureAttribution, FnFactory, RankEngine, RankFeatureFactory, RankFeatureInstance, RankedHit,
+    build_engine_from_weights,
+};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
 pub use rerank::{RerankerError, RerankerLike};

@@ -112,10 +112,19 @@ pub enum PrivacyTier {
 pub struct ScoreAttribution {
     /// Active concern weight in `[0, 1]`.
     pub tension: f32,
-    /// Cosine similarity against the current attention vector.
+    /// Cosine similarity against the current attention vector (the
+    /// per-turn resonance *term*, not the durable counter below).
     pub resonance: f32,
-    /// Turns containing this handle within the attention window.
-    pub familiarity: u32,
+    /// Raw literal-match recurrence — turns containing this handle's
+    /// kebab-token. Document-frequency proxy; kept for reachability /
+    /// reanimation only. **Does not drive the floor** (see
+    /// `resonance_count`). Carried over from the pre-split `familiarity`.
+    pub mentions: u32,
+    /// Resonance-gated recurrence — the salience counter. Incremented
+    /// only when a mention lands in a turn that cosines with the thread
+    /// anchor >= `RESONANCE_GATE`. Drives `familiarity_floor`: a thread
+    /// surfaces at idle only to the extent it has genuinely resonated.
+    pub resonance_count: u32,
     /// Bonus for the low-tension + high-resonance quadrant.
     pub off_diagonal_lift: f32,
     /// Seconds since the thread was last touched.
@@ -360,14 +369,16 @@ mod tests {
         let s = ScoreAttribution {
             tension: 0.42,
             resonance: 0.71,
-            familiarity: 47,
+            mentions: 47,
+            resonance_count: 9,
             off_diagonal_lift: 0.03,
             time_since_touch_secs: 11 * 86_400,
         };
         let v: ScoreAttribution = round_trip(&s);
         assert!(f32_eq(v.tension, s.tension));
         assert!(f32_eq(v.resonance, s.resonance));
-        assert_eq!(v.familiarity, s.familiarity);
+        assert_eq!(v.mentions, s.mentions);
+        assert_eq!(v.resonance_count, s.resonance_count);
         assert!(f32_eq(v.off_diagonal_lift, s.off_diagonal_lift));
         assert_eq!(v.time_since_touch_secs, s.time_since_touch_secs);
     }
@@ -381,7 +392,8 @@ mod tests {
             why: ScoreAttribution {
                 tension: 0.0,
                 resonance: 0.71,
-                familiarity: 47,
+                mentions: 47,
+                resonance_count: 9,
                 off_diagonal_lift: 0.03,
                 time_since_touch_secs: 950_400,
             },
@@ -390,7 +402,8 @@ mod tests {
         assert_eq!(v.handle, p.handle);
         assert_eq!(v.depth, p.depth);
         assert!(f32_eq(v.score, p.score));
-        assert_eq!(v.why.familiarity, 47);
+        assert_eq!(v.why.mentions, 47);
+        assert_eq!(v.why.resonance_count, 9);
     }
 
     #[test]

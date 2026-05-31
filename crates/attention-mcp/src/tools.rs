@@ -82,7 +82,7 @@ pub fn tool_attention_fold() -> Value {
 pub fn tool_attention_familiarize() -> Value {
     json!({
         "name": "attention_familiarize",
-        "description": "Increment familiarity counter for a handle within the scope (called per turn-end). Returns the post-increment value.",
+        "description": "Observe a mention of a handle within the scope (called per turn-end). Increments the raw `mentions` counter, and the resonance-gated salience counter iff the turn resonates with the thread anchor. Returns post-increment `mentions`, `resonance`, and whether it `resonant`.",
         "inputSchema": {
             "type": "object",
             "properties": {

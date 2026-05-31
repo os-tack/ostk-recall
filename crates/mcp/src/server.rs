@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info, warn};
 
+use ostk_recall_store::ChainEvent;
+
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::resources::{ClientId, ResourceRegistry};
 use crate::tools::tool_list;
@@ -66,6 +68,23 @@ impl Server {
     pub fn with_attention(mut self, dispatch: Arc<AttentionDispatch>) -> Self {
         self.attention = Some(dispatch);
         self
+    }
+
+    /// P7b: append access-ledger events, best-effort. Requires the
+    /// attention dispatch (which owns the threads ledger + chain sink) —
+    /// on the `--stdio`/no-attention path there is no sink and events are
+    /// silently skipped. A ledger write must NEVER fail the recall that
+    /// produced it, so append errors are logged and swallowed.
+    fn log_access_events(&self, events: &[ChainEvent]) {
+        let Some(dispatch) = self.attention.as_ref() else {
+            return;
+        };
+        let sink = dispatch.threads.chain_sink();
+        for ev in events {
+            if let Err(e) = sink.append(ev) {
+                warn!(error = %e, kind = ev.kind_str(), "access-ledger append failed (best-effort)");
+            }
+        }
     }
 
     /// Replace the resource registry. Callers needing to register
@@ -133,8 +152,32 @@ impl Server {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // stdio transport: the process-scoped singleton client.
+        self.serve_with_client(ClientId::stdio_singleton(), reader, writer)
+            .await
+    }
+
+    /// Transport-agnostic serve loop for one connection identified by
+    /// `client`. The daemon's network listener calls this once per
+    /// accepted connection with a fresh [`ClientId::Network`]; the
+    /// stdio path goes through [`Self::serve`] with the singleton id.
+    ///
+    /// On exit a network client is fully evicted from the resource
+    /// registry (sender + subscriptions) so a long-lived daemon
+    /// doesn't leak dead ids; the stdio singleton keeps its
+    /// (process-scoped) subscriptions and only drops its sender.
+    pub async fn serve_with_client<R, W>(
+        &self,
+        client: ClientId,
+        reader: R,
+        writer: W,
+    ) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        self.resources.set_outbound(out_tx.clone());
+        self.resources.add_outbound(client.clone(), out_tx.clone());
 
         let writer_handle = tokio::spawn(writer_task(out_rx, writer));
 
@@ -158,7 +201,7 @@ impl Server {
                     continue;
                 }
                 let response = match serde_json::from_str::<Value>(trimmed) {
-                    Ok(v) => self.handle_request(v).await,
+                    Ok(v) => self.handle_request_as(v, &client).await,
                     Err(e) => Some(JsonRpcResponse::err(
                         Value::Null,
                         JsonRpcError::parse(format!("parse error: {e}")),
@@ -177,7 +220,14 @@ impl Server {
         .await;
 
         info!("mcp server shutting down");
-        self.resources.clear_outbound();
+        match &client {
+            // Network connection closed: evict its sender and prune
+            // its subscriptions so the daemon doesn't leak dead ids.
+            ClientId::Network { .. } => self.resources.remove_client(&client),
+            // stdio singleton: drop only the sender; process-scoped
+            // subscriptions are kept (serve_eof regression contract).
+            ClientId::StdioSingleton => self.resources.remove_outbound(&client),
+        }
         drop(out_tx);
         let writer_result = writer_handle.await;
 
@@ -194,7 +244,22 @@ impl Server {
     }
 
     /// Dispatch one JSON-RPC message. Returns None for notifications (no id).
+    /// `resources/subscribe` is attributed to the stdio singleton; the
+    /// daemon network path uses [`Self::handle_request_as`] with a
+    /// per-connection id.
     pub async fn handle_request(&self, raw: Value) -> Option<JsonRpcResponse> {
+        self.handle_request_as(raw, &ClientId::stdio_singleton())
+            .await
+    }
+
+    /// Dispatch one JSON-RPC message on behalf of `client`. `client`
+    /// only affects `resources/subscribe` routing; every other method
+    /// is client-agnostic.
+    pub async fn handle_request_as(
+        &self,
+        raw: Value,
+        client: &ClientId,
+    ) -> Option<JsonRpcResponse> {
         let req: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
             Ok(r) => r,
             Err(e) => {
@@ -226,7 +291,7 @@ impl Server {
                 Err(err) => Some(JsonRpcResponse::err(id, err)),
             },
             "resources/subscribe" => match resource_uri_param(&req.params) {
-                Ok(uri) => match self.resources.subscribe(ClientId::stdio_singleton(), &uri) {
+                Ok(uri) => match self.resources.subscribe(client.clone(), &uri) {
                     Ok(()) => Some(JsonRpcResponse::ok(id, json!({}))),
                     Err(err) => Some(JsonRpcResponse::err(id, err.into_rpc())),
                 },
@@ -289,6 +354,7 @@ impl Server {
                 let p: RecallParams = serde_json::from_value(args.clone())
                     .map_err(|e| JsonRpcError::invalid_params(format!("recall args: {e}")))?;
                 let bias = p.attention_bias.clone();
+                let query_hash = query_hash(&p.query);
                 let mut hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
                 // Phase F: lens declaration. Capture the pinned focus
                 // (if any) BEFORE applying bias so we can attach a
@@ -302,6 +368,19 @@ impl Server {
                         apply_attention_bias(&mut hits, &bias, dispatch).await;
                     }
                 }
+                // P7b: log one ExplicitRecall access event per returned hit
+                // (best-effort; daemon path only). ACT-R freshness is
+                // per-chunk, so each surfaced chunk is its own access.
+                let now = chrono::Utc::now();
+                let events: Vec<ChainEvent> = hits
+                    .iter()
+                    .map(|h| ChainEvent::ExplicitRecall {
+                        chunk_id: h.chunk_id.clone(),
+                        query_hash: query_hash.clone(),
+                        ts: now,
+                    })
+                    .collect();
+                self.log_access_events(&events);
                 match lens {
                     Some(lens) => json!({ "hits": hits, "lens": lens }),
                     None => json!({ "hits": hits }),
@@ -349,6 +428,17 @@ impl Server {
                     return Err(JsonRpcError::invalid_params("query must be non-empty"));
                 }
                 let hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                // P7b: capture chunk_ids BEFORE `collapse` consumes `hits`;
+                // log one RecallFault access event per retrieved chunk.
+                let now = chrono::Utc::now();
+                let events: Vec<ChainEvent> = hits
+                    .iter()
+                    .map(|h| ChainEvent::RecallFault {
+                        chunk_id: h.chunk_id.clone(),
+                        ts: now,
+                    })
+                    .collect();
+                self.log_access_events(&events);
                 let pages = Synthesizer::collapse(hits);
                 let named: Vec<Value> = pages
                     .iter()
@@ -647,6 +737,17 @@ fn build_recall_lens(
     }))
 }
 
+/// Opaque short hash of a normalized query, stored on `ExplicitRecall`
+/// access events so "which query surfaced this chunk" is recoverable
+/// without persisting the full query text. `access_history` never reads
+/// it — it exists purely for future provenance analysis.
+fn query_hash(query: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    query.trim().to_lowercase().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 fn query_error_to_rpc(err: QueryError) -> JsonRpcError {
     match err {
         QueryError::Forbidden(msg) => JsonRpcError::invalid_params(msg),
@@ -742,7 +843,8 @@ mod attention_bias_tests {
             .upsert_thread(&ThreadRecord {
                 handle: handle.clone(),
                 tension: TensionState::Active,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: now,
                 anchor_chunk_id: Some(anchor_chunk.into()),
                 fold_override: None,

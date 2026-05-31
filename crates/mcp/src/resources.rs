@@ -156,16 +156,19 @@ impl ResourceError {
 // ClientId
 // ---------------------------------------------------------------------
 
-/// Placeholder for the eventual multi-transport client identifier.
+/// Identifies a connected MCP client for subscription routing.
 ///
-/// P9a-min targets the stdio singleton — exactly one client per
-/// process. `StdioSingleton` is the only variant. When the server
-/// gains a network transport, this gains a `Network { id: u64 }`
-/// variant and the subscriber map starts pruning on disconnect; the
-/// existing surface (subscribe / notify_updated) stays.
+/// `StdioSingleton` is the process-scoped stdio client (`serve
+/// --stdio` / `run_stdio`): exactly one per process, and its
+/// subscriptions live for the process lifetime. `Network { id }`
+/// identifies one accepted connection on the daemon's MCP socket /
+/// named pipe; the daemon hands each connection a fresh id from a
+/// monotonic counter, and the subscriber map prunes that id when the
+/// connection closes.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum ClientId {
     StdioSingleton,
+    Network { id: u64 },
 }
 
 impl ClientId {
@@ -175,6 +178,13 @@ impl ClientId {
     #[must_use]
     pub const fn stdio_singleton() -> Self {
         Self::StdioSingleton
+    }
+
+    /// Construct a network client identifier for one accepted daemon
+    /// connection. `id` must be unique per live connection.
+    #[must_use]
+    pub const fn network(id: u64) -> Self {
+        Self::Network { id }
     }
 }
 
@@ -193,11 +203,14 @@ impl ClientId {
 pub struct ResourceRegistry {
     resources: RwLock<HashMap<String, Arc<dyn Resource>>>,
     subscribers: RwLock<HashMap<String, HashSet<ClientId>>>,
-    /// Outbound channel into the stdio writer task. `None` until
-    /// `set_outbound` is called by `run_stdio` (or test fixtures).
-    /// `emit_resource_updated` is a no-op when this is unset, so
-    /// libraries can construct a registry without wiring a transport.
-    outbound: Mutex<Option<UnboundedSender<String>>>,
+    /// Per-client outbound channels into each connection's writer
+    /// task. Empty until a transport installs one via
+    /// [`Self::add_outbound`] (or the [`Self::set_outbound`] stdio
+    /// shim). `emit_resource_updated` fans a notification out to every
+    /// subscriber that still has a live sender here, so a daemon
+    /// serving N connections reaches all N. Keyed by [`ClientId`] so a
+    /// closing connection drops only its own sender.
+    outbound: Mutex<HashMap<ClientId, UnboundedSender<String>>>,
 }
 
 impl ResourceRegistry {
@@ -307,28 +320,58 @@ impl ResourceRegistry {
             .unwrap_or_default()
     }
 
-    /// Install the outbound channel used by
-    /// [`Self::emit_resource_updated`].
-    pub fn set_outbound(&self, tx: UnboundedSender<String>) {
+    /// Register `client`'s outbound channel into its writer task.
+    /// [`Self::emit_resource_updated`] fans notifications out to every
+    /// subscriber with a sender registered here.
+    pub fn add_outbound(&self, client: ClientId, tx: UnboundedSender<String>) {
         if let Ok(mut guard) = self.outbound.lock() {
-            *guard = Some(tx);
+            guard.insert(client, tx);
         }
     }
 
-    /// Drop the held outbound `Sender`, if any.
-    ///
-    /// Called by [`crate::Server::serve`] during shutdown so the
-    /// writer task's receiver sees every sender close and exits
-    /// cleanly. Without this, the registry's clone keeps the
-    /// channel alive past stdin EOF and the writer task wedges on
-    /// `rx.recv().await` forever.
-    ///
-    /// After `clear_outbound`, `emit_resource_updated` becomes a
-    /// silent no-op until a new sender is installed.
-    pub fn clear_outbound(&self) {
+    /// Drop only `client`'s outbound sender, leaving its subscriptions
+    /// intact. Used by the stdio shutdown path: when stdin EOFs the
+    /// process is exiting, so the registry's clone of the sender must
+    /// be released (or the writer task wedges on `rx.recv().await`
+    /// forever), but the subscription bookkeeping is process-scoped
+    /// and harmless to keep.
+    pub fn remove_outbound(&self, client: &ClientId) {
         if let Ok(mut guard) = self.outbound.lock() {
-            *guard = None;
+            guard.remove(client);
         }
+    }
+
+    /// Fully evict a disconnected `client`: drop its outbound sender
+    /// AND every subscription it held. Used by the daemon's network
+    /// transport when a connection closes, so a long-lived daemon
+    /// doesn't leak dead [`ClientId`]s in the subscriber map.
+    pub fn remove_client(&self, client: &ClientId) {
+        if let Ok(mut guard) = self.outbound.lock() {
+            guard.remove(client);
+        }
+        if let Ok(mut subs) = self.subscribers.write() {
+            for clients in subs.values_mut() {
+                clients.remove(client);
+            }
+        }
+    }
+
+    /// Install the stdio singleton's outbound channel. Back-compat
+    /// shim over [`Self::add_outbound`] for the `run_stdio` path and
+    /// test fixtures.
+    pub fn set_outbound(&self, tx: UnboundedSender<String>) {
+        self.add_outbound(ClientId::StdioSingleton, tx);
+    }
+
+    /// Drop the stdio singleton's outbound sender (subscriptions kept).
+    /// Back-compat shim over [`Self::remove_outbound`]; called by the
+    /// stdio [`crate::Server::serve`] shutdown so the writer task sees
+    /// the channel close and exits.
+    ///
+    /// After `clear_outbound`, `emit_resource_updated` is a silent
+    /// no-op for the stdio client until a new sender is installed.
+    pub fn clear_outbound(&self) {
+        self.remove_outbound(&ClientId::StdioSingleton);
     }
 
     /// Push `notifications/resources/updated` to every subscriber of
@@ -345,24 +388,36 @@ impl ResourceRegistry {
         if subscribers.is_empty() {
             return;
         }
-        let tx = match self.outbound.lock() {
-            Ok(g) => g.clone(),
-            Err(p) => p.into_inner().clone(),
+        // Collect the live senders for this URI's subscribers, then
+        // release the lock before sending so a send can't hold off the
+        // next add_outbound / remove_client. Sends are non-blocking
+        // (unbounded channel) but the lock discipline keeps the
+        // "collect under lock, send after" contract.
+        let txs: Vec<UnboundedSender<String>> = match self.outbound.lock() {
+            Ok(g) => subscribers.iter().filter_map(|c| g.get(c).cloned()).collect(),
+            Err(p) => p
+                .into_inner()
+                .iter()
+                .filter(|(c, _)| subscribers.contains(c))
+                .map(|(_, tx)| tx.clone())
+                .collect(),
         };
-        let Some(tx) = tx else { return };
+        if txs.is_empty() {
+            return;
+        }
         let envelope = json!({
             "jsonrpc": "2.0",
             "method": "notifications/resources/updated",
             "params": { "uri": uri },
         })
         .to_string();
-        // The MCP spec treats notifications as fire-and-forget per
-        // subscriber, but the singleton stdio transport has exactly
-        // one channel — multi-client routing is P9a-full work, so
-        // sending once is sufficient even when subscribers.len() > 1
-        // (which can't happen in P9a-min).
-        if tx.send(envelope).is_err() {
-            warn!(uri = %uri, "writer task closed; resource update dropped");
+        // Fan out to every subscribed connection. Per the MCP spec,
+        // notifications are fire-and-forget per subscriber; a closed
+        // writer task just drops that one.
+        for tx in txs {
+            if tx.send(envelope.clone()).is_err() {
+                warn!(uri = %uri, "writer task closed; resource update dropped for a subscriber");
+            }
         }
     }
 }
@@ -499,5 +554,80 @@ mod tests {
         reg.emit_resource_updated("ostk://x");
         // try_recv should be empty.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn emit_fans_out_to_all_subscribed_network_clients() {
+        // The multi-client contract: two distinct network connections
+        // each subscribe and register their own outbound, and a single
+        // emit reaches both.
+        let reg = ResourceRegistry::new();
+        reg.register(fake("ostk://x", "body"));
+
+        let c1 = ClientId::network(1);
+        let c2 = ClientId::network(2);
+        reg.subscribe(c1.clone(), "ostk://x").unwrap();
+        reg.subscribe(c2.clone(), "ostk://x").unwrap();
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel::<String>();
+        reg.add_outbound(c1, tx1);
+        reg.add_outbound(c2, tx2);
+
+        reg.emit_resource_updated("ostk://x");
+
+        assert!(rx1.recv().await.is_some(), "client 1 must receive");
+        assert!(rx2.recv().await.is_some(), "client 2 must receive");
+    }
+
+    #[tokio::test]
+    async fn remove_client_prunes_subscription_and_sender() {
+        // A disconnected network client is fully evicted: its sender is
+        // dropped AND its subscription pruned, so a long-lived daemon
+        // doesn't leak dead ids or try to notify a closed connection.
+        let reg = ResourceRegistry::new();
+        reg.register(fake("ostk://x", "body"));
+
+        let gone = ClientId::network(1);
+        let live = ClientId::network(2);
+        reg.subscribe(gone.clone(), "ostk://x").unwrap();
+        reg.subscribe(live.clone(), "ostk://x").unwrap();
+        let (tx_gone, mut rx_gone) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx_live, mut rx_live) = tokio::sync::mpsc::unbounded_channel::<String>();
+        reg.add_outbound(gone.clone(), tx_gone);
+        reg.add_outbound(live, tx_live);
+
+        reg.remove_client(&gone);
+
+        assert_eq!(
+            reg.subscribers_for("ostk://x").len(),
+            1,
+            "evicted client's subscription must be pruned"
+        );
+        reg.emit_resource_updated("ostk://x");
+        assert!(rx_live.recv().await.is_some(), "live client still notified");
+        assert!(
+            rx_gone.try_recv().is_err(),
+            "evicted client must not be notified"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_outbound_keeps_stdio_subscription() {
+        // The stdio shim drops only the sender, not the subscription
+        // (process-scoped) — matches the serve_eof regression contract.
+        let reg = ResourceRegistry::new();
+        reg.register(fake("ostk://x", "body"));
+        reg.subscribe(ClientId::stdio_singleton(), "ostk://x")
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        reg.set_outbound(tx);
+
+        reg.clear_outbound();
+
+        assert_eq!(
+            reg.subscribers_for("ostk://x").len(),
+            1,
+            "clear_outbound must not prune the stdio subscription"
+        );
     }
 }

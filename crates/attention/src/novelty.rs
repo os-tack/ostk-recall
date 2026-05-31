@@ -397,7 +397,7 @@ mod tests {
         let mut embs = Vec::new();
         for i in 0..3 {
             chunks.push(chunk_at(&format!("novel-{i}"), now));
-            embs.push(near_axis(7, dim, 0.001));
+            embs.push(near_axis(7, dim, (i as f32).mul_add(1e-4, 0.001)));
         }
         chunks.push(chunk_at("aligned", now));
         embs.push(near_axis(0, dim, 0.001));
@@ -512,7 +512,7 @@ mod tests {
         let mut embs = Vec::new();
         for i in 0..3 {
             chunks.push(chunk_at(&format!("novel-{i}"), now));
-            embs.push(near_axis(7, dim, 0.001));
+            embs.push(near_axis(7, dim, (i as f32).mul_add(1e-4, 0.001)));
         }
         store.upsert(&chunks, &embs).await.unwrap();
 

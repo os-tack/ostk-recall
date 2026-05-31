@@ -61,6 +61,69 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
 #     "status:archived",       #   (privacy / status denylist)
 # ]
 
+# ──────────────────────────────────────────────────────────────────────
+# Optional weaver tuning. `exclude_facets` lists `key:value` facets whose
+# presence makes the auto-weaver treat a chunk as apparatus — it is skipped
+# for anchor-matching and proposal seeding (so templated harness scaffolding
+# can't form degenerate threads). Omit the block for the default, which
+# excludes only `record_kind:harness_orchestration`. NOTE: adding
+# `record_kind:audit_significant` here is a deliberate thread-graph change
+# (that facet is attenuated from the *lens* by default, but still woven).
+#
+# [weaver]
+# exclude_facets = ["record_kind:harness_orchestration"]
+#
+# Independent of this facet denylist, the weaver ALWAYS treats two classes of
+# structural apparatus as un-weavable (they stay in the corpus + recall, but
+# never anchor or seed threads): Claude Code tool-call envelopes
+# (block_kind tool_use / tool_result) and `<task-notification>` monitor events.
+# These are block_kind / content properties, not facets, so they are not
+# expressible here — see `is_structural_apparatus` in the weaver. To drop them
+# from recall entirely (not just weaving), use `CorpusStore::mark_tool_blocks_stale`.
+
+# ──────────────────────────────────────────────────────────────────────
+# Optional record rules (interpretation overlay). Each [[record_rule]] is a
+# `match → action` applied to every chunk once, at ingest, for ALL scanners.
+# This is where apparatus filtering lives — drop pure scaffolding, or tag
+# low-salience content with a `record_kind` facet so the lens denylist
+# attenuates it (still retained + recall-able).
+#
+#   match  — any of: prefix / contains / regex (tested against text after
+#            trim_start); source_kind (a list of SourceKind, e.g.
+#            ["claude_code"]); source (a concrete Source, e.g.
+#            "ostk_session"); role. All present predicates must match (AND).
+#            A rule with NO predicates is rejected (it would match
+#            everything). Unknown source_kind/source values are rejected.
+#   action — { kind = "drop" }  OR
+#            { kind = "tag", record_kind = "<value>" }
+#
+# OMIT the section entirely to use the built-in defaults (the Claude Code
+# apparatus filters, each scoped to the scanner that needs it). PRESENT
+# (even an empty list `record_rule = []`) replaces the defaults — so if you
+# author your own rules, re-add any defaults you still want.
+#
+# IMPORTANT: scope rules with `source_kind` (and `source` where needed).
+# An unscoped `prefix = "<system-reminder>"` drop would also delete real
+# markdown/code that happens to start with that text.
+#
+# Defaults (shown explicitly; this is what you get when the section is omitted):
+#
+# [[record_rule]]                              # pure harness apparatus → drop
+# match  = { source_kind = ["claude_code"], prefix = "<system-reminder>" }
+# action = { kind = "drop" }
+#
+# [[record_rule]]                              # slash/local-command wrappers → drop
+# match  = { source_kind = ["claude_code"], regex = "^(<local-command-|<command-name>|</command-name>|<command-message>|<command-args>)" }
+# action = { kind = "drop" }
+#
+# [[record_rule]]                              # same wrappers, ostk session chunks only
+# match  = { source_kind = ["ostk_project"], source = "ostk_session", regex = "^(<local-command-|<command-name>|</command-name>|<command-message>|<command-args>)" }
+# action = { kind = "drop" }
+#
+# [[record_rule]]                              # multi-agent envelopes → tag (attenuated, kept)
+# match  = { source_kind = ["claude_code"], prefix = "<teammate-message" }
+# action = { kind = "tag", record_kind = "harness_orchestration" }
+
 # One [[sources]] table per logical corpus slice.
 # `project` is a free-text tag — namespace your corpora however you like.
 

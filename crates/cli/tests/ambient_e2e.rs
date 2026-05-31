@@ -136,7 +136,8 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
         db.upsert_thread(&ThreadRecord {
             handle: handle.clone(),
             tension: TensionState::Active,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: now,
             anchor_chunk_id: Some(anchor_chunk_id.clone()),
             fold_override: None,
@@ -175,10 +176,10 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
             .expect("seeded thread missing after scan");
         let evidence = db.list_evidence(&handle).unwrap();
         assert_eq!(
-            after.familiarity, 0,
-            "P11a gate regressed: bulk scan advanced familiarity to {} \
+            after.mentions, 0,
+            "P11a gate regressed: bulk scan advanced mentions to {} \
              (observer fired on a non-TurnEnd)",
-            after.familiarity
+            after.mentions
         );
         assert!(
             evidence.is_empty(),
@@ -211,8 +212,8 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
     // Familiarity is the observer's responsibility and advances only on
     // live watched TurnEnds — an offline weave must never touch it.
     assert_eq!(
-        after.familiarity, 0,
-        "weave must not advance familiarity (observer-only); got {}",
-        after.familiarity
+        after.mentions, 0,
+        "weave must not advance mentions (observer-only); got {}",
+        after.mentions
     );
 }

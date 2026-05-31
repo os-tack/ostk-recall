@@ -82,12 +82,20 @@ enum Command {
     /// it does not make bulk scans look like watched conversation turns.
     Weave {
         /// Only weave chunks newer than this duration, e.g. 1h, 24h, 7d.
-        /// Omit for the whole active corpus.
+        /// Omit for the whole active corpus. With `--consolidate` this is
+        /// the horizon of the consolidation layer (the cron tier picks it).
         #[arg(long)]
         since: Option<String>,
         /// Number of chunk ids per synthesized source-kind batch.
         #[arg(long, default_value_t = 256)]
         epoch_size: usize,
+        /// Run a coarse **consolidation** cycle, not just capture: after the
+        /// windowed re-weave, bridge consolidated threads across canyons,
+        /// promote recurring high-cohesion proposals to durable threads, and
+        /// fade idle threads. Offline policy — schedule under cron/launchd at
+        /// the cadences in `config.example.toml`, never inside `serve`.
+        #[arg(long)]
+        consolidate: bool,
     },
     /// Inspect a single chunk by id.
     Inspect {
@@ -95,16 +103,35 @@ enum Command {
         chunk_id: String,
     },
     /// Serve the MCP endpoint.
+    ///
+    /// Without `--stdio`, runs as a standalone daemon: serves MCP to
+    /// many clients over a local socket / named pipe (dial it with
+    /// `ostk-recall connect`) and keeps the corpus fresh in the
+    /// background. With `--stdio`, this process is itself the MCP
+    /// server, talking JSON-RPC over its own stdin/stdout.
     Serve {
-        /// Use stdio transport.
+        /// Use stdio transport (this process is the MCP server).
         #[arg(long)]
         stdio: bool,
+        /// Daemon mode only: also run the filesystem watcher in-process
+        /// so file changes trigger a rescan without a separate
+        /// `ostk-recall watch`. Ignored under `--stdio`.
+        #[arg(long)]
+        watch: bool,
     },
     /// Watch configured source paths and poke the running `serve`'s
     /// scan-trigger socket whenever a debounced batch of events lands.
     /// Requires `[watch].enabled = true` in config; reuses each
     /// `[[sources]].paths` and `extensions`.
     Watch,
+    /// Bridge a stdio MCP client to a running `serve` daemon.
+    ///
+    /// A dumb byte pump: splices this process's stdin/stdout to the
+    /// daemon's MCP socket / named pipe. No engine, no corpus lock, no
+    /// scanning — point a stdio-only MCP client (Claude Code/Desktop)
+    /// at `ostk-recall connect` so it reaches the shared daemon instead
+    /// of spawning its own `serve`.
+    Connect,
     /// Attention substrate verbs (forward-attention runtime).
     Attention {
         /// Emit JSON instead of the human-readable summary.
@@ -266,6 +293,14 @@ enum ThreadVerb {
         handle_from_proposed: String,
         #[arg(long = "to")]
         target_tier: String,
+    },
+    /// Delete a thread by handle (chains `ThreadDelete`; CASCADE drops its
+    /// evidence). The underlying corpus chunks are untouched — use this to
+    /// prune apparatus / frequency-promoted threads (e.g. harness
+    /// orchestration vocab) without forgetting any observation.
+    Delete {
+        /// Thread handle to delete.
+        handle: String,
     },
     /// List threads, optionally filtered by tension.
     List {
@@ -536,18 +571,45 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                 None => println!("done in {:.1}s", out.elapsed.as_secs_f64()),
             }
         }
-        Command::Weave { since, epoch_size } => {
+        Command::Weave {
+            since,
+            epoch_size,
+            consolidate,
+        } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
             let since = since.as_deref().map(parse_since_duration).transpose()?;
-            let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
-            println!(
-                "weave summary: batches={} chunks={} evidence_links={} proposed_weaves={} proposed_threads={}",
-                out.batches_processed,
-                out.chunks_seen,
-                out.evidence_links_written,
-                out.proposed_weaves,
-                out.proposed_threads_written
-            );
+            if consolidate {
+                let out =
+                    commands::consolidate(&config_path, embedder, since, epoch_size).await?;
+                let w = &out.window;
+                println!(
+                    "consolidate summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_threads={} proposals_pruned={} | bridges_written={} bridges_touched={} proposals_promoted={} threads_merged={} threads_abstracted={} threads_faded={}",
+                    w.batches_processed,
+                    w.chunks_seen,
+                    w.evidence_links_written,
+                    w.evidence_links_touched,
+                    w.proposed_threads_written,
+                    w.proposals_pruned,
+                    out.anchor_bridges_written,
+                    out.anchor_bridges_touched,
+                    out.proposals_promoted,
+                    out.threads_merged,
+                    out.threads_abstracted,
+                    out.threads_faded,
+                );
+            } else {
+                let out = commands::weave(&config_path, embedder, since, epoch_size).await?;
+                println!(
+                    "weave summary: batches={} chunks={} evidence_links={} evidence_touched={} proposed_weaves={} proposed_threads={} proposals_pruned={}",
+                    out.batches_processed,
+                    out.chunks_seen,
+                    out.evidence_links_written,
+                    out.evidence_links_touched,
+                    out.proposed_weaves,
+                    out.proposed_threads_written,
+                    out.proposals_pruned
+                );
+            }
         }
         Command::Verify => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
@@ -570,12 +632,15 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             let result = commands::inspect(&config_path, embedder, &chunk_id).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        Command::Serve { stdio } => {
+        Command::Serve { stdio, watch } => {
             let embedder = resolve_embedder(cli.config.as_ref())?;
-            commands::serve(&config_path, embedder, stdio).await?;
+            commands::serve(&config_path, embedder, stdio, watch).await?;
         }
         Command::Watch => {
             commands::watch(&config_path).await?;
+        }
+        Command::Connect => {
+            commands::connect(&config_path).await?;
         }
         Command::Attention { json, verb } => {
             let dispatch = build_attention_dispatch(&config_path)?;
@@ -825,6 +890,14 @@ async fn run_thread(d: &AttentionDispatch, verb: ThreadVerb) -> Result<serde_jso
         } => attn_cli::run_thread_promote(d, handle_from_proposed, target_tier)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ThreadVerb::Delete { handle } => {
+            let h = ostk_recall_core::ThreadHandle::new(&handle)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            d.threads
+                .delete_thread(&h)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            serde_json::json!({ "deleted": handle })
+        }
         ThreadVerb::List {
             scope_project,
             tension,
@@ -895,22 +968,24 @@ fn print_attention_output(json: bool, value: &serde_json::Value) {
             println!("pages ({}):", pages.len());
             for p in pages {
                 println!(
-                    "  {}: score={:.3} depth={} resonance={:.3} familiarity={}",
+                    "  {}: score={:.3} depth={} resonance={:.3} mentions={} resonance_count={}",
                     p["handle"].as_str().unwrap_or("?"),
                     p["score"].as_f64().unwrap_or(0.0),
                     p["depth"].as_str().unwrap_or("?"),
                     p["why"]["resonance"].as_f64().unwrap_or(0.0),
-                    p["why"]["familiarity"].as_u64().unwrap_or(0),
+                    p["why"]["mentions"].as_u64().unwrap_or(0),
+                    p["why"]["resonance_count"].as_u64().unwrap_or(0),
                 );
             }
         } else if let Some(records) = value.get("records").and_then(|v| v.as_array()) {
             println!("threads ({}):", records.len());
             for r in records {
                 println!(
-                    "  {}: tension={} familiarity={} privacy_tier={}",
+                    "  {}: tension={} mentions={} resonance={} privacy_tier={}",
                     r["handle"].as_str().unwrap_or("?"),
                     r["tension"].as_str().unwrap_or("?"),
-                    r["familiarity"].as_u64().unwrap_or(0),
+                    r["mentions"].as_u64().unwrap_or(0),
+                    r["resonance"].as_u64().unwrap_or(0),
                     r["privacy_tier"].as_str().unwrap_or("?"),
                 );
             }

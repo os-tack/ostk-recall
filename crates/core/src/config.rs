@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::record_rules::{RecordRule, default_record_rules};
 use crate::source::SourceKind;
 
 /// Top-level configuration loaded from `config.toml`.
@@ -33,6 +34,26 @@ pub struct Config {
     /// the daemon's runtime `LensConfig`.
     #[serde(default)]
     pub lens: Option<LensSettings>,
+    /// Optional config-driven interpretation rules (P12). `[[record_rule]]`
+    /// blocks each `pattern → action` (drop / tag `record_kind`), applied once
+    /// in the pipeline overlay stage for all scanners. **Omit** the section to
+    /// use the built-in [`default_record_rules`] (the apparatus filters);
+    /// **present** (even an empty list) replaces the defaults entirely. See
+    /// [`crate::record_rules`].
+    #[serde(default, rename = "record_rule")]
+    pub record_rules: Option<Vec<RecordRule>>,
+    /// Optional weaver tuning. Omit to accept defaults (attenuate only
+    /// `record_kind:harness_orchestration` from weaving).
+    #[serde(default)]
+    pub weaver: Option<WeaverSettings>,
+    /// Optional rank-engine feature weights (P5), keyed by retrieval
+    /// profile. Omit the `[ranking]` block to accept the compiled-in
+    /// defaults (explicit recall: `rrf = 1.0`; ambient/lens:
+    /// `attention_affinity = 1.0`) — these match shipped v0.6 behavior.
+    /// Present (even partial) overlays the compiled-in defaults; see
+    /// [`ProfileWeights::effective`].
+    #[serde(default)]
+    pub ranking: Option<RankingConfig>,
 }
 
 /// Runtime resource caps. Each field is the upper bound on the
@@ -147,8 +168,11 @@ pub struct LensSettings {
     #[serde(default = "default_lens_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// `key:value` facet entries that exclude a chunk from the lens
-    /// (privacy / status denylist), e.g. `["status:archived"]`.
-    #[serde(default)]
+    /// (privacy / status denylist), e.g. `["status:archived"]`. Defaults
+    /// to attenuating operational telemetry (`record_kind:audit_significant`)
+    /// from ambient surfacing — it stays fully recall-able. Set an explicit
+    /// (possibly empty) list to override.
+    #[serde(default = "default_lens_exclude_facets")]
     pub exclude_facets: Vec<String>,
     /// Per-lane candidate cap (the dense lane in p9b-min).
     #[serde(default = "default_lens_candidate_k_per_lane")]
@@ -157,6 +181,17 @@ pub struct LensSettings {
     /// slot, as a fraction.
     #[serde(default = "default_lens_dominance_threshold")]
     pub dominance_threshold: f32,
+    /// Refractory decay time-constant in seconds (P9b-full). A chunk
+    /// included in a recent lens is penalized by
+    /// `refractory_weight * exp(-Δt / refractory_tau_secs)`; ~1h default
+    /// means a just-surfaced chunk is strongly suppressed and the penalty
+    /// fades over a few hours, so the lens doesn't repeat itself.
+    #[serde(default = "default_lens_refractory_tau_secs")]
+    pub refractory_tau_secs: u64,
+    /// Peak refractory penalty (subtracted from `total_score` for a chunk
+    /// surfaced just now). P9b-full.
+    #[serde(default = "default_lens_refractory_weight")]
+    pub refractory_weight: f32,
 }
 
 // Defaults below MUST match `ostk_recall_query::lens::LensConfig::default()`.
@@ -180,6 +215,23 @@ const fn default_lens_candidate_k_per_lane() -> usize {
 fn default_lens_dominance_threshold() -> f32 {
     0.30
 }
+const fn default_lens_refractory_tau_secs() -> u64 {
+    3600
+}
+fn default_lens_refractory_weight() -> f32 {
+    0.5
+}
+/// Operational telemetry is attenuated from ambient surfacing by default
+/// (still fully recall-able). Keep in sync with `LensConfig::default()`.
+fn default_lens_exclude_facets() -> Vec<String> {
+    vec![
+        "record_kind:audit_significant".to_string(),
+        // RT-7: Claude Code multi-agent `<teammate-message>` orchestration
+        // envelopes — apparatus, attenuated from ambient surfacing but kept
+        // recall-able.
+        "record_kind:harness_orchestration".to_string(),
+    ]
+}
 
 impl Default for LensSettings {
     fn default() -> Self {
@@ -188,10 +240,173 @@ impl Default for LensSettings {
             min_excerpt_tokens: default_lens_min_excerpt_tokens(),
             drift_threshold: default_lens_drift_threshold(),
             poll_interval_secs: default_lens_poll_interval_secs(),
-            exclude_facets: Vec::new(),
+            exclude_facets: default_lens_exclude_facets(),
             candidate_k_per_lane: default_lens_candidate_k_per_lane(),
             dominance_threshold: default_lens_dominance_threshold(),
+            refractory_tau_secs: default_lens_refractory_tau_secs(),
+            refractory_weight: default_lens_refractory_weight(),
         }
+    }
+}
+
+/// Weaver tuning, surfaced as the optional `[weaver]` block (P12).
+///
+/// `exclude_facets` lists `key:value` facet entries whose presence makes the
+/// weaver treat a chunk as apparatus — it is skipped for anchor-matching and
+/// proposal seeding (generalizes the former hardcoded
+/// `is_harness_apparatus` check). The default preserves pre-P12 behavior:
+/// only `record_kind:harness_orchestration` is excluded. Excluding
+/// `record_kind:audit_significant` from *weaving* would be a deliberate
+/// thread-graph behavior change (that exclusion is established for the lens
+/// only) and must be opted into explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeaverSettings {
+    #[serde(default = "default_weaver_exclude_facets")]
+    pub exclude_facets: Vec<String>,
+}
+
+fn default_weaver_exclude_facets() -> Vec<String> {
+    vec!["record_kind:harness_orchestration".to_string()]
+}
+
+impl Default for WeaverSettings {
+    fn default() -> Self {
+        Self {
+            exclude_facets: default_weaver_exclude_facets(),
+        }
+    }
+}
+
+impl WeaverSettings {
+    /// Resolve from an optional `[weaver]` block, falling back to defaults.
+    #[must_use]
+    pub fn resolve(slot: Option<&Self>) -> Self {
+        slot.cloned().unwrap_or_default()
+    }
+}
+
+/// Retrieval profile a weight map applies to (P5). `Explicit` is the
+/// user-text `recall` path (lanes + rerank); `Ambient` is the
+/// attention-driven recall path; `Lens` is the proactive memory-lens
+/// portfolio path (P9b-full). Ambient and Lens both run without a
+/// reranker — the rank features ARE the ranking — but Lens carries the
+/// salience portfolio (freshness now; entity/concept later) while Ambient
+/// stays attention-only, so they are distinct profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankProfile {
+    Explicit,
+    Ambient,
+    Lens,
+}
+
+/// Compiled-in default rank-engine weights for a profile. These define
+/// shipped v0.6 behavior when no `[ranking]` block is present:
+/// explicit recall fuses on RRF only; ambient ranks on attention affinity.
+/// P5's empirical bench tunes these; ratified weights are committed here.
+#[must_use]
+pub fn default_profile_weights(profile: RankProfile) -> std::collections::BTreeMap<String, f32> {
+    let mut m = std::collections::BTreeMap::new();
+    match profile {
+        RankProfile::Explicit => {
+            m.insert("rrf".to_string(), 1.0);
+        }
+        RankProfile::Ambient => {
+            m.insert("attention_affinity".to_string(), 1.0);
+        }
+        // P9b-full: the lens portfolio ranks on attention affinity plus the
+        // ACT-R freshness feature (P7b). freshness=0.5 vs attention=1.0 lets a
+        // fresh chunk's freshness contribution clear the 0.30 slot-dominance
+        // bar with headroom while attention still leads overall. Tunable via
+        // `[ranking.weights.lens]`; not yet bench-validated (no ambient/lens
+        // corpus run — honest seam, mirrors P5's NEUTRAL explicit-path gate).
+        RankProfile::Lens => {
+            m.insert("attention_affinity".to_string(), 1.0);
+            m.insert("freshness".to_string(), 0.5);
+        }
+    }
+    m
+}
+
+/// Rank-engine feature weights (P5), surfaced as the optional `[ranking]`
+/// block. Known feature ids: `rrf`, `bm25`, `attention_affinity`,
+/// `freshness`. Unknown ids are accepted (forward-compat for features that
+/// land later) and ignored by an engine builder that doesn't know them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankingConfig {
+    #[serde(default)]
+    pub weights: ProfileWeights,
+}
+
+/// Per-profile weight maps with fall-through. The effective map for a
+/// profile is the compiled-in [`default_profile_weights`] overlaid by
+/// `[ranking.weights.default]`, then by the profile-specific map (profile
+/// entries win; keys absent from the profile fall through).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileWeights {
+    /// Fall-through weights applied to every profile.
+    #[serde(default)]
+    pub default: std::collections::BTreeMap<String, f32>,
+    /// Explicit-recall overrides.
+    #[serde(default)]
+    pub explicit: std::collections::BTreeMap<String, f32>,
+    /// Ambient-recall overrides (attention-driven, non-lens).
+    #[serde(default)]
+    pub ambient: std::collections::BTreeMap<String, f32>,
+    /// Memory-lens portfolio overrides (P9b-full). The lens is the sole
+    /// consumer of this profile today; kept separate from `ambient` so the
+    /// attention-only ambient default stays pure.
+    #[serde(default)]
+    pub lens: std::collections::BTreeMap<String, f32>,
+}
+
+impl ProfileWeights {
+    /// The effective weight map for `profile`: compiled-in defaults,
+    /// overlaid by `default`, overlaid by the profile-specific map.
+    #[must_use]
+    pub fn effective(&self, profile: RankProfile) -> std::collections::BTreeMap<String, f32> {
+        let mut m = default_profile_weights(profile);
+        for (k, v) in &self.default {
+            m.insert(k.clone(), *v);
+        }
+        let profile_map = match profile {
+            RankProfile::Explicit => &self.explicit,
+            RankProfile::Ambient => &self.ambient,
+            RankProfile::Lens => &self.lens,
+        };
+        for (k, v) in profile_map {
+            m.insert(k.clone(), *v);
+        }
+        m
+    }
+}
+
+impl RankingConfig {
+    /// Effective weight map for `profile`, resolving an optional
+    /// `[ranking]` block against the compiled-in defaults.
+    #[must_use]
+    pub fn effective_weights(
+        slot: Option<&Self>,
+        profile: RankProfile,
+    ) -> std::collections::BTreeMap<String, f32> {
+        slot.map_or_else(
+            || default_profile_weights(profile),
+            |r| r.weights.effective(profile),
+        )
+    }
+}
+
+impl Config {
+    /// Effective rank-engine weight map for a retrieval profile (P5).
+    /// Falls back to [`default_profile_weights`] when `[ranking]` is omitted.
+    #[must_use]
+    pub fn effective_ranking_weights(
+        &self,
+        profile: RankProfile,
+    ) -> std::collections::BTreeMap<String, f32> {
+        RankingConfig::effective_weights(self.ranking.as_ref(), profile)
     }
 }
 
@@ -465,6 +680,17 @@ impl Config {
     /// Expand the corpus root (`~` → home, `$VAR` → env).
     pub fn expanded_root(&self) -> Result<PathBuf> {
         expand_path(&self.corpus.root)
+    }
+
+    /// The effective record-rule set (P12): the operator's `[[record_rule]]`
+    /// list verbatim when present (even an empty list = "explicitly no rules"),
+    /// else the built-in [`default_record_rules`]. Pipeline construction is fed
+    /// this — there is no silent no-op fallback on the production path.
+    #[must_use]
+    pub fn effective_record_rules(&self) -> Vec<RecordRule> {
+        self.record_rules
+            .clone()
+            .unwrap_or_else(default_record_rules)
     }
 }
 
@@ -891,6 +1117,143 @@ mode = "burst"
         assert!(
             err.contains("burst") || err.contains("unknown") || err.contains("variant"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ranking_omitted_uses_compiled_defaults() {
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        assert!(cfg.ranking.is_none());
+        let explicit = cfg.effective_ranking_weights(RankProfile::Explicit);
+        assert_eq!(explicit.get("rrf").copied(), Some(1.0));
+        assert_eq!(explicit.len(), 1, "explicit default is rrf only");
+        let ambient = cfg.effective_ranking_weights(RankProfile::Ambient);
+        assert_eq!(ambient.get("attention_affinity").copied(), Some(1.0));
+        assert_eq!(ambient.len(), 1, "ambient default is attention only");
+        // P9b-full: the lens profile carries the salience portfolio
+        // (attention + freshness) while ambient stays attention-only.
+        let lens = cfg.effective_ranking_weights(RankProfile::Lens);
+        assert_eq!(lens.get("attention_affinity").copied(), Some(1.0));
+        assert_eq!(lens.get("freshness").copied(), Some(0.5));
+        assert_eq!(lens.len(), 2, "lens default is attention + freshness");
+    }
+
+    #[test]
+    fn ranking_profile_overlays_default_and_compiled() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[ranking.weights.default]
+freshness = 0.5
+
+[ranking.weights.explicit]
+bm25 = 2.0
+rrf = 0.25
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let explicit = cfg.effective_ranking_weights(RankProfile::Explicit);
+        // compiled rrf=1.0 overridden by explicit rrf=0.25
+        assert_eq!(explicit.get("rrf").copied(), Some(0.25));
+        // default freshness=0.5 falls through (no explicit override)
+        assert_eq!(explicit.get("freshness").copied(), Some(0.5));
+        // explicit-only bm25
+        assert_eq!(explicit.get("bm25").copied(), Some(2.0));
+
+        // Ambient sees the default overlay but not the explicit map.
+        let ambient = cfg.effective_ranking_weights(RankProfile::Ambient);
+        assert_eq!(ambient.get("attention_affinity").copied(), Some(1.0));
+        assert_eq!(ambient.get("freshness").copied(), Some(0.5));
+        assert!(
+            !ambient.contains_key("bm25"),
+            "explicit-only weight must not leak into ambient"
+        );
+    }
+
+    #[test]
+    fn ranking_lens_profile_overlays_and_isolates() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[ranking.weights.lens]
+freshness = 0.8
+attention_affinity = 0.6
+
+[ranking.weights.ambient]
+attention_affinity = 0.2
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let lens = cfg.effective_ranking_weights(RankProfile::Lens);
+        // compiled lens defaults (attention=1.0, freshness=0.5) overridden by
+        // the [ranking.weights.lens] map.
+        assert_eq!(lens.get("attention_affinity").copied(), Some(0.6));
+        assert_eq!(lens.get("freshness").copied(), Some(0.8));
+        // The ambient override must NOT leak into the lens profile (and the
+        // lens override must not leak into ambient): they are isolated.
+        let ambient = cfg.effective_ranking_weights(RankProfile::Ambient);
+        assert_eq!(ambient.get("attention_affinity").copied(), Some(0.2));
+        assert!(
+            !ambient.contains_key("freshness"),
+            "lens-only freshness override must not leak into ambient"
+        );
+    }
+
+    #[test]
+    fn ranking_block_with_lens_round_trips() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[ranking.weights.lens]
+freshness = 0.7
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let reser = toml::to_string(&cfg).unwrap();
+        let cfg2: Config = toml::from_str(&reser).unwrap();
+        assert_eq!(
+            cfg2.effective_ranking_weights(RankProfile::Lens),
+            cfg.effective_ranking_weights(RankProfile::Lens),
+            "lens weight map must survive a serialize/deserialize round-trip"
+        );
+        assert_eq!(
+            cfg2.ranking.unwrap().weights.lens.get("freshness").copied(),
+            Some(0.7)
+        );
+    }
+
+    #[test]
+    fn ranking_block_round_trips() {
+        let body = r#"
+[corpus]
+root = "/tmp"
+
+[embedder]
+model = "x"
+
+[ranking.weights.ambient]
+attention_affinity = 0.8
+freshness = 0.3
+"#;
+        let cfg: Config = toml::from_str(body).unwrap();
+        let r = cfg.ranking.as_ref().unwrap();
+        assert_eq!(r.weights.ambient.get("attention_affinity").copied(), Some(0.8));
+        assert_eq!(r.weights.ambient.get("freshness").copied(), Some(0.3));
+        // Re-serialize and re-parse: stable.
+        let toml_out = toml::to_string(&cfg).unwrap();
+        let cfg2: Config = toml::from_str(&toml_out).unwrap();
+        assert_eq!(
+            cfg2.effective_ranking_weights(RankProfile::Ambient),
+            cfg.effective_ranking_weights(RankProfile::Ambient)
         );
     }
 }

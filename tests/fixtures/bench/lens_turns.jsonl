@@ -1,0 +1,8 @@
+{"turn": 0, "ts": "2026-05-30T10:00:00Z", "focus_text": "auth redirect flow validates the issuer claim"}
+{"turn": 1, "ts": "2026-05-30T10:01:00Z", "focus_text": "auth redirect state cookie check before login"}
+{"turn": 2, "ts": "2026-05-30T10:03:00Z", "focus_text": "ABI rename auth_redirect_v2 deprecates oauth_redirect"}
+{"turn": 3, "ts": "2026-05-30T10:06:00Z", "focus_text": "retention policy keeps conversation data ninety days"}
+{"turn": 4, "ts": "2026-05-30T10:09:00Z", "focus_text": "pruning old data under the retention policy"}
+{"turn": 5, "ts": "2026-05-30T10:12:00Z", "focus_text": "spawning background subprocess workers under the daemon"}
+{"turn": 6, "ts": "2026-05-30T10:15:00Z", "focus_text": "cache control header max-age for the reviewed url"}
+{"turn": 7, "ts": "2026-05-30T10:18:00Z", "focus_text": "allocate a page in the allocator"}

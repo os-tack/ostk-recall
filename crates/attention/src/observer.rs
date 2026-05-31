@@ -335,31 +335,49 @@ impl TurnObserver {
             // especially under seed_known_handles in tests). Increment
             // returns Err for those; we drop them silently rather than
             // failing the whole observation.
-            let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(mentioned.len());
+            // Resonance-gated familiarity: `mentions` advances on every
+            // observed mention (raw recurrence), but the salience counter
+            // `resonance` advances ONLY when the mention lands in a turn
+            // that resonates with the thread anchor. The in-memory
+            // `familiarize` returns that gate decision so the durable
+            // `increment_resonance` is gated on the *same* cosine — one
+            // compute, no divergence between the tiers.
+            let mut entries: Vec<(ThreadHandle, u32, u32)> =
+                Vec::with_capacity(mentioned.len());
             for handle in &mentioned {
-                if let Ok(new_familiarity) = self.store.increment_familiarity(handle) {
-                    entries.push((handle.clone(), new_familiarity));
-                }
-            }
-            if !entries.is_empty() {
-                self.store
-                    .record_familiarity_batch(entries.clone(), turn_seq)?;
-                // Mirror the durable familiarity bumps into the in-memory
-                // score tier so `surface()` / `score_thread()` see them
-                // without waiting for chain replay on next boot. Matches
-                // the v0.4.0 fix for auto-promotion; closes the parallel
-                // gap on the known-handle path. Best-effort.
-                if let Some(attn) = &self.attention {
-                    for (handle, _) in &entries {
-                        if let Err(err) = attn.familiarize(scope, handle).await {
+                // Durable `mentions` first; this also filters cache-drift
+                // handles (increment errors for handles not yet in the
+                // ledger) — drop them silently rather than fail the turn.
+                let Ok(mentions_after) = self.store.increment_mentions(handle) else {
+                    continue;
+                };
+                // Mirror into the in-memory score tier and read back
+                // whether the mention resonated. Best-effort: a failure
+                // here just means resonance holds this turn.
+                let resonant = if let Some(attn) = &self.attention {
+                    match attn.familiarize(scope, handle).await {
+                        Ok(r) => r,
+                        Err(err) => {
                             tracing::warn!(
                                 error = %err,
                                 handle = %handle,
                                 "persistent-attention: familiarize failed on known-handle mention"
                             );
+                            false
                         }
                     }
-                }
+                } else {
+                    false
+                };
+                let resonance_after = if resonant {
+                    self.store.increment_resonance(handle).unwrap_or(0)
+                } else {
+                    self.store.current_resonance(handle).unwrap_or(0)
+                };
+                entries.push((handle.clone(), mentions_after, resonance_after));
+            }
+            if !entries.is_empty() {
+                self.store.record_familiarity_batch(entries, turn_seq)?;
             }
         }
 
@@ -396,7 +414,18 @@ impl TurnObserver {
             let qualifies_for_promotion = count >= PROMOTE_MIN_OCCURRENCES
                 && self.promotions_this_session.load(Ordering::Relaxed) < PROMOTION_CAP_PER_SESSION;
             let promoted_to_handle = if qualifies_for_promotion {
-                ThreadHandle::new(phrase.clone()).ok()
+                ThreadHandle::new(phrase.clone()).ok().filter(|h| {
+                    // Derived stop-handle gate (secondary defense): never
+                    // re-promote a token an existing thread already shows
+                    // is ubiquitous-but-unresonant (high mentions, near-zero
+                    // resonance). The resonance-driven floor is the primary
+                    // collapse; this stops a known stopword re-forming as a
+                    // fresh Active thread once its stats exist.
+                    match self.store.get_thread(h) {
+                        Ok(Some(rec)) => !crate::is_stop_handle(rec.mentions, rec.resonance),
+                        _ => true,
+                    }
+                })
             } else {
                 None
             };
@@ -437,7 +466,8 @@ impl TurnObserver {
                 let thread_record = ThreadRecord {
                     handle: handle.clone(),
                     tension: TensionState::Slack,
-                    familiarity: 0,
+                    mentions: 0,
+                    resonance: 0,
                     last_touched_at: now,
                     anchor_chunk_id: Some(anchor_chunk_id.to_string()),
                     fold_override: None,
@@ -446,10 +476,17 @@ impl TurnObserver {
                     privacy_tier: scope.privacy_tier,
                 };
                 self.store.upsert_thread(&thread_record)?;
-                if let Ok(new_fam) = self.store.increment_familiarity(&handle) {
-                    self.store
-                        .record_familiarity_batch(vec![(handle.clone(), new_fam)], turn_seq)?;
-                }
+                // Seed mentions=1 AND resonance=1 on mint: a promoted
+                // thread was distilled from the current resonant turn, so
+                // it earns a non-baseline floor immediately (it must keep
+                // resonating to climb further). Both counters round-trip
+                // through the same FamiliarityBatch row.
+                let mentions_after = self.store.increment_mentions(&handle).unwrap_or(0);
+                let resonance_after = self.store.increment_resonance(&handle).unwrap_or(0);
+                self.store.record_familiarity_batch(
+                    vec![(handle.clone(), mentions_after, resonance_after)],
+                    turn_seq,
+                )?;
                 // Mirror the durable familiarity bump into the in-memory
                 // score tier so the curator's next tick sees a non-zero
                 // score and doesn't demote a freshly-promoted thread to
@@ -1070,7 +1107,8 @@ mod tests {
             .upsert_thread(&ostk_recall_store::ThreadRecord {
                 handle: h.clone(),
                 tension: ostk_recall_store::TensionState::Active,
-                familiarity: 0,
+                mentions: 0,
+                resonance: 0,
                 last_touched_at: Utc::now(),
                 anchor_chunk_id: None,
                 fold_override: None,
@@ -1249,7 +1287,8 @@ mod tests {
                 .upsert_thread(&ostk_recall_store::ThreadRecord {
                     handle: h.clone(),
                     tension: ostk_recall_store::TensionState::Active,
-                    familiarity: 0,
+                    mentions: 0,
+                    resonance: 0,
                     last_touched_at: Utc::now(),
                     anchor_chunk_id: None,
                     fold_override: None,
@@ -1373,7 +1412,7 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, ChainEvent::FamiliarityBatch { entries, .. }
-                    if entries.iter().any(|(h, _)| h.as_str() == "fade-is-concentration"))),
+                    if entries.iter().any(|(h, _, _)| h.as_str() == "fade-is-concentration"))),
             "FamiliarityBatch must include the promoted handle"
         );
     }
@@ -1587,7 +1626,8 @@ mod tests {
         db.upsert_thread(&ostk_recall_store::ThreadRecord {
             handle: h.clone(),
             tension: ostk_recall_store::TensionState::Slack,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: now,
             anchor_chunk_id: None,
             fold_override: None,

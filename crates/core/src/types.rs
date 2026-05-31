@@ -158,6 +158,25 @@ pub struct RankingOverrides {
     /// without code changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k_bm25: Option<f32>,
+    /// Override `SELF_REFERENCE_PENALTY` (default 2.0). Magnitude of
+    /// the post-rerank salience penalty subtracted from freshly
+    /// self-authored chunks (`source = "membrane"` whose creation
+    /// `ts` is within the recency window). Scaled linearly by
+    /// recency so old self-narration is untouched. Set to `0.0` to
+    /// disable. This is the explicit-path debut of the salience axis
+    /// P7/P7b formalize in the lens path; when the P7b access ledger
+    /// lands it should be re-expressed as a creation-vs-access term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_reference_penalty: Option<f32>,
+    /// Rank-engine feature weights (P5), `feature_id → weight`. `None`
+    /// falls through to the explicit-profile compiled default
+    /// (`default_profile_weights(RankProfile::Explicit)` = `{rrf: 1.0}`),
+    /// numerically identical to the pre-P5 hardcoded rrf-only engine.
+    /// Resolved from `[ranking.weights]` config by the caller (MCP server /
+    /// `QueryEngine`) and passed through, or set per-call for a one-off
+    /// tune. Consumed by `build_engine_from_weights` in the query crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<std::collections::BTreeMap<String, f32>>,
 }
 
 /// One retrieval row, shaped for MCP consumers.

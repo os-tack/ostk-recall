@@ -65,19 +65,24 @@ Works today:
   `ostk-recall lens show` / `lens disable` to inspect or stop the loop.
 - Idempotent re-ingest via `chunk_id = sha256(source:source_id:chunk_index)`
   and LanceDB `merge_insert`.
-- File-watcher (`ostk-recall watch`) that pokes a running `serve` whenever
-  edits land under any configured source path. Path-aware incremental
-  ingest: ~250 ms from save to corpus, opt-in via `[watch].mode = "incremental"`
-  in config (default `legacy` runs a full re-scan per kick for safe
-  rollout).
-- Two daemon modes that share `corpus.lance` via Lance MVCC: read-only
-  driver mode (`ostk-recall serve --stdio`, spawned by the ostk kernel)
-  and read-write standalone mode (`ostk-recall serve`, operator-managed
-  with the scan-trigger socket the watcher pokes).
+- File-watcher that pokes a running daemon whenever edits land under any
+  configured source path. Run it in-process with `ostk-recall serve
+  --watch`, or as a separate `ostk-recall watch` process. Path-aware
+  incremental ingest: ~250 ms from save to corpus, opt-in via
+  `[watch].mode = "incremental"` in config (default `legacy` runs a full
+  re-scan per kick for safe rollout).
+- One daemon, many clients. `ostk-recall serve` (no `--stdio`) runs as a
+  standalone daemon that owns the corpus: it serves MCP to any number of
+  clients over a local socket / named pipe, keeps the corpus fresh
+  (scan-trigger socket + optional in-process `--watch`), and runs the
+  attention loop. A `.serve.lock` flock makes it the single writer per
+  corpus. Stdio clients reach it through the thin `ostk-recall connect`
+  bridge; `ostk-recall serve --stdio` remains as the direct in-process
+  transport (this process is itself the MCP server) for a client that
+  prefers to spawn its own.
 
 Deferred:
 
-- Tree-sitter aware code chunking (line-window fallback today).
 - ChatGPT export scanner (zip layout differs from Claude exports).
 - Per-file offset cursors for incremental scan of `claude_code` and
   `gemini` (append-only JSONL falls back to full-source scan when poked
@@ -139,20 +144,26 @@ and all tunables.
 ostk-recall init                # create corpus root, download model
 ostk-recall scan                # ingest configured sources
 ostk-recall weave               # weave bulk-scanned content into the thread graph
+ostk-recall weave --consolidate # coarse consolidation cycle (bridge/promote/merge/fade)
 ostk-recall verify              # reconcile counts across store + manifest
 ostk-recall optimize            # compact + fold indexes (--aggressive to collapse old versions)
-ostk-recall serve --stdio       # MCP server on stdio (driver mode, RO)
-ostk-recall serve               # standalone w/ scan-trigger socket (RW) + ambient lens
-ostk-recall watch               # file-watcher → poke standalone serve
+ostk-recall serve               # standalone daemon: MCP over socket/pipe + ambient lens
+ostk-recall serve --watch       # daemon + in-process file-watcher (keep corpus fresh)
+ostk-recall serve --stdio       # direct stdio MCP transport (this process is the server)
+ostk-recall connect             # bridge a stdio MCP client to a running daemon
+ostk-recall watch               # standalone file-watcher → poke a running daemon
 ostk-recall lens show           # print the current ambient memory lens
 ```
 
 ### Live updates
 
-`serve` (no `--stdio`) binds a Unix socket at `corpus.root/recall.sock`
-that accepts scan-trigger pokes. Run `watch` next to it and edits under
-any configured source path get debounced and re-ingested without
-manual re-scan. Add to your config:
+The daemon binds a scan-trigger socket at `corpus.root/recall.sock`
+(named pipe `\\.\pipe\ostk-recall-recall` on Windows) that accepts
+pokes. The simplest setup is `ostk-recall serve --watch`, which runs
+the watcher in-process and skips the socket round-trip; alternatively
+run a separate `ostk-recall watch` next to the daemon. Either way,
+edits under any configured source path get debounced and re-ingested
+without a manual re-scan. Add to your config:
 
 ```toml
 [watch]
@@ -162,6 +173,42 @@ enabled = true
 mode = "incremental"             # opt-in path-aware ingest (~250 ms save → corpus).
                                  # default "legacy" runs a full re-scan per kick.
 ```
+
+### Consolidation cadence (scheduling)
+
+`serve` owns *live* cognition (a watched transcript turn → observer +
+weaver). Offline **consolidation** is separate and operator-scheduled — it
+must not run inside `serve` or compete with lens responsiveness. The
+maintenance shape is explicit and one-directional; nothing is implicitly
+coupled:
+
+```
+ostk-recall scan                          # ingest (prints a `weave` hint on new chunks)
+ostk-recall weave --since 24h             # capture: bind recent arrivals to anchors
+ostk-recall weave --consolidate --since 1w  # coarse cycle (see below)
+ostk-recall optimize                      # compact fragments when you want it
+```
+
+`weave --consolidate` runs the full cycle over its `--since` window:
+deep re-weave → anchor↔anchor bridge → near-duplicate thread merge →
+promote recurring high-cohesion proposals → fold deeply-familiar stable
+threads → idle-fade. The `--since` value *is* the consolidation horizon;
+pick it per cron tier. A sketch (`p11-temporal-consolidation.md` horizons):
+
+```cron
+# crontab — offline consolidation tiers (single-writer; runs beside serve via WAL,
+# or stop serve first for a clean measurement window).
+17 * * * *   ostk-recall weave --since 90m                       # hourly capture
+37 */6 * * * ostk-recall weave --consolidate --since 24h         # 6h: cohere day-threads
+53 4 * * *   ostk-recall weave --consolidate --since 7d          # daily: 1-week consolidate
+23 5 * * 0   ostk-recall weave --consolidate --since 30d && ostk-recall optimize  # weekly: month + compact
+```
+
+On macOS, wrap the same commands in a `launchd` `StartCalendarInterval`
+agent (`~/Library/LaunchAgents/ai.ostk.recall.consolidate.plist`); on
+Linux a systemd timer. The scheduler is policy — the CLI is the only
+contract. Prefix offline runs with `HF_HUB_OFFLINE=1` once the model is
+cached.
 
 The Makefile wraps the same loop:
 
@@ -180,7 +227,7 @@ make serve
 | kind           | what it ingests                                                  | chunking                                         |
 | -------------- | ---------------------------------------------------------------- | ------------------------------------------------ |
 | `markdown`     | `.md` / `.markdown` trees                                        | split on headings, soft-wrap at ~400 tokens      |
-| `code`         | source files filtered by `extensions = [...]`                    | sliding line window (tree-sitter deferred)       |
+| `code`         | source files filtered by `extensions = [...]`                    | tree-sitter symbol chunks (rs/py/ts/js/go); line-window fallback |
 | `claude_code`  | Claude Code project session logs (`<slug>/*.jsonl`)              | one chunk per user / assistant turn              |
 | `gemini`       | Gemini CLI session JSON (`session-*.json`, walks recursively)    | one chunk per user/gemini exchange pair          |
 | `file_glob`    | arbitrary glob, ingested as plain text                           | paragraph split, soft-wrap at ~400 tokens        |
@@ -191,8 +238,9 @@ make serve
 ## MCP tools exposed
 
 24 tools total across two families. All callable from any MCP client
-(Claude Desktop, Cursor, Claude Code, ostk kernel, etc.) via the
-same `ostk-recall serve --stdio` process.
+(Claude Desktop, Cursor, Claude Code, ostk kernel, etc.) — either by
+spawning `ostk-recall serve --stdio` directly, or, when a shared daemon
+is running, through the `ostk-recall connect` bridge.
 
 Alongside the tools, `serve` exposes an MCP **resources** surface —
 `resources/list`, `resources/read`, `resources/subscribe` — currently
@@ -287,6 +335,23 @@ Edit `.mcp.json` at user or project level:
 }
 ```
 
+This spawns a self-contained server per client. If you instead run a
+shared daemon (`ostk-recall serve --watch`, for the background watcher
+and ambient lens), point the client at the bridge so it joins the
+daemon rather than colliding with its `.serve.lock`:
+
+```json
+{
+  "mcpServers": {
+    "ostk-recall": {
+      "type": "stdio",
+      "command": "ostk-recall",
+      "args": ["connect"]
+    }
+  }
+}
+```
+
 ### ostk (llmOS)
 
 **ostk v6.0.0+** ships with `fcp-recall` baked into the driver
@@ -369,13 +434,20 @@ query on CPU, ~80 MB to the model cache. Opt out with
                                           (per-path scan)
 ```
 
-**Read path** (clients → corpus): `serve --stdio` runs as a stdio MCP
-server. Used as the `fcp-recall` driver under ostk v6+; equally
-callable from Claude Desktop, Cursor, Claude Code, etc.
+**Read path** (clients → corpus): the daemon (`serve`, no `--stdio`)
+serves MCP to many clients over a local socket / named pipe; stdio
+clients reach it through the `connect` bridge. `serve --stdio` is the
+alternative direct transport — the process is itself the MCP server —
+for a client (e.g. the `fcp-recall` driver under ostk v6+) that prefers
+to spawn its own rather than share a daemon. A `.serve.lock` flock
+admits one `serve` per corpus, so run *either* a shared daemon (clients
+use `connect`) *or* per-client `serve --stdio`, not both at once.
 
-**Write path** (operator edits → corpus): `serve` (no `--stdio`) binds
-`recall.sock`; `watch` debounces filesystem events and pokes the socket
-with the changed paths; `Pipeline::scan_paths` does per-path ingest.
+**Write path** (edits → corpus): the daemon binds `recall.sock`; a
+watcher (`serve --watch` in-process, or a separate `watch` process)
+debounces filesystem events and delivers the changed paths; a single
+scan mutex serialises every trigger so `Pipeline::scan_paths` does
+per-path ingest without overlapping the single writer.
 
 **Attention loop** (conversational stream → live state): on a watched
 transcript **TurnEnd**, TurnObserver emits membrane chunks via
@@ -384,7 +456,9 @@ transcript **TurnEnd**, TurnObserver emits membrane chunks via
 `ostk-recall weave` runs the same weaver over bulk content on demand.
 IdleCurator scores fade on a timer and transitions tension states.
 
-Read and write daemons share `corpus.lance` via Lance MVCC. The
+One daemon owns the corpus as the single writer (`.serve.lock`); its
+read-only query engine reopens the Lance table per query, so background
+scans are visible to in-flight reads immediately. The
 `InMemoryAttention` score tier is per-process; it rebuilds from the
 `threads.sqlite` chain ledger on boot.
 
@@ -400,7 +474,6 @@ full writeups.
 
 ## Roadmap
 
-- Symbol-aware chunking for non-Rust source ([#11](https://github.com/os-tack/ostk-recall/issues/11)). Rust is already done — `code` scanner shells out to `fcp-rust` (rust-analyzer) for symbol-bounded chunks. Python / Go / JS are next; tree-sitter is the likely vehicle.
 - ChatGPT export scanner ([#12](https://github.com/os-tack/ostk-recall/issues/12)). Today's `zip_export` only handles Claude.ai exports; ChatGPT's zip layout differs.
 - Per-file offset cursors so `claude_code` and `gemini` benefit from path-aware incremental scan ([#13](https://github.com/os-tack/ostk-recall/issues/13)). Speed item, not correctness — content-addressed chunk_ids mean today's full re-parse is idempotent, just wasteful.
 - MCP transport diversity — HTTP / SSE per the 2025-06-18 spec ([#14](https://github.com/os-tack/ostk-recall/issues/14)). stdio-only today.

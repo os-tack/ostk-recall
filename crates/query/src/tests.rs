@@ -335,8 +335,8 @@ async fn recall_round_trips_extra_symbols() {
     let mut c = code_chunk("tier2", "fn tier2_line_rebase() { /* body */ }", Some("p"));
     c.extra = serde_json::json!({
         "symbols": ["tier2_line_rebase"],
-        "kind": "function",
-        "chunker": "fcp-rust",
+        "kind": "fn",
+        "chunker": "tree-sitter",
     });
     let chunks = vec![c];
     let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
@@ -364,10 +364,7 @@ async fn recall_round_trips_extra_symbols() {
         .expect("expected extra.symbols array");
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].as_str(), Some("tier2_line_rebase"));
-    assert_eq!(
-        hit.extra.get("kind").and_then(|v| v.as_str()),
-        Some("function")
-    );
+    assert_eq!(hit.extra.get("kind").and_then(|v| v.as_str()), Some("fn"));
 }
 
 /// Identifier-mode boost: a single code chunk should out-rank a

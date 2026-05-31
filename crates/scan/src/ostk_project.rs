@@ -29,14 +29,17 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ostk_recall_core::{
-    Chunk, Error, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
+    Chunk, Error, FacetSet, Links, Result, Scanner, Source, SourceConfig, SourceItem, SourceKind,
+    merge_override,
 };
 use ostk_recall_store::{AuditEventRow, EventsDb};
 use serde::Deserialize;
 
-use crate::anthropic_session::{drop_local_command_wrappers, drop_tool_blocks, parse_session_file};
+// `drop_local_command_wrappers` moved to the config record-rule overlay (P12);
+// `drop_tool_blocks` is structural and stays.
+use crate::anthropic_session::{drop_tool_blocks, parse_session_file};
 use crate::code::walk_and_window;
-use crate::fcp_rust;
+use crate::tree_sitter;
 use crate::markdown::split_markdown;
 use crate::walk::walk_filtered;
 
@@ -199,6 +202,14 @@ impl OstkProjectScanner {
 impl Scanner for OstkProjectScanner {
     fn kind(&self) -> SourceKind {
         SourceKind::OstkProject
+    }
+
+    // P12: bumped to 1 — the session sub-scan's command-wrapper filtering moves
+    // into the config record-rule overlay (P12-B), changing the emitted-chunk
+    // set for `Source::OstkSession` chunks. Folded into the Tier-1 freshness
+    // key so the first post-P12 scan re-parses.
+    fn parse_version(&self) -> u32 {
+        1
     }
 
     fn discover<'a>(
@@ -778,12 +789,18 @@ fn build_significant_chunk(
         duckdb_row_key: Some(row_key.clone()),
         ..Links::default()
     };
+    // Tag the channel so ambient surfacing can attenuate operational
+    // telemetry by default (lens `exclude_facets`) while it stays fully
+    // recall-able. `record_kind` is embedding-allowlisted, so it also
+    // separates these in embedding space. (gate, don't delete)
+    let mut facets = FacetSet::new();
+    merge_override(&mut facets, "record_kind", vec!["audit_significant".to_string()]);
     Chunk {
         chunk_id,
         source: Source::OstkAuditSignificant,
         project: project.map(str::to_string),
         source_id: row_key,
-        facets: Default::default(),
+        facets,
         embedding_input_sha256: String::new(),
         source_config_id: source_config_id.to_string(),
         chunk_index,
@@ -1000,9 +1017,10 @@ fn scan_sessions(root: &Path, project: Option<&str>, source_config_id: &str) -> 
             source_config_id,
             mtime,
         )?;
-        chunks.extend(drop_local_command_wrappers(drop_tool_blocks(
-            session_chunks,
-        )));
+        // `drop_tool_blocks` is structural and stays; the command-wrapper drop
+        // moved to the config record-rule overlay (P12), scoped to
+        // source_kind=ostk_project + source=ostk_session, applied pipeline-side.
+        chunks.extend(drop_tool_blocks(session_chunks));
     }
     Ok(chunks)
 }
@@ -1032,7 +1050,6 @@ fn scan_one_session(
         mtime,
     )
     .map(drop_tool_blocks)
-    .map(drop_local_command_wrappers)
 }
 
 // ──────────────────────────────── memory ────────────────────────────────
@@ -1284,37 +1301,30 @@ fn scan_code(
             let mtime = file_mtime_utc(path).ok();
             let abs = absolute(path);
 
-            // `.rs` files route through the shared fcp-rust chunker so
-            // the haystack-style composite scanner produces per-symbol
-            // chunks (matching the standalone `code` scanner). On any
-            // failure (no fcp-rust on PATH, no Cargo workspace, query
-            // error), fall through to the line-window strategy.
-            let is_rust = path
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x.eq_ignore_ascii_case("rs"));
-            if is_rust {
-                if let Some(rust_chunks) = fcp_rust::chunk_rust_file(
-                    path,
-                    &text,
-                    Source::Code,
-                    &source_id,
-                    project,
-                    source_config_id,
-                    mtime,
-                    &abs,
-                ) {
-                    // Renumber chunk_index so the composite scanner's
-                    // monotonic counter stays consistent across files.
-                    for mut c in rust_chunks {
-                        c.chunk_index = chunk_index;
-                        c.chunk_id =
-                            Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
-                        chunks.push(c);
-                        chunk_index = chunk_index.saturating_add(1);
-                    }
-                    continue;
+            // Symbol-aware tree-sitter chunking for any supported
+            // language (matching the standalone `code` scanner). On
+            // unsupported extension, parse failure, or no items, fall
+            // through to the line-window strategy.
+            if let Some(ts_chunks) = tree_sitter::chunk_code_file(
+                path,
+                &text,
+                Source::Code,
+                &source_id,
+                project,
+                source_config_id,
+                mtime,
+                &abs,
+            ) {
+                // Renumber chunk_index so the composite scanner's
+                // monotonic counter stays consistent across files.
+                for mut c in ts_chunks {
+                    c.chunk_index = chunk_index;
+                    c.chunk_id =
+                        Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
+                    chunks.push(c);
+                    chunk_index = chunk_index.saturating_add(1);
                 }
+                continue;
             }
 
             for window in
@@ -1380,30 +1390,23 @@ fn scan_one_code(
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_index: u32 = 0;
 
-    let is_rust = path
-        .extension()
-        .and_then(|x| x.to_str())
-        .is_some_and(|x| x.eq_ignore_ascii_case("rs"));
-    if is_rust {
-        if let Some(rust_chunks) = fcp_rust::chunk_rust_file(
-            path,
-            &text,
-            Source::Code,
-            &source_id,
-            project,
-            source_config_id,
-            mtime,
-            &abs,
-        ) {
-            for mut c in rust_chunks {
-                c.chunk_index = chunk_index;
-                c.chunk_id =
-                    Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
-                chunks.push(c);
-                chunk_index = chunk_index.saturating_add(1);
-            }
-            return chunks;
+    if let Some(ts_chunks) = tree_sitter::chunk_code_file(
+        path,
+        &text,
+        Source::Code,
+        &source_id,
+        project,
+        source_config_id,
+        mtime,
+        &abs,
+    ) {
+        for mut c in ts_chunks {
+            c.chunk_index = chunk_index;
+            c.chunk_id = Chunk::make_id(Source::Code, &source_id, chunk_index, source_config_id);
+            chunks.push(c);
+            chunk_index = chunk_index.saturating_add(1);
         }
+        return chunks;
     }
 
     for window in walk_and_window(&text, crate::code::WINDOW_LINES, crate::code::OVERLAP_LINES) {
@@ -1460,6 +1463,31 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+
+    #[test]
+    fn significant_audit_chunk_carries_record_kind_facet() {
+        let value = serde_json::json!({
+            "ts": "2026-05-18T03:32:20Z",
+            "event": "tool.bash",
+            "tool": "bash",
+            "agent": "a1",
+            "success": false
+        });
+        let chunk = build_significant_chunk(
+            &value,
+            Some("proj"),
+            "cfg",
+            "rowkey".to_string(),
+            "/abs/journal.jsonl",
+            0,
+        );
+        let facets = ostk_recall_core::to_list(&chunk.facets);
+        assert!(
+            facets.iter().any(|f| f == "record_kind:audit_significant"),
+            "audit chunk should carry record_kind facet; got {facets:?}"
+        );
+        assert!(chunk.text.contains("which failed"));
     }
 
     #[test]
@@ -1768,80 +1796,32 @@ mod tests {
         assert!(chunks.is_empty());
     }
 
-    /// Live integration: a tiny `.ostk/` + Cargo project fixture drives
-    /// the composite scanner's code subscan through the shared fcp-rust
-    /// helper. Asserts that the resulting code chunk is symbol-shaped
-    /// (has `extra.symbols == ["bar"]` and `extra.kind == "function"`),
-    /// which is the whole point of the Deliverable A — previously the
-    /// subscan used line-window chunks even when fcp-rust was available.
-    ///
-    /// Skipped unless `fcp-rust` is on PATH.
+    /// The composite scanner's code subscan chunks `.rs` files through the
+    /// shared tree-sitter chunker. Asserts the resulting code chunk is
+    /// symbol-shaped (`extra.symbols == ["bar"]`, `extra.kind == "fn"`,
+    /// `extra.chunker == "tree-sitter"`) — previously the subscan used
+    /// line-window chunks. Deterministic: no subprocess, no PATH skip.
     #[test]
-    fn ostk_project_code_subscan_uses_fcp_rust() {
-        if which::which("fcp-rust").is_err() {
-            eprintln!("skipping: fcp-rust not on PATH");
-            return;
-        }
-        // Drain any sessions a prior test left behind so this run opens
-        // a fresh workspace pointing at our fixture.
-        crate::fcp_rust::drain_session_cache();
-
+    fn ostk_project_code_subscan_uses_tree_sitter() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".ostk")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        // A minimal Cargo package so `find_cargo_workspace` resolves.
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"ostk_project_fcp_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/foo.rs\"\n",
-        )
-        .unwrap();
         std::fs::write(root.join("src/foo.rs"), "pub fn bar() {}\n").unwrap();
 
         let scanner = OstkProjectScanner::new();
         let cfg = cfg_for(root, Some("fixture"));
         let item = scanner.discover(&cfg).next().unwrap().unwrap();
-        let chunks = match scanner.parse(item) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("skipping: scanner.parse failed: {e}");
-                return;
-            }
-        };
+        let chunks = scanner.parse(item).expect("scanner.parse failed");
 
-        // Find the code chunk. There may be zero if fcp-rust couldn't
-        // open the workspace (e.g. rust-analyzer refused to index a
-        // bare fixture) — in that case fall back to skip.
-        let code_chunks: Vec<_> = chunks.iter().filter(|c| c.source == Source::Code).collect();
-        if code_chunks.is_empty() {
-            eprintln!("skipping: no code chunks emitted (fcp-rust indexing likely declined)");
-            return;
-        }
-
-        let rust_chunk = code_chunks
+        let c = chunks
             .iter()
-            .find(|c| c.extra.get("chunker").and_then(|v| v.as_str()) == Some("fcp-rust"));
-        let Some(c) = rust_chunk else {
-            // If fcp-rust is on PATH but the workspace refused, the
-            // line-window fallback still produces a chunk. That's not a
-            // failure of the shared helper wiring — it's an indexing
-            // refusal — so skip with a note.
-            eprintln!(
-                "skipping: no fcp-rust-tagged chunks emitted (workspace indexing likely declined)"
-            );
-            return;
-        };
-        // symbols should be ["bar"]
+            .filter(|c| c.source == Source::Code)
+            .find(|c| c.extra.get("chunker").and_then(|v| v.as_str()) == Some("tree-sitter"))
+            .expect("expected a tree-sitter-tagged code chunk");
         let syms = c.extra.get("symbols").and_then(|v| v.as_array()).unwrap();
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].as_str(), Some("bar"));
-        // kind should be "function"
-        assert_eq!(
-            c.extra.get("kind").and_then(|v| v.as_str()),
-            Some("function")
-        );
-
-        // Clean up so the session doesn't leak into later tests.
-        crate::fcp_rust::drain_session_cache();
+        assert_eq!(c.extra.get("kind").and_then(|v| v.as_str()), Some("fn"));
     }
 }

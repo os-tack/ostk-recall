@@ -132,13 +132,32 @@ fn bad_enum(field: &str, value: &str) -> StoreError {
 pub struct ThreadRecord {
     pub handle: ThreadHandle,
     pub tension: TensionState,
-    pub familiarity: u32,
+    /// Raw literal-match recurrence (the pre-split `familiarity`). Kept
+    /// for reachability / reanimation; does NOT drive the floor.
+    pub mentions: u32,
+    /// Resonance-gated recurrence — the salience counter that drives
+    /// `familiarity_floor`. Backfilled to 0 on migration (the intended
+    /// reset: salience is re-earned by present resonance).
+    pub resonance: u32,
     pub last_touched_at: DateTime<Utc>,
     pub anchor_chunk_id: Option<String>,
     pub fold_override: Option<FoldDepth>,
     pub created_at: DateTime<Utc>,
     pub created_scope_key: Option<String>,
     pub privacy_tier: PrivacyTier,
+}
+
+/// Durable anchor sources for boot re-anchoring
+/// (`re_anchor_threads_from_corpus`). `anchor_vec` (the cached embedding) is
+/// preferred because it survives corpus chunk-id churn (edit / reingest);
+/// `anchor_chunk_id` is the fallback, and when it resolves it backfills
+/// `anchor_vec` so the next boot no longer depends on the corpus.
+#[derive(Debug, Clone)]
+pub struct ReanchorInput {
+    pub handle: ThreadHandle,
+    pub privacy_tier: PrivacyTier,
+    pub anchor_chunk_id: Option<String>,
+    pub anchor_vec: Option<Vec<f32>>,
 }
 
 /// A row in the `threads_proposed` table.
@@ -173,6 +192,16 @@ pub struct EvidenceLink {
     pub similarity: Option<f32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Number of times this edge has re-resonated (P11b-full). Starts
+    /// at 1 on insert; the weaver bumps it each time a chunk re-matches
+    /// an anchor whose edge already exists. Drives `edge_activation`'s
+    /// touch floor — recurring canyon edges strengthen across passes.
+    pub touch_count: u32,
+    /// Wall-clock of the most recent (re-)resonance. Starts equal to
+    /// `created_at`; the weaver advances it on re-touch. The idle term
+    /// in `edge_activation` decays against this, so edges that stop
+    /// resonating fade in activation without being deleted.
+    pub last_touched_at: DateTime<Utc>,
 }
 
 /// A row in the `thread_thread_links` table — directed evidence edge
@@ -227,8 +256,14 @@ pub enum ChainEvent {
         to: RelationState,
         ts: DateTime<Utc>,
     },
+    /// Per-turn batch of recurrence ticks. Each entry is
+    /// `(handle, mentions_after, resonance_after)` — the post-increment
+    /// durable counters, so chain replay reconstructs both exactly
+    /// (the replay scope has no attention vector, so resonance cannot
+    /// be recomputed at replay time). Pre-split rows carry 2-element
+    /// `[handle, mentions]` entries; those decode with `resonance = 0`.
     FamiliarityBatch {
-        entries: Vec<(ThreadHandle, u32)>,
+        entries: Vec<(ThreadHandle, u32, u32)>,
         turn_seq: u64,
         ts: DateTime<Utc>,
     },
@@ -306,6 +341,28 @@ pub enum ChainEvent {
         slot: String,
         ts: DateTime<Utc>,
     },
+    /// P7b — a chunk was surfaced by an explicit `recall` (one event per
+    /// returned hit). `query_hash` is an opaque short hash of the
+    /// normalized query (we don't store the full text); `access_history`
+    /// ignores it. Audit-only on replay — the access ledger is read on
+    /// demand, never replayed into in-memory state.
+    ExplicitRecall {
+        chunk_id: String,
+        query_hash: String,
+        ts: DateTime<Utc>,
+    },
+    /// P7b — a chunk was retrieved by a `recall_fault` synthesis pass.
+    RecallFault {
+        chunk_id: String,
+        ts: DateTime<Utc>,
+    },
+    /// P7b — an operator explicitly selected a chunk from a surface.
+    /// Variant + ledger support ship now; no producer yet (no
+    /// operator-select surface exists). Strongest "proven-useful" signal.
+    OperatorSelected {
+        chunk_id: String,
+        ts: DateTime<Utc>,
+    },
 }
 
 /// Sink for substrate chain rows.
@@ -359,6 +416,9 @@ impl ChainEvent {
             Self::RollingVectorSnapshot { .. } => "rolling_vector_snapshot",
             Self::AttentionTurnSkipped { .. } => "attention_turn_skipped",
             Self::LensIncluded { .. } => "lens_included",
+            Self::ExplicitRecall { .. } => "explicit_recall",
+            Self::RecallFault { .. } => "recall_fault",
+            Self::OperatorSelected { .. } => "operator_selected",
         }
     }
 
@@ -378,7 +438,10 @@ impl ChainEvent {
             | Self::FocusSet { ts, .. }
             | Self::RollingVectorSnapshot { ts, .. }
             | Self::AttentionTurnSkipped { ts, .. }
-            | Self::LensIncluded { ts, .. } => ts,
+            | Self::LensIncluded { ts, .. }
+            | Self::ExplicitRecall { ts, .. }
+            | Self::RecallFault { ts, .. }
+            | Self::OperatorSelected { ts, .. } => ts,
         }
     }
 
@@ -427,7 +490,9 @@ impl ChainEvent {
             } => {
                 let pairs: Vec<serde_json::Value> = entries
                     .iter()
-                    .map(|(h, fam)| serde_json::json!([h.as_str(), fam]))
+                    .map(|(h, mentions, resonance)| {
+                        serde_json::json!([h.as_str(), mentions, resonance])
+                    })
                     .collect();
                 serde_json::json!({
                     "entries": pairs,
@@ -476,6 +541,16 @@ impl ChainEvent {
                 "chunk_id": chunk_id,
                 "slot": slot,
             }),
+            Self::ExplicitRecall {
+                chunk_id,
+                query_hash,
+                ..
+            } => serde_json::json!({
+                "chunk_id": chunk_id,
+                "query_hash": query_hash,
+            }),
+            Self::RecallFault { chunk_id, .. } => serde_json::json!({ "chunk_id": chunk_id }),
+            Self::OperatorSelected { chunk_id, .. } => serde_json::json!({ "chunk_id": chunk_id }),
         };
         serde_json::to_string(&v)
     }
@@ -578,7 +653,8 @@ impl ChainEvent {
                             source: None,
                         })
                     })?;
-                let mut entries: Vec<(ThreadHandle, u32)> = Vec::with_capacity(entries_raw.len());
+                let mut entries: Vec<(ThreadHandle, u32, u32)> =
+                    Vec::with_capacity(entries_raw.len());
                 for row in entries_raw {
                     let pair = row.as_array().ok_or_else(|| {
                         StoreError::Lance(lancedb::Error::Other {
@@ -595,7 +671,7 @@ impl ChainEvent {
                                 source: None,
                             })
                         })?;
-                    let fam = pair
+                    let mentions = pair
                         .get(1)
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| {
@@ -604,19 +680,32 @@ impl ChainEvent {
                                 source: None,
                             })
                         })?;
+                    // Pre-split rows are 2-element `[handle, mentions]`;
+                    // the third slot is the resonance counter (default 0
+                    // for legacy rows, which is the intended salience reset).
+                    let resonance = pair
+                        .get(2)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
                     let h = ThreadHandle::new(h_s).map_err(|e| {
                         StoreError::Lance(lancedb::Error::Other {
                             message: format!("familiarity entry bad handle: {e}"),
                             source: None,
                         })
                     })?;
-                    let fam_u32 = u32::try_from(fam).map_err(|_| {
+                    let mentions_u32 = u32::try_from(mentions).map_err(|_| {
                         StoreError::Lance(lancedb::Error::Other {
-                            message: format!("familiarity count overflow: {fam}"),
+                            message: format!("familiarity count overflow: {mentions}"),
                             source: None,
                         })
                     })?;
-                    entries.push((h, fam_u32));
+                    let resonance_u32 = u32::try_from(resonance).map_err(|_| {
+                        StoreError::Lance(lancedb::Error::Other {
+                            message: format!("resonance count overflow: {resonance}"),
+                            source: None,
+                        })
+                    })?;
+                    entries.push((h, mentions_u32, resonance_u32));
                 }
                 let turn_seq = v
                     .get("turn_seq")
@@ -782,6 +871,19 @@ impl ChainEvent {
                 slot: s_field("slot")?,
                 ts,
             },
+            "explicit_recall" => Self::ExplicitRecall {
+                chunk_id: s_field("chunk_id")?,
+                query_hash: s_field("query_hash")?,
+                ts,
+            },
+            "recall_fault" => Self::RecallFault {
+                chunk_id: s_field("chunk_id")?,
+                ts,
+            },
+            "operator_selected" => Self::OperatorSelected {
+                chunk_id: s_field("chunk_id")?,
+                ts,
+            },
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
                     message: format!("unknown chain kind: {other}"),
@@ -790,6 +892,159 @@ impl ChainEvent {
             }
         };
         Ok(ev)
+    }
+}
+
+// ---------------------------------------------------------------------
+// P7b — access ledger
+// ---------------------------------------------------------------------
+
+/// A kind of chunk *access* contributing to ACT-R base activation. Unlike
+/// [`ChainEvent`], this includes a synthetic `Creation` (sourced from the
+/// chunk's own `ts`, never a chain row) alongside the four ledger-backed
+/// access events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessKind {
+    /// The chunk's own creation time (`chunk.ts`); the document-recency
+    /// baseline, not a chain event.
+    Creation,
+    /// Surfaced by an explicit `recall`.
+    ExplicitRecall,
+    /// Included in a rendered memory-lens.
+    LensIncluded,
+    /// Retrieved by a `recall_fault` synthesis pass.
+    RecallFault,
+    /// Explicitly selected by an operator from a surface.
+    OperatorSelected,
+}
+
+impl AccessKind {
+    /// Map a `chain_log.kind` string to its access kind. Returns `None`
+    /// for non-access kinds (thread/evidence/attention events). `Creation`
+    /// has no chain-kind — it is synthesized from `chunk.ts`.
+    #[must_use]
+    pub fn from_kind_str(kind: &str) -> Option<Self> {
+        match kind {
+            "explicit_recall" => Some(Self::ExplicitRecall),
+            "lens_included" => Some(Self::LensIncluded),
+            "recall_fault" => Some(Self::RecallFault),
+            "operator_selected" => Some(Self::OperatorSelected),
+            _ => None,
+        }
+    }
+}
+
+/// Per-`AccessKind` weights for the ACT-R activation sum. Configurable so
+/// P5 / P9b-full can tune retrieval signal strength without touching the
+/// freshness math. An explicit retrieval / operator selection is the
+/// strongest "proven-useful" signal; an ambient lens inclusion the weakest.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessWeights {
+    pub creation: f32,
+    pub explicit_recall: f32,
+    pub lens_included: f32,
+    pub recall_fault: f32,
+    pub operator_selected: f32,
+}
+
+impl Default for AccessWeights {
+    fn default() -> Self {
+        Self {
+            creation: 1.0,
+            explicit_recall: 1.0,
+            operator_selected: 1.0,
+            recall_fault: 0.7,
+            lens_included: 0.5,
+        }
+    }
+}
+
+impl AccessWeights {
+    #[must_use]
+    pub const fn weight_of(&self, kind: AccessKind) -> f32 {
+        match kind {
+            AccessKind::Creation => self.creation,
+            AccessKind::ExplicitRecall => self.explicit_recall,
+            AccessKind::LensIncluded => self.lens_included,
+            AccessKind::RecallFault => self.recall_fault,
+            AccessKind::OperatorSelected => self.operator_selected,
+        }
+    }
+}
+
+/// Read-only access to the chunk-access ledger backing ACT-R freshness.
+///
+/// Synchronous (the backing query is a single indexed SQLite scan under a
+/// `Mutex`, like [`ThreadsDb::iter_chain`]); callers in async contexts
+/// invoke it inline without awaiting. The trait lets the query crate hold
+/// an `Arc<dyn ChainLogReader>` without depending on the concrete
+/// [`ThreadsDb`].
+pub trait ChainLogReader: Send + Sync {
+    /// For each requested `chunk_id`, the access events at/after `since`,
+    /// as `(kind, ts)` pairs in ascending `ts`. Chunks with no events are
+    /// absent from the map. Does NOT include `Creation` — callers
+    /// synthesize that from `chunk.ts`.
+    fn access_history(
+        &self,
+        chunk_ids: &[String],
+        since: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<String, Vec<(AccessKind, DateTime<Utc>)>>>;
+}
+
+impl ChainLogReader for ThreadsDb {
+    fn access_history(
+        &self,
+        chunk_ids: &[String],
+        since: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<String, Vec<(AccessKind, DateTime<Utc>)>>> {
+        let mut out: std::collections::HashMap<String, Vec<(AccessKind, DateTime<Utc>)>> =
+            std::collections::HashMap::new();
+        if chunk_ids.is_empty() {
+            return Ok(out);
+        }
+        let wanted: std::collections::HashSet<&str> =
+            chunk_ids.iter().map(String::as_str).collect();
+        let conn = self.lock();
+        // Filter by ts (indexed range) + access kinds in SQL; extract the
+        // chunk_id from the JSON payload and filter to `wanted` in Rust.
+        // Read the row `ts` column directly — NOT via `ChainEvent::from_row`,
+        // which synthesizes `Utc::now()` and would collapse every age to ~1h.
+        let mut stmt = conn.prepare(
+            "SELECT ts, kind, payload FROM chain_log \
+             WHERE ts >= ?1 AND kind IN \
+             ('explicit_recall', 'lens_included', 'recall_fault', 'operator_selected') \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt
+            .query_map([since.to_rfc3339()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        for (ts_s, kind, payload) in rows {
+            let Some(access) = AccessKind::from_kind_str(&kind) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            let Some(chunk_id) = v.get("chunk_id").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if !wanted.contains(chunk_id) {
+                continue;
+            }
+            let Ok(ts) = DateTime::parse_from_rfc3339(&ts_s) else {
+                continue;
+            };
+            out.entry(chunk_id.to_string())
+                .or_default()
+                .push((access, ts.with_timezone(&Utc)));
+        }
+        Ok(out)
     }
 }
 
@@ -938,17 +1193,17 @@ impl ThreadsDb {
 CREATE TABLE IF NOT EXISTS threads (
     handle TEXT PRIMARY KEY,
     tension TEXT NOT NULL DEFAULT 'active',
-    familiarity INTEGER NOT NULL DEFAULT 0,
+    mentions INTEGER NOT NULL DEFAULT 0,
     last_touched_at TEXT NOT NULL,
     anchor_chunk_id TEXT,
     fold_override TEXT,
     created_at TEXT NOT NULL,
     created_scope_key TEXT,
-    privacy_tier TEXT NOT NULL DEFAULT 't1_project'
+    privacy_tier TEXT NOT NULL DEFAULT 't1_project',
+    resonance INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_tension ON threads(tension);
-CREATE INDEX IF NOT EXISTS idx_threads_familiarity ON threads(familiarity);
 CREATE INDEX IF NOT EXISTS idx_threads_anchor ON threads(anchor_chunk_id)
     WHERE anchor_chunk_id IS NOT NULL;
 
@@ -995,6 +1250,10 @@ CREATE TABLE IF NOT EXISTS chain_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_kind ON chain_log(kind);
+-- P7b access-ledger reads filter by `ts >= since` (the selective
+-- predicate); index `ts` so `ChainLogReader::access_history` is an
+-- indexed range scan, not a full table walk.
+CREATE INDEX IF NOT EXISTS idx_chain_ts ON chain_log(ts);
 
 -- thread → thread evidence edges (v0.4.x). evidence_links is
 -- chunk → thread (path-shaped source); this table captures the
@@ -1018,6 +1277,74 @@ CREATE TABLE IF NOT EXISTS thread_thread_links (
 CREATE INDEX IF NOT EXISTS idx_thread_thread_from ON thread_thread_links(from_thread);
 CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread);
 ",
+        )?;
+
+        // --- idempotent column adds (P11b-full: edge activation) ---
+        // `migrate` predates a versioned-migration mechanism; the bodies
+        // above use CREATE TABLE IF NOT EXISTS, which never adds columns
+        // to a table that already exists. Add the edge-activation
+        // components by hand, guarded by a `table_info` probe so re-running
+        // migrate on every open stays a no-op once the columns exist.
+        add_column_if_missing(
+            conn,
+            "evidence_links",
+            "touch_count",
+            "ALTER TABLE evidence_links ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 1",
+        )?;
+        add_column_if_missing(
+            conn,
+            "evidence_links",
+            "last_touched_at",
+            "ALTER TABLE evidence_links ADD COLUMN last_touched_at TEXT",
+        )?;
+        // Backfill rows created before the column existed: a fresh edge's
+        // activation clock starts at creation (newest available stamp).
+        conn.execute(
+            "UPDATE evidence_links SET last_touched_at = COALESCE(updated_at, created_at) \
+             WHERE last_touched_at IS NULL",
+            [],
+        )?;
+
+        // --- salience-vs-familiarity split (resonance-gated familiarity) ---
+        // `familiarity` is document-frequency in disguise; split it into
+        // `mentions` (raw recurrence, this column carried over verbatim) and
+        // a new `resonance` counter (gated salience) that drives the floor.
+        // On a pre-split DB the table exists with a `familiarity` column;
+        // rename it in place (preserving the accumulated counts as
+        // `mentions`) and add `resonance` defaulted to 0 — the intended
+        // reset, since salience is re-earned by present resonance.
+        if column_exists(conn, "threads", "familiarity")?
+            && !column_exists(conn, "threads", "mentions")?
+        {
+            conn.execute("ALTER TABLE threads RENAME COLUMN familiarity TO mentions", [])?;
+        }
+        add_column_if_missing(
+            conn,
+            "threads",
+            "resonance",
+            "ALTER TABLE threads ADD COLUMN resonance INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Index on the floor driver. Created here, AFTER the column add,
+        // because on a pre-split DB the `resonance` column doesn't exist
+        // until the ALTER above runs (it can't live in the CREATE-TABLE
+        // batch, which is a no-op when the table already exists).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_threads_resonance ON threads(resonance)",
+            [],
+        )?;
+
+        // --- durable anchor vector (anchor-continuity across reingest) ---
+        // `anchor_chunk_id` is a content-hash: editing or reingesting the
+        // anchored chunk mints a NEW id, orphaning the anchor so boot
+        // re-anchor silently loses it and the waypoint goes dark. Cache the
+        // anchor EMBEDDING on the row (managed out of band via
+        // `set_anchor_vec`) so the durable waypoint survives corpus churn,
+        // independent of whether the original chunk still exists.
+        add_column_if_missing(
+            conn,
+            "threads",
+            "anchor_vec",
+            "ALTER TABLE threads ADD COLUMN anchor_vec BLOB",
         )?;
         Ok(())
     }
@@ -1059,21 +1386,39 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             let exists = conn
                 .prepare("SELECT 1 FROM threads WHERE handle = ? LIMIT 1")?
                 .exists(params![record.handle.as_str()])?;
+            // ON CONFLICT DO UPDATE (not INSERT OR REPLACE) so the cached
+            // `anchor_vec` column — managed out of band via `set_anchor_vec` —
+            // is PRESERVED across re-touches. INSERT OR REPLACE would
+            // delete+reinsert the row, nulling anchor_vec (and firing any
+            // ON DELETE CASCADE on referencing tables). `anchor_vec` is
+            // intentionally absent from the column list so a fresh insert
+            // leaves it NULL until seeded.
             conn.execute(
-                "INSERT OR REPLACE INTO threads
-                 (handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                  fold_override, created_at, created_scope_key, privacy_tier)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO threads
+                 (handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                  fold_override, created_at, created_scope_key, privacy_tier, resonance)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(handle) DO UPDATE SET
+                     tension = excluded.tension,
+                     mentions = excluded.mentions,
+                     last_touched_at = excluded.last_touched_at,
+                     anchor_chunk_id = excluded.anchor_chunk_id,
+                     fold_override = excluded.fold_override,
+                     created_at = excluded.created_at,
+                     created_scope_key = excluded.created_scope_key,
+                     privacy_tier = excluded.privacy_tier,
+                     resonance = excluded.resonance",
                 params![
                     record.handle.as_str(),
                     record.tension.as_str(),
-                    record.familiarity,
+                    record.mentions,
                     record.last_touched_at.to_rfc3339(),
                     record.anchor_chunk_id,
                     record.fold_override.map(fold_to_str),
                     record.created_at.to_rfc3339(),
                     record.created_scope_key,
                     privacy_to_str(record.privacy_tier),
+                    record.resonance,
                 ],
             )?;
             !exists
@@ -1085,6 +1430,59 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             })?;
         }
         Ok(())
+    }
+
+    /// Persist a thread's anchor *embedding* out of band from
+    /// `upsert_thread`. This vector is the durable waypoint identity: it lets
+    /// boot re-anchor restore resonance even after the anchored corpus chunk's
+    /// content-hash id has churned (edit / reingest). No-op if `handle` has no
+    /// row.
+    pub fn set_anchor_vec(&self, handle: &ThreadHandle, vec: &[f32]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE threads SET anchor_vec = ? WHERE handle = ?",
+            params![f32_vec_to_bytes(vec), handle.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Re-anchor inputs for boot: every thread with *some* anchor source — a
+    /// cached `anchor_vec` (corpus-independent) and/or an `anchor_chunk_id`.
+    /// The caller prefers the stored vector and falls back to fetching the
+    /// chunk embedding from the corpus (then backfills via `set_anchor_vec`).
+    pub fn reanchor_inputs(&self) -> Result<Vec<ReanchorInput>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT handle, privacy_tier, anchor_chunk_id, anchor_vec FROM threads \
+             WHERE anchor_chunk_id IS NOT NULL OR anchor_vec IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let handle_s: String = r.get(0)?;
+                let tier_s: String = r.get(1)?;
+                let anchor_chunk_id: Option<String> = r.get(2)?;
+                let anchor_bytes: Option<Vec<u8>> = r.get(3)?;
+                Ok((handle_s, tier_s, anchor_chunk_id, anchor_bytes))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (handle_s, tier_s, anchor_chunk_id, anchor_bytes) in rows {
+            let Ok(handle) = ThreadHandle::new(handle_s) else {
+                continue;
+            };
+            let privacy_tier = privacy_parse(&tier_s).unwrap_or(PrivacyTier::T1Project);
+            let anchor_vec = match anchor_bytes {
+                Some(b) => Some(bytes_to_f32_vec(&b)?),
+                None => None,
+            };
+            out.push(ReanchorInput {
+                handle,
+                privacy_tier,
+                anchor_chunk_id,
+                anchor_vec,
+            });
+        }
+        Ok(out)
     }
 
     /// Return every thread handle that anchors on the given `chunk_id`
@@ -1121,8 +1519,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     pub fn get_thread(&self, handle: &ThreadHandle) -> Result<Option<ThreadRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                    fold_override, created_at, created_scope_key, privacy_tier
+            "SELECT handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                    fold_override, created_at, created_scope_key, privacy_tier, resonance
              FROM threads WHERE handle = ? LIMIT 1",
         )?;
         let res = stmt.query_row(params![handle.as_str()], row_to_thread);
@@ -1139,8 +1537,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         let rows = match tension {
             Some(t) => {
                 let mut stmt = conn.prepare(
-                    "SELECT handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                            fold_override, created_at, created_scope_key, privacy_tier
+                    "SELECT handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                            fold_override, created_at, created_scope_key, privacy_tier, resonance
                      FROM threads WHERE tension = ? ORDER BY last_touched_at DESC",
                 )?;
                 stmt.query_map(params![t.as_str()], row_to_thread)?
@@ -1148,8 +1546,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT handle, tension, familiarity, last_touched_at, anchor_chunk_id,
-                            fold_override, created_at, created_scope_key, privacy_tier
+                    "SELECT handle, tension, mentions, last_touched_at, anchor_chunk_id,
+                            fold_override, created_at, created_scope_key, privacy_tier, resonance
                      FROM threads ORDER BY last_touched_at DESC",
                 )?;
                 stmt.query_map([], row_to_thread)?
@@ -1176,27 +1574,68 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(())
     }
 
-    /// Increment familiarity and return the post-increment value.
+    /// Increment `mentions` (raw literal-match recurrence) and return the
+    /// post-increment value.
     ///
-    /// Does NOT chain — the turn observer batches familiarity ticks
+    /// Does NOT chain — the turn observer batches recurrence ticks
     /// through [`ChainEvent::FamiliarityBatch`] (see chain-policy doc).
-    pub fn increment_familiarity(&self, handle: &ThreadHandle) -> Result<u32> {
+    pub fn increment_mentions(&self, handle: &ThreadHandle) -> Result<u32> {
+        self.increment_counter(handle, "mentions")
+    }
+
+    /// Increment `resonance` (the resonance-gated salience counter that
+    /// drives the floor) and return the post-increment value. Called by
+    /// the observer only when a mention lands in a turn that resonates
+    /// with the thread anchor >= `RESONANCE_GATE`.
+    ///
+    /// Does NOT chain — batched alongside `mentions` in the same
+    /// [`ChainEvent::FamiliarityBatch`].
+    pub fn increment_resonance(&self, handle: &ThreadHandle) -> Result<u32> {
+        self.increment_counter(handle, "resonance")
+    }
+
+    /// Read the current `resonance` counter without mutating it. Used by
+    /// the observer to stamp the post-batch value for a non-resonant
+    /// mention (mentions advanced, resonance held).
+    pub fn current_resonance(&self, handle: &ThreadHandle) -> Result<u32> {
+        let conn = self.lock();
+        let value: i64 = conn
+            .query_row(
+                "SELECT resonance FROM threads WHERE handle = ?",
+                params![handle.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| missing_thread(handle))?;
+        u32::try_from(value).map_err(|_| {
+            StoreError::Lance(lancedb::Error::Other {
+                message: format!("resonance out of range for thread {handle}: {value}"),
+                source: None,
+            })
+        })
+    }
+
+    /// Shared `UPDATE col = col + 1 RETURNING col` body for the two
+    /// recurrence counters. `column` is a fixed internal string literal
+    /// (`"mentions"` / `"resonance"`), never user input — no injection
+    /// surface.
+    fn increment_counter(&self, handle: &ThreadHandle, column: &str) -> Result<u32> {
         let conn = self.lock();
         let n = conn.execute(
-            "UPDATE threads SET familiarity = familiarity + 1 WHERE handle = ?",
+            &format!("UPDATE threads SET {column} = {column} + 1 WHERE handle = ?"),
             params![handle.as_str()],
         )?;
         if n == 0 {
             return Err(missing_thread(handle));
         }
         let new_value: i64 = conn.query_row(
-            "SELECT familiarity FROM threads WHERE handle = ?",
+            &format!("SELECT {column} FROM threads WHERE handle = ?"),
             params![handle.as_str()],
             |r| r.get(0),
         )?;
         u32::try_from(new_value).map_err(|_| {
             StoreError::Lance(lancedb::Error::Other {
-                message: format!("familiarity overflow for thread {handle}: {new_value}"),
+                message: format!("{column} overflow for thread {handle}: {new_value}"),
                 source: None,
             })
         })
@@ -1207,7 +1646,7 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
     /// across the turn and flush once at turn-end.
     pub fn record_familiarity_batch(
         &self,
-        entries: Vec<(ThreadHandle, u32)>,
+        entries: Vec<(ThreadHandle, u32, u32)>,
         turn_seq: u64,
     ) -> Result<()> {
         if entries.is_empty() {
@@ -1318,6 +1757,84 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(())
     }
 
+    /// Merge `from` into `into`: re-point every evidence and thread→thread
+    /// edge onto `into`, then delete `from`. Used by the P11b-full
+    /// consolidation merge pass for near-duplicate threads. Edges that would
+    /// collide on the target (same `(thread, path, category)`, or a would-be
+    /// `from == to` self-loop) are dropped — they are evidence the target
+    /// already holds. Chains a `ThreadDelete` for the merged-away handle.
+    /// Returns `false` (no-op) if `from == into` or `from` is absent.
+    pub fn merge_thread(&self, from: &ThreadHandle, into: &ThreadHandle) -> Result<bool> {
+        if from == into {
+            return Ok(false);
+        }
+        let merged = {
+            let mut conn = self.lock();
+            let exists = conn
+                .prepare("SELECT 1 FROM threads WHERE handle = ? LIMIT 1")?
+                .exists(params![from.as_str()])?;
+            if exists {
+                let tx = conn.transaction()?;
+                tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+                // chunk→thread evidence. OR IGNORE skips UNIQUE(thread, path,
+                // category) collisions; the leftover from-rows are then dropped.
+                tx.execute(
+                    "UPDATE OR IGNORE evidence_links SET thread_handle = ?1 WHERE thread_handle = ?2",
+                    params![into.as_str(), from.as_str()],
+                )?;
+                tx.execute(
+                    "DELETE FROM evidence_links WHERE thread_handle = ?1",
+                    params![from.as_str()],
+                )?;
+                // thread→thread edges on both endpoints. OR IGNORE skips
+                // UNIQUE(from,to,category) dups and CHECK(from<>to) self-loops.
+                tx.execute(
+                    "UPDATE OR IGNORE thread_thread_links SET from_thread = ?1 WHERE from_thread = ?2",
+                    params![into.as_str(), from.as_str()],
+                )?;
+                tx.execute(
+                    "UPDATE OR IGNORE thread_thread_links SET to_thread = ?1 WHERE to_thread = ?2",
+                    params![into.as_str(), from.as_str()],
+                )?;
+                tx.execute(
+                    "DELETE FROM thread_thread_links WHERE from_thread = ?1 OR to_thread = ?1",
+                    params![from.as_str()],
+                )?;
+                tx.execute(
+                    "DELETE FROM threads WHERE handle = ?1",
+                    params![from.as_str()],
+                )?;
+                tx.commit()?;
+                true
+            } else {
+                false
+            }
+        };
+        if merged {
+            self.sink.append(&ChainEvent::ThreadDelete {
+                handle: from.clone(),
+                ts: Utc::now(),
+            })?;
+        }
+        Ok(merged)
+    }
+
+    /// Set (or clear with `None`) a thread's fold override. Used by the
+    /// consolidation abstraction pass to fold deeply-familiar, stable threads
+    /// to a sparse summary depth. No chain event — fold depth is a
+    /// presentation hint, not a substrate-shape change. Errors if absent.
+    pub fn set_fold_override(&self, handle: &ThreadHandle, depth: Option<FoldDepth>) -> Result<()> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE threads SET fold_override = ? WHERE handle = ?",
+            params![depth.map(fold_to_str), handle.as_str()],
+        )?;
+        if n == 0 {
+            return Err(missing_thread(handle));
+        }
+        Ok(())
+    }
+
     // ---------- evidence ----------
 
     /// Insert an evidence row and return the new `id`.
@@ -1331,8 +1848,9 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
                 "INSERT INTO evidence_links
                  (thread_handle, original_path, current_path, content_hash,
                   last_resolved_chunk_id, relation_state, association_type,
-                  category, similarity, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  category, similarity, created_at, updated_at,
+                  touch_count, last_touched_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     link.thread_handle.as_str(),
                     path_to_str(&link.original_path),
@@ -1345,6 +1863,8 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
                     link.similarity,
                     link.created_at.to_rfc3339(),
                     link.updated_at.to_rfc3339(),
+                    link.touch_count,
+                    link.last_touched_at.to_rfc3339(),
                 ],
             )?;
             conn.last_insert_rowid()
@@ -1358,13 +1878,44 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         Ok(id)
     }
 
+    /// Re-touch an existing edge (P11b-full future→past curation): bump
+    /// `touch_count` and advance `last_touched_at`. Keyed on the same
+    /// `(thread_handle, original_path, category)` tuple the UNIQUE
+    /// constraint uses, so it pairs with the weaver's idempotent-insert
+    /// path: a re-resonance that hits the UNIQUE violation calls this to
+    /// strengthen the edge instead of dropping the signal on the floor.
+    /// Returns `true` if a row was updated. No chain event — a re-touch
+    /// is a transient activation bump, not a substrate-shape change.
+    pub fn touch_evidence_link(
+        &self,
+        thread: &ThreadHandle,
+        original_path: &Path,
+        category: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE evidence_links
+             SET touch_count = touch_count + 1, last_touched_at = ?
+             WHERE thread_handle = ? AND original_path = ? AND category = ?",
+            params![
+                now.to_rfc3339(),
+                thread.as_str(),
+                path_to_str(original_path),
+                category,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     /// All evidence rows for a thread, ordered by `created_at ASC`.
     pub fn list_evidence(&self, handle: &ThreadHandle) -> Result<Vec<EvidenceLink>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, thread_handle, original_path, current_path, content_hash,
                     last_resolved_chunk_id, relation_state, association_type,
-                    category, similarity, created_at, updated_at
+                    category, similarity, created_at, updated_at,
+                    touch_count, last_touched_at
              FROM evidence_links
              WHERE thread_handle = ?
              ORDER BY created_at ASC, id ASC",
@@ -1684,6 +2235,24 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
         )?;
         Ok(n)
     }
+
+    /// Delete *unpromoted* proposals older than `age`. Promoted rows are
+    /// always kept (they record a real promotion). Returns rows deleted.
+    ///
+    /// Proposals are regenerable derived overlay: the weaver re-proposes a
+    /// still-live cluster on the next pass (idempotently, via the
+    /// content-based handle), so pruning a stale unpromoted proposal
+    /// un-freezes a transient judgment — it forgets no primary observation.
+    /// This is the consolidation counterweight to unbounded capture.
+    pub fn prune_proposed_threads_older_than(&self, age: chrono::Duration) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - age).to_rfc3339();
+        let conn = self.lock();
+        let n = conn.execute(
+            "DELETE FROM threads_proposed WHERE promoted_to IS NULL AND created_at < ?",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
 }
 
 // ---------- helpers ----------
@@ -1756,13 +2325,14 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
     let handle_s: String = r.get(0)?;
     let tension_s: String = r.get(1)?;
-    let familiarity_i: i64 = r.get(2)?;
+    let mentions_i: i64 = r.get(2)?;
     let last_touched_s: String = r.get(3)?;
     let anchor: Option<String> = r.get(4)?;
     let fold_s: Option<String> = r.get(5)?;
     let created_s: String = r.get(6)?;
     let scope_key: Option<String> = r.get(7)?;
     let privacy_s: String = r.get(8)?;
+    let resonance_i: i64 = r.get(9)?;
 
     let handle = ThreadHandle::new(handle_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1776,12 +2346,15 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
         .map_err(to_sql_err)?;
     let created_at = parse_ts(&created_s).map_err(to_sql_err)?;
     let privacy_tier = privacy_parse(&privacy_s).map_err(to_sql_err)?;
-    let familiarity = u32::try_from(familiarity_i)
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, familiarity_i))?;
+    let mentions = u32::try_from(mentions_i)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, mentions_i))?;
+    let resonance = u32::try_from(resonance_i)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, resonance_i))?;
     Ok(ThreadRecord {
         handle,
         tension,
-        familiarity,
+        mentions,
+        resonance,
         last_touched_at,
         anchor_chunk_id: anchor,
         fold_override,
@@ -1804,6 +2377,8 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
     let similarity: Option<f64> = r.get(9)?;
     let created_s: String = r.get(10)?;
     let updated_s: String = r.get(11)?;
+    let touch_count: i64 = r.get(12)?;
+    let last_touched_s: Option<String> = r.get(13)?;
 
     let handle = ThreadHandle::new(handle_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
@@ -1812,11 +2387,19 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
     let association_type = AssociationType::parse(&association_s).map_err(to_sql_err)?;
     let created_at = parse_ts(&created_s).map_err(to_sql_err)?;
     let updated_at = parse_ts(&updated_s).map_err(to_sql_err)?;
+    // Backfill guarantees last_touched_at is non-null after migrate, but
+    // tolerate a null defensively (fall back to created_at).
+    let last_touched_at = match last_touched_s {
+        Some(s) => parse_ts(&s).map_err(to_sql_err)?,
+        None => created_at,
+    };
     // SQLite REAL is f64; on-the-wire similarity is f32. The cast
     // truncates mantissa bits but cannot overflow — the value was an
     // f32 at insert time.
     #[allow(clippy::cast_possible_truncation)]
     let similarity = similarity.map(|f| f as f32);
+    #[allow(clippy::cast_sign_loss)]
+    let touch_count = touch_count.max(0) as u32;
     Ok(EvidenceLink {
         id,
         thread_handle: handle,
@@ -1830,7 +2413,36 @@ fn row_to_evidence(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceLink> {
         similarity,
         created_at,
         updated_at,
+        touch_count,
+        last_touched_at,
     })
+}
+
+/// Add `column` to `table` via `alter_sql` unless it already exists.
+/// Idempotent: a `PRAGMA table_info` probe makes re-running `migrate`
+/// (which happens on every `open`) a no-op once the column is present.
+/// Predates a versioned-migration mechanism; see `migrate`.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute(alter_sql, [])?;
+    }
+    Ok(())
+}
+
+/// `true` if `table` has a column named `column`. Used by idempotent
+/// migrations (column adds + the `familiarity → mentions` rename guard).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    Ok(found)
 }
 
 fn row_to_thread_thread_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadThreadLink> {
@@ -1941,6 +2553,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prune_proposed_threads_drops_only_stale_unpromoted() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(30);
+
+        let mk = |handle: &str, created: DateTime<Utc>, promoted: Option<&str>| {
+            ProposedThreadRecord {
+                id: 0,
+                proposed_handle: handle.to_string(),
+                chunk_ids: vec![format!("{handle}-chunk")],
+                centroid_vec: vec![0.1, 0.2],
+                cohesion: 0.9,
+                created_at: created,
+                promoted_to: promoted.map(str::to_string),
+            }
+        };
+
+        db.insert_proposed_thread(&mk("stale-unpromoted", old, None))
+            .unwrap();
+        db.insert_proposed_thread(&mk("stale-promoted", old, Some("real-thread")))
+            .unwrap();
+        db.insert_proposed_thread(&mk("fresh-unpromoted", now, None))
+            .unwrap();
+
+        let pruned = db
+            .prune_proposed_threads_older_than(chrono::Duration::days(7))
+            .unwrap();
+        assert_eq!(pruned, 1, "only the stale unpromoted row is pruned");
+
+        let remaining: Vec<String> = db
+            .list_proposed_threads()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.proposed_handle)
+            .collect();
+        assert!(
+            remaining.contains(&"stale-promoted".to_string()),
+            "promoted proposals are kept regardless of age"
+        );
+        assert!(
+            remaining.contains(&"fresh-unpromoted".to_string()),
+            "recent proposals are kept"
+        );
+        assert!(
+            !remaining.contains(&"stale-unpromoted".to_string()),
+            "stale unpromoted proposal is pruned"
+        );
+    }
+
     /// Errors on `append_within` — used to exercise the rollback path
     /// for link mutations. Plain `append` (used by `upsert_thread`
     /// and friends) still succeeds via the recording side so tests
@@ -1971,7 +2634,8 @@ mod tests {
         ThreadRecord {
             handle: handle(s),
             tension: TensionState::Active,
-            familiarity: 0,
+            mentions: 0,
+            resonance: 0,
             last_touched_at: now,
             anchor_chunk_id: None,
             fold_override: None,
@@ -1996,6 +2660,8 @@ mod tests {
             similarity: None,
             created_at: now,
             updated_at: now,
+            touch_count: 1,
+            last_touched_at: now,
         }
     }
 
@@ -2042,6 +2708,122 @@ mod tests {
     }
 
     #[test]
+    fn anchor_vec_survives_reupsert_and_drives_reanchor() {
+        // Anchor-continuity (PG-5 / membrane-connector-gap M7): the cached
+        // anchor embedding must survive a normal re-touch (the ON CONFLICT DO
+        // UPDATE fix) and be returned by reanchor_inputs so boot re-anchor can
+        // restore the waypoint without the (churnable) corpus chunk.
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+
+        let mut rec = sample_thread("durable-anchor");
+        rec.anchor_chunk_id = Some("chunk-xyz".to_string());
+        db.upsert_thread(&rec).unwrap();
+
+        let vec = vec![0.5_f32, -0.25, 0.75, 0.1];
+        db.set_anchor_vec(&rec.handle, &vec).unwrap();
+
+        // Re-touch (would null anchor_vec under the old INSERT OR REPLACE).
+        rec.mentions = 7;
+        db.upsert_thread(&rec).unwrap();
+        assert_eq!(
+            db.get_thread(&rec.handle).unwrap().unwrap().mentions,
+            7,
+            "the re-upsert must still update the row's other columns"
+        );
+
+        let inputs = db.reanchor_inputs().unwrap();
+        let found = inputs
+            .iter()
+            .find(|i| i.handle.as_str() == "durable-anchor")
+            .expect("thread must appear in reanchor_inputs");
+        let got = found.anchor_vec.clone().expect("anchor_vec must be present");
+        assert_eq!(got.len(), vec.len(), "anchor_vec length preserved");
+        for (a, b) in got.iter().zip(vec.iter()) {
+            assert!((a - b).abs() < 1e-6, "anchor_vec element mismatch: {a} vs {b}");
+        }
+        assert_eq!(found.anchor_chunk_id.as_deref(), Some("chunk-xyz"));
+    }
+
+    #[test]
+    fn evidence_activation_columns_backfill_on_legacy_db() {
+        // A pre-P11b-full evidence_links table (no touch_count /
+        // last_touched_at) with one row. migrate() must add the columns
+        // and backfill last_touched_at from updated_at without error.
+        let tmp = TempDir::new().unwrap();
+        let pre = Connection::open(tmp.path().join("threads.sqlite")).unwrap();
+        pre.execute_batch(
+            "CREATE TABLE evidence_links (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 thread_handle TEXT NOT NULL,
+                 original_path TEXT NOT NULL,
+                 current_path TEXT,
+                 content_hash TEXT,
+                 last_resolved_chunk_id TEXT,
+                 relation_state TEXT NOT NULL DEFAULT 'active',
+                 association_type TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 similarity REAL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO evidence_links
+                 (thread_handle, original_path, association_type, category,
+                  created_at, updated_at)
+             VALUES ('legacy-thread', 'chunk-x', 'derived', 'doc',
+                     '2026-01-01T00:00:00+00:00', '2026-02-02T00:00:00+00:00');",
+        )
+        .unwrap();
+        drop(pre);
+
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let conn = db.lock();
+        let (touch, last_touched): (i64, String) = conn
+            .query_row(
+                "SELECT touch_count, last_touched_at FROM evidence_links WHERE original_path = 'chunk-x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(touch, 1, "legacy rows default to touch_count 1");
+        assert_eq!(
+            last_touched, "2026-02-02T00:00:00+00:00",
+            "last_touched_at backfills from updated_at"
+        );
+    }
+
+    #[test]
+    fn evidence_touch_count_round_trips_and_bumps() {
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        db.upsert_thread(&sample_thread("edge-thread")).unwrap();
+        let link = sample_evidence("edge-thread", "chunk-y", "doc");
+        let created = link.created_at;
+        db.add_evidence_link(&link).unwrap();
+
+        let back = &db.list_evidence(&handle("edge-thread")).unwrap()[0];
+        assert_eq!(back.touch_count, 1);
+        assert_eq!(back.last_touched_at, created);
+
+        // Re-touch: count bumps, timestamp advances, no duplicate row.
+        let later = created + chrono::Duration::hours(3);
+        let touched = db
+            .touch_evidence_link(&handle("edge-thread"), Path::new("chunk-y"), "doc", later)
+            .unwrap();
+        assert!(touched, "existing edge is re-touched");
+        let rows = db.list_evidence(&handle("edge-thread")).unwrap();
+        assert_eq!(rows.len(), 1, "re-touch updates in place, no new row");
+        assert_eq!(rows[0].touch_count, 2);
+        assert_eq!(rows[0].last_touched_at, later);
+
+        // A non-existent edge re-touch is a no-op miss.
+        let missed = db
+            .touch_evidence_link(&handle("edge-thread"), Path::new("nope"), "doc", later)
+            .unwrap();
+        assert!(!missed, "touch on a missing edge reports no update");
+    }
+
+    #[test]
     fn thread_crud_round_trip() {
         let tmp = TempDir::new().unwrap();
         let db = ThreadsDb::open(tmp.path()).unwrap();
@@ -2066,16 +2848,69 @@ mod tests {
     }
 
     #[test]
-    fn familiarity_inc_returns_new_value() {
+    #[ignore = "manual: set MIG_TEST_ROOT to a dir holding a COPY of a pre-split \
+                threads.sqlite (familiarity column). Exercises the real \
+                familiarity->mentions rename + resonance backfill on live data."]
+    fn migration_on_live_copy_preserves_mentions_resets_resonance() {
+        let root = std::env::var("MIG_TEST_ROOT").expect("set MIG_TEST_ROOT");
+        let root = std::path::Path::new(&root);
+        // Capture a couple of known dominators before-state via raw sqlite.
+        let probe = |handle: &str| -> i64 {
+            let conn = Connection::open(root.join("threads.sqlite")).unwrap();
+            // Column may be `familiarity` (pre) or `mentions` (post) — try both.
+            conn.query_row(
+                "SELECT COALESCE(\
+                   (SELECT mentions FROM threads WHERE handle=?1),\
+                   0)",
+                params![handle],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        };
+
+        // open() runs migrate(): rename familiarity->mentions, add resonance=0.
+        let db = ThreadsDb::open(root).unwrap();
+        let tl = db
+            .get_thread(&ThreadHandle::new("top-level").unwrap())
+            .unwrap()
+            .expect("top-level present in live copy");
+        assert!(
+            tl.mentions >= 1000,
+            "raw recurrence carried over verbatim (got mentions={})",
+            tl.mentions
+        );
+        assert_eq!(tl.resonance, 0, "resonance backfilled to baseline (the reset)");
+        let mentions_after_first = probe("top-level");
+        assert_eq!(mentions_after_first, tl.mentions as i64);
+
+        // Idempotent: re-open is a no-op (no double-rename, counters stable).
+        drop(db);
+        let db2 = ThreadsDb::open(root).unwrap();
+        let tl2 = db2
+            .get_thread(&ThreadHandle::new("top-level").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(tl2.mentions, tl.mentions, "re-open must not change mentions");
+        assert_eq!(tl2.resonance, 0, "re-open must not change resonance");
+    }
+
+    #[test]
+    fn mentions_and_resonance_increment_independently() {
         let tmp = TempDir::new().unwrap();
         let db = ThreadsDb::open(tmp.path()).unwrap();
         db.upsert_thread(&sample_thread("fam")).unwrap();
-        let v1 = db.increment_familiarity(&handle("fam")).unwrap();
-        let v2 = db.increment_familiarity(&handle("fam")).unwrap();
+        // mentions advance every observation…
+        let v1 = db.increment_mentions(&handle("fam")).unwrap();
+        let v2 = db.increment_mentions(&handle("fam")).unwrap();
         assert_eq!(v1, 1);
         assert_eq!(v2, 2);
+        // …resonance is a separate, gated counter.
+        assert_eq!(db.current_resonance(&handle("fam")).unwrap(), 0);
+        let r1 = db.increment_resonance(&handle("fam")).unwrap();
+        assert_eq!(r1, 1);
         let row = db.get_thread(&handle("fam")).unwrap().unwrap();
-        assert_eq!(row.familiarity, 2);
+        assert_eq!(row.mentions, 2, "mentions tracks raw recurrence");
+        assert_eq!(row.resonance, 1, "resonance tracks gated salience");
     }
 
     #[test]
@@ -2219,7 +3054,7 @@ mod tests {
         let db = ThreadsDb::open_with_sink(tmp.path(), sink.clone()).unwrap();
         db.upsert_thread(&sample_thread("fb")).unwrap();
         let _ = sink.take();
-        db.record_familiarity_batch(vec![(handle("fb"), 3)], 17)
+        db.record_familiarity_batch(vec![(handle("fb"), 3, 1)], 17)
             .unwrap();
         let ev = sink.take();
         assert_eq!(ev.len(), 1);
@@ -2230,7 +3065,8 @@ mod tests {
                 assert_eq!(*turn_seq, 17);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].0, handle("fb"));
-                assert_eq!(entries[0].1, 3);
+                assert_eq!(entries[0].1, 3, "mentions_after");
+                assert_eq!(entries[0].2, 1, "resonance_after");
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -2244,7 +3080,7 @@ mod tests {
 
         // Three mutations chained: thread create + familiarity batch + tension transition.
         db.upsert_thread(&sample_thread("scribe")).unwrap();
-        db.record_familiarity_batch(vec![(handle("scribe"), 7)], 42)
+        db.record_familiarity_batch(vec![(handle("scribe"), 7, 4)], 42)
             .unwrap();
         db.set_tension(&handle("scribe"), TensionState::Slack)
             .unwrap();
@@ -2265,7 +3101,8 @@ mod tests {
                 assert_eq!(*turn_seq, 42);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].0.as_str(), "scribe");
-                assert_eq!(entries[0].1, 7);
+                assert_eq!(entries[0].1, 7, "mentions_after");
+                assert_eq!(entries[0].2, 4, "resonance_after survives disk round-trip");
             }
             other => panic!("expected FamiliarityBatch, got {other:?}"),
         }
