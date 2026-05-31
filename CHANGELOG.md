@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-31
+
 ### Added
+
+- **Structural weave-apparatus gate — tool-call envelopes + `<task-notification>`
+  can't seed threads.** Generalizing RT-7 beyond facets: the weaver now treats
+  Claude Code tool-call blocks (`block_kind` `tool_use` / `tool_result`) and
+  `<task-notification>` monitor events as *structural* apparatus and skips them
+  for anchor-matching + emergent proposals, so they can't form degenerate
+  high-cohesion threads (post-recovery they dominated the proposal pool).
+  `block_kind`/content properties aren't facets, so this is the structural
+  counterpart to `[weaver] exclude_facets` (`is_structural_apparatus`).
+  Weave-only — the chunks stay in the corpus and remain recall-able (cf.
+  `CorpusStore::mark_tool_blocks_stale` to drop them from recall entirely).
 
 - **RT-7 — demux Claude Code multi-agent orchestration off the content
   channel.** `<teammate-message>` envelopes are harness apparatus (the same

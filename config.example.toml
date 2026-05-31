@@ -72,6 +72,14 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
 #
 # [weaver]
 # exclude_facets = ["record_kind:harness_orchestration"]
+#
+# Independent of this facet denylist, the weaver ALWAYS treats two classes of
+# structural apparatus as un-weavable (they stay in the corpus + recall, but
+# never anchor or seed threads): Claude Code tool-call envelopes
+# (block_kind tool_use / tool_result) and `<task-notification>` monitor events.
+# These are block_kind / content properties, not facets, so they are not
+# expressible here — see `is_structural_apparatus` in the weaver. To drop them
+# from recall entirely (not just weaving), use `CorpusStore::mark_tool_blocks_stale`.
 
 # ──────────────────────────────────────────────────────────────────────
 # Optional record rules (interpretation overlay). Each [[record_rule]] is a

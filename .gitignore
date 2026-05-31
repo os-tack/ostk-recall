@@ -17,3 +17,8 @@ Cargo.lock.user
 .vscode/
 *.swp
 .fastembed_cache/
+
+# local agent tooling (per-machine, never committed)
+.claude/
+.antigravitycli/
+.mcp.json

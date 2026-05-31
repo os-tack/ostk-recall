@@ -221,6 +221,23 @@ fn has_excluded_facet(facets: &ostk_recall_core::FacetSet, exclude: &[String]) -
         .any(|f| exclude.iter().any(|e| e == f))
 }
 
+/// Structural apparatus that must never anchor or seed emergent threads,
+/// independent of the facet denylist: Claude Code tool-call envelopes
+/// (`block_kind` of `tool_use` / `tool_result`) and `<task-notification>`
+/// monitor events. These are high-volume templated scaffolding — left ungated
+/// they cluster into degenerate high-cohesion proposals (post-recovery they
+/// dominated the proposal pool). The gate is weave-only: such chunks stay in
+/// the corpus and remain recall-able (cf. `CorpusStore::mark_tool_blocks_stale`,
+/// which instead drops them from recall entirely) — they just don't drive
+/// cognition. `block_kind` lives in `Chunk::extra`, and task-notifications are
+/// `block_kind=user`, so neither is expressible as a `[weaver] exclude_facets`
+/// entry; this is the structural counterpart to that facet denylist.
+fn is_structural_apparatus(text: &str, extra: &serde_json::Value) -> bool {
+    let block_kind = extra.get("block_kind").and_then(serde_json::Value::as_str);
+    matches!(block_kind, Some("tool_use" | "tool_result"))
+        || text.trim_start().starts_with("<task-notification>")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WeaverError {
     #[error("store error: {0}")]
@@ -628,7 +645,10 @@ impl AutoWeaver {
             .await?;
         let new_embeds: HashMap<String, Vec<f32>> = fetched
             .into_iter()
-            .filter(|(_, (chunk, _))| !has_excluded_facet(&chunk.facets, &self.exclude_facets))
+            .filter(|(_, (chunk, _))| {
+                !has_excluded_facet(&chunk.facets, &self.exclude_facets)
+                    && !is_structural_apparatus(&chunk.text, &chunk.extra)
+            })
             .filter_map(|(id, (_, emb))| emb.map(|e| (id, e)))
             .collect();
         let threshold = self.thresholds.for_source(event.source);
@@ -919,6 +939,38 @@ mod tests {
             "audit_significant must NOT be excluded from weaving by default"
         );
         assert!(!has_excluded_facet(&facets_with("anything_else"), &default));
+    }
+
+    #[test]
+    fn structural_apparatus_is_excluded_but_real_content_is_not() {
+        use serde_json::json;
+        // Tool-call envelopes and task-notifications are structural apparatus,
+        // gated regardless of facets so they never seed degenerate threads.
+        assert!(is_structural_apparatus(
+            "[tool_use Read: {\"file_path\":\"src/main.rs\"}]",
+            &json!({ "block_kind": "tool_use" })
+        ));
+        assert!(is_structural_apparatus(
+            "[tool_result: 1\t2026-05-12 claim id=os-builds-os]",
+            &json!({ "block_kind": "tool_result" })
+        ));
+        // task-notifications are block_kind=user, caught by the text prefix
+        // (with leading whitespace tolerated).
+        assert!(is_structural_apparatus(
+            "\n<task-notification>\n<task-id>bwl7bzhhn</task-id>",
+            &json!({ "block_kind": "user" })
+        ));
+        // Real cognition must pass: assistant prose, genuine user turns, and
+        // chunks with no `extra` are all woven.
+        assert!(!is_structural_apparatus(
+            "The kernel survives.",
+            &json!({ "block_kind": "assistant_text" })
+        ));
+        assert!(!is_structural_apparatus(
+            "commit that please, the os builds the os",
+            &json!({ "block_kind": "user" })
+        ));
+        assert!(!is_structural_apparatus("plain text, no extra", &json!(null)));
     }
 
     #[test]
