@@ -126,9 +126,6 @@ pub fn find_clusters_with(
             continue;
         }
 
-        let mut ids: Vec<String> = members.iter().map(|&i| chunks[i].0.clone()).collect();
-        ids.sort();
-
         let dim = chunks[members[0]].1.len();
         let mut centroid = vec![0.0_f32; dim];
         for &i in &members {
@@ -149,6 +146,26 @@ pub fn find_clusters_with(
             *slot *= inv;
         }
 
+        // Order members by similarity to the centroid (nearest first) so
+        // `chunk_ids[0]` is the cluster's most-representative chunk — the
+        // anchor the weaver promotes. Anchor quality is the binding constraint
+        // on whether the off-diagonal bridge can fire: an arbitrary first-chunk
+        // anchor (e.g. a bare `struct`) resonates poorly, while the
+        // centroid-nearest chunk best represents the idea. Tiebreak lexically
+        // for determinism. The proposed handle hashes a *sorted* copy
+        // (`generate_proposed_handle`), so this display order never affects
+        // RT-5 idempotency.
+        let mut scored: Vec<(String, f32)> = members
+            .iter()
+            .map(|&i| (chunks[i].0.clone(), cosine_similarity(&chunks[i].1, &centroid)))
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let ids: Vec<String> = scored.into_iter().map(|(id, _)| id).collect();
+
         let cohesion = average_pairwise_cosine(chunks, &members);
 
         clusters.push(EmergentCluster {
@@ -158,7 +175,10 @@ pub fn find_clusters_with(
         });
     }
 
-    clusters.sort_by(|a, b| a.chunk_ids[0].cmp(&b.chunk_ids[0]));
+    // Deterministic cluster order by the lexically-smallest member id.
+    // `chunk_ids[0]` is now the centroid-nearest representative (not the
+    // lex-min), so sort on the canonical min rather than the first element.
+    clusters.sort_by(|a, b| a.chunk_ids.iter().min().cmp(&b.chunk_ids.iter().min()));
     clusters
 }
 
@@ -396,5 +416,28 @@ mod tests {
         assert_eq!(clusters.len(), 2);
         assert!(clusters[0].chunk_ids[0].starts_with("alpha-"));
         assert!(clusters[1].chunk_ids[0].starts_with("zeta-"));
+    }
+
+    #[test]
+    fn chunk_ids_lead_with_centroid_nearest_representative() {
+        // Anchor quality (M4): chunk_ids[0] must be the centroid-nearest
+        // (most-representative) member, NOT the lexicographically-smallest, so
+        // the weaver promotes a representative anchor instead of an arbitrary
+        // chunk. The center vector here is lexically LAST, so passing proves
+        // ordering by centroid similarity rather than by id.
+        let chunks = vec![
+            v("z-center", vec![1.0, 0.0, 0.0]),
+            v("a-edge", vec![0.98, 0.2, 0.0]),
+            v("m-edge", vec![0.98, 0.0, 0.2]),
+        ];
+        let clusters = find_clusters_with(&chunks, 0.82, 3, 2);
+        assert_eq!(clusters.len(), 1, "the three tight vectors form one cluster");
+        let c = &clusters[0];
+        assert_eq!(
+            c.chunk_ids[0], "z-center",
+            "chunk_ids[0] must be the centroid-nearest member, not the lex-min; got {:?}",
+            c.chunk_ids
+        );
+        assert_eq!(c.chunk_ids.len(), 3);
     }
 }

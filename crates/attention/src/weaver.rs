@@ -462,7 +462,10 @@ impl AutoWeaver {
     /// a still-live cluster idempotently rather than re-creating it, and stale
     /// proposals are pruned — so a proposal that is still present and clears the
     /// size/cohesion bar has recurred across passes. The new thread anchors on
-    /// the cluster's first chunk. Idempotent: already-promoted rows are skipped.
+    /// `chunk_ids[0]`, which `cluster.rs` orders to be the **centroid-nearest**
+    /// (most-representative) chunk — not an arbitrary first chunk — so the
+    /// anchor resonates with the idea (anchor quality gates the off-diagonal
+    /// bridge). Idempotent: already-promoted rows are skipped.
     fn promote_recurring_proposals(&self) -> Result<usize, WeaverError> {
         let proposals = self.threads.list_proposed_threads()?;
         let mut promoted = 0usize;
@@ -854,8 +857,15 @@ struct AnchorSnapshot {
 /// proposal accumulation.
 pub(crate) fn generate_proposed_handle(chunk_ids: &[String]) -> String {
     use sha2::{Digest, Sha256};
+    // Hash a *sorted* copy so the handle is canonical (RT-5 idempotency):
+    // independent of member order, so reordering chunk_ids to put the
+    // centroid-nearest representative first (cluster.rs) never changes the
+    // handle. Identical to the prior hash for existing proposals, whose ids
+    // were already lexically sorted.
+    let mut sorted: Vec<&String> = chunk_ids.iter().collect();
+    sorted.sort();
     let mut hasher = Sha256::new();
-    for id in chunk_ids {
+    for id in sorted {
         hasher.update(id.as_bytes());
         hasher.update(b"\n");
     }
