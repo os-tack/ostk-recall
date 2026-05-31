@@ -115,8 +115,20 @@ pub fn is_stop_handle(mentions: u32, resonance: u32) -> bool {
 
 /// Tension below this counts as "dormant enough" for off-diagonal lift.
 pub const OFF_DIAGONAL_TENSION_MAX: f32 = 0.2;
-/// Resonance above this counts as "resonant enough" for off-diagonal lift.
-pub const OFF_DIAGONAL_RESONANCE_MIN: f32 = 0.7;
+/// `resonance_count` at/below which a thread is "rarely established" and thus
+/// eligible for the off-diagonal *surprise* lift. This is the discriminator
+/// that keeps broad attractors out: live observation (membrane-connector-gap
+/// + session-meta-log) shows central concepts like `cognitive-memory` /
+/// `cross-scope` sit at 8–15 resonant turns while genuine dormant bridges sit
+/// at 0–3. A thread that has resonated many times is *established*, not a
+/// surprise. (Config-exposure via a `[attention]` section is a follow-up; this
+/// mirrors the other module-level scoring consts.)
+pub const OFF_DIAGONAL_ESTABLISHED_MAX: u32 = 5;
+/// Absolute resonance floor below which nothing is "surprising enough" to lift,
+/// regardless of dormancy — keeps embedding noise (~0.2) out. Real on-topic
+/// resonance against good anchors reaches ~0.3–0.53 (the old absolute gate of
+/// 0.7 was unreachable in the wild — see membrane-connector-gap finding #1).
+pub const OFF_DIAGONAL_RESONANCE_FLOOR: f32 = 0.30;
 
 // --- edge activation (P11b-full) ------------------------------------------
 // Componentized activation for evidence edges, per the ratified
@@ -239,20 +251,43 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Gate for the off-diagonal "surprising discovery" quadrant.
+/// Off-diagonal "surprising discovery" lift — the north-star associative
+/// bridge: an *old, rarely-resonant* idea that *acutely* resonates with
+/// current work.
 ///
-/// Returns 1.0 when both `tension < OFF_DIAGONAL_TENSION_MAX` and
-/// `resonance > OFF_DIAGONAL_RESONANCE_MIN`; 0.0 otherwise. The score
-/// formula multiplies this gate by `BETA`, and the attribution carries
-/// that already-weighted value so attribution rows sum to `score`
-/// cleanly.
+/// The old gate fired on `resonance > 0.7` absolute, which never happened in
+/// the wild (real resonance tops out ~0.5) and — worse — high *raw* resonance
+/// favours broad attractors that resonate with everything, the opposite of a
+/// surprise. This is now a **graded, multi-signal surprise gate** keyed on
+/// existing state (no new schema):
+///
+/// - `tension < OFF_DIAGONAL_TENSION_MAX` — the idea is dormant; AND
+/// - `resonance_count <= OFF_DIAGONAL_ESTABLISHED_MAX` and not a stop-handle —
+///   it is *rarely established* (this is what excludes broad attractors, which
+///   carry high resonance counts); AND
+/// - `resonance >= OFF_DIAGONAL_RESONANCE_FLOOR` — it is *acutely* resonating
+///   now, above the embedding-noise floor.
+///
+/// Returns a value in `[0, 1]`, **graded** by how far `resonance` clears the
+/// floor toward 1.0 so the strongest surprise leads (the old binary 0/1 is the
+/// degenerate case at `resonance = 1.0`, which still yields 1.0). The score
+/// formula multiplies this by `BETA`, and the attribution carries that
+/// already-weighted value so rows sum to `score` cleanly.
+///
+/// NOTE: the additive lift alone cannot surface a dormant low-count thread
+/// above an *established* one — the latter's `familiarity_floor` gap exceeds
+/// the max lift `BETA`. `surface()` therefore also reserves a *bridge slot*
+/// for the strongest-lift thread; this graded value ranks candidates for it.
 #[must_use]
-pub fn off_diagonal_lift_gate(tension: f32, resonance: f32) -> f32 {
-    if tension < OFF_DIAGONAL_TENSION_MAX && resonance > OFF_DIAGONAL_RESONANCE_MIN {
-        1.0
-    } else {
-        0.0
+pub fn off_diagonal_lift(tension: f32, resonance: f32, resonance_count: u32, is_stop: bool) -> f32 {
+    if tension >= OFF_DIAGONAL_TENSION_MAX
+        || is_stop
+        || resonance_count > OFF_DIAGONAL_ESTABLISHED_MAX
+        || resonance < OFF_DIAGONAL_RESONANCE_FLOOR
+    {
+        return 0.0;
     }
+    ((resonance - OFF_DIAGONAL_RESONANCE_FLOOR) / (1.0 - OFF_DIAGONAL_RESONANCE_FLOOR)).clamp(0.0, 1.0)
 }
 
 // --- errors ------------------------------------------------------------
@@ -696,13 +731,58 @@ fn compute_score_parts(
     let floor = resonance_floor * state.fade_multiplier;
     let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
     let resonance_term = ALPHA * resonance;
-    let lift_term = BETA * off_diagonal_lift_gate(state.tension, resonance);
+    let lift_term = BETA
+        * off_diagonal_lift(
+            state.tension,
+            resonance,
+            state.resonance,
+            is_stop_handle(state.mentions, state.resonance),
+        );
     let score = decay_term + resonance_term + lift_term;
     ScoreParts {
         score,
         resonance,
         lift_term,
         dt_secs,
+    }
+}
+
+/// Reserve a "bridge slot" for the strongest off-diagonal surprise.
+///
+/// An additive `off_diagonal_lift` cannot, on its own, surface a dormant
+/// low-`resonance_count` thread above an *established* one: the established
+/// thread's `familiarity_floor` advantage exceeds the maximum lift (`BETA`),
+/// so even a perfectly-calibrated lift leaves the bridge buried (membrane-
+/// connector-gap session finding M5). This guarantees the single highest-lift
+/// thread a seat within `limit` — taking the last slot when it would otherwise
+/// fall outside — mirroring the reserved-ambient slot and the lens portfolio's
+/// diversity-jump. `pages` must already be sorted by score descending.
+fn reserve_bridge_slot(pages: &mut Vec<AttentionPage>, limit: usize) {
+    if limit == 0 {
+        pages.clear();
+        return;
+    }
+    let bridge_idx = pages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.why.off_diagonal_lift > 0.0)
+        .max_by(|(_, a), (_, b)| {
+            a.why
+                .off_diagonal_lift
+                .partial_cmp(&b.why.off_diagonal_lift)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i);
+    match bridge_idx {
+        // The strongest surprise would be truncated away — reserve it the last
+        // seat, keeping the top `limit - 1` by score.
+        Some(bi) if bi >= limit => {
+            let bridge = pages.remove(bi);
+            pages.truncate(limit - 1);
+            pages.push(bridge);
+        }
+        // Bridge already within `limit`, or no surprise present.
+        _ => pages.truncate(limit),
     }
 }
 
@@ -1429,7 +1509,10 @@ impl AttentionForwardStore for InMemoryAttention {
             return Ok(pages);
         }
 
-        pages.truncate(limit);
+        // Reserved bridge slot (off-diagonal calibration, membrane-connector-gap
+        // finding #1 + M5): the strongest off-diagonal surprise is guaranteed a
+        // seat even when an established thread's familiarity floor would bury it.
+        reserve_bridge_slot(&mut pages, limit);
         Ok(pages)
     }
 
@@ -2027,6 +2110,75 @@ mod tests {
             "dormant-resonant (score {}) must surface above active-orthogonal (score {})",
             dormant_page.score,
             active_page.score
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_bridge_slot_surfaces_buried_surprise() {
+        // M5: an additive lift cannot lift a dormant low-count bridge above an
+        // *established* thread, because the established thread's familiarity
+        // floor (resonance_count -> floor) outweighs the max lift. The reserved
+        // bridge slot guarantees the strongest surprise a seat anyway.
+        let store = InMemoryAttention::new();
+        let scope = scope_for("bridge-slot");
+        store
+            .attend(&scope, "the surprising off-diagonal bridge topic")
+            .await
+            .unwrap();
+        let anchor = stub_embed("the surprising off-diagonal bridge topic");
+
+        // Five established threads: high resonance_count -> high familiarity
+        // floor (they dominate raw score) and (count > ESTABLISHED_MAX) get no
+        // lift. Same anchor, so they resonate identically — only the floor and
+        // the surprise-eligibility differ.
+        for i in 0..5 {
+            store
+                .__install_thread_for_test(
+                    &scope,
+                    handle(&format!("established-{i}")),
+                    0.0,
+                    15,
+                    Utc::now(),
+                    FoldDepth::Folded,
+                    anchor.clone(),
+                )
+                .await;
+        }
+        // One dormant, rarely-resonant thread: a low floor buries it on raw
+        // score, but it is the only off-diagonal surprise.
+        store
+            .__install_thread_for_test(
+                &scope,
+                handle("surprise-bridge"),
+                0.05,
+                1,
+                Utc::now() - Duration::days(7),
+                FoldDepth::Folded,
+                anchor.clone(),
+            )
+            .await;
+
+        // Only four seats — fewer than the five established threads, so the
+        // surprise would be truncated away without the reserved bridge slot.
+        let pages = store.surface(&scope, 4).await.unwrap();
+        let surprise = pages.iter().find(|p| p.handle == "surprise-bridge");
+        assert!(
+            surprise.is_some(),
+            "reserved bridge slot must surface the buried surprise; got {:?}",
+            pages.iter().map(|p| &p.handle).collect::<Vec<_>>()
+        );
+        assert!(
+            surprise.unwrap().why.off_diagonal_lift > 0.0,
+            "the surprise must carry a positive off-diagonal lift"
+        );
+        // Established threads still lead and get NO lift (resonance_count > max).
+        let est = pages
+            .iter()
+            .find(|p| p.handle.starts_with("established-"))
+            .expect("established threads must still hold the top seats");
+        assert_eq!(
+            est.why.off_diagonal_lift, 0.0,
+            "an established (high resonance_count) thread must not receive lift"
         );
     }
 
