@@ -147,6 +147,19 @@ pub struct ThreadRecord {
     pub privacy_tier: PrivacyTier,
 }
 
+/// Durable anchor sources for boot re-anchoring
+/// (`re_anchor_threads_from_corpus`). `anchor_vec` (the cached embedding) is
+/// preferred because it survives corpus chunk-id churn (edit / reingest);
+/// `anchor_chunk_id` is the fallback, and when it resolves it backfills
+/// `anchor_vec` so the next boot no longer depends on the corpus.
+#[derive(Debug, Clone)]
+pub struct ReanchorInput {
+    pub handle: ThreadHandle,
+    pub privacy_tier: PrivacyTier,
+    pub anchor_chunk_id: Option<String>,
+    pub anchor_vec: Option<Vec<f32>>,
+}
+
 /// A row in the `threads_proposed` table.
 ///
 /// The substrate writes proposals when it notices a chunk cluster
@@ -1319,6 +1332,20 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             "CREATE INDEX IF NOT EXISTS idx_threads_resonance ON threads(resonance)",
             [],
         )?;
+
+        // --- durable anchor vector (anchor-continuity across reingest) ---
+        // `anchor_chunk_id` is a content-hash: editing or reingesting the
+        // anchored chunk mints a NEW id, orphaning the anchor so boot
+        // re-anchor silently loses it and the waypoint goes dark. Cache the
+        // anchor EMBEDDING on the row (managed out of band via
+        // `set_anchor_vec`) so the durable waypoint survives corpus churn,
+        // independent of whether the original chunk still exists.
+        add_column_if_missing(
+            conn,
+            "threads",
+            "anchor_vec",
+            "ALTER TABLE threads ADD COLUMN anchor_vec BLOB",
+        )?;
         Ok(())
     }
 
@@ -1359,11 +1386,28 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             let exists = conn
                 .prepare("SELECT 1 FROM threads WHERE handle = ? LIMIT 1")?
                 .exists(params![record.handle.as_str()])?;
+            // ON CONFLICT DO UPDATE (not INSERT OR REPLACE) so the cached
+            // `anchor_vec` column — managed out of band via `set_anchor_vec` —
+            // is PRESERVED across re-touches. INSERT OR REPLACE would
+            // delete+reinsert the row, nulling anchor_vec (and firing any
+            // ON DELETE CASCADE on referencing tables). `anchor_vec` is
+            // intentionally absent from the column list so a fresh insert
+            // leaves it NULL until seeded.
             conn.execute(
-                "INSERT OR REPLACE INTO threads
+                "INSERT INTO threads
                  (handle, tension, mentions, last_touched_at, anchor_chunk_id,
                   fold_override, created_at, created_scope_key, privacy_tier, resonance)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(handle) DO UPDATE SET
+                     tension = excluded.tension,
+                     mentions = excluded.mentions,
+                     last_touched_at = excluded.last_touched_at,
+                     anchor_chunk_id = excluded.anchor_chunk_id,
+                     fold_override = excluded.fold_override,
+                     created_at = excluded.created_at,
+                     created_scope_key = excluded.created_scope_key,
+                     privacy_tier = excluded.privacy_tier,
+                     resonance = excluded.resonance",
                 params![
                     record.handle.as_str(),
                     record.tension.as_str(),
@@ -1386,6 +1430,59 @@ CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread
             })?;
         }
         Ok(())
+    }
+
+    /// Persist a thread's anchor *embedding* out of band from
+    /// `upsert_thread`. This vector is the durable waypoint identity: it lets
+    /// boot re-anchor restore resonance even after the anchored corpus chunk's
+    /// content-hash id has churned (edit / reingest). No-op if `handle` has no
+    /// row.
+    pub fn set_anchor_vec(&self, handle: &ThreadHandle, vec: &[f32]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE threads SET anchor_vec = ? WHERE handle = ?",
+            params![f32_vec_to_bytes(vec), handle.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Re-anchor inputs for boot: every thread with *some* anchor source — a
+    /// cached `anchor_vec` (corpus-independent) and/or an `anchor_chunk_id`.
+    /// The caller prefers the stored vector and falls back to fetching the
+    /// chunk embedding from the corpus (then backfills via `set_anchor_vec`).
+    pub fn reanchor_inputs(&self) -> Result<Vec<ReanchorInput>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT handle, privacy_tier, anchor_chunk_id, anchor_vec FROM threads \
+             WHERE anchor_chunk_id IS NOT NULL OR anchor_vec IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let handle_s: String = r.get(0)?;
+                let tier_s: String = r.get(1)?;
+                let anchor_chunk_id: Option<String> = r.get(2)?;
+                let anchor_bytes: Option<Vec<u8>> = r.get(3)?;
+                Ok((handle_s, tier_s, anchor_chunk_id, anchor_bytes))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (handle_s, tier_s, anchor_chunk_id, anchor_bytes) in rows {
+            let Ok(handle) = ThreadHandle::new(handle_s) else {
+                continue;
+            };
+            let privacy_tier = privacy_parse(&tier_s).unwrap_or(PrivacyTier::T1Project);
+            let anchor_vec = match anchor_bytes {
+                Some(b) => Some(bytes_to_f32_vec(&b)?),
+                None => None,
+            };
+            out.push(ReanchorInput {
+                handle,
+                privacy_tier,
+                anchor_chunk_id,
+                anchor_vec,
+            });
+        }
+        Ok(out)
     }
 
     /// Return every thread handle that anchors on the given `chunk_id`
@@ -2608,6 +2705,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn anchor_vec_survives_reupsert_and_drives_reanchor() {
+        // Anchor-continuity (PG-5 / membrane-connector-gap M7): the cached
+        // anchor embedding must survive a normal re-touch (the ON CONFLICT DO
+        // UPDATE fix) and be returned by reanchor_inputs so boot re-anchor can
+        // restore the waypoint without the (churnable) corpus chunk.
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+
+        let mut rec = sample_thread("durable-anchor");
+        rec.anchor_chunk_id = Some("chunk-xyz".to_string());
+        db.upsert_thread(&rec).unwrap();
+
+        let vec = vec![0.5_f32, -0.25, 0.75, 0.1];
+        db.set_anchor_vec(&rec.handle, &vec).unwrap();
+
+        // Re-touch (would null anchor_vec under the old INSERT OR REPLACE).
+        rec.mentions = 7;
+        db.upsert_thread(&rec).unwrap();
+        assert_eq!(
+            db.get_thread(&rec.handle).unwrap().unwrap().mentions,
+            7,
+            "the re-upsert must still update the row's other columns"
+        );
+
+        let inputs = db.reanchor_inputs().unwrap();
+        let found = inputs
+            .iter()
+            .find(|i| i.handle.as_str() == "durable-anchor")
+            .expect("thread must appear in reanchor_inputs");
+        let got = found.anchor_vec.clone().expect("anchor_vec must be present");
+        assert_eq!(got.len(), vec.len(), "anchor_vec length preserved");
+        for (a, b) in got.iter().zip(vec.iter()) {
+            assert!((a - b).abs() < 1e-6, "anchor_vec element mismatch: {a} vs {b}");
+        }
+        assert_eq!(found.anchor_chunk_id.as_deref(), Some("chunk-xyz"));
     }
 
     #[test]

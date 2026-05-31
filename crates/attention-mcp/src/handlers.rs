@@ -357,6 +357,10 @@ pub async fn thread_create(
             d.attention
                 .seed_anchor(&scope, record.handle.clone(), vec.clone())
                 .await?;
+            // Cache the anchor embedding on the durable row so the waypoint
+            // survives corpus chunk-id churn (edit / reingest) — boot
+            // re-anchor prefers this over re-fetching by anchor_chunk_id.
+            d.threads.set_anchor_vec(&record.handle, vec)?;
             seeded_anchor = true;
         }
     }

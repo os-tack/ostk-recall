@@ -1489,47 +1489,75 @@ async fn re_anchor_threads_from_corpus(
     corpus: &Arc<CorpusStore>,
     attention: &InMemoryAttention,
 ) -> Result<usize> {
-    let records = threads
-        .list_threads(None)
-        .map_err(|e| anyhow!("list_threads: {e}"))?;
-    let with_anchors: Vec<(ostk_recall_core::ThreadHandle, PrivacyTier, String)> = records
-        .into_iter()
-        .filter_map(|r| r.anchor_chunk_id.map(|id| (r.handle, r.privacy_tier, id)))
-        .collect();
-    if with_anchors.is_empty() {
+    let inputs = threads
+        .reanchor_inputs()
+        .map_err(|e| anyhow!("reanchor_inputs: {e}"))?;
+    if inputs.is_empty() {
         return Ok(0);
     }
-    let chunk_ids: Vec<String> = with_anchors.iter().map(|(_, _, id)| id.clone()).collect();
-    let embeddings = corpus
-        .fetch_embeddings(&chunk_ids)
+    // Only threads without a cached anchor_vec need a corpus lookup; the rest
+    // are restored from their durable embedding, independent of corpus churn.
+    let need_fetch: Vec<String> = inputs
+        .iter()
+        .filter(|i| i.anchor_vec.is_none())
+        .filter_map(|i| i.anchor_chunk_id.clone())
+        .collect();
+    let fetched = corpus
+        .fetch_embeddings(&need_fetch)
         .await
         .map_err(|e| anyhow!("fetch_embeddings for re-anchor: {e}"))?;
+
     let mut seeded = 0usize;
-    for (handle, tier, id) in with_anchors {
-        let Some(vec) = embeddings.get(&id) else {
-            // anchor_chunk_id points outside the current corpus
-            // table (stale or deleted chunk) — skip silently. The
-            // thread row is still on disk; an operator can reassign
-            // or delete it.
-            continue;
-        };
-        // Use the same single "replay" scope shape as
-        // `replay_chain_into_attention`. Re-anchoring lands in that
-        // scope so the boot-time materialised threads are visible
-        // to subsequent queries against the replay scope. Carrying
-        // the thread's `privacy_tier` keeps origin-private threads
-        // origin-restricted.
+    let mut orphaned: Vec<String> = Vec::new();
+    for input in inputs {
+        // Same single "replay"/"substrate" scope shape as
+        // `replay_chain_into_attention`, so boot-materialised threads are
+        // visible to cross-scope `surface()`. Carrying `privacy_tier` keeps
+        // origin-private threads origin-restricted.
         let scope = AttentionScope {
             project: None,
             session_id: Some("replay".into()),
             agent: Some("substrate".into()),
-            privacy_tier: tier,
+            privacy_tier: input.privacy_tier,
         };
-        attention
-            .seed_anchor(&scope, handle, vec.clone())
-            .await
-            .map_err(|e| anyhow!("seed_anchor: {e}"))?;
-        seeded += 1;
+        // Prefer the cached, corpus-independent anchor vector.
+        if let Some(vec) = input.anchor_vec {
+            attention
+                .seed_anchor(&scope, input.handle, vec)
+                .await
+                .map_err(|e| anyhow!("seed_anchor: {e}"))?;
+            seeded += 1;
+            continue;
+        }
+        // Fall back to the corpus chunk; backfill anchor_vec so the next boot
+        // no longer depends on the (content-hash, churnable) chunk id.
+        if let Some(vec) = input
+            .anchor_chunk_id
+            .as_ref()
+            .and_then(|id| fetched.get(id))
+        {
+            attention
+                .seed_anchor(&scope, input.handle.clone(), vec.clone())
+                .await
+                .map_err(|e| anyhow!("seed_anchor: {e}"))?;
+            if let Err(e) = threads.set_anchor_vec(&input.handle, vec) {
+                tracing::warn!(handle = %input.handle.as_str(), error = %e, "anchor_vec backfill failed");
+            }
+            seeded += 1;
+            continue;
+        }
+        // Neither a cached vector nor a resolvable chunk: the anchor is
+        // orphaned (its chunk's content changed before anchor_vec was cached).
+        // Surface it instead of silently dropping it.
+        orphaned.push(input.handle.as_str().to_string());
+    }
+    if !orphaned.is_empty() {
+        tracing::warn!(
+            count = orphaned.len(),
+            handles = %orphaned.join(", "),
+            "threads with unresolved anchors (chunk id not in corpus and no cached anchor_vec); \
+             re-anchor with `thread create --anchor <chunk_id>`"
+        );
     }
     Ok(seeded)
 }
