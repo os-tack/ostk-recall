@@ -491,6 +491,7 @@ fn concept_card(threads: &ThreadsDb, project: &str, handle: &str) -> Result<Valu
     let edges_to = threads
         .list_concept_edges(&rec.project, &rec.handle, EdgeDirection::To)
         .map_err(map_store_err)?;
+    let notes = threads.list_concept_notes(rec.id).map_err(map_store_err)?;
     Ok(json!({
         "concept": concept_to_json(&rec),
         "aliases": aliases.iter().map(|a| json!({
@@ -504,6 +505,9 @@ fn concept_card(threads: &ThreadsDb, project: &str, handle: &str) -> Result<Valu
         })).collect::<Vec<_>>(),
         "edges_from": edges_from.iter().map(edge_to_json).collect::<Vec<_>>(),
         "edges_to": edges_to.iter().map(edge_to_json).collect::<Vec<_>>(),
+        "notes": notes.iter().map(|n| json!({
+            "kind": n.kind, "text": n.text, "created_at": n.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -511,11 +515,11 @@ async fn memory_surface(dispatch: &AttentionDispatch, args: &Value) -> Result<Va
     let threads = dispatch.threads.as_ref();
     let view = args.get("view").and_then(Value::as_str).unwrap_or("now");
     let project = project_arg(args);
-    let project_filter = if project.is_empty() {
-        None
-    } else {
-        Some(project.as_str())
-    };
+    // Empty project ⇒ Some("") ⇒ global-only (list_concepts treats Some(p)
+    // as "p OR global"); a real project shows its own concepts + globals.
+    // This keeps project-scoped concepts (e.g. acme/auth) out of the global
+    // working-memory view.
+    let project_filter = Some(project.as_str());
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
@@ -617,7 +621,7 @@ fn memory_remember(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcEr
             // Operator-asserted → force at least `proposed` (ensure won't
             // upgrade an existing candidate).
             threads
-                .set_concept_status(&project, &handle, ConceptStatus::Proposed, None)
+                .set_concept_status(&project, &handle, ConceptStatus::Proposed, Some(0.5))
                 .map_err(map_store_err)?;
             threads
                 .touch_alias(rec.id, &text, AliasSource::User)
@@ -641,15 +645,11 @@ fn memory_remember(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcEr
                 .ok_or_else(|| {
                     JsonRpcError::invalid_params(format!("concept `{concept}` not found"))
                 })?;
-            let body = format!("[{kind}] {text}");
-            let merged = match rec.summary {
-                Some(existing) if !existing.is_empty() => format!("{existing}\n{body}"),
-                _ => body,
-            };
-            threads
-                .set_concept_summary(&rec.project, &rec.handle, &merged)
+            // Durable, timestamped provenance row — not summary-append.
+            let note_id = threads
+                .add_concept_note(rec.id, &kind, &text)
                 .map_err(map_store_err)?;
-            Ok(json!({ "kind": kind, "concept": rec.handle, "appended": true }))
+            Ok(json!({ "kind": kind, "concept": rec.handle, "note_id": note_id }))
         }
         other => Err(JsonRpcError::invalid_params(format!(
             "unknown remember kind: {other}"
@@ -666,11 +666,8 @@ fn memory_concept(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
             concept_card(threads, &project, &handle)
         }
         "list" => {
-            let project_filter = if project.is_empty() {
-                None
-            } else {
-                Some(project.as_str())
-            };
+            // Some("") ⇒ globals only; Some("acme") ⇒ acme + globals.
+            let project_filter = Some(project.as_str());
             let status = args
                 .get("status")
                 .and_then(Value::as_str)
@@ -795,7 +792,13 @@ fn memory_connect(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
     threads
         .ensure_concept(&project, &to, ConceptStatus::Candidate)
         .map_err(map_store_err)?;
-    let evidence = args.get("evidence").and_then(Value::as_str);
+    // Provenance is mandatory: fall back to a self-describing note rather
+    // than writing a null evidence edge ("always records provenance").
+    let evidence = args
+        .get("evidence")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "operator-asserted via memory_connect".to_string());
     let id = threads
         .add_concept_edge(
             &project,
@@ -803,7 +806,7 @@ fn memory_connect(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
             &relation,
             &to,
             OPERATOR_EDGE_CONFIDENCE,
-            evidence,
+            Some(&evidence),
         )
         .map_err(map_store_err)?;
     Ok(json!({ "edge_id": id, "from": from, "relation": relation, "to": to }))

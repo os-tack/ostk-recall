@@ -254,6 +254,17 @@ pub struct ConceptEdge {
     pub touch_count: u32,
 }
 
+/// A narrative memory event attached to a concept (`memory_remember` of
+/// kind note/decision/fact/open_question) — a durable, timestamped
+/// provenance row rather than summary text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConceptNote {
+    pub id: i64,
+    pub kind: String,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Direction filter for [`ThreadsDb::list_concept_edges`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeDirection {
@@ -507,25 +518,28 @@ impl ThreadsDb {
         get_concept_exact(&conn, project, handle)
     }
 
-    /// Resolve a handle within `project`, preferring the exact scope and
-    /// falling back to the global (`""`) concept. This is the read path
-    /// callers should use when they have a project context but a concept
-    /// might be global.
+    /// Resolve a name within `project` to its live concept. Matches a
+    /// `handle` first, then an inbound **alias** (so `ss` lands on
+    /// `slipstream`), preferring the exact scope then the global (`""`)
+    /// concept. Follows `merged_into` **forward** so a merged handle/alias
+    /// resolves to its canonical concept rather than the tombstone (with a
+    /// cycle guard). This is the read path callers should use.
     pub fn resolve_concept(&self, project: &str, handle: &str) -> Result<Option<ConceptRecord>> {
         let conn = self.lock();
-        let row = conn
-            .query_row(
-                "SELECT id, project, handle, summary, status, confidence, merged_into,
-                        created_at, updated_at
-                 FROM concepts
-                 WHERE handle = ? AND (project = ? OR project = '')
-                 ORDER BY (project = ?) DESC, id ASC
-                 LIMIT 1",
-                params![handle, project, project],
-                row_to_concept,
-            )
-            .optional()?;
-        Ok(row)
+        let mut current = handle.to_string();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                return Ok(None); // merge cycle — give up rather than loop
+            }
+            match resolve_one(&conn, project, &current)? {
+                Some(rec) if rec.status == ConceptStatus::Merged => match rec.merged_into.clone() {
+                    Some(canonical) => current = canonical, // follow the tombstone forward
+                    None => return Ok(Some(rec)),
+                },
+                other => return Ok(other),
+            }
+        }
     }
 
     /// List concepts, optionally filtered by project and/or status,
@@ -542,7 +556,10 @@ impl ThreadsDb {
         );
         let mut clauses = Vec::new();
         if project_filter.is_some() {
-            clauses.push("project = ?");
+            // "Visible from scope p" = the project's own concepts + globals,
+            // mirroring resolve_concept. So Some("") lists only globals, and
+            // Some("acme") lists acme + globals. None lists every project.
+            clauses.push("(project = ? OR project = '')");
         }
         if status.is_some() {
             clauses.push("status = ?");
@@ -647,9 +664,17 @@ impl ThreadsDb {
                   first_seen_at, last_seen_at, touch_count)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 1)
              ON CONFLICT(concept_id, source, source_id) DO UPDATE SET
-                 last_resolved_chunk_id = excluded.last_resolved_chunk_id,
-                 content_sha256 = COALESCE(excluded.content_sha256, content_sha256),
-                 anchor_vec     = COALESCE(excluded.anchor_vec, anchor_vec),
+                 -- Keep (pointer, sha, anchor) describing the SAME chunk:
+                 -- replace the triple together only when the new observation
+                 -- is corpus-backed (carries an anchor_vec); otherwise leave
+                 -- the prior coherent triple untouched. Avoids a pointer that
+                 -- names one chunk while sha/anchor describe another.
+                 last_resolved_chunk_id = CASE WHEN excluded.anchor_vec IS NOT NULL
+                     THEN excluded.last_resolved_chunk_id ELSE last_resolved_chunk_id END,
+                 content_sha256 = CASE WHEN excluded.anchor_vec IS NOT NULL
+                     THEN excluded.content_sha256 ELSE content_sha256 END,
+                 anchor_vec = CASE WHEN excluded.anchor_vec IS NOT NULL
+                     THEN excluded.anchor_vec ELSE anchor_vec END,
                  score          = excluded.score,
                  reason         = COALESCE(excluded.reason, reason),
                  relation_state = 'active',
@@ -875,6 +900,38 @@ impl ThreadsDb {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Append a narrative note (note/decision/fact/open_question) to a
+    /// concept. A durable, timestamped provenance row.
+    pub fn add_concept_note(&self, concept_id: i64, kind: &str, text: &str) -> Result<i64> {
+        let now = Utc::now();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO concept_notes (concept_id, kind, text, created_at) VALUES (?, ?, ?, ?)",
+            params![concept_id, kind, text, now.to_rfc3339()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// List a concept's narrative notes, newest first.
+    pub fn list_concept_notes(&self, concept_id: i64) -> Result<Vec<ConceptNote>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, text, created_at FROM concept_notes
+             WHERE concept_id = ? ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![concept_id], |r| {
+                Ok(ConceptNote {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    text: r.get(2)?,
+                    created_at: parse_ts(&r.get::<_, String>(3)?)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows)
     }
 
     // ---------- reconciler support ----------
@@ -1193,18 +1250,61 @@ fn get_concept_exact(
     Ok(row)
 }
 
-/// Resolve a handle to its concept id within `project` (global fallback).
-fn resolve_id_opt(conn: &rusqlite::Connection, project: &str, handle: &str) -> Result<Option<i64>> {
-    let id = conn
+/// One resolution step: match `name` as a concept handle first, then as an
+/// inbound alias, preferring the exact `project` over the global (`""`)
+/// row. Does NOT follow merges — the caller's loop does that.
+fn resolve_one(
+    conn: &rusqlite::Connection,
+    project: &str,
+    name: &str,
+) -> Result<Option<ConceptRecord>> {
+    let by_handle = conn
         .query_row(
-            "SELECT id FROM concepts
+            "SELECT id, project, handle, summary, status, confidence, merged_into,
+                    created_at, updated_at
+             FROM concepts
              WHERE handle = ? AND (project = ? OR project = '')
              ORDER BY (project = ?) DESC, id ASC LIMIT 1",
-            params![handle, project, project],
-            |r| r.get(0),
+            params![name, project, project],
+            row_to_concept,
         )
         .optional()?;
-    Ok(id)
+    if by_handle.is_some() {
+        return Ok(by_handle);
+    }
+    let by_alias = conn
+        .query_row(
+            "SELECT c.id, c.project, c.handle, c.summary, c.status, c.confidence, c.merged_into,
+                    c.created_at, c.updated_at
+             FROM concept_aliases a JOIN concepts c ON c.id = a.concept_id
+             WHERE a.alias = ? AND (c.project = ? OR c.project = '')
+             ORDER BY (c.project = ?) DESC, c.id ASC LIMIT 1",
+            params![name, project, project],
+            row_to_concept,
+        )
+        .optional()?;
+    Ok(by_alias)
+}
+
+/// Resolve a handle to its concept id within `project` (global fallback).
+fn resolve_id_opt(conn: &rusqlite::Connection, project: &str, name: &str) -> Result<Option<i64>> {
+    // Same alias + merge-forward resolution as `resolve_concept`, returning
+    // just the id — so edges connect to the canonical, alias-resolved concept.
+    let mut current = name.to_string();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return Ok(None);
+        }
+        match resolve_one(conn, project, &current)? {
+            Some(rec) if rec.status == ConceptStatus::Merged => match rec.merged_into.clone() {
+                Some(canonical) => current = canonical,
+                None => return Ok(Some(rec.id)),
+            },
+            Some(rec) => return Ok(Some(rec.id)),
+            None => return Ok(None),
+        }
+    }
 }
 
 fn resolve_id(conn: &rusqlite::Connection, project: &str, handle: &str) -> Result<i64> {
@@ -1323,16 +1423,18 @@ mod tests {
         assert_eq!(merged.status, ConceptStatus::Merged);
         assert_eq!(merged.merged_into.as_deref(), Some("mish"));
 
-        // No edge references the tombstone anymore.
+        // The merged handle resolves FORWARD: querying it returns the
+        // canonical's edges, and none reference the tombstone (all rewritten).
         let from = db
             .list_concept_edges(G, "mish-shell", EdgeDirection::From)
             .unwrap();
-        let to = db
-            .list_concept_edges(G, "mish-shell", EdgeDirection::To)
-            .unwrap();
         assert!(
-            from.is_empty() && to.is_empty(),
-            "no stranded edges on tombstone"
+            !from.is_empty(),
+            "merged handle forwards to canonical edges"
+        );
+        assert!(
+            from.iter().all(|e| e.from_handle == "mish"),
+            "no edge references the tombstone"
         );
 
         // Canonical: absorbed_into→ostk (deduped to one), pairs_with→slipstream
@@ -1362,6 +1464,81 @@ mod tests {
             1,
             "duplicate edge deduped"
         );
+    }
+
+    #[test]
+    fn resolve_follows_aliases_and_merges() {
+        let (_t, db) = db();
+        let (slip, _) = db
+            .ensure_concept(G, "slipstream", ConceptStatus::Active)
+            .unwrap();
+        db.touch_alias(slip.id, "ss", AliasSource::User).unwrap();
+        // Inbound alias resolves to the concept (ss → slipstream).
+        assert_eq!(
+            db.resolve_concept(G, "ss").unwrap().unwrap().handle,
+            "slipstream"
+        );
+        // Merge-forward: a merged handle resolves to its canonical, not the
+        // tombstone.
+        db.ensure_concept(G, "slip", ConceptStatus::Candidate)
+            .unwrap();
+        db.merge_concept(G, "slip", "slipstream").unwrap();
+        let r = db.resolve_concept(G, "slip").unwrap().unwrap();
+        assert_eq!(r.handle, "slipstream");
+        assert_eq!(r.status, ConceptStatus::Active);
+    }
+
+    #[test]
+    fn list_scope_includes_globals() {
+        let (_t, db) = db();
+        db.ensure_concept(G, "mish", ConceptStatus::Active).unwrap();
+        db.ensure_concept("acme", "auth", ConceptStatus::Proposed)
+            .unwrap();
+        // Global scope sees only globals; acme sees acme + globals; None = all.
+        assert_eq!(db.list_concepts(Some(G), None).unwrap().len(), 1);
+        assert_eq!(db.list_concepts(Some("acme"), None).unwrap().len(), 2);
+        assert_eq!(db.list_concepts(None, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn evidence_triple_stays_coherent_on_retouch() {
+        let (_t, db) = db();
+        let (rec, _) = db
+            .ensure_concept(G, "mish", ConceptStatus::Candidate)
+            .unwrap();
+        // Corpus-backed attach: pointer + sha + anchor describe chunk-a.
+        attach(&db, rec.id, "~/projects/mish", "chunk-a");
+        // A no-corpus re-touch (anchor None) must NOT advance the pointer past
+        // the anchor — the triple stays coherent on chunk-a.
+        db.attach_concept_evidence(&EvidenceAttach {
+            concept_id: rec.id,
+            project: G,
+            source: "code",
+            source_id: "~/projects/mish",
+            chunk_id: Some("chunk-b"),
+            content_sha256: None,
+            anchor_vec: None,
+            score: Some(0.9),
+            reason: None,
+        })
+        .unwrap();
+        let ev = db.list_concept_evidence(rec.id).unwrap();
+        assert_eq!(ev[0].last_resolved_chunk_id.as_deref(), Some("chunk-a"));
+        assert_eq!(ev[0].content_sha256.as_deref(), Some("sha-1"));
+        assert_eq!(ev[0].touch_count, 2);
+    }
+
+    #[test]
+    fn notes_are_durable_rows() {
+        let (_t, db) = db();
+        let (rec, _) = db.ensure_concept(G, "ostk", ConceptStatus::Active).unwrap();
+        db.add_concept_note(rec.id, "decision", "absorbed mish + slipstream")
+            .unwrap();
+        db.add_concept_note(rec.id, "fact", "one binary, no IPC")
+            .unwrap();
+        let notes = db.list_concept_notes(rec.id).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().any(|n| n.kind == "decision"));
     }
 
     #[test]

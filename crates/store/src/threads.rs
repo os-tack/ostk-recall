@@ -1359,6 +1359,18 @@ CREATE TABLE IF NOT EXISTS concept_edges (
 
 CREATE INDEX IF NOT EXISTS idx_concept_edges_from ON concept_edges(from_concept);
 CREATE INDEX IF NOT EXISTS idx_concept_edges_to ON concept_edges(to_concept);
+
+-- Narrative memory events (note|decision|fact|open_question) attached to a
+-- concept. A durable, timestamped provenance row -- not summary mush -- so
+-- remember-this is a first-class record the card can surface.
+CREATE TABLE IF NOT EXISTS concept_notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    concept_id  INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_concept_notes_concept ON concept_notes(concept_id);
 ",
         )?;
 

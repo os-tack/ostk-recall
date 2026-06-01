@@ -11,10 +11,10 @@ pub mod schema;
 pub mod threads;
 
 pub use concepts::{
-    AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptRecord, ConceptStatus,
-    EdgeDirection, EvidenceAttach, EvidenceReconcileRow, EvidenceState, ExtractedTerm,
-    GLOBAL_PROJECT, HitView, ReconcileStats, extract_concept_terms, reconcile_concept_evidence,
-    slugify,
+    AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote, ConceptRecord,
+    ConceptStatus, EdgeDirection, EvidenceAttach, EvidenceReconcileRow, EvidenceState,
+    ExtractedTerm, GLOBAL_PROJECT, HitView, ReconcileStats, extract_concept_terms,
+    reconcile_concept_evidence, slugify,
 };
 pub use corpus::{ActivityBurst, CorpusStore, StoreError};
 pub use events::{AuditEventRow, EventsDb};
