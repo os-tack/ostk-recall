@@ -157,6 +157,27 @@ paths = ["~/projects/ostk/.ostk/threads"]   # one chunk per *.md directly
                                             # under the configured root;
                                             # tension state lifted into
                                             # chunk metadata.
+# NOTE: the `thread` scanner reads *.md via a direct read_dir, so it
+# BYPASSES the hidden-file + .gitignore filtering that the `markdown` /
+# `code` walkers apply. That is exactly what lets it index `.ostk/`
+# content (a dotdir, usually gitignored) into the corpus while git keeps
+# it private — your design thinking stays off the web but is still
+# locally recallable. Two caveats: it is FLAT (only *.md directly under
+# each root, not recursive) and it SKIPS `INDEX.md`. So to index a doc
+# tree like `.ostk/threads/cognitive-memory/`, list each subdir as its
+# own root:
+#
+#   [[sources]]
+#   kind = "thread"
+#   project = "my-design-notes"
+#   paths = [
+#       "~/projects/myrepo/.ostk/threads",
+#       "~/projects/myrepo/.ostk/threads/cognitive-memory",
+#   ]
+#
+# (No-frontmatter docs parse fine — the handle defaults to the filename.
+# This indexes them as corpus chunks; it does NOT create attention-thread
+# records, so the thread surfacer is not polluted.)
 
 [[sources]]
 kind = "code"
