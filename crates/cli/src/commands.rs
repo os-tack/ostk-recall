@@ -1227,6 +1227,12 @@ pub async fn serve(
         // penalty. ThreadsDb implements both ChainSink (write) and
         // ChainLogReader (read); the reader is a fresh-handle clone of the Arc.
         let chain_reader: Arc<dyn ChainLogReader> = ctx.threads.clone();
+        // Concept-activation reader for the lens concept slot
+        // (memory-activation-frame.md). ThreadsDb implements
+        // ConceptActivationReader over the same chain_log + concept ledger;
+        // a fresh-handle Arc clone, like chain_reader above.
+        let concept_reader: Arc<dyn ostk_recall_store::ConceptActivationReader> =
+            ctx.threads.clone();
         // Lens rank engine, built ONCE from the Lens-profile weights
         // (attention_affinity + freshness, overlaid by [ranking.weights.lens])
         // and shared across ticks via Arc — concurrent recall + lens never
@@ -1250,6 +1256,7 @@ pub async fn serve(
                 resource,
                 chain_sink_clone,
                 chain_reader,
+                concept_reader,
                 lens_engine,
                 lens_config,
                 scope,
@@ -1434,7 +1441,16 @@ async fn replay_chain_into_attention(
             // (for ACT-R freshness), never replayed into in-memory state.
             | ChainEvent::ExplicitRecall { .. }
             | ChainEvent::RecallFault { .. }
-            | ChainEvent::OperatorSelected { .. } => {}
+            | ChainEvent::OperatorSelected { .. }
+            // memory-activation-frame.md slice 1: concept-activation events
+            // are audit-only on replay — the ConceptActivationReader reads
+            // them on demand (frame + lens concept slot), never into
+            // in-memory state, the same as the P7b access ledger above.
+            | ChainEvent::ConceptAccessed { .. }
+            | ChainEvent::ConceptFocused { .. }
+            | ChainEvent::ConceptConnected { .. }
+            | ChainEvent::ConceptPromoted { .. }
+            | ChainEvent::ConceptNoteAdded { .. } => {}
         }
     }
 

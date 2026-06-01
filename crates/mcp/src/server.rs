@@ -510,22 +510,32 @@ impl Server {
                     })
                     .collect();
                 self.log_access_events(&events);
-                let memory_delta = if learn {
-                    match self.attention.as_ref() {
-                        Some(d) => {
-                            crate::memory::observe_recall(
-                                d.threads.as_ref(),
-                                Some(self.engine.store().as_ref()),
-                                &project,
-                                &query,
-                                &hits,
-                            )
-                            .await
-                        }
-                        None => Value::Null,
+                let memory_delta = match (learn, self.attention.as_ref()) {
+                    (true, Some(d)) => {
+                        crate::memory::observe_recall(
+                            d.threads.as_ref(),
+                            Some(self.engine.store().as_ref()),
+                            &project,
+                            &query,
+                            &query_hash,
+                            &hits,
+                        )
+                        .await
                     }
-                } else {
-                    Value::Null
+                    // learn=false still activates already-known concepts the
+                    // recall resolved (emits ConceptAccessed), creating none —
+                    // "must still activate already-known concepts it resolved."
+                    (false, Some(d)) => {
+                        let activated = crate::memory::activate_known_concepts(
+                            d.threads.as_ref(),
+                            &project,
+                            &query,
+                            &query_hash,
+                            &hits,
+                        );
+                        json!({ "concepts_activated": activated })
+                    }
+                    (_, None) => Value::Null,
                 };
                 let mut out = json!({
                     "hits": hits, "memory_delta": memory_delta, "learned": learn,

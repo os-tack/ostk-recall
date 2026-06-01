@@ -2,6 +2,7 @@
 //! (`events.sqlite` for audit firehose, `ingest.sqlite` for idempotency,
 //! `threads.sqlite` for the attention-substrate threads/evidence ledger).
 
+pub mod activation;
 pub mod concepts;
 pub mod corpus;
 pub mod events;
@@ -10,6 +11,10 @@ pub mod manifest;
 pub mod schema;
 pub mod threads;
 
+pub use activation::{
+    ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy, default_since,
+    default_since_now,
+};
 pub use concepts::{
     AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote, ConceptRecord,
     ConceptStatus, EdgeDirection, EvidenceAttach, EvidenceReconcileRow, EvidenceState,

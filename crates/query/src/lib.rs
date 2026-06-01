@@ -14,6 +14,7 @@ use ostk_recall_store::{EventsDb, IngestDb};
 
 pub mod audit;
 pub mod candidate;
+pub mod concept;
 pub mod context;
 pub mod error;
 pub mod freshness;
@@ -29,6 +30,7 @@ pub mod synthesis;
 pub mod types;
 
 pub use candidate::Candidate;
+pub use concept::{ConceptSupportFactory, ConceptSupportInstance};
 pub use context::{AttentionContext, QueryContext};
 pub use error::{QueryError, Result};
 pub use freshness::{FreshnessFactory, FreshnessInstance};

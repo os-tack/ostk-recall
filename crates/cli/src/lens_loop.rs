@@ -31,7 +31,7 @@ use ostk_recall_query::lens::{Lens, LensConfig, build_lens};
 use ostk_recall_query::rank::RankEngine;
 use ostk_recall_store::corpus::CorpusStore;
 use ostk_recall_store::threads::ChainSink;
-use ostk_recall_store::{ChainEvent, ChainLogReader};
+use ostk_recall_store::{ChainEvent, ChainLogReader, ConceptActivationReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -202,6 +202,7 @@ pub async fn try_refresh_lens(
     last_state: &LensState,
     engine: &RankEngine,
     chain_reader: Option<Arc<dyn ChainLogReader>>,
+    concept_reader: Option<Arc<dyn ConceptActivationReader>>,
     corpus: &CorpusStore,
     config: &LensConfig,
 ) -> LensRefreshDecision {
@@ -248,6 +249,7 @@ pub async fn try_refresh_lens(
         snapshot.rolling_vec.clone(),
         pinned,
         chain_reader,
+        concept_reader,
         Vec::new(),
         None,
     )
@@ -386,6 +388,7 @@ pub async fn run_lens_loop(
     resource: Arc<MemoryLensResource>,
     chain_sink: Arc<dyn ChainSink>,
     chain_reader: Arc<dyn ChainLogReader>,
+    concept_reader: Arc<dyn ConceptActivationReader>,
     engine: Arc<RankEngine>,
     config: LensConfig,
     scope: AttentionScope,
@@ -415,6 +418,7 @@ pub async fn run_lens_loop(
                     &state,
                     &engine,
                     Some(Arc::clone(&chain_reader)),
+                    Some(Arc::clone(&concept_reader)),
                     &corpus,
                     &config,
                 )
@@ -601,6 +605,7 @@ mod tests {
             &state,
             &RankEngine::new(),
             None,
+            None,
             &corpus,
             &config,
         ));
@@ -633,6 +638,7 @@ mod tests {
             &state,
             &RankEngine::new(),
             None,
+            None,
             &corpus,
             &config,
         ));
@@ -662,6 +668,7 @@ mod tests {
             &snap,
             &state,
             &RankEngine::new(),
+            None,
             None,
             &corpus,
             &config,
@@ -700,6 +707,7 @@ mod tests {
             &state,
             &RankEngine::new(),
             None,
+            None,
             &corpus,
             &config,
         ));
@@ -731,6 +739,7 @@ mod tests {
             &snap,
             &state,
             &RankEngine::new(),
+            None,
             None,
             &corpus,
             &config,

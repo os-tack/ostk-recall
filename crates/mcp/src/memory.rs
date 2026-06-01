@@ -25,8 +25,8 @@ use ostk_recall_attention_mcp::{AttentionDispatch, DefaultAttentionHandlers};
 use ostk_recall_core::RecallHit;
 use ostk_recall_store::concepts::HitView;
 use ostk_recall_store::{
-    AliasSource, ConceptStatus, CorpusStore, EdgeDirection, EvidenceAttach, ThreadsDb,
-    extract_concept_terms, slugify,
+    AliasSource, ConceptActivation, ConceptActivationReader, ConceptStatus, CorpusStore,
+    EdgeDirection, EvidenceAttach, ThreadsDb, default_since_now, extract_concept_terms, slugify,
 };
 
 use crate::protocol::JsonRpcError;
@@ -235,6 +235,7 @@ pub async fn observe_recall(
     corpus: Option<&CorpusStore>,
     project: &str,
     query: &str,
+    query_hash: &str,
     hits: &[RecallHit],
 ) -> Value {
     let symbols_owned: Vec<Vec<String>> = hits.iter().map(hit_symbols).collect();
@@ -296,6 +297,18 @@ pub async fn observe_recall(
         touched.push(term.handle.clone());
         if was_created {
             created.push(term.handle.clone());
+        }
+        // Activation: this recall touched the concept. Emit ConceptAccessed
+        // so the activation surface (frame + lens concept slot) sees it; the
+        // distinct-query salience gate keys on `query_hash`. Best-effort —
+        // a failed append never fails the recall.
+        if let Err(e) = threads.record_concept_accessed(
+            project,
+            &term.handle,
+            &format!("recall:{}", term.source.as_str()),
+            query_hash,
+        ) {
+            tracing::warn!(handle = %term.handle, error = %e, "ConceptAccessed emit failed");
         }
         if threads
             .touch_alias(rec.id, &term.alias, term.source)
@@ -372,6 +385,50 @@ pub async fn observe_recall(
     })
 }
 
+/// Activate already-known concepts a recall resolved, creating none — the
+/// `learn=false` path. The hardening discipline is *no model belief becomes
+/// memory without provenance*; this mints nothing, only **activates** concepts
+/// that already exist (non-terminal). Emits `ConceptAccessed` (reason
+/// `recall:known`) for each so the activation surface warms what the recall
+/// surfaced, and returns the activated handles for the receipt.
+pub fn activate_known_concepts(
+    threads: &ThreadsDb,
+    project: &str,
+    query: &str,
+    query_hash: &str,
+    hits: &[RecallHit],
+) -> Vec<String> {
+    let symbols_owned: Vec<Vec<String>> = hits.iter().map(hit_symbols).collect();
+    let views: Vec<HitView> = hits
+        .iter()
+        .zip(&symbols_owned)
+        .map(|(h, syms)| HitView {
+            source_id: &h.source_id,
+            symbols: syms.as_slice(),
+        })
+        .collect();
+    let mut activated = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for term in extract_concept_terms(query, &views) {
+        if !seen.insert(term.handle.clone()) {
+            continue;
+        }
+        // Only activate what already exists and is non-terminal — never mint.
+        if let Ok(Some(rec)) = threads.get_concept(project, &term.handle) {
+            if rec.status.is_terminal() {
+                continue;
+            }
+            if let Err(e) =
+                threads.record_concept_accessed(project, &rec.handle, "recall:known", query_hash)
+            {
+                tracing::warn!(handle = %rec.handle, error = %e, "ConceptAccessed emit failed");
+            }
+            activated.push(rec.handle);
+        }
+    }
+    activated
+}
+
 /// Promote corroborated candidates to `proposed` (the deterministic half
 /// of `memory_reflect`; the evidence reconciler is wired in the server
 /// where the corpus + ingest handles live). Returns the promoted handles.
@@ -401,6 +458,7 @@ pub fn reflect_promote(threads: &ThreadsDb) -> Result<(usize, Vec<String>), Json
                 .set_concept_status(&c.project, &c.handle, ConceptStatus::Proposed, Some(0.4))
                 .is_ok()
             {
+                let _ = threads.record_concept_promoted(&c.project, &c.handle, "proposed");
                 promoted.push(c.handle.clone());
             }
         }
@@ -461,6 +519,30 @@ fn concept_to_json(rec: &ostk_recall_store::ConceptRecord) -> Value {
         "merged_into": rec.merged_into,
         "created_at": rec.created_at.to_rfc3339(),
         "updated_at": rec.updated_at.to_rfc3339(),
+    })
+}
+
+/// Render an active concept's activation + decomposed `why` for the frame.
+/// The `abi-as-sovereign-boundary` law: the surface ranks, but must expose
+/// the math — every field that moved `activation` is shown so the operator
+/// can argue with it, not just trust it. `next_actions` are the correction
+/// handles the frame always offers.
+fn activation_to_json(a: &ConceptActivation) -> Value {
+    json!({
+        "project": a.project,
+        "handle": a.handle,
+        "activation": a.activation,
+        "why": {
+            "confidence": a.why.confidence,
+            "decayed_access": a.why.decayed_access,
+            "focus_lift": a.why.focus_lift,
+            "edge_lift": a.why.edge_lift,
+            "note_recency": a.why.note_recency,
+            "distinct_queries": a.why.distinct_queries,
+            "distinct_sources": a.why.distinct_sources,
+            "time_since_touch_secs": a.why.time_since_touch_secs,
+        },
+        "next_actions": ["summarize", "promote", "connect", "reject"],
     })
 }
 
@@ -561,11 +643,21 @@ async fn memory_surface(dispatch: &AttentionDispatch, args: &Value) -> Result<Va
                 .take(limit)
                 .map(|t| json!({ "handle": t.handle.as_str(), "resonance": t.resonance }))
                 .collect();
+            // Active concepts ranked by activation, each carrying its `why`
+            // (the working-memory frame, memory-activation-frame.md). Reads the
+            // same activation surface that fuels the lens concept slot.
+            let active_concepts: Vec<Value> = threads
+                .concept_activations(project_filter, default_since_now())
+                .map_err(map_store_err)?
+                .iter()
+                .take(limit)
+                .map(activation_to_json)
+                .collect();
             Ok(json!({
                 "view": "now",
                 "focus": focus,
                 "active_threads": active_threads,
-                "active_concepts": cards(ConceptStatus::Active)?,
+                "active_concepts": active_concepts,
                 "pending_proposals": cards(ConceptStatus::Proposed)?,
             }))
         }
@@ -579,6 +671,13 @@ async fn memory_focus(dispatch: &AttentionDispatch, args: Value) -> Result<Value
     // aliases so the pin's vector is grounded in evidence, not the bare handle.
     let query = match dispatch.threads.resolve_concept(&project, &target) {
         Ok(Some(rec)) => {
+            // Activation: focus pinned onto a concept. Best-effort emission.
+            if let Err(e) = dispatch
+                .threads
+                .record_concept_focused(&rec.project, &rec.handle)
+            {
+                tracing::warn!(handle = %rec.handle, error = %e, "ConceptFocused emit failed");
+            }
             let aliases = dispatch.threads.list_aliases(rec.id).unwrap_or_default();
             let alias_str = aliases
                 .iter()
@@ -623,6 +722,9 @@ fn memory_remember(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcEr
             threads
                 .set_concept_status(&project, &handle, ConceptStatus::Proposed, Some(0.5))
                 .map_err(map_store_err)?;
+            if let Err(e) = threads.record_concept_promoted(&project, &handle, "proposed") {
+                tracing::warn!(handle = %handle, error = %e, "ConceptPromoted emit failed");
+            }
             threads
                 .touch_alias(rec.id, &text, AliasSource::User)
                 .map_err(map_store_err)?;
@@ -649,6 +751,9 @@ fn memory_remember(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcEr
             let note_id = threads
                 .add_concept_note(rec.id, &kind, &text)
                 .map_err(map_store_err)?;
+            if let Err(e) = threads.record_concept_note_added(&rec.project, &rec.handle, &kind) {
+                tracing::warn!(handle = %rec.handle, error = %e, "ConceptNoteAdded emit failed");
+            }
             Ok(json!({ "kind": kind, "concept": rec.handle, "note_id": note_id }))
         }
         other => Err(JsonRpcError::invalid_params(format!(
@@ -697,6 +802,11 @@ fn memory_concept(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
             threads
                 .set_concept_status(&rec.project, &rec.handle, status, Some(confidence))
                 .map_err(map_store_err)?;
+            if let Err(e) =
+                threads.record_concept_promoted(&rec.project, &rec.handle, status.as_str())
+            {
+                tracing::warn!(handle = %rec.handle, error = %e, "ConceptPromoted emit failed");
+            }
             concept_card(threads, &rec.project, &rec.handle)
         }
         "reject" => {
@@ -809,6 +919,10 @@ fn memory_connect(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
             Some(&evidence),
         )
         .map_err(map_store_err)?;
+    // Activation: a new live association. Best-effort chain emission.
+    if let Err(e) = threads.record_concept_connected(&project, &from, &relation, &to) {
+        tracing::warn!(error = %e, "ConceptConnected emit failed");
+    }
     Ok(json!({ "edge_id": id, "from": from, "relation": relation, "to": to }))
 }
 
@@ -843,7 +957,7 @@ mod tests {
             hit("~/projects/mish", "c-mish", 0.9, &["MishServer"]),
             hit("~/projects/slipstream", "c-slip", 0.8, &[]),
         ];
-        let delta = observe_recall(&db, None, "", "mish and slipstream", &hits).await;
+        let delta = observe_recall(&db, None, "", "mish and slipstream", "qh-1", &hits).await;
         let created: Vec<&str> = delta["concepts_created"]
             .as_array()
             .unwrap()
@@ -862,7 +976,7 @@ mod tests {
     async fn observe_drops_unsupported_and_terminal() {
         let (_t, db) = db();
         // Zero hits → no concept (mandatory provenance).
-        let delta = observe_recall(&db, None, "", "ghost concept", &[]).await;
+        let delta = observe_recall(&db, None, "", "ghost concept", "qh-2", &[]).await;
         assert!(delta["concepts_created"].as_array().unwrap().is_empty());
 
         // A rejected concept is not re-touched by observation.
@@ -871,7 +985,7 @@ mod tests {
         db.set_concept_status("", "mish", ConceptStatus::Rejected, None)
             .unwrap();
         let hits = vec![hit("~/projects/mish", "c1", 0.9, &[])];
-        let _ = observe_recall(&db, None, "", "mish", &hits).await;
+        let _ = observe_recall(&db, None, "", "mish", "qh-3", &hits).await;
         assert_eq!(
             db.resolve_concept("", "mish").unwrap().unwrap().status,
             ConceptStatus::Rejected

@@ -323,6 +323,14 @@ pub fn default_profile_weights(profile: RankProfile) -> std::collections::BTreeM
         RankProfile::Lens => {
             m.insert("attention_affinity".to_string(), 1.0);
             m.insert("freshness".to_string(), 0.5);
+            // concept_support (memory-activation-frame.md slice 1) lights the
+            // dormant lens concept slot: a chunk that strongly supports an
+            // active concept (raw→1.0) contributes 0.5, clearing the 0.30
+            // dominance bar against the attention+freshness field. Degrades to
+            // 0 when no concept_reader is wired or no active concept cites the
+            // candidate, so the slot skips cleanly on a fresh corpus. Tunable
+            // via `[ranking.weights.lens]`; not yet bench-validated.
+            m.insert("concept_support".to_string(), 0.5);
         }
     }
     m
@@ -1130,12 +1138,17 @@ mode = "burst"
         let ambient = cfg.effective_ranking_weights(RankProfile::Ambient);
         assert_eq!(ambient.get("attention_affinity").copied(), Some(1.0));
         assert_eq!(ambient.len(), 1, "ambient default is attention only");
-        // P9b-full: the lens profile carries the salience portfolio
-        // (attention + freshness) while ambient stays attention-only.
+        // The lens profile carries the salience portfolio (attention +
+        // freshness + concept_support) while ambient stays attention-only.
         let lens = cfg.effective_ranking_weights(RankProfile::Lens);
         assert_eq!(lens.get("attention_affinity").copied(), Some(1.0));
         assert_eq!(lens.get("freshness").copied(), Some(0.5));
-        assert_eq!(lens.len(), 2, "lens default is attention + freshness");
+        assert_eq!(lens.get("concept_support").copied(), Some(0.5));
+        assert_eq!(
+            lens.len(),
+            3,
+            "lens default is attention + freshness + concept_support"
+        );
     }
 
     #[test]

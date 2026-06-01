@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use ostk_recall_store::ChainLogReader;
+use ostk_recall_store::{ChainLogReader, ConceptActivationReader};
 
 /// The query side of a rank call.
 ///
@@ -86,6 +86,13 @@ pub struct AttentionContext {
     /// reader; the Freshness feature degrades to `chunk.ts`-only
     /// (creation-recency) base activation when absent.
     pub chain_log: Option<Arc<dyn ChainLogReader>>,
+    /// Concept-activation reader (memory-activation-frame.md slice 1),
+    /// consumed by the [`crate::concept::ConceptSupportFactory`] feature's
+    /// `prepare()` to score candidates by the activation of the concepts
+    /// that cite them. `None` on the explicit-recall path and until the
+    /// lens loop wires the reader; the feature degrades to a zero
+    /// contribution (the concept slot skips cleanly) when absent.
+    pub concept_reader: Option<Arc<dyn ConceptActivationReader>>,
     /// P9b-full — `true` when an operator pin is driving ranking. The lens
     /// loop sets this explicitly from its pin-fingerprint detection;
     /// [`crate::lens`]'s `pinned()` heuristic (scope ≠ rolling) is the
@@ -119,6 +126,10 @@ impl std::fmt::Debug for AttentionContext {
                 "chain_log",
                 &self.chain_log.as_ref().map_or("none", |_| "set"),
             )
+            .field(
+                "concept_reader",
+                &self.concept_reader.as_ref().map_or("none", |_| "set"),
+            )
             .field("pinned", &self.pinned)
             .field("recent_entities", &self.recent_entities)
             .field("dominant_concept_label", &self.dominant_concept_label)
@@ -134,6 +145,7 @@ impl AttentionContext {
             scope_vector: None,
             rolling_vec: None,
             chain_log: None,
+            concept_reader: None,
             pinned: false,
             recent_entities: Vec::new(),
             dominant_concept_label: None,
@@ -155,6 +167,15 @@ impl AttentionContext {
     #[must_use]
     pub fn with_chain_log(mut self, reader: Arc<dyn ChainLogReader>) -> Self {
         self.chain_log = Some(reader);
+        self
+    }
+
+    /// Attach a concept-activation reader so the
+    /// [`crate::concept::ConceptSupportFactory`] feature can pull concept
+    /// support in its `prepare()`. Additive builder.
+    #[must_use]
+    pub fn with_concept_reader(mut self, reader: Arc<dyn ConceptActivationReader>) -> Self {
+        self.concept_reader = Some(reader);
         self
     }
 
@@ -191,11 +212,13 @@ impl AttentionContext {
     /// `pseudo_query` is `None` and the MaxSim (P4) feature contributes 0.
     #[must_use]
     #[allow(clippy::unused_async)] // async reserves the P8 concept-lookup seam
+    #[allow(clippy::too_many_arguments)]
     pub async fn enrich_for_lens(
         scope_vector: Option<Vec<f32>>,
         rolling_vec: Option<Vec<f32>>,
         pinned: bool,
         chain_log: Option<Arc<dyn ChainLogReader>>,
+        concept_reader: Option<Arc<dyn ConceptActivationReader>>,
         recent_entities: Vec<String>,
         dominant_concept_label: Option<String>,
     ) -> Self {
@@ -204,6 +227,7 @@ impl AttentionContext {
             scope_vector,
             rolling_vec,
             chain_log,
+            concept_reader,
             pinned,
             recent_entities,
             dominant_concept_label,

@@ -17,6 +17,7 @@ async fn empty_inputs_yield_no_pseudo_query() {
         Some(vec![1.0, 0.0]),
         false,
         None,
+        None,
         Vec::new(),
         None,
     )
@@ -35,6 +36,7 @@ async fn concept_and_entities_compose_into_pseudo_query() {
         Some(vec![0.0, 1.0]),
         None,
         false,
+        None,
         None,
         vec!["path:auth.rs".to_string(), "decision:→1840".to_string()],
         Some("auth-overhaul".to_string()),
@@ -58,6 +60,7 @@ async fn blank_strings_are_ignored() {
         None,
         false,
         None,
+        None,
         vec![String::new()],
         Some(String::new()),
     )
@@ -74,6 +77,7 @@ async fn enrich_sets_pinned_and_carries_vectors() {
         Some(vec![1.0, 2.0, 3.0]),
         Some(vec![0.5, 0.5, 0.0]),
         true,
+        None,
         None,
         Vec::new(),
         None,

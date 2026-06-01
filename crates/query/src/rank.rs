@@ -418,6 +418,14 @@ pub fn build_engine_from_weights(weights: &BTreeMap<String, f32>) -> RankEngine 
                 Arc::new(crate::freshness::FreshnessFactory::default()),
                 weight,
             ),
+            // `concept_support` — lens concept slot (memory-activation-frame.md).
+            // Reads `attn.concept_reader` when present (the lens loop wires it),
+            // else degrades to a zero contribution. Registering it lights the
+            // dormant concept portfolio slot with zero allocator changes.
+            "concept_support" => engine.with_factory(
+                Arc::new(crate::concept::ConceptSupportFactory::default()),
+                weight,
+            ),
             // Unknown id: a feature not (yet) known to this builder. Ignore
             // rather than panic so a forward-looking config doesn't break an
             // older binary.

@@ -357,6 +357,60 @@ pub enum ChainEvent {
     /// Variant + ledger support ship now; no producer yet (no
     /// operator-select surface exists). Strongest "proven-useful" signal.
     OperatorSelected { chunk_id: String, ts: DateTime<Utc> },
+
+    // ---- concept activation (memory-activation-frame.md, slice 1) -------
+    // Keyed `(project, handle)` — concept identity is scoped, not a row id
+    // (`memory-tool-surface.md` hardening). Emitted from the `memory_*`
+    // tools so concept activation derives from the same `chain_log` as
+    // chunk freshness + thread resonance — NOT a parallel
+    // `memory_activations` table (that would fragment the cognition stream
+    // `abi-as-sovereign-boundary` / `chain-as-cognition-history` keeps
+    // unified). All five are **audit-only on replay**: the
+    // `ConceptActivationReader` reads them on demand, the same way the P7b
+    // access ledger is read, never replayed into in-memory state.
+    /// A recall resolved/touched a concept (one event per touched concept).
+    /// `query_hash` is the opaque short hash of the normalized query (the
+    /// salience gate counts *distinct* `query_hash`, not raw recurrence —
+    /// the `salience-vs-familiarity` discipline); `reason` records the
+    /// surface (`recall:path`, `recall:known`, …). `learn=false` recall
+    /// still emits this for concepts it resolved, creating none.
+    ConceptAccessed {
+        project: String,
+        handle: String,
+        reason: String,
+        query_hash: String,
+        ts: DateTime<Utc>,
+    },
+    /// The operator pinned focus onto a concept (or one of its aliases).
+    ConceptFocused {
+        project: String,
+        handle: String,
+        ts: DateTime<Utc>,
+    },
+    /// A concept→concept edge was asserted (`memory_connect`).
+    ConceptConnected {
+        project: String,
+        from: String,
+        relation: String,
+        to: String,
+        ts: DateTime<Utc>,
+    },
+    /// A concept's lifecycle status advanced (`memory_concept promote`,
+    /// `concept_seed`, `memory_reflect`). `to_status` is the new status.
+    ConceptPromoted {
+        project: String,
+        handle: String,
+        to_status: String,
+        ts: DateTime<Utc>,
+    },
+    /// A narrative note was attached to a concept (`memory_remember` of
+    /// kind note/decision/fact/open_question). `kind` is that narrative kind.
+    ConceptNoteAdded {
+        project: String,
+        handle: String,
+        kind: String,
+        ts: DateTime<Utc>,
+    },
 }
 
 /// Sink for substrate chain rows.
@@ -413,6 +467,11 @@ impl ChainEvent {
             Self::ExplicitRecall { .. } => "explicit_recall",
             Self::RecallFault { .. } => "recall_fault",
             Self::OperatorSelected { .. } => "operator_selected",
+            Self::ConceptAccessed { .. } => "concept_accessed",
+            Self::ConceptFocused { .. } => "concept_focused",
+            Self::ConceptConnected { .. } => "concept_connected",
+            Self::ConceptPromoted { .. } => "concept_promoted",
+            Self::ConceptNoteAdded { .. } => "concept_note_added",
         }
     }
 
@@ -435,7 +494,12 @@ impl ChainEvent {
             | Self::LensIncluded { ts, .. }
             | Self::ExplicitRecall { ts, .. }
             | Self::RecallFault { ts, .. }
-            | Self::OperatorSelected { ts, .. } => ts,
+            | Self::OperatorSelected { ts, .. }
+            | Self::ConceptAccessed { ts, .. }
+            | Self::ConceptFocused { ts, .. }
+            | Self::ConceptConnected { ts, .. }
+            | Self::ConceptPromoted { ts, .. }
+            | Self::ConceptNoteAdded { ts, .. } => ts,
         }
     }
 
@@ -545,6 +609,56 @@ impl ChainEvent {
             }),
             Self::RecallFault { chunk_id, .. } => serde_json::json!({ "chunk_id": chunk_id }),
             Self::OperatorSelected { chunk_id, .. } => serde_json::json!({ "chunk_id": chunk_id }),
+            Self::ConceptAccessed {
+                project,
+                handle,
+                reason,
+                query_hash,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "handle": handle,
+                "reason": reason,
+                "query_hash": query_hash,
+            }),
+            Self::ConceptFocused {
+                project, handle, ..
+            } => serde_json::json!({
+                "project": project,
+                "handle": handle,
+            }),
+            Self::ConceptConnected {
+                project,
+                from,
+                relation,
+                to,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "from": from,
+                "relation": relation,
+                "to": to,
+            }),
+            Self::ConceptPromoted {
+                project,
+                handle,
+                to_status,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "handle": handle,
+                "to_status": to_status,
+            }),
+            Self::ConceptNoteAdded {
+                project,
+                handle,
+                kind,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "handle": handle,
+                "kind": kind,
+            }),
         };
         serde_json::to_string(&v)
     }
@@ -875,6 +989,37 @@ impl ChainEvent {
                 chunk_id: s_field("chunk_id")?,
                 ts,
             },
+            "concept_accessed" => Self::ConceptAccessed {
+                project: s_field("project")?,
+                handle: s_field("handle")?,
+                reason: s_field("reason")?,
+                query_hash: s_field("query_hash")?,
+                ts,
+            },
+            "concept_focused" => Self::ConceptFocused {
+                project: s_field("project")?,
+                handle: s_field("handle")?,
+                ts,
+            },
+            "concept_connected" => Self::ConceptConnected {
+                project: s_field("project")?,
+                from: s_field("from")?,
+                relation: s_field("relation")?,
+                to: s_field("to")?,
+                ts,
+            },
+            "concept_promoted" => Self::ConceptPromoted {
+                project: s_field("project")?,
+                handle: s_field("handle")?,
+                to_status: s_field("to_status")?,
+                ts,
+            },
+            "concept_note_added" => Self::ConceptNoteAdded {
+                project: s_field("project")?,
+                handle: s_field("handle")?,
+                kind: s_field("kind")?,
+                ts,
+            },
             other => {
                 return Err(StoreError::Lance(lancedb::Error::Other {
                     message: format!("unknown chain kind: {other}"),
@@ -1160,6 +1305,85 @@ impl ThreadsDb {
     #[must_use]
     pub fn chain_sink(&self) -> Arc<dyn ChainSink> {
         Arc::clone(&self.sink)
+    }
+
+    // ---- concept-activation chain emission (slice 1) -------------------
+    //
+    // Thin appenders for the five concept `ChainEvent`s. They `append`
+    // through the configured sink (never inside a `self.lock()` scope, so
+    // the SQLite sink's own connection acquisition cannot deadlock — same
+    // ordering rule `upsert_thread` follows for `ThreadCreate`). The
+    // `memory_*` façade calls these after the ledger mutation it describes
+    // has committed; a failed append is logged by the caller, never fatal.
+
+    /// Emit [`ChainEvent::ConceptAccessed`] — a recall resolved/touched a
+    /// concept. `reason` is the surface (`recall:path`, `recall:known`);
+    /// `query_hash` drives the distinct-query salience gate.
+    pub fn record_concept_accessed(
+        &self,
+        project: &str,
+        handle: &str,
+        reason: &str,
+        query_hash: &str,
+    ) -> Result<()> {
+        self.sink.append(&ChainEvent::ConceptAccessed {
+            project: project.to_string(),
+            handle: handle.to_string(),
+            reason: reason.to_string(),
+            query_hash: query_hash.to_string(),
+            ts: Utc::now(),
+        })
+    }
+
+    /// Emit [`ChainEvent::ConceptFocused`] — focus was pinned onto a concept.
+    pub fn record_concept_focused(&self, project: &str, handle: &str) -> Result<()> {
+        self.sink.append(&ChainEvent::ConceptFocused {
+            project: project.to_string(),
+            handle: handle.to_string(),
+            ts: Utc::now(),
+        })
+    }
+
+    /// Emit [`ChainEvent::ConceptConnected`] — a concept→concept edge was asserted.
+    pub fn record_concept_connected(
+        &self,
+        project: &str,
+        from: &str,
+        relation: &str,
+        to: &str,
+    ) -> Result<()> {
+        self.sink.append(&ChainEvent::ConceptConnected {
+            project: project.to_string(),
+            from: from.to_string(),
+            relation: relation.to_string(),
+            to: to.to_string(),
+            ts: Utc::now(),
+        })
+    }
+
+    /// Emit [`ChainEvent::ConceptPromoted`] — a concept's status advanced.
+    pub fn record_concept_promoted(
+        &self,
+        project: &str,
+        handle: &str,
+        to_status: &str,
+    ) -> Result<()> {
+        self.sink.append(&ChainEvent::ConceptPromoted {
+            project: project.to_string(),
+            handle: handle.to_string(),
+            to_status: to_status.to_string(),
+            ts: Utc::now(),
+        })
+    }
+
+    /// Emit [`ChainEvent::ConceptNoteAdded`] — a narrative note was attached.
+    pub fn record_concept_note_added(&self, project: &str, handle: &str, kind: &str) -> Result<()> {
+        self.sink.append(&ChainEvent::ConceptNoteAdded {
+            project: project.to_string(),
+            handle: handle.to_string(),
+            kind: kind.to_string(),
+            ts: Utc::now(),
+        })
     }
 
     pub(crate) fn setup_connection(conn: &Connection) -> Result<()> {

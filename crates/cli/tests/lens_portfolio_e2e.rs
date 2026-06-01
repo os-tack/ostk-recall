@@ -122,6 +122,7 @@ async fn lens_engine_wires_freshness_and_refractory_rows() {
         &LensState::default(),
         &engine,
         Some(reader),
+        None,
         &corpus,
         &config,
     )
@@ -172,6 +173,7 @@ async fn refractory_demotes_recently_included_chunk_end_to_end() {
         &LensState::default(),
         &engine,
         Some(reader),
+        None,
         &corpus,
         &config,
     )
