@@ -324,7 +324,7 @@ fn parse_thread(text: &str, _handle: &str) -> ParsedThread {
 /// The YAML block excludes the delimiter lines themselves. The body is
 /// the remainder after the closing delimiter, with one leading newline
 /// stripped if present.
-fn split_front_matter(text: &str) -> Option<(&str, &str)> {
+pub fn split_front_matter(text: &str) -> Option<(&str, &str)> {
     let stripped = text.strip_prefix('\u{feff}').unwrap_or(text);
     let after_open = stripped
         .strip_prefix("---\n")
@@ -370,6 +370,8 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            entity_type: None,
+            edges: Vec::new(),
             id: None,
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),

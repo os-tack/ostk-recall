@@ -82,6 +82,8 @@ fn markdown_cfg(fixtures_dir: &Path) -> SourceConfig {
             paths: vec![fixtures_dir.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            entity_type: None,
+            edges: Vec::new(),
             id: None,
             source_config_id: String::new(),
             facets: std::collections::BTreeMap::new(),

@@ -500,7 +500,23 @@ pub async fn scan_with_context(
 
         let stats = pipeline.ingest_source(scanner, source_cfg).await;
         totals = totals.merge(stats);
-        per_source.push((label, stats));
+        per_source.push((label.clone(), stats));
+
+        // Relational-substrate slice 3: seed typed nodes + authored edges
+        // from this source's markdown files (only when it declares an
+        // `entity_type`). Synchronous ledger pass — the Pipeline has no
+        // ThreadsDb. Idempotent, so re-scans are safe.
+        if !dry_run && source_cfg.entity_type.is_some() {
+            if let Some(threads) = threads_db.as_ref() {
+                let s = crate::seed::seed_nodes_from_source(threads, source_cfg);
+                if s.nodes_seeded + s.edges_seeded > 0 {
+                    tracing::info!(
+                        source = %label, nodes = s.nodes_seeded, edges = s.edges_seeded,
+                        "seeded graph nodes/edges"
+                    );
+                }
+            }
+        }
     }
 
     // Drain ambient daemons FIRST so any synthetic ingests they fire
@@ -711,6 +727,26 @@ pub async fn scan_paths_with_context(
         .scan_paths(&pairs, paths)
         .await
         .map_err(|e| anyhow!("scan_paths: {e}"))?;
+
+    // Relational-substrate slice 3: seed nodes/edges for the changed paths
+    // that fall under an `entity_type` source. Mirrors scan_with_context but
+    // scoped to `paths` so live edits seed without rewalking every dir.
+    if !dry_run {
+        if let Some(threads) = threads_db.as_ref() {
+            for (_, source_cfg) in &pairs {
+                if source_cfg.entity_type.is_some() {
+                    let s = crate::seed::seed_nodes_for_paths(threads, source_cfg, paths);
+                    if s.nodes_seeded + s.edges_seeded > 0 {
+                        tracing::info!(
+                            nodes = s.nodes_seeded,
+                            edges = s.edges_seeded,
+                            "seeded graph nodes/edges (incremental)"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let mut totals = PipelineStats::default();
     for (_, s) in &per_source {

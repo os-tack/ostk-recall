@@ -333,6 +333,8 @@ mod tests {
             paths: vec![pat.into()],
             ignore: vec![],
             extensions: vec![],
+            entity_type: None,
+            edges: Vec::new(),
             id: None,
             source_config_id: "test-cfg".to_string(),
             facets: Default::default(),

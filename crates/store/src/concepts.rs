@@ -240,6 +240,9 @@ pub struct ConceptRecord {
     pub confidence: f32,
     /// Canonical handle this concept was merged into (when `status == Merged`).
     pub merged_into: Option<String>,
+    /// Typed-node kind (`person`, `meeting`, …) when file-seeded; `None` =
+    /// untyped (observed/asserted concepts). See `relational-substrate.md`.
+    pub kind: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -564,6 +567,54 @@ impl ThreadsDb {
         Ok((record, n == 1))
     }
 
+    /// Get-or-create a *typed* concept by `(project, handle)`.
+    ///
+    /// Like [`Self::ensure_concept`] but carries a node `kind` (`person`,
+    /// `meeting`, …). On conflict: status is never downgraded (same contract),
+    /// and `kind` is **COALESCE-backfilled** — a node first observed untyped
+    /// gets its kind set by a later file-seed, while an already-typed node
+    /// keeps its kind (never overwritten). Returns `(record, created)`.
+    pub fn ensure_typed_concept(
+        &self,
+        project: &str,
+        handle: &str,
+        initial_status: ConceptStatus,
+        kind: Option<&str>,
+    ) -> Result<(ConceptRecord, bool)> {
+        let now = Utc::now();
+        let conn = self.lock();
+        // `DO UPDATE` makes rows-affected unreliable for "created", so probe
+        // existence first.
+        let created = get_concept_exact(&conn, project, handle)?.is_none();
+        let confidence = if matches!(initial_status, ConceptStatus::Candidate) {
+            CANDIDATE_CONFIDENCE
+        } else {
+            0.0
+        };
+        conn.execute(
+            "INSERT INTO concepts (project, handle, status, confidence, kind, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(project, handle) DO UPDATE SET
+                 kind = COALESCE(concepts.kind, excluded.kind)",
+            params![
+                project,
+                handle,
+                initial_status.as_str(),
+                confidence,
+                kind,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        let record = get_concept_exact(&conn, project, handle)?.ok_or_else(|| {
+            StoreError::InvalidEnumValue {
+                field: "concept.handle".into(),
+                value: format!("{project}/{handle} vanished after ensure_typed"),
+            }
+        })?;
+        Ok((record, created))
+    }
+
     /// Fetch a concept by exact `(project, handle)`.
     pub fn get_concept(&self, project: &str, handle: &str) -> Result<Option<ConceptRecord>> {
         let conn = self.lock();
@@ -604,7 +655,7 @@ impl ThreadsDb {
         let conn = self.lock();
         let mut sql = String::from(
             "SELECT id, project, handle, summary, status, confidence, merged_into,
-                    created_at, updated_at FROM concepts",
+                    created_at, updated_at, kind FROM concepts",
         );
         let mut clauses = Vec::new();
         if project_filter.is_some() {
@@ -780,6 +831,12 @@ impl ThreadsDb {
     /// Add (or re-touch) a concept→concept relation edge by handle, resolved
     /// within `project` (global fallback). Both endpoints must exist.
     /// Returns the edge id; re-observation bumps `touch_count`.
+    ///
+    /// Note: resolving handles here re-applies the project→global preference,
+    /// so callers that have already resolved a *specific* (possibly global)
+    /// endpoint should use [`Self::add_concept_edge_by_id`] to avoid a
+    /// same-handle local concept shadowing the intended global one.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_concept_edge(
         &self,
         project: &str,
@@ -791,45 +848,49 @@ impl ThreadsDb {
         by: Option<&str>,
         evidence_json: Option<&str>,
     ) -> Result<i64> {
-        let now = Utc::now();
         let conn = self.lock();
         let from_id = resolve_id(&conn, project, from_handle)?;
         let to_id = resolve_id(&conn, project, to_handle)?;
-        if from_id == to_id {
-            return Err(StoreError::InvalidEnumValue {
-                field: "concept_edge".into(),
-                value: "self-loop not allowed".into(),
-            });
-        }
-        // ON CONFLICT deliberately leaves `source` and `by` untouched:
-        // an edge's origin is immutable. Re-observation is *use* (bump
-        // touch_count, refresh last_seen_at → raises derived conductance),
-        // not re-authoring — so the first writer's provenance wins.
-        let id: i64 = conn.query_row(
-            "INSERT INTO concept_edges
-                 (from_concept, relation, to_concept, confidence, evidence_json,
-                  first_seen_at, last_seen_at, touch_count, source, [by])
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-             ON CONFLICT(from_concept, relation, to_concept) DO UPDATE SET
-                 last_seen_at  = excluded.last_seen_at,
-                 touch_count   = touch_count + 1,
-                 confidence    = MAX(confidence, excluded.confidence),
-                 evidence_json = COALESCE(excluded.evidence_json, evidence_json)
-             RETURNING id",
-            params![
-                from_id,
-                relation,
-                to_id,
-                confidence,
-                evidence_json,
-                now.to_rfc3339(),
-                now.to_rfc3339(),
-                source.as_str(),
-                by,
-            ],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+        insert_concept_edge(
+            &conn,
+            from_id,
+            relation,
+            to_id,
+            confidence,
+            source,
+            by,
+            evidence_json,
+        )
+        .map(|(id, _)| id)
+    }
+
+    /// Add (or re-touch) an edge between two concepts identified by their
+    /// surrogate ids — no handle re-resolution, so the exact endpoints the
+    /// caller resolved are used (the scope-correct path for cross-project /
+    /// global edges). Returns `(edge_id, created)` where `created` is true
+    /// only on first insert (so callers can gate a one-time chain event).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_concept_edge_by_id(
+        &self,
+        from_id: i64,
+        relation: &str,
+        to_id: i64,
+        confidence: f32,
+        source: EdgeSource,
+        by: Option<&str>,
+        evidence_json: Option<&str>,
+    ) -> Result<(i64, bool)> {
+        let conn = self.lock();
+        insert_concept_edge(
+            &conn,
+            from_id,
+            relation,
+            to_id,
+            confidence,
+            source,
+            by,
+            evidence_json,
+        )
     }
 
     /// List edges incident on `(project, handle)` in the given direction.
@@ -1275,6 +1336,7 @@ fn row_to_concept(row: &rusqlite::Row) -> rusqlite::Result<ConceptRecord> {
         merged_into: row.get(6)?,
         created_at: parse_ts(&row.get::<_, String>(7)?)?,
         updated_at: parse_ts(&row.get::<_, String>(8)?)?,
+        kind: row.get(9)?,
     })
 }
 
@@ -1327,6 +1389,65 @@ fn row_to_edge(row: &rusqlite::Row) -> rusqlite::Result<ConceptEdge> {
     })
 }
 
+/// Insert (or re-touch) a concept edge by surrogate ids. Shared core of
+/// [`ThreadsDb::add_concept_edge`] and [`ThreadsDb::add_concept_edge_by_id`].
+/// ON CONFLICT leaves `source`/`by` untouched — an edge's origin is immutable;
+/// re-observation is *use* (bump `touch_count`, refresh `last_seen_at`), not
+/// re-authoring. Returns `(edge_id, created)`.
+#[allow(clippy::too_many_arguments)]
+fn insert_concept_edge(
+    conn: &rusqlite::Connection,
+    from_id: i64,
+    relation: &str,
+    to_id: i64,
+    confidence: f32,
+    source: EdgeSource,
+    by: Option<&str>,
+    evidence_json: Option<&str>,
+) -> Result<(i64, bool)> {
+    if from_id == to_id {
+        return Err(StoreError::InvalidEnumValue {
+            field: "concept_edge".into(),
+            value: "self-loop not allowed".into(),
+        });
+    }
+    let now = Utc::now();
+    let existed = conn
+        .query_row(
+            "SELECT 1 FROM concept_edges
+             WHERE from_concept = ? AND relation = ? AND to_concept = ?",
+            params![from_id, relation, to_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let id: i64 = conn.query_row(
+        "INSERT INTO concept_edges
+             (from_concept, relation, to_concept, confidence, evidence_json,
+              first_seen_at, last_seen_at, touch_count, source, [by])
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+         ON CONFLICT(from_concept, relation, to_concept) DO UPDATE SET
+             last_seen_at  = excluded.last_seen_at,
+             touch_count   = touch_count + 1,
+             confidence    = MAX(confidence, excluded.confidence),
+             evidence_json = COALESCE(excluded.evidence_json, evidence_json)
+         RETURNING id",
+        params![
+            from_id,
+            relation,
+            to_id,
+            confidence,
+            evidence_json,
+            now.to_rfc3339(),
+            now.to_rfc3339(),
+            source.as_str(),
+            by,
+        ],
+        |r| r.get(0),
+    )?;
+    Ok((id, !existed))
+}
+
 fn get_concept_exact(
     conn: &rusqlite::Connection,
     project: &str,
@@ -1335,7 +1456,7 @@ fn get_concept_exact(
     let row = conn
         .query_row(
             "SELECT id, project, handle, summary, status, confidence, merged_into,
-                    created_at, updated_at
+                    created_at, updated_at, kind
              FROM concepts WHERE project = ? AND handle = ?",
             params![project, handle],
             row_to_concept,
@@ -1355,7 +1476,7 @@ fn resolve_one(
     let by_handle = conn
         .query_row(
             "SELECT id, project, handle, summary, status, confidence, merged_into,
-                    created_at, updated_at
+                    created_at, updated_at, kind
              FROM concepts
              WHERE handle = ? AND (project = ? OR project = '')
              ORDER BY (project = ?) DESC, id ASC LIMIT 1",
@@ -1369,7 +1490,7 @@ fn resolve_one(
     let by_alias = conn
         .query_row(
             "SELECT c.id, c.project, c.handle, c.summary, c.status, c.confidence, c.merged_into,
-                    c.created_at, c.updated_at
+                    c.created_at, c.updated_at, c.kind
              FROM concept_aliases a JOIN concepts c ON c.id = a.concept_id
              WHERE a.alias = ? AND (c.project = ? OR c.project = '')
              ORDER BY (c.project = ?) DESC, c.id ASC LIMIT 1",
@@ -1431,6 +1552,60 @@ mod tests {
             reason: Some("test"),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn kind_column_present_after_open() {
+        let (_t, db) = db();
+        // ensure_typed_concept round-trips the kind through the new column.
+        let (rec, created) = db
+            .ensure_typed_concept(G, "tori", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+        assert!(created);
+        assert_eq!(rec.kind.as_deref(), Some("person"));
+        assert_eq!(rec.status, ConceptStatus::Proposed);
+    }
+
+    #[test]
+    fn ensure_typed_concept_is_idempotent() {
+        let (_t, db) = db();
+        db.ensure_typed_concept(G, "tori", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+        let (rec, created) = db
+            .ensure_typed_concept(G, "tori", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+        assert!(!created, "second ensure does not re-create");
+        assert_eq!(rec.kind.as_deref(), Some("person"));
+        assert_eq!(db.list_concepts(Some(G), None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_typed_concept_backfills_null_kind() {
+        let (_t, db) = db();
+        // First observed untyped (kind NULL)...
+        db.ensure_concept(G, "tori", ConceptStatus::Candidate)
+            .unwrap();
+        // ...then a file-seed assigns the kind via COALESCE.
+        let (rec, created) = db
+            .ensure_typed_concept(G, "tori", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+        assert!(!created, "already existed");
+        assert_eq!(rec.kind.as_deref(), Some("person"), "NULL kind backfilled");
+        // Status not downgraded/changed by the typed ensure.
+        assert_eq!(rec.status, ConceptStatus::Candidate);
+    }
+
+    #[test]
+    fn ensure_typed_concept_preserves_existing_kind() {
+        let (_t, db) = db();
+        db.ensure_typed_concept(G, "tori", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+        // A later seed with a different kind must NOT overwrite (COALESCE keeps
+        // the non-null original).
+        let (rec, _) = db
+            .ensure_typed_concept(G, "tori", ConceptStatus::Proposed, Some("meeting"))
+            .unwrap();
+        assert_eq!(rec.kind.as_deref(), Some("person"), "first kind wins");
     }
 
     #[test]
@@ -1501,6 +1676,39 @@ mod tests {
     }
 
     #[test]
+    fn add_concept_edge_by_id_reports_created_then_retouch() {
+        let (_t, db) = db();
+        let (a, _) = db
+            .ensure_concept(G, "a-node", ConceptStatus::Active)
+            .unwrap();
+        let (b, _) = db
+            .ensure_concept(G, "b-node", ConceptStatus::Active)
+            .unwrap();
+        let (id1, created) = db
+            .add_concept_edge_by_id(
+                a.id,
+                "rel",
+                b.id,
+                0.1,
+                EdgeSource::Authored,
+                Some("scanner"),
+                None,
+            )
+            .unwrap();
+        assert!(created, "first insert is created");
+        let (id2, created2) = db
+            .add_concept_edge_by_id(a.id, "rel", b.id, 0.1, EdgeSource::Observed, None, None)
+            .unwrap();
+        assert_eq!(id1, id2, "same edge row");
+        assert!(!created2, "re-touch is not a creation");
+        // Self-loop by id is rejected.
+        assert!(
+            db.add_concept_edge_by_id(a.id, "rel", a.id, 0.1, EdgeSource::Authored, None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn authored_edge_enters_low_and_carries_provenance() {
         let (_t, db) = db();
         seed_north_star(&db);
@@ -1518,7 +1726,11 @@ mod tests {
         let edges = db
             .list_concept_edges(G, "ostk-recall", EdgeDirection::From)
             .unwrap();
-        assert_eq!(edges.len(), 1, "the north-star edge is present and readable");
+        assert_eq!(
+            edges.len(),
+            1,
+            "the north-star edge is present and readable"
+        );
         let e = &edges[0];
         assert_eq!(e.to_handle, "ostk");
         assert_eq!(e.relation, "memory_layer_for");
@@ -1603,16 +1815,52 @@ mod tests {
             db.ensure_concept(G, h, ConceptStatus::Active).unwrap();
         }
         // dup (mish-shell) has an edge to ostk; canonical (mish) also → ostk.
-        db.add_concept_edge(G, "mish-shell", "absorbed_into", "ostk", 0.5, EdgeSource::Observed, None, None)
-            .unwrap();
-        db.add_concept_edge(G, "mish", "absorbed_into", "ostk", 0.6, EdgeSource::Observed, None, None)
-            .unwrap();
+        db.add_concept_edge(
+            G,
+            "mish-shell",
+            "absorbed_into",
+            "ostk",
+            0.5,
+            EdgeSource::Observed,
+            None,
+            None,
+        )
+        .unwrap();
+        db.add_concept_edge(
+            G,
+            "mish",
+            "absorbed_into",
+            "ostk",
+            0.6,
+            EdgeSource::Observed,
+            None,
+            None,
+        )
+        .unwrap();
         // dup also pairs_with mish itself → would become a self-loop on merge.
-        db.add_concept_edge(G, "mish-shell", "pairs_with", "mish", 0.3, EdgeSource::Observed, None, None)
-            .unwrap();
+        db.add_concept_edge(
+            G,
+            "mish-shell",
+            "pairs_with",
+            "mish",
+            0.3,
+            EdgeSource::Observed,
+            None,
+            None,
+        )
+        .unwrap();
         // and a unique edge that should survive the rewrite.
-        db.add_concept_edge(G, "mish-shell", "pairs_with", "slipstream", 0.4, EdgeSource::Observed, None, None)
-            .unwrap();
+        db.add_concept_edge(
+            G,
+            "mish-shell",
+            "pairs_with",
+            "slipstream",
+            0.4,
+            EdgeSource::Observed,
+            None,
+            None,
+        )
+        .unwrap();
 
         db.merge_concept(G, "mish-shell", "mish").unwrap();
 

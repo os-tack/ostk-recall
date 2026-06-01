@@ -578,6 +578,20 @@ pub struct SourceConfig {
     /// is rejected at parse (it routes to `Pipeline::ingest_synthetic`).
     #[serde(default)]
     pub id: Option<String>,
+    /// Relational-substrate node typing (slice 3). When set, each markdown
+    /// file under this source seeds a typed concept *node* of this kind
+    /// (e.g. `"person"`) into the concept ledger at scan time. `None` = no
+    /// node seeding. NOT part of physical identity — ontology is not a
+    /// scan-shape discriminator.
+    #[serde(default)]
+    pub entity_type: Option<String>,
+    /// Frontmatter field names that ARE edge types (slice 3). Each named
+    /// field is read as a list (or scalar) of target names; each target
+    /// becomes an authored edge `<file-node> --<field>--> <target>`. The
+    /// field name becomes the edge `relation`, so entries are validated to
+    /// `[a-z0-9_-]+`.
+    #[serde(default)]
+    pub edges: Vec<String>,
     /// Computed at config parse from `(kind, paths, extensions, ignore,
     /// optional legacy project)` via [`compute_source_config_id`]. Always
     /// non-empty after `Config::load` / `Config::validate` returns. Never
@@ -628,6 +642,44 @@ impl Config {
                          that prefix is reserved for `Pipeline::ingest_synthetic` chunks",
                         s.kind.as_str(),
                         SYNTHETIC_SOURCE_CONFIG_ID_PREFIX,
+                    )));
+                }
+            }
+            // Slice-3 ontology fields. `entity_type` must be a real kind when
+            // present; each `edges` entry becomes an edge `relation` (and
+            // `add_concept_edge` takes raw relation text), so the config is the
+            // guard: non-empty, unique, shaped `[a-z0-9_-]+`.
+            if let Some(et) = &s.entity_type {
+                if et.trim().is_empty() {
+                    return Err(Error::Config(format!(
+                        "sources[{i}] (kind={}) has empty `entity_type`",
+                        s.kind.as_str()
+                    )));
+                }
+            }
+            let mut seen_edges = std::collections::HashSet::new();
+            for e in &s.edges {
+                let t = e.trim();
+                if t.is_empty() {
+                    return Err(Error::Config(format!(
+                        "sources[{i}] (kind={}) has an empty `edges` entry",
+                        s.kind.as_str()
+                    )));
+                }
+                if !t
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+                {
+                    return Err(Error::Config(format!(
+                        "sources[{i}] (kind={}) edge `{t}` must match [a-z0-9_-]+ \
+                         (it becomes an edge relation)",
+                        s.kind.as_str()
+                    )));
+                }
+                if !seen_edges.insert(t.to_string()) {
+                    return Err(Error::Config(format!(
+                        "sources[{i}] (kind={}) has duplicate `edges` entry `{t}`",
+                        s.kind.as_str()
                     )));
                 }
             }
@@ -845,6 +897,78 @@ paths = []
         let cfg: Config = toml::from_str(bad).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("no paths"));
+    }
+
+    fn cfg_with_source(extra: &str) -> Config {
+        let body = format!(
+            "[corpus]\nroot = \"/tmp\"\n\n[embedder]\nmodel = \"x\"\n\n\
+             [[sources]]\nkind = \"markdown\"\npaths = [\"~/m\"]\n{extra}\n"
+        );
+        toml::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn entity_type_and_edges_parse() {
+        let cfg = cfg_with_source("entity_type = \"person\"\nedges = [\"families\"]");
+        assert_eq!(cfg.sources[0].entity_type.as_deref(), Some("person"));
+        assert_eq!(cfg.sources[0].edges, vec!["families".to_string()]);
+    }
+
+    #[test]
+    fn entity_type_edges_default_absent() {
+        let cfg = cfg_with_source("");
+        assert_eq!(cfg.sources[0].entity_type, None);
+        assert!(cfg.sources[0].edges.is_empty());
+    }
+
+    #[test]
+    fn entity_type_edges_round_trip() {
+        let cfg = cfg_with_source("entity_type = \"meeting\"\nedges = [\"people\", \"places\"]");
+        let serialized = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.sources[0].entity_type.as_deref(), Some("meeting"));
+        assert_eq!(
+            back.sources[0].edges,
+            vec!["people".to_string(), "places".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_node_field_rejected() {
+        // deny_unknown_fields still guards typos like `entity_typ`.
+        let body = "[corpus]\nroot = \"/tmp\"\n\n[embedder]\nmodel = \"x\"\n\n\
+                    [[sources]]\nkind = \"markdown\"\npaths = [\"~/m\"]\nentity_typ = \"person\"\n";
+        assert!(toml::from_str::<Config>(body).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_entity_type() {
+        let mut cfg = cfg_with_source("entity_type = \"  \"");
+        let err = cfg.validate_and_seal().unwrap_err();
+        assert!(err.to_string().contains("entity_type"));
+    }
+
+    #[test]
+    fn rejects_bad_and_dup_edges() {
+        let mut bad_shape = cfg_with_source("entity_type = \"person\"\nedges = [\"Has Spaces\"]");
+        assert!(
+            bad_shape
+                .validate_and_seal()
+                .unwrap_err()
+                .to_string()
+                .contains("Has Spaces")
+                || bad_shape.validate_and_seal().is_err()
+        );
+        let mut empty = cfg_with_source("entity_type = \"person\"\nedges = [\"\"]");
+        assert!(empty.validate_and_seal().is_err());
+        let mut dup =
+            cfg_with_source("entity_type = \"person\"\nedges = [\"families\", \"families\"]");
+        assert!(
+            dup.validate_and_seal()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
     }
 
     #[test]

@@ -519,6 +519,7 @@ fn concept_to_json(rec: &ostk_recall_store::ConceptRecord) -> Value {
         "status": rec.status.as_str(),
         "confidence": rec.confidence,
         "merged_into": rec.merged_into,
+        "kind": rec.kind,
         "created_at": rec.created_at.to_rfc3339(),
         "updated_at": rec.updated_at.to_rfc3339(),
     })
@@ -533,6 +534,7 @@ fn activation_to_json(a: &ConceptActivation) -> Value {
     json!({
         "project": a.project,
         "handle": a.handle,
+        "kind": a.kind,
         "activation": a.activation,
         "why": {
             "confidence": a.why.confidence,
@@ -1030,6 +1032,20 @@ mod tests {
         )
         .unwrap();
         assert!(conn["edge_id"].as_i64().is_some());
+    }
+
+    #[test]
+    fn concept_card_surfaces_kind() {
+        let (_t, db) = db();
+        db.ensure_typed_concept("", "tori", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+        let card = memory_concept(&db, &json!({"action":"show","handle":"tori"})).unwrap();
+        assert_eq!(card["concept"]["kind"], json!("person"));
+        // An untyped concept reports null kind.
+        db.ensure_concept("", "slipstream", ConceptStatus::Active)
+            .unwrap();
+        let card2 = memory_concept(&db, &json!({"action":"show","handle":"slipstream"})).unwrap();
+        assert_eq!(card2["concept"]["kind"], serde_json::Value::Null);
     }
 
     #[test]

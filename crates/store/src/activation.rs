@@ -94,6 +94,10 @@ pub struct ConceptActivation {
     /// across corpora; the ordering and the `why` breakdown are.
     pub activation: f32,
     pub why: ConceptWhy,
+    /// Typed-node kind (`person`, …) or `None` if untyped. Surfaced on the
+    /// frame so `memory_surface(now)` shows what *kind* of thing each active
+    /// concept is.
+    pub kind: Option<String>,
 }
 
 /// Per-coordinate lens support: the most-active active concept citing a
@@ -328,6 +332,7 @@ impl ThreadsDb {
                 handle: rec.handle.clone(),
                 activation,
                 why,
+                kind: rec.kind.clone(),
             };
             out.push((rec, activation_row));
         }
@@ -497,7 +502,10 @@ mod tests {
         let edge = test_edge(crate::concepts::AUTHORED_EDGE_CONFIDENCE, now);
         let c = edge_conductance(&edge, now);
         // confidence(0.1) × recency(~1) — low, never 1.0.
-        assert!(c > 0.0 && c <= 0.1 + 1e-4, "fresh authored edge is low, got {c}");
+        assert!(
+            c > 0.0 && c <= 0.1 + 1e-4,
+            "fresh authored edge is low, got {c}"
+        );
     }
 
     #[test]
@@ -583,10 +591,28 @@ mod tests {
         db.ensure_concept(G, "dormant", ConceptStatus::Candidate)
             .unwrap();
         // mish—slipstream (both active) and mish—dormant (neighbour inactive).
-        db.add_concept_edge(G, "mish", "pairs_with", "slipstream", 0.6, EdgeSource::Observed, None, None)
-            .unwrap();
-        db.add_concept_edge(G, "mish", "pairs_with", "dormant", 0.6, EdgeSource::Observed, None, None)
-            .unwrap();
+        db.add_concept_edge(
+            G,
+            "mish",
+            "pairs_with",
+            "slipstream",
+            0.6,
+            EdgeSource::Observed,
+            None,
+            None,
+        )
+        .unwrap();
+        db.add_concept_edge(
+            G,
+            "mish",
+            "pairs_with",
+            "dormant",
+            0.6,
+            EdgeSource::Observed,
+            None,
+            None,
+        )
+        .unwrap();
         let acts = db
             .concept_activations(None, default_since(Utc::now()))
             .unwrap();

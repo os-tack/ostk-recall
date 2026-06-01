@@ -76,6 +76,8 @@ fn make_cfg(fixtures_dir: &Path, facets_override: &[(&str, &[&str])]) -> SourceC
             paths: vec![fixtures_dir.to_string_lossy().into_owned()],
             ignore: vec![],
             extensions: vec![],
+            entity_type: None,
+            edges: Vec::new(),
             id: None,
             source_config_id: String::new(),
             facets: overrides,

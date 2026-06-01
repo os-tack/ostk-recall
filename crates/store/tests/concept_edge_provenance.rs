@@ -27,7 +27,10 @@ fn connected(source: &str, by: Option<&str>) -> ChainEvent {
 #[test]
 fn concept_connected_kind_string_is_stable() {
     // Durable wire identifier in chain_log.kind — renaming orphans rows.
-    assert_eq!(connected("authored", Some("claude")).kind_str(), "concept_connected");
+    assert_eq!(
+        connected("authored", Some("claude")).kind_str(),
+        "concept_connected"
+    );
 }
 
 #[test]

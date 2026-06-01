@@ -1541,6 +1541,9 @@ CREATE TABLE IF NOT EXISTS concepts (
     status      TEXT NOT NULL DEFAULT 'candidate',
     confidence  REAL NOT NULL DEFAULT 0.0,
     merged_into TEXT,
+    -- Typed-node kind (person, meeting, …) when file-seeded; NULL = untyped
+    -- (observed/asserted concepts). relational-substrate.md slice 3.
+    kind        TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     UNIQUE(project, handle)
@@ -1769,6 +1772,16 @@ PRAGMA foreign_keys=ON;
             "concept_edges",
             "by",
             "ALTER TABLE concept_edges ADD COLUMN [by] TEXT",
+        )?;
+        // --- typed-node kind (relational-substrate.md slice 3) ---
+        // Nullable; NULL = untyped. No backfill — legacy concepts are
+        // genuinely untyped. Runs after the concepts_new rebuild above so the
+        // column lands regardless of which path created the table.
+        add_column_if_missing(
+            conn,
+            "concepts",
+            "kind",
+            "ALTER TABLE concepts ADD COLUMN kind TEXT",
         )?;
 
         // --- salience-vs-familiarity split (resonance-gated familiarity) ---
@@ -3068,7 +3081,10 @@ CREATE TABLE concept_edges (
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(source, "observed", "legacy edge defaults to observed, not authored");
+        assert_eq!(
+            source, "observed",
+            "legacy edge defaults to observed, not authored"
+        );
         assert_eq!(by, None, "legacy author is unknowable");
         assert_eq!(touch, 3, "use history preserved");
         assert!((conf - 0.6).abs() < 1e-6, "confidence preserved");

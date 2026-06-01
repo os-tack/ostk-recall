@@ -5,6 +5,7 @@
 pub mod commands;
 pub mod lens_loop;
 pub mod lens_state;
+pub mod seed;
 
 pub use commands::{
     InitOptions, InitOutcome, ScanOutcome, VerifyOutcome, default_config_path, init,
