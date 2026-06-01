@@ -1,54 +1,91 @@
-# ostk-recall configuration.
-# Location: ${XDG_CONFIG_HOME:-~/.config}/ostk-recall/config.toml
+# ============================================================================
+# ostk-recall configuration  (copy to: ${XDG_CONFIG_HOME:-~/.config}/ostk-recall/config.toml)
+# ============================================================================
 #
-# Every field below is validated at load time (unknown keys error).
-# See `ostk-recall --help` for CLI.
+# This file is a COMPLETE reference: every option is shown with its default and
+# documented inline. It also reads as a spectrum — from the smallest useful
+# setup to the full relational (entity/concept) scanner:
+#
+#   1. Minimal      — [corpus] + [embedder] + one [[sources]] block. That's it.
+#   2. Transcripts  — point at ~/.claude/projects and recall your past sessions.
+#   3. Knowledge    — add notes / code / PDFs / design docs as more [[sources]].
+#   4. Relational   — turn a directory into a typed-node + authored-edge graph
+#                     with `entity_type` / `edges` (the slice-3 scanner).
+#   5. Live         — add [watch] so saves re-index and transcripts drive cognition.
+#
+# Lifecycle:  ostk-recall init   →  scan   →  serve   (+ watch, optionally)
+# Every field is validated at load time (unknown keys error). `~` and `$VAR`
+# in any path are shell-expanded. See `ostk-recall --help` for the CLI, and the
+# runnable, self-contained `examples/` directory for end-to-end walkthroughs.
+#
+# ── Smallest config that works ──────────────────────────────────────────────
+#   [corpus]
+#   root = "~/.local/share/ostk-recall"
+#   [embedder]
+#   model = "minishlab/potion-retrieval-32M"
+#   [[sources]]
+#   kind = "markdown"
+#   project = "notes"
+#   paths = ["~/notes"]
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# ============================================================================
+# REQUIRED GLOBALS
+# ============================================================================
 
 [corpus]
-# Where the LanceDB corpus, SQLite ingest manifest, and audit event log
-# live. The path is shell-expanded (`~` → home, `$VAR` → env). The serve
-# daemon also binds `<root>/recall.sock` for scan-trigger pokes from the
-# watcher (see [watch] below).
+# Where the LanceDB corpus, SQLite ingest manifest, the threads.sqlite ledger
+# (concepts + edges + chain), and the audit log live. Shell-expanded. The
+# `serve` daemon also binds `<root>/recall.sock` for scan-trigger pokes from
+# the watcher (see [watch]), and holds a singleton `<root>/.serve.lock` — only
+# one `serve` per root; a second exits cleanly (run many CLIENTS via
+# `ostk-recall connect`, not many daemons).
 root = "~/.local/share/ostk-recall"
 
 [embedder]
-# model2vec-rs model name. potion-retrieval-32M (default, 512-dim) has better
-# recall than potion-base-8M (256-dim) but takes a fixed extra few ms per batch.
-# Switching models requires `ostk-recall init --force` + full re-scan.
-model = "potion-retrieval-32M"
+# model2vec-rs repo id, as "org/name". model2vec searches $HF_HOME / local HF
+# caches first, then downloads from HuggingFace — so the org prefix is REQUIRED
+# (a bare "potion-retrieval-32M" 404/401s).
+#   minishlab/potion-retrieval-32M  (default, 512-dim) — best recall
+#   minishlab/potion-base-8M        (256-dim)          — smaller / faster
+# Switching models requires `ostk-recall init --force` + a full re-scan.
+model = "minishlab/potion-retrieval-32M"
 
-# Cross-encoder reranker. After hybrid (dense + BM25 + RRF) returns a
-# top-N candidate pool, the reranker scores each (query, doc) pair jointly
-# and re-orders. Adds ~150 ms per query (CPU) and ~80 MB to the model cache.
-# Omit this block entirely to keep the default (enabled, JINA Turbo English).
+
+# ============================================================================
+# OPTIONAL GLOBALS  (every block here may be omitted; defaults shown)
+# ============================================================================
+
+# Cross-encoder reranker. After hybrid (dense + BM25 + RRF) returns a top-N
+# candidate pool, the reranker scores each (query, doc) pair jointly and
+# re-orders. Adds ~150 ms/query (CPU) and ~80 MB to the model cache, and `init`
+# prefetches the model. OMIT this block to keep the default (ENABLED, JINA
+# Turbo English). Set `enabled = false` to skip the rerank pass and its download.
 [reranker]
-enabled = true                              # set false to skip the rerank pass
-model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
-                                            # also accepts: jina-reranker-v2-base-multilingual,
-                                            # bge-reranker-base, bge-reranker-v2-m3.
-                                            # Legacy "ms-marco-MiniLM-L-6-v2" maps to JINA
-                                            # Turbo English (closest equivalent in v5).
+enabled = true                              # false → RRF-fused order, no second pass
+model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id; also:
+                                            #   jina-reranker-v2-base-multilingual,
+                                            #   bge-reranker-base, bge-reranker-v2-m3.
+                                            # Legacy "ms-marco-MiniLM-L-6-v2" maps to
+                                            # JINA Turbo English (closest v5 equivalent).
 
-# Runtime resource caps. The substrate is meant to run in the background
-# while a human or agent uses the same machine, so the default is
-# intentionally low. Omit the block to accept the default.
-#
-# Precedence: OSTK_RECALL_WORKERS env var > [runtime].worker_threads >
-# default (4). The same value pins the tokio runtime, DataFusion query
-# parallelism, and rayon compute pool — no need to tune them independently.
+# Runtime resource caps. The substrate is meant to run in the background while a
+# human or agent shares the machine, so the default is intentionally low. Omit
+# to accept the default (4). Precedence: OSTK_RECALL_WORKERS env var >
+# [runtime].worker_threads > 4. One value pins the tokio runtime, DataFusion
+# query parallelism, AND the rayon compute pool — no need to tune separately.
 #
 # [runtime]
 # worker_threads = 4    # raise toward num_cpus() for one-shot CLI runs
 
-# ──────────────────────────────────────────────────────────────────────
-# Optional ambient memory lens. When `ostk-recall serve` runs with an
-# attention substrate online, a background loop maintains the
-# `ostk://memory-lens` MCP resource: a small, query-less portfolio of
-# corpus excerpts aligned to whatever the current attention/scope vector
-# is focused on. Subscribing clients get proactive context without asking
-# for it. Omit the block to accept the defaults shown; set
-# `OSTK_RECALL_LENS_DISABLED=1` to turn the loop off for a session, or
-# inspect/disable at runtime with `ostk-recall lens show` / `lens disable`.
+# Ambient memory lens. When `ostk-recall serve` runs with an attention substrate
+# online, a background loop maintains the `ostk://memory-lens` MCP resource: a
+# small, query-less portfolio of corpus excerpts aligned to whatever the current
+# attention/scope vector is focused on — subscribing clients get proactive
+# context without asking. Omit to accept the defaults shown; set
+# OSTK_RECALL_LENS_DISABLED=1 to turn it off for a session, or use
+# `ostk-recall lens show` / `lens disable` at runtime.
 #
 # [lens]
 # token_budget = 4000          # hard cap on the rendered lens; excerpts truncate to fit
@@ -61,52 +98,46 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
 #     "status:archived",       #   (privacy / status denylist)
 # ]
 
-# ──────────────────────────────────────────────────────────────────────
-# Optional weaver tuning. `exclude_facets` lists `key:value` facets whose
-# presence makes the auto-weaver treat a chunk as apparatus — it is skipped
-# for anchor-matching and proposal seeding (so templated harness scaffolding
-# can't form degenerate threads). Omit the block for the default, which
-# excludes only `record_kind:harness_orchestration`. NOTE: adding
-# `record_kind:audit_significant` here is a deliberate thread-graph change
-# (that facet is attenuated from the *lens* by default, but still woven).
+# Auto-weaver tuning. `exclude_facets` lists `key:value` facets whose presence
+# makes the weaver treat a chunk as apparatus — skipped for anchor-matching and
+# proposal seeding (so templated harness scaffolding can't form degenerate
+# threads). Omit for the default (excludes only `record_kind:harness_orchestration`).
+# NOTE: adding `record_kind:audit_significant` here is a deliberate thread-graph
+# change (that facet is attenuated from the *lens* by default, but still woven).
 #
 # [weaver]
 # exclude_facets = ["record_kind:harness_orchestration"]
 #
-# Independent of this facet denylist, the weaver ALWAYS treats two classes of
-# structural apparatus as un-weavable (they stay in the corpus + recall, but
-# never anchor or seed threads): Claude Code tool-call envelopes
-# (block_kind tool_use / tool_result) and `<task-notification>` monitor events.
-# These are block_kind / content properties, not facets, so they are not
-# expressible here — see `is_structural_apparatus` in the weaver. To drop them
-# from recall entirely (not just weaving), use `CorpusStore::mark_tool_blocks_stale`.
+# Independent of this denylist, the weaver ALWAYS treats two classes of
+# structural apparatus as un-weavable (kept in corpus + recall, never anchor or
+# seed threads): Claude Code tool-call envelopes (block_kind tool_use /
+# tool_result) and `<task-notification>` monitor events. These are block_kind /
+# content properties, not facets, so they aren't expressible here — see
+# `is_structural_apparatus` in the weaver. To drop them from recall entirely,
+# use `CorpusStore::mark_tool_blocks_stale`.
 
-# ──────────────────────────────────────────────────────────────────────
-# Optional record rules (interpretation overlay). Each [[record_rule]] is a
-# `match → action` applied to every chunk once, at ingest, for ALL scanners.
-# This is where apparatus filtering lives — drop pure scaffolding, or tag
-# low-salience content with a `record_kind` facet so the lens denylist
-# attenuates it (still retained + recall-able).
+# Interpretation overlay (record rules). Each [[record_rule]] is a `match →
+# action` applied to every chunk once, at ingest, for ALL scanners — this is
+# where apparatus filtering lives: drop pure scaffolding, or tag low-salience
+# content with a `record_kind` facet so the lens denylist attenuates it (still
+# retained + recall-able).
 #
 #   match  — any of: prefix / contains / regex (tested against text after
-#            trim_start); source_kind (a list of SourceKind, e.g.
-#            ["claude_code"]); source (a concrete Source, e.g.
-#            "ostk_session"); role. All present predicates must match (AND).
-#            A rule with NO predicates is rejected (it would match
-#            everything). Unknown source_kind/source values are rejected.
-#   action — { kind = "drop" }  OR
-#            { kind = "tag", record_kind = "<value>" }
+#            trim_start); source_kind (a list, e.g. ["claude_code"]); source
+#            (a concrete Source, e.g. "ostk_session"); role. All present
+#            predicates must match (AND). A rule with NO predicates is rejected
+#            (it would match everything). Unknown source_kind/source values error.
+#   action — { kind = "drop" }  OR  { kind = "tag", record_kind = "<value>" }
 #
-# OMIT the section entirely to use the built-in defaults (the Claude Code
-# apparatus filters, each scoped to the scanner that needs it). PRESENT
-# (even an empty list `record_rule = []`) replaces the defaults — so if you
-# author your own rules, re-add any defaults you still want.
+# OMIT the section to use the built-in defaults (the Claude Code apparatus
+# filters, each scoped to the scanner that needs it). PRESENT (even an empty
+# `record_rule = []`) REPLACES the defaults — re-add any you still want.
 #
-# IMPORTANT: scope rules with `source_kind` (and `source` where needed).
-# An unscoped `prefix = "<system-reminder>"` drop would also delete real
+# IMPORTANT: scope rules with `source_kind` (and `source` where needed). An
+# unscoped `prefix = "<system-reminder>"` drop would also delete real
 # markdown/code that happens to start with that text.
 #
-# Defaults (shown explicitly; this is what you get when the section is omitted):
+# Defaults shown explicitly (this is what you get when the section is omitted):
 #
 # [[record_rule]]                              # pure harness apparatus → drop
 # match  = { source_kind = ["claude_code"], prefix = "<system-reminder>" }
@@ -124,13 +155,18 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id;
 # match  = { source_kind = ["claude_code"], prefix = "<teammate-message" }
 # action = { kind = "tag", record_kind = "harness_orchestration" }
 
-# One [[sources]] table per logical corpus slice.
-# `project` is a free-text tag — namespace your corpora however you like.
 
-[[sources]]
-kind = "markdown"
-project = "notes"
-paths = ["~/notes", "~/Documents/research"]
+# ============================================================================
+# SOURCES  —  one [[sources]] table per logical corpus slice
+# ============================================================================
+# Every block needs `kind` + `paths`. `project` is a free-text tag — namespace
+# your corpora however you like (it also drives the [watch].projects allowlist).
+# `paths` entries are shell-expanded and may be directories or globs depending
+# on the scanner. The blocks below climb the spectrum: transcripts → knowledge
+# → relational graph.
+
+# ── Tier 1: transcripts — the quickest useful corpus ────────────────────────
+# Point at your assistant history and recall past sessions immediately.
 
 [[sources]]
 kind = "claude_code"
@@ -142,60 +178,29 @@ kind = "gemini"
 project = "gemini-cli-history"
 paths = ["~/.gemini/tmp"]           # walks every <hash>/chats/session-*.json
 
-[[sources]]
-kind = "ostk_project"
-project = "ostk"
-paths = ["~/projects/ostk"]         # composite — expands to decisions,
-                                    # needles, audit, conversations,
-                                    # sessions, memory, specs, code
-                                    # under .ostk/
+# ── Tier 2: knowledge — notes, code, papers, exports, design docs ────────────
 
 [[sources]]
-kind = "thread"
-project = "ostk-threads"
-paths = ["~/projects/ostk/.ostk/threads"]   # one chunk per *.md directly
-                                            # under the configured root;
-                                            # tension state lifted into
-                                            # chunk metadata.
-# NOTE: the `thread` scanner reads *.md via a direct read_dir, so it
-# BYPASSES the hidden-file + .gitignore filtering that the `markdown` /
-# `code` walkers apply. That is exactly what lets it index `.ostk/`
-# content (a dotdir, usually gitignored) into the corpus while git keeps
-# it private — your design thinking stays off the web but is still
-# locally recallable. Two caveats: it is FLAT (only *.md directly under
-# each root, not recursive) and it SKIPS `INDEX.md`. So to index a doc
-# tree like `.ostk/threads/cognitive-memory/`, list each subdir as its
-# own root:
-#
-#   [[sources]]
-#   kind = "thread"
-#   project = "my-design-notes"
-#   paths = [
-#       "~/projects/myrepo/.ostk/threads",
-#       "~/projects/myrepo/.ostk/threads/cognitive-memory",
-#   ]
-#
-# (No-frontmatter docs parse fine — the handle defaults to the filename.
-# This indexes them as corpus chunks; it does NOT create attention-thread
-# records, so the thread surfacer is not polluted.)
+kind = "markdown"
+project = "notes"
+paths = ["~/notes", "~/Documents/research"]
 
 [[sources]]
 kind = "code"
 project = "experiments"
 paths = ["~/experiments"]
 extensions = ["rs", "py", "ts"]
-# Patterns merged on top of standard .gitignore / .ignore /
-# .ostk-recall-ignore handling. Globs are anchored at each path root.
-# Underlying engine is the `ignore` crate (same as ripgrep), so anything
-# you'd write in a .gitignore works here.
+# Patterns merged on top of standard .gitignore / .ignore / .ostk-recall-ignore
+# handling. Globs are anchored at each path root; engine is the `ignore` crate
+# (same as ripgrep), so anything you'd write in a .gitignore works.
 ignore = [
     ".venv/**",        # cover venvs not always in .gitignore
     "vendor/**",
     "**/__pycache__/**",
 ]
-# Optional per-source facets: key → values, stamped onto every chunk this
-# source emits. Used for filtered recall and for the lens `exclude_facets`
-# denylist above. Single-value keys replace; multi-value keys accumulate.
+# Optional per-source facets: key → values, stamped onto every chunk this source
+# emits. Used for filtered recall and for the lens / weaver `exclude_facets`
+# denylists. Single-value keys replace; multi-value keys accumulate.
 facets = { tier = ["reference"], lang = ["rust"] }
 
 [[sources]]
@@ -208,76 +213,173 @@ kind = "zip_export"
 project = "claude-ai-exports"
 paths = ["~/Downloads/claude-data-export-*.zip"]
 
-# ──────────────────────────────────────────────────────────────────────
-# Optional file-watcher. Pokes the running `ostk-recall serve` daemon's
-# scan-trigger socket whenever a debounced batch of FS events lands
-# under any watched source path. Run with `ostk-recall watch` in a
-# separate process from `ostk-recall serve` (the writer-side daemon
-# that binds <corpus.root>/recall.sock).
+[[sources]]
+kind = "ostk_project"
+project = "ostk"
+paths = ["~/projects/ostk"]         # composite — expands to decisions, needles,
+                                    # audit, conversations, sessions, memory,
+                                    # specs, and code under .ostk/
+
+[[sources]]
+kind = "thread"
+project = "ostk-threads"
+paths = ["~/projects/ostk/.ostk/threads"]   # one chunk per *.md directly under
+                                            # the root; tension state lifted into
+                                            # chunk metadata.
+# NOTE: the `thread` scanner reads *.md via a direct read_dir, so it BYPASSES
+# the hidden-file + .gitignore filtering the `markdown`/`code` walkers apply.
+# That's what lets it index `.ostk/` (a dotdir, usually gitignored) into the
+# corpus while git keeps it private — design thinking stays off the web but
+# stays locally recallable. Two caveats: it is FLAT (only *.md directly under
+# each root, not recursive) and it SKIPS `INDEX.md`. To index a doc tree, list
+# each subdir as its own root:
 #
-# When omitted, the watcher is disabled and `ostk-recall watch` exits
-# at startup with a clear message.
+#   [[sources]]
+#   kind = "thread"
+#   project = "my-design-notes"
+#   paths = [
+#       "~/projects/myrepo/.ostk/threads",
+#       "~/projects/myrepo/.ostk/threads/cognitive-memory",
+#   ]
 #
-# Recommended-source guidance (updated for the v0.6 TurnEnd gate):
+# (No-frontmatter docs parse fine — the handle defaults to the filename. This
+# indexes them as corpus chunks; it does NOT create attention-thread records,
+# so the thread surfacer is not polluted.)
+
+# ── Tier 3: relational substrate — the entity / concept scanner ──────────────
+# Two optional fields turn a directory into a TYPED-NODE + AUTHORED-EDGE graph
+# in the concept ledger, in addition to indexing the files for recall. This is
+# the "dropping a file is authoring" surface: the directory layout IS the
+# ontology — no wiki-links, no API calls.
 #
-#   INCLUDE conversation transcripts — `claude_code` and `gemini`. As of
-#   v0.6 these are the *only* sources that drive live cognition: a watched
-#   transcript append is a "TurnEnd" that wakes the turn observer
-#   (familiarity, membrane), the auto-weaver (evidence links), and the
-#   ambient memory lens. This is safe now — appends dedup to only-new
-#   turns, commits are batched, and non-transcript sources never trigger
-#   cognition regardless of how they arrive. (Pre-v0.6 advice was the
-#   opposite — back then every ingest looked like a live turn, so watching
-#   transcripts flooded the corpus. The gate fixed that.)
+#   entity_type = "person"      # every *.md file here seeds a typed concept
+#                               #   NODE of this kind (the filename → handle).
+#                               #   Validated: non-empty. (Seeding reads
+#                               #   markdown frontmatter, so use it on markdown
+#                               #   directories.)
+#   edges = ["families"]        # frontmatter field names that ARE edge types.
+#                               #   Each listed field is read as a list (or a
+#                               #   scalar) of target names; each target becomes
+#                               #   an AUTHORED edge  <file-node> --<field>--> <target>.
+#                               #   The field name becomes the edge `relation`,
+#                               #   so entries are validated to [a-z0-9_-]+,
+#                               #   non-empty, and unique within the block.
 #
-#   INCLUDE codebases / notes / plans — saves there are intent to
-#   re-index. They get ingested and become searchable, but, not being
-#   transcripts, they do NOT trigger cognition.
+# Authoring sets the topology hypothesis; USE sets the conductance. Authored
+# edges enter at a LOW prior (confidence 0.1) — not as fact — and earn
+# conductance (`confidence × recency`, derived, never stored) only as real work
+# traverses them; un-traversed edges decay. Edge targets that don't exist yet
+# are auto-created as untyped nodes; existing targets (by handle/alias/merge, in
+# project or global scope) are resolved, never shadowed. Seeding runs INSIDE
+# `scan` and is idempotent — re-scanning never duplicates nodes/edges, it just
+# re-touches edges (recency = use). Provenance is recorded on every edge
+# (`source = authored`, `by = scanner`).
 #
+# A worked personal-KB example (see examples/02-personal-kb for the full run):
+#
+#   ~/memories/people/tori.md  with frontmatter:
+#       ---
+#       families: [sarah]
+#       works_on: [ostk-recall]
+#       ---
+#   →  a `person` node `tori`, plus authored edges
+#      tori --families--> sarah   and   tori --works_on--> ostk-recall.
+
+[[sources]]
+kind = "markdown"
+project = "memories"
+paths = ["~/memories/people"]
+entity_type = "person"
+edges = ["families", "works_on"]
+
+[[sources]]
+kind = "markdown"
+project = "memories"
+paths = ["~/memories/meetings"]
+entity_type = "meeting"
+edges = ["people", "places"]        # meetings point at the people and places
+                                    # they involve — connective hubs.
+
+[[sources]]
+kind = "markdown"
+project = "memories"
+paths = ["~/memories/places"]
+entity_type = "place"               # typed nodes with no outgoing edge
+                                    # vocabulary of their own (meetings point
+                                    # at them; they accrue incoming edges).
+
+# Prose mention-linking against a gazetteer of known nodes (a bare mention of
+# `ostk` or `sarah` lighting an edge with no frontmatter) is the next slice;
+# until then, edges come from the `edges` frontmatter fields above.
+
+# ── `id`: disambiguating same-shape blocks ──────────────────────────────────
+# Physical identity is derived from (kind, paths, extensions, ignore). Two
+# blocks with the same shape collide and are rejected. If you genuinely need two
+# (e.g. same paths, different facets), set a distinct `id = "..."` on each.
+# `entity_type`/`edges`/`project` are NOT part of physical identity. The
+# reserved prefix `synthetic:` is rejected.
+#
+# [[sources]]
+# kind = "markdown"
+# project = "notes"
+# paths = ["~/notes"]
+# id = "notes-reference"
+# facets = { tier = ["reference"] }
+
+
+# ============================================================================
+# LIVE: file-watcher  (optional)
+# ============================================================================
+# Pokes the running `ostk-recall serve` daemon's scan-trigger socket whenever a
+# debounced batch of FS events lands under a watched source path. Run
+# `ostk-recall watch` in a SEPARATE process from `serve` (the writer-side daemon
+# that binds <corpus.root>/recall.sock). When omitted, the watcher is disabled
+# and `ostk-recall watch` exits at startup with a clear message.
+#
+# Recommended sources (v0.6 TurnEnd gate):
+#   INCLUDE transcripts — `claude_code` / `gemini`. As of v0.6 these are the
+#     ONLY sources that drive live cognition: a watched transcript append is a
+#     "TurnEnd" that wakes the turn observer (familiarity, membrane), the
+#     auto-weaver (evidence links), and the ambient lens. Safe now — appends
+#     dedup to only-new turns, commits are batched, and non-transcript sources
+#     never trigger cognition regardless of how they arrive.
+#   INCLUDE codebases / notes / plans — saves are intent to re-index. Ingested
+#     and searchable, but (not being transcripts) they do NOT trigger cognition.
 #   EXCLUDE self-writing non-transcript sources like `ostk_project`
-#   (`.ostk/journal.jsonl`, epoch seals) — watching them just causes
-#   constant re-index churn with no cognition benefit.
+#     (`.ostk/journal.jsonl`, epoch seals) — watching them just churns the
+#     index with no cognition benefit.
 #
 # [watch]
 # enabled = true
 #
-# # `mode` (v0.1.7+) gates the per-path scan path:
-# #   "legacy"      (default) — every kick runs a full scan(...). Safe
-# #                 fallback that always picks up every source. Use
-# #                 while the path-aware path bakes.
-# #   "incremental" — kick passes the changed paths to scan_paths(...);
-# #                 ~250 ms save → corpus on Linux/Windows, slightly
-# #                 longer on macOS due to FSEvents floor. Per-path
-# #                 ingest. Empty body still falls back to legacy
-# #                 scan-all on either side, so old↔new versions
-# #                 across the wire degrade gracefully.
-# #
-# # Recommended for the live-cognition flow: "incremental". It keeps the
-# # save→corpus latency low enough that watched transcript TurnEnds feel
-# # live. ("legacy" is still the built-in default pending field bake-in.)
+# # `mode` gates the per-path scan path:
+# #   "legacy"      (default) — every kick runs a full scan(...). Safe fallback
+# #                 that always picks up every source.
+# #   "incremental" — kick passes the changed paths to scan_paths(...); lower
+# #                 save→corpus latency (per-path ingest). Empty body falls back
+# #                 to legacy scan-all on either side, so old↔new versions
+# #                 across the wire degrade gracefully. Recommended for the
+# #                 live-cognition flow.
 # mode = "incremental"
 #
-# # Debounce window (ms). When omitted, defaults are per-platform —
-# # Linux 800 (inotify is precise; saves are the burst), macOS 1500
-# # (FSEvents adds a ~30 ms floor), Windows 1200 (ReadDirChangesW +
-# # IOCP batching + AV filter latency). Override only if your editor's
-# # save pattern doesn't behave well at the default.
+# # Debounce window (ms). Omitted → per-platform defaults: Linux 800, macOS 1500
+# # (FSEvents floor), Windows 1200. Override only if your editor's save pattern
+# # misbehaves at the default.
 # # debounce_ms = 1500
 #
-# # Optional `[[sources]].project` allowlist. When empty/omitted, watches
-# # every source. When set, ONLY sources whose `project` tag matches drive
-# # the watcher — useful for skipping the noisy auto-writers above.
+# # Optional `[[sources]].project` allowlist. Empty/omitted → watch every
+# # source. When set, ONLY matching-project sources drive the watcher — useful
+# # for skipping noisy auto-writers.
 # projects = [
-#     "claude-code-history",  # ← watch these: transcript appends are the
-#     "gemini-cli-history",   #   TurnEnds that drive live cognition (v0.6+)
+#     "claude-code-history",  # ← transcript appends are the TurnEnds that drive
+#     "gemini-cli-history",   #   live cognition (v0.6+)
 #     "notes",
 #     "experiments",
-#     "claude-plans",         # if you index ~/.claude/plans, watch it
 #     # NOT "ostk"            — .ostk/ self-writes on every verb (churn, no
 #     #                         cognition benefit — it isn't a transcript)
 # ]
 #
 # # Override the trigger socket path. Defaults to <corpus.root>/recall.sock
-# # which is the same path `serve` binds. Rare to need this — set only if
-# # you're running multiple corpora or non-default deployments.
+# # (the same path `serve` binds). Rare — set only for multiple corpora or
+# # non-default deployments.
 # # socket = "~/.local/share/ostk-recall/recall.sock"
