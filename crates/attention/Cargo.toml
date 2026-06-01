@@ -42,3 +42,7 @@ ostk-recall-attention-mcp = { workspace = true }
 # P2 Probe 5: HDBSCAN clustering crate evaluated for P8's concept
 # refresh. Dev-dep only — the production decision lives in P8.
 hdbscan = "0.12"
+# Contextual-embedder probe (P8 viability): re-embed sampled chunk text with a
+# small ONNX sentence-transformer to test whether contextual embeddings form
+# topical density basins where static potion did not. Dev-dep only.
+fastembed = { workspace = true }

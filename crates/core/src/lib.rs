@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod apparatus;
 pub mod attention;
 pub mod chunk;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod scanner;
 pub mod source;
 pub mod types;
 
+pub use apparatus::{APPARATUS_BLOCK_KINDS, APPARATUS_TEXT_PREFIXES, is_structural_apparatus};
 pub use attention::{
     AttentionPage, AttentionScope, AttentionSkipReason, FoldDepth, IngestEvent, IngestOrigin,
     PrivacyTier, ScoreAttribution, ThreadHandle, ThreadHandleError,

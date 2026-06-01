@@ -4734,6 +4734,7 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "fastembed",
  "hdbscan",
  "hex",
  "ostk-recall-attention-mcp",

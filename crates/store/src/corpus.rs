@@ -380,6 +380,188 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Fetch up to `limit` `(chunk_id, embedding, extra_json)` triples for
+    /// active (non-stale) chunks, no id filter. Sibling of
+    /// [`Self::fetch_embeddings`] — the read side P8's concept refresh needs
+    /// (`fetch_all_embeddings` with a bound) and what the HDBSCAN scale probe
+    /// uses. No ordering guarantee beyond Lance scan order.
+    ///
+    /// When `exclude_apparatus` is true, structural apparatus is filtered out
+    /// SQL-side so the `limit` lands on real-cognition chunks. The exclusion is
+    /// derived from the same `ostk_recall_core::APPARATUS_*` consts that back
+    /// `is_structural_apparatus`, so the SQL and Rust encodings can't drift.
+    pub async fn fetch_sample_embeddings(
+        &self,
+        limit: usize,
+        exclude_apparatus: bool,
+    ) -> Result<Vec<(String, Vec<f32>, String)>> {
+        use arrow_array::Array;
+
+        let mut filter = String::from("stale = false");
+        if exclude_apparatus {
+            // The consts are fixed, non-quote-bearing identifiers, so direct
+            // interpolation into the LIKE clauses is injection-safe.
+            let mut excl: Vec<String> = Vec::new();
+            for bk in ostk_recall_core::APPARATUS_BLOCK_KINDS {
+                excl.push(format!("extra_json LIKE '%\"block_kind\":\"{bk}\"%'"));
+            }
+            for prefix in ostk_recall_core::APPARATUS_TEXT_PREFIXES {
+                excl.push(format!("text LIKE '{prefix}%'"));
+            }
+            if !excl.is_empty() {
+                filter.push_str(&format!(" AND NOT ({})", excl.join(" OR ")));
+            }
+        }
+
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let stream = table
+            .query()
+            .only_if(&filter)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "embedding".into(),
+                "extra_json".into(),
+            ]))
+            .limit(limit)
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut out: Vec<(String, Vec<f32>, String)> = Vec::new();
+        for batch in &batches {
+            let ids_arr = batch
+                .column_by_name("chunk_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                        "chunk_id column missing or not Utf8".into(),
+                    ))
+                })?;
+            let extra_arr = batch
+                .column_by_name("extra_json")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let emb_arr = batch
+                .column_by_name("embedding")
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                        "embedding column missing or not FixedSizeList".into(),
+                    ))
+                })?;
+            let f32_values = emb_arr
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "embedding inner not Float32".into(),
+                    ))
+                })?;
+            let dim = usize::try_from(emb_arr.value_length()).unwrap_or(0);
+            for i in 0..batch.num_rows() {
+                if dim == 0 || emb_arr.is_null(i) {
+                    continue;
+                }
+                let start = i * dim;
+                let slice = &f32_values.values()[start..start + dim];
+                let extra = extra_arr
+                    .filter(|a| !a.is_null(i))
+                    .map(|a| a.value(i).to_string())
+                    .unwrap_or_default();
+                out.push((ids_arr.value(i).to_string(), slice.to_vec(), extra));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Sibling of [`Self::fetch_sample_embeddings`] returning `(chunk_id, text)`
+    /// instead of the stored embedding — for callers that re-embed (the
+    /// contextual-embedder probe) or need text for concept labeling. Same
+    /// apparatus-exclusion semantics, derived from the same core consts.
+    pub async fn fetch_sample_texts(
+        &self,
+        limit: usize,
+        exclude_apparatus: bool,
+    ) -> Result<Vec<(String, String)>> {
+        self.fetch_sample_texts_inner(limit, exclude_apparatus, None)
+            .await
+    }
+
+    /// Like [`Self::fetch_sample_texts`], but constrained to one concrete
+    /// stored source. Probe-only callers use this to test whether concept
+    /// clustering works per source when global clustering collapses into the
+    /// dominant corpus basin.
+    pub async fn fetch_sample_texts_for_source(
+        &self,
+        limit: usize,
+        exclude_apparatus: bool,
+        source: ostk_recall_core::Source,
+    ) -> Result<Vec<(String, String)>> {
+        self.fetch_sample_texts_inner(limit, exclude_apparatus, Some(source.as_str()))
+            .await
+    }
+
+    async fn fetch_sample_texts_inner(
+        &self,
+        limit: usize,
+        exclude_apparatus: bool,
+        source: Option<&str>,
+    ) -> Result<Vec<(String, String)>> {
+        use arrow_array::Array;
+
+        let mut filter = String::from("stale = false");
+        if let Some(source) = source {
+            filter.push_str(&format!(" AND source = '{}'", escape_sql(source)));
+        }
+        if exclude_apparatus {
+            let mut excl: Vec<String> = Vec::new();
+            for bk in ostk_recall_core::APPARATUS_BLOCK_KINDS {
+                excl.push(format!("extra_json LIKE '%\"block_kind\":\"{bk}\"%'"));
+            }
+            for prefix in ostk_recall_core::APPARATUS_TEXT_PREFIXES {
+                excl.push(format!("text LIKE '{prefix}%'"));
+            }
+            if !excl.is_empty() {
+                filter.push_str(&format!(" AND NOT ({})", excl.join(" OR ")));
+            }
+        }
+
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let stream = table
+            .query()
+            .only_if(&filter)
+            .select(Select::Columns(vec!["chunk_id".into(), "text".into()]))
+            .limit(limit)
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for batch in &batches {
+            let ids_arr = batch
+                .column_by_name("chunk_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                        "chunk_id column missing or not Utf8".into(),
+                    ))
+                })?;
+            let txt_arr = batch
+                .column_by_name("text")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                        "text column missing or not Utf8".into(),
+                    ))
+                })?;
+            for i in 0..batch.num_rows() {
+                if txt_arr.is_null(i) {
+                    continue;
+                }
+                out.push((ids_arr.value(i).to_string(), txt_arr.value(i).to_string()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch the `text` column for a batch of chunks by their `chunk_id`.
     /// Mirrors `fetch_embeddings` — used by ambient consumers (e.g.
     /// `TurnObserver`) that subscribe to `IngestEvent` and need the
