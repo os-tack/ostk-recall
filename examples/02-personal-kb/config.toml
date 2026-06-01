@@ -1,0 +1,41 @@
+# Personal knowledge base — the relational-substrate slice-3 showcase.
+#
+# Each directory is a node-kind. Dropping a markdown file under a typed source
+# seeds a typed concept *node*; a frontmatter field named in `edges` seeds an
+# authored *edge* to the named target. "Dropping a file is authoring" — the
+# directory layout IS the ontology. No wiki-links, no manual API calls.
+#
+# Run with `bash run.sh` (it sets $EX to this directory).
+
+[corpus]
+root = "$EX/.recall"
+
+[embedder]
+model = "minishlab/potion-retrieval-32M"
+
+[reranker]
+enabled = false
+
+# People. A file `people/tori.md` → a `person` node `tori`. Frontmatter
+# `families: [sarah]` or `works_on: [ostk-recall]` → authored edges.
+[[sources]]
+kind = "markdown"
+project = "memories"
+paths = ["$EX/content/people"]
+entity_type = "person"
+edges = ["families", "works_on"]
+
+# Meetings. `people:`/`places:` frontmatter → edges to those nodes.
+[[sources]]
+kind = "markdown"
+project = "memories"
+paths = ["$EX/content/meetings"]
+entity_type = "meeting"
+edges = ["people", "places"]
+
+# Places. Typed nodes; no outgoing edge vocabulary of their own.
+[[sources]]
+kind = "markdown"
+project = "memories"
+paths = ["$EX/content/places"]
+entity_type = "place"

@@ -1,0 +1,22 @@
+# One substrate, many minds.
+#
+# This is a SINGLE corpus + threads.sqlite. The point of the example is that
+# several minds (clients) use ONE shared substrate — not that several daemons
+# run. `serve` holds a singleton lock per corpus root, so you start ONE
+# daemon with this config and attach multiple `connect` clients to it.
+#
+# Run with `bash run.sh` (it sets $EX to this directory).
+
+[corpus]
+root = "$EX/.recall"
+
+[embedder]
+model = "minishlab/potion-retrieval-32M"
+
+[reranker]
+enabled = false
+
+[[sources]]
+kind = "markdown"
+project = "shared"
+paths = ["$EX/content"]

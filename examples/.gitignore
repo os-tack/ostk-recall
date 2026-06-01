@@ -1,0 +1,4 @@
+# Generated per-example corpus (Lance + threads.sqlite + ingest manifest).
+# Content, configs, READMEs, and run.sh are the committed fixtures; the
+# corpus is rebuilt by each example's run.sh.
+*/.recall/

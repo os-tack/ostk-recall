@@ -1,0 +1,26 @@
+# Engineering substrate: source code + design decisions in one corpus.
+# Run with `bash run.sh` (it sets $EX to this directory).
+
+[corpus]
+root = "$EX/.recall"
+
+[embedder]
+model = "minishlab/potion-retrieval-32M"
+
+[reranker]
+# Examples don't test reranking; disabling skips a second model prefetch at
+# `init`. Omitting this block would leave the reranker ON by default.
+enabled = false
+
+# Source code — tree-sitter chunked per function/block.
+[[sources]]
+kind = "code"
+project = "engineering"
+paths = ["$EX/content/code"]
+extensions = ["rs", "py"]
+
+# Design decisions — plain markdown, one corpus chunk per doc section.
+[[sources]]
+kind = "markdown"
+project = "engineering"
+paths = ["$EX/content/decisions"]

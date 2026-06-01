@@ -1,0 +1,25 @@
+# An agent's durable, cross-session memory.
+#
+# The agent's notes live as markdown files (seeded as typed `note` nodes with
+# `relates_to` edges), and the agent ALSO writes memory at runtime through the
+# `memory_remember` / `memory_connect` MCP tools. Everything it learns is
+# durable in `threads.sqlite` — it survives process restarts, which is what
+# makes the memory "persistent" rather than per-session.
+#
+# Run with `bash run.sh` (it sets $EX to this directory).
+
+[corpus]
+root = "$EX/.recall"
+
+[embedder]
+model = "minishlab/potion-retrieval-32M"
+
+[reranker]
+enabled = false
+
+[[sources]]
+kind = "markdown"
+project = "agent-memory"
+paths = ["$EX/content/memory"]
+entity_type = "note"
+edges = ["relates_to"]
