@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::concepts::{ConceptRecord, ConceptStatus, EdgeDirection};
+use crate::concepts::{ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection};
 use crate::corpus::Result;
 use crate::threads::ThreadsDb;
 
@@ -41,6 +41,12 @@ pub const ACT_R_DECAY_D: f32 = 0.5;
 /// Recency time-constants (hours) for the focus / note lifts.
 pub const FOCUS_TAU_HOURS: f32 = 24.0;
 pub const NOTE_TAU_HOURS: f32 = 72.0;
+/// Recency time-constant (hours) for edge conductance.
+///
+/// An untouched edge fades toward zero over days; re-observation (which
+/// resets `last_seen_at`) pulls it back up. Longer than the focus τ — a
+/// relationship is stickier than a momentary pin.
+pub const EDGE_TAU_HOURS: f32 = 72.0;
 
 /// Activation-sum weights.
 ///
@@ -369,6 +375,23 @@ fn recency_lift(now: DateTime<Utc>, ts: DateTime<Utc>, tau_hours: f32) -> f32 {
     (-age / tau_hours).exp().clamp(0.0, 1.0)
 }
 
+/// Derived **conductance** of an edge — how readily diffusion current flows
+/// through it — as of `now`.
+///
+/// Never stored: it is the edge's `confidence` prior gated by `last_seen_at`
+/// recency, so it cannot drift from the edge's actual use history. An
+/// authored edge enters low ([`AUTHORED_EDGE_CONFIDENCE`]
+/// ≈ 0.1) and decays as it goes untouched; re-observation resets
+/// `last_seen_at` (recency → ~1), pulling conductance back up. This is "use
+/// sets the conductance" made arithmetic — decay is free from the timestamp.
+///
+/// [`AUTHORED_EDGE_CONFIDENCE`]: crate::concepts::AUTHORED_EDGE_CONFIDENCE
+#[must_use]
+pub fn edge_conductance(edge: &ConceptEdge, now: DateTime<Utc>) -> f32 {
+    let recency = recency_lift(now, edge.last_seen_at, EDGE_TAU_HOURS);
+    (edge.confidence.max(0.0) * recency).clamp(0.0, 1.0)
+}
+
 impl ConceptActivationReader for ThreadsDb {
     fn concept_activations(
         &self,
@@ -432,7 +455,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::concepts::{EvidenceAttach, GLOBAL_PROJECT};
+    use crate::concepts::{EdgeSource, EvidenceAttach, GLOBAL_PROJECT};
     use crate::threads::{ChainSink, SqliteChainSink};
 
     const G: &str = GLOBAL_PROJECT;
@@ -450,6 +473,42 @@ mod tests {
 
     fn active(db: &ThreadsDb, handle: &str) {
         db.ensure_concept(G, handle, ConceptStatus::Active).unwrap();
+    }
+
+    fn test_edge(confidence: f32, last_seen: DateTime<Utc>) -> ConceptEdge {
+        ConceptEdge {
+            id: 1,
+            from_handle: "a".into(),
+            relation: "memory_layer_for".into(),
+            to_handle: "b".into(),
+            confidence,
+            evidence_json: None,
+            first_seen_at: last_seen,
+            last_seen_at: last_seen,
+            touch_count: 1,
+            source: crate::concepts::EdgeSource::Authored,
+            by: None,
+        }
+    }
+
+    #[test]
+    fn edge_conductance_low_when_authored_and_unused() {
+        let now = Utc::now();
+        let edge = test_edge(crate::concepts::AUTHORED_EDGE_CONFIDENCE, now);
+        let c = edge_conductance(&edge, now);
+        // confidence(0.1) × recency(~1) — low, never 1.0.
+        assert!(c > 0.0 && c <= 0.1 + 1e-4, "fresh authored edge is low, got {c}");
+    }
+
+    #[test]
+    fn edge_conductance_decays_with_disuse() {
+        let now = Utc::now();
+        let fresh = test_edge(0.6, now);
+        let stale = test_edge(0.6, now - Duration::days(30));
+        let cf = edge_conductance(&fresh, now);
+        let cs = edge_conductance(&stale, now);
+        assert!(cs < cf, "an untouched edge decays: stale {cs} < fresh {cf}");
+        assert!(cs >= 0.0, "conductance never goes negative");
     }
 
     #[test]
@@ -524,9 +583,9 @@ mod tests {
         db.ensure_concept(G, "dormant", ConceptStatus::Candidate)
             .unwrap();
         // mish—slipstream (both active) and mish—dormant (neighbour inactive).
-        db.add_concept_edge(G, "mish", "pairs_with", "slipstream", 0.6, None)
+        db.add_concept_edge(G, "mish", "pairs_with", "slipstream", 0.6, EdgeSource::Observed, None, None)
             .unwrap();
-        db.add_concept_edge(G, "mish", "pairs_with", "dormant", 0.6, None)
+        db.add_concept_edge(G, "mish", "pairs_with", "dormant", 0.6, EdgeSource::Observed, None, None)
             .unwrap();
         let acts = db
             .concept_activations(None, default_since(Utc::now()))

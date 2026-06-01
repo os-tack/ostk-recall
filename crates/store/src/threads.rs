@@ -393,6 +393,11 @@ pub enum ChainEvent {
         from: String,
         relation: String,
         to: String,
+        /// Edge origin (`authored`/`observed`/`promoted`). Wire-optional:
+        /// legacy rows predate it and decode as `observed`.
+        source: String,
+        /// Operator that authored/observed it, if known.
+        by: Option<String>,
         ts: DateTime<Utc>,
     },
     /// A concept's lifecycle status advanced (`memory_concept promote`,
@@ -632,12 +637,16 @@ impl ChainEvent {
                 from,
                 relation,
                 to,
+                source,
+                by,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "from": from,
                 "relation": relation,
                 "to": to,
+                "source": source,
+                "by": by,
             }),
             Self::ConceptPromoted {
                 project,
@@ -1006,6 +1015,18 @@ impl ChainEvent {
                 from: s_field("from")?,
                 relation: s_field("relation")?,
                 to: s_field("to")?,
+                // Legacy `concept_connected` rows predate provenance: a
+                // missing `source` decodes as `observed`, missing `by` as
+                // None. Never `?` here — that would orphan old rows.
+                source: v
+                    .get("source")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("observed")
+                    .to_string(),
+                by: v
+                    .get("by")
+                    .and_then(|x| x.as_str())
+                    .map(ToString::to_string),
                 ts,
             },
             "concept_promoted" => Self::ConceptPromoted {
@@ -1351,12 +1372,16 @@ impl ThreadsDb {
         from: &str,
         relation: &str,
         to: &str,
+        source: crate::concepts::EdgeSource,
+        by: Option<&str>,
     ) -> Result<()> {
         self.sink.append(&ChainEvent::ConceptConnected {
             project: project.to_string(),
             from: from.to_string(),
             relation: relation.to_string(),
             to: to.to_string(),
+            source: source.as_str().to_string(),
+            by: by.map(ToString::to_string),
             ts: Utc::now(),
         })
     }
@@ -1577,6 +1602,14 @@ CREATE TABLE IF NOT EXISTS concept_edges (
     first_seen_at TEXT NOT NULL,
     last_seen_at  TEXT NOT NULL,
     touch_count   INTEGER NOT NULL DEFAULT 1,
+    -- Edge origin (relational-substrate.md): authored|observed|promoted.
+    -- Immutable once set; default 'observed' so legacy rows (added before
+    -- provenance existed) read as system-observed, not falsely 'authored'.
+    source        TEXT NOT NULL DEFAULT 'observed',
+    -- Operator that authored/observed the edge, if known. NULL for legacy
+    -- and co-occurrence rows. `by` is a SQL reserved word -> bracket-quoted
+    -- ([by]) so it does not terminate the surrounding raw string literal.
+    [by]          TEXT,
     UNIQUE(from_concept, relation, to_concept),
     CHECK (from_concept <> to_concept)
 );
@@ -1716,6 +1749,26 @@ PRAGMA foreign_keys=ON;
             "UPDATE evidence_links SET last_touched_at = COALESCE(updated_at, created_at) \
              WHERE last_touched_at IS NULL",
             [],
+        )?;
+
+        // --- concept-edge provenance (relational-substrate.md, slice 1) ---
+        // Add edge origin + author to a pre-existing concept_edges table.
+        // `NOT NULL DEFAULT 'observed'` populates every existing row in the
+        // ALTER itself; "by" stays NULL (legacy authors are unknowable).
+        // Existing edges default to 'observed' (system-observed), never
+        // 'authored' — 'authored' is the privileged low-weight class and
+        // mislabeling co-occurrence as operator hypotheses would lie.
+        add_column_if_missing(
+            conn,
+            "concept_edges",
+            "source",
+            "ALTER TABLE concept_edges ADD COLUMN source TEXT NOT NULL DEFAULT 'observed'",
+        )?;
+        add_column_if_missing(
+            conn,
+            "concept_edges",
+            "by",
+            "ALTER TABLE concept_edges ADD COLUMN [by] TEXT",
         )?;
 
         // --- salience-vs-familiarity split (resonance-gated familiarity) ---
@@ -2967,6 +3020,61 @@ mod tests {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn concept_edges_migration_adds_provenance_preserving_rows() {
+        let tmp = TempDir::new().unwrap();
+        let dbfile = tmp.path().join("threads.sqlite");
+        // Hand-build a pre-slice-1 concept_edges table (no source/by) + a row.
+        {
+            let conn = Connection::open(&dbfile).unwrap();
+            conn.execute_batch(
+                r"
+CREATE TABLE concept_edges (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_concept  INTEGER NOT NULL,
+    relation      TEXT NOT NULL,
+    to_concept    INTEGER NOT NULL,
+    confidence    REAL NOT NULL DEFAULT 0.0,
+    evidence_json TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    touch_count   INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(from_concept, relation, to_concept),
+    CHECK (from_concept <> to_concept)
+);
+",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO concept_edges
+                    (from_concept, relation, to_concept, confidence, evidence_json,
+                     first_seen_at, last_seen_at, touch_count)
+                 VALUES (1, 'memory_layer_for', 2, 0.6, NULL, ?, ?, 3)",
+                params![Utc::now().to_rfc3339(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+        // Open through ThreadsDb -> migrate runs add_column_if_missing.
+        let _db = ThreadsDb::open(tmp.path()).unwrap();
+        // The legacy row gains provenance with the honest defaults: observed
+        // (NOT authored — that's the privileged low-weight class) + NULL by.
+        let conn = Connection::open(&dbfile).unwrap();
+        let (source, by, touch, conf): (String, Option<String>, i64, f64) = conn
+            .query_row(
+                "SELECT source, [by], touch_count, confidence FROM concept_edges",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(source, "observed", "legacy edge defaults to observed, not authored");
+        assert_eq!(by, None, "legacy author is unknowable");
+        assert_eq!(touch, 3, "use history preserved");
+        assert!((conf - 0.6).abs() < 1e-6, "confidence preserved");
+        drop(conn);
+        // Re-running migrate (a second open) is a no-op, not an error.
+        let _db2 = ThreadsDb::open(tmp.path()).unwrap();
     }
 
     #[test]

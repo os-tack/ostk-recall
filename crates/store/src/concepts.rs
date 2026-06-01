@@ -52,6 +52,14 @@ use crate::threads::{ThreadsDb, bytes_to_f32_vec, f32_vec_to_bytes};
 /// are eligible (enforced by the future rank feature).
 pub const CANDIDATE_CONFIDENCE: f32 = 0.1;
 
+/// Confidence stamped on a freshly *authored* edge.
+///
+/// Low by design: an authored edge is a topology *hypothesis* — a low-weight
+/// prior that must earn conductance through use (re-observation), not a fact
+/// asserted at full strength. "Authoring sets the topology hypothesis; use
+/// sets the conductance" (relational-substrate.md).
+pub const AUTHORED_EDGE_CONFIDENCE: f32 = 0.1;
+
 /// The global (cross-project) namespace. `project = ""` concepts are
 /// visible from every project's resolution fallback.
 pub const GLOBAL_PROJECT: &str = "";
@@ -141,6 +149,44 @@ impl AliasSource {
             "model" => Ok(Self::Model),
             other => Err(StoreError::InvalidEnumValue {
                 field: "concept_alias.source".into(),
+                value: other.into(),
+            }),
+        }
+    }
+}
+
+/// How an edge entered the substrate — its origin, not its strength.
+///
+/// `authored` = an operator drew it (a low-weight topology prior, see
+/// [`AUTHORED_EDGE_CONFIDENCE`]); `observed` = co-occurrence the system
+/// noticed; `promoted` = a latent (similarity) edge walked enough to be
+/// reified (no writer yet — slice 2's diffusion produces it). Origin is
+/// immutable: re-observation is *use*, not re-authoring, so this never
+/// changes once set (relational-substrate.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EdgeSource {
+    Authored,
+    Observed,
+    Promoted,
+}
+
+impl EdgeSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::Observed => "observed",
+            Self::Promoted => "promoted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "authored" => Ok(Self::Authored),
+            "observed" => Ok(Self::Observed),
+            "promoted" => Ok(Self::Promoted),
+            other => Err(StoreError::InvalidEnumValue {
+                field: "concept_edge.source".into(),
                 value: other.into(),
             }),
         }
@@ -252,6 +298,12 @@ pub struct ConceptEdge {
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub touch_count: u32,
+    /// How the edge entered (immutable origin). See [`EdgeSource`].
+    pub source: EdgeSource,
+    /// Operator that authored/observed the edge, if known. Operators are
+    /// *users* of the substrate, not graph nodes — this is a provenance
+    /// tag, not an endpoint.
+    pub by: Option<String>,
 }
 
 /// A narrative memory event attached to a concept (`memory_remember` of
@@ -735,6 +787,8 @@ impl ThreadsDb {
         relation: &str,
         to_handle: &str,
         confidence: f32,
+        source: EdgeSource,
+        by: Option<&str>,
         evidence_json: Option<&str>,
     ) -> Result<i64> {
         let now = Utc::now();
@@ -747,11 +801,15 @@ impl ThreadsDb {
                 value: "self-loop not allowed".into(),
             });
         }
+        // ON CONFLICT deliberately leaves `source` and `by` untouched:
+        // an edge's origin is immutable. Re-observation is *use* (bump
+        // touch_count, refresh last_seen_at → raises derived conductance),
+        // not re-authoring — so the first writer's provenance wins.
         let id: i64 = conn.query_row(
             "INSERT INTO concept_edges
                  (from_concept, relation, to_concept, confidence, evidence_json,
-                  first_seen_at, last_seen_at, touch_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                  first_seen_at, last_seen_at, touch_count, source, [by])
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
              ON CONFLICT(from_concept, relation, to_concept) DO UPDATE SET
                  last_seen_at  = excluded.last_seen_at,
                  touch_count   = touch_count + 1,
@@ -766,6 +824,8 @@ impl ThreadsDb {
                 evidence_json,
                 now.to_rfc3339(),
                 now.to_rfc3339(),
+                source.as_str(),
+                by,
             ],
             |r| r.get(0),
         )?;
@@ -786,7 +846,7 @@ impl ThreadsDb {
         let sql = match direction {
             EdgeDirection::From => {
                 "SELECT e.id, cf.handle, e.relation, ct.handle, e.confidence, e.evidence_json,
-                        e.first_seen_at, e.last_seen_at, e.touch_count
+                        e.first_seen_at, e.last_seen_at, e.touch_count, e.source, e.[by]
                  FROM concept_edges e
                  JOIN concepts cf ON cf.id = e.from_concept
                  JOIN concepts ct ON ct.id = e.to_concept
@@ -794,7 +854,7 @@ impl ThreadsDb {
             }
             EdgeDirection::To => {
                 "SELECT e.id, cf.handle, e.relation, ct.handle, e.confidence, e.evidence_json,
-                        e.first_seen_at, e.last_seen_at, e.touch_count
+                        e.first_seen_at, e.last_seen_at, e.touch_count, e.source, e.[by]
                  FROM concept_edges e
                  JOIN concepts cf ON cf.id = e.from_concept
                  JOIN concepts ct ON ct.id = e.to_concept
@@ -806,6 +866,35 @@ impl ThreadsDb {
             .query_map(params![id], row_to_edge)?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
         Ok(rows)
+    }
+
+    /// Edges incident on `(project, handle)` paired with each edge's
+    /// **derived conductance** as of `now` — the one-hop traversal read for
+    /// the relational substrate. Conductance is not stored; it is computed
+    /// from `confidence` and `last_seen_at` recency (see
+    /// [`crate::activation::edge_conductance`]) so it cannot drift from the
+    /// edge's use history. Sorted strongest-conductance first.
+    pub fn neighbors(
+        &self,
+        project: &str,
+        handle: &str,
+        direction: EdgeDirection,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(ConceptEdge, f32)>> {
+        let mut out: Vec<(ConceptEdge, f32)> = self
+            .list_concept_edges(project, handle, direction)?
+            .into_iter()
+            .map(|e| {
+                let c = crate::activation::edge_conductance(&e, now);
+                (e, c)
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.id.cmp(&b.0.id))
+        });
+        Ok(out)
     }
 
     /// Merge `from_handle` into `into_handle` (both resolved within
@@ -1220,6 +1309,9 @@ fn row_to_evidence(row: &rusqlite::Row) -> rusqlite::Result<ConceptEvidence> {
 }
 
 fn row_to_edge(row: &rusqlite::Row) -> rusqlite::Result<ConceptEdge> {
+    let source = EdgeSource::parse(&row.get::<_, String>(9)?).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     Ok(ConceptEdge {
         id: row.get(0)?,
         from_handle: row.get(1)?,
@@ -1230,6 +1322,8 @@ fn row_to_edge(row: &rusqlite::Row) -> rusqlite::Result<ConceptEdge> {
         first_seen_at: parse_ts(&row.get::<_, String>(6)?)?,
         last_seen_at: parse_ts(&row.get::<_, String>(7)?)?,
         touch_count: row.get(8)?,
+        source,
+        by: row.get(10)?,
     })
 }
 
@@ -1399,6 +1493,109 @@ mod tests {
         assert_eq!(ev[0].relation_state, EvidenceState::Active);
     }
 
+    /// Seed the two endpoints of the north-star self-referential edge.
+    fn seed_north_star(db: &ThreadsDb) {
+        for h in ["ostk-recall", "ostk"] {
+            db.ensure_concept(G, h, ConceptStatus::Active).unwrap();
+        }
+    }
+
+    #[test]
+    fn authored_edge_enters_low_and_carries_provenance() {
+        let (_t, db) = db();
+        seed_north_star(&db);
+        db.add_concept_edge(
+            G,
+            "ostk-recall",
+            "memory_layer_for",
+            "ostk",
+            AUTHORED_EDGE_CONFIDENCE,
+            EdgeSource::Authored,
+            Some("claude"),
+            Some("ostk-recall is the virtual memory layer for ostk"),
+        )
+        .unwrap();
+        let edges = db
+            .list_concept_edges(G, "ostk-recall", EdgeDirection::From)
+            .unwrap();
+        assert_eq!(edges.len(), 1, "the north-star edge is present and readable");
+        let e = &edges[0];
+        assert_eq!(e.to_handle, "ostk");
+        assert_eq!(e.relation, "memory_layer_for");
+        assert!(
+            (e.confidence - AUTHORED_EDGE_CONFIDENCE).abs() < 1e-6,
+            "authored edge enters at the low prior, not full strength"
+        );
+        assert_eq!(e.source, EdgeSource::Authored);
+        assert_eq!(e.by.as_deref(), Some("claude"));
+        assert_eq!(e.touch_count, 1);
+    }
+
+    #[test]
+    fn reobservation_is_use_and_preserves_origin() {
+        let (_t, db) = db();
+        seed_north_star(&db);
+        let add = |source, by| {
+            db.add_concept_edge(
+                G,
+                "ostk-recall",
+                "memory_layer_for",
+                "ostk",
+                AUTHORED_EDGE_CONFIDENCE,
+                source,
+                by,
+                None,
+            )
+            .unwrap()
+        };
+        add(EdgeSource::Authored, Some("claude"));
+        // Re-observed by another mind: use, not re-authoring. Origin is immutable.
+        add(EdgeSource::Observed, Some("codex"));
+        let e = db
+            .list_concept_edges(G, "ostk-recall", EdgeDirection::From)
+            .unwrap()
+            .remove(0);
+        assert_eq!(e.touch_count, 2, "re-observation bumps use");
+        assert_eq!(
+            e.source,
+            EdgeSource::Authored,
+            "first author wins; an edge's origin never changes"
+        );
+        assert_eq!(
+            e.by.as_deref(),
+            Some("claude"),
+            "the original author is preserved across re-observation"
+        );
+    }
+
+    #[test]
+    fn neighbors_pairs_edges_with_low_conductance() {
+        let (_t, db) = db();
+        seed_north_star(&db);
+        db.add_concept_edge(
+            G,
+            "ostk-recall",
+            "memory_layer_for",
+            "ostk",
+            AUTHORED_EDGE_CONFIDENCE,
+            EdgeSource::Authored,
+            None,
+            None,
+        )
+        .unwrap();
+        let ns = db
+            .neighbors(G, "ostk-recall", EdgeDirection::From, Utc::now())
+            .unwrap();
+        assert_eq!(ns.len(), 1);
+        let (edge, conductance) = &ns[0];
+        assert_eq!(edge.to_handle, "ostk");
+        // Freshly authored: recency ≈ 1, so conductance ≈ confidence, and low.
+        assert!(
+            *conductance > 0.0 && *conductance <= AUTHORED_EDGE_CONFIDENCE + 1e-4,
+            "authored edge enters at low conductance, got {conductance}"
+        );
+    }
+
     #[test]
     fn merge_rewrites_edges_and_drops_self_loops() {
         let (_t, db) = db();
@@ -1406,15 +1603,15 @@ mod tests {
             db.ensure_concept(G, h, ConceptStatus::Active).unwrap();
         }
         // dup (mish-shell) has an edge to ostk; canonical (mish) also → ostk.
-        db.add_concept_edge(G, "mish-shell", "absorbed_into", "ostk", 0.5, None)
+        db.add_concept_edge(G, "mish-shell", "absorbed_into", "ostk", 0.5, EdgeSource::Observed, None, None)
             .unwrap();
-        db.add_concept_edge(G, "mish", "absorbed_into", "ostk", 0.6, None)
+        db.add_concept_edge(G, "mish", "absorbed_into", "ostk", 0.6, EdgeSource::Observed, None, None)
             .unwrap();
         // dup also pairs_with mish itself → would become a self-loop on merge.
-        db.add_concept_edge(G, "mish-shell", "pairs_with", "mish", 0.3, None)
+        db.add_concept_edge(G, "mish-shell", "pairs_with", "mish", 0.3, EdgeSource::Observed, None, None)
             .unwrap();
         // and a unique edge that should survive the rewrite.
-        db.add_concept_edge(G, "mish-shell", "pairs_with", "slipstream", 0.4, None)
+        db.add_concept_edge(G, "mish-shell", "pairs_with", "slipstream", 0.4, EdgeSource::Observed, None, None)
             .unwrap();
 
         db.merge_concept(G, "mish-shell", "mish").unwrap();

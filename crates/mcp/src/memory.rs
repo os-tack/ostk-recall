@@ -25,8 +25,9 @@ use ostk_recall_attention_mcp::{AttentionDispatch, DefaultAttentionHandlers};
 use ostk_recall_core::RecallHit;
 use ostk_recall_store::concepts::HitView;
 use ostk_recall_store::{
-    AliasSource, ConceptActivation, ConceptActivationReader, ConceptStatus, CorpusStore,
-    EdgeDirection, EvidenceAttach, ThreadsDb, default_since_now, extract_concept_terms, slugify,
+    AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptActivation, ConceptActivationReader,
+    ConceptStatus, CorpusStore, EdgeDirection, EdgeSource, EvidenceAttach, ThreadsDb,
+    default_since_now, extract_concept_terms, slugify,
 };
 
 use crate::protocol::JsonRpcError;
@@ -51,7 +52,6 @@ pub fn is_memory_tool(name: &str) -> bool {
 /// (conservative: only among path-sourced concepts).
 const MAX_PROPOSED_EDGES: usize = 8;
 const PROPOSED_EDGE_CONFIDENCE: f32 = 0.2;
-const OPERATOR_EDGE_CONFIDENCE: f32 = 0.6;
 const REFLECT_EVIDENCE_THRESHOLD: usize = 2;
 const REFLECT_ALIAS_TOUCH_THRESHOLD: u32 = 3;
 
@@ -365,6 +365,8 @@ pub async fn observe_recall(
                     "pairs_with",
                     to,
                     PROPOSED_EDGE_CONFIDENCE,
+                    EdgeSource::Observed,
+                    None,
                     Some(&evidence_json),
                 )
                 .is_ok()
@@ -550,6 +552,7 @@ fn edge_to_json(e: &ostk_recall_store::ConceptEdge) -> Value {
     json!({
         "from": e.from_handle, "relation": e.relation, "to": e.to_handle,
         "confidence": e.confidence, "evidence": e.evidence_json, "touch_count": e.touch_count,
+        "source": e.source.as_str(), "by": e.by,
     })
 }
 
@@ -909,21 +912,36 @@ fn memory_connect(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .unwrap_or_else(|| "operator-asserted via memory_connect".to_string());
+    // Operators are *users* of the substrate, not graph nodes — `by` is a
+    // provenance tag, optional and explicit (None until the partition layer
+    // supplies a caller identity).
+    let by = args.get("by").and_then(Value::as_str);
+    // An authored edge is a topology *hypothesis*: it enters at low
+    // conductance (`AUTHORED_EDGE_CONFIDENCE`) and must earn weight through
+    // use, not assertion. "Authoring sets the topology; use sets the
+    // conductance" (relational-substrate.md).
     let id = threads
         .add_concept_edge(
             &project,
             &from,
             &relation,
             &to,
-            OPERATOR_EDGE_CONFIDENCE,
+            AUTHORED_EDGE_CONFIDENCE,
+            EdgeSource::Authored,
+            by,
             Some(&evidence),
         )
         .map_err(map_store_err)?;
     // Activation: a new live association. Best-effort chain emission.
-    if let Err(e) = threads.record_concept_connected(&project, &from, &relation, &to) {
+    if let Err(e) =
+        threads.record_concept_connected(&project, &from, &relation, &to, EdgeSource::Authored, by)
+    {
         tracing::warn!(error = %e, "ConceptConnected emit failed");
     }
-    Ok(json!({ "edge_id": id, "from": from, "relation": relation, "to": to }))
+    Ok(json!({
+        "edge_id": id, "from": from, "relation": relation, "to": to,
+        "source": EdgeSource::Authored.as_str(), "by": by,
+    }))
 }
 
 #[cfg(test)]
@@ -1053,5 +1071,41 @@ mod tests {
         let (examined, promoted) = reflect_promote(&db).unwrap();
         assert_eq!(examined, 1);
         assert!(promoted.contains(&"mish".to_string()));
+    }
+
+    #[test]
+    fn memory_connect_authors_low_conductance_edge() {
+        let (_t, db) = db();
+        // The north-star self-referential edge, drawn through the operator
+        // entry point with a `by` tag.
+        let conn = memory_connect(
+            &db,
+            &json!({
+                "from": "ostk-recall",
+                "relation": "memory_layer_for",
+                "to": "ostk",
+                "by": "claude",
+            }),
+        )
+        .unwrap();
+        assert!(conn["edge_id"].as_i64().is_some());
+        assert_eq!(conn["source"], json!("authored"));
+        assert_eq!(conn["by"], json!("claude"));
+
+        // The concept card surfaces the edge with authored provenance and the
+        // low prior — NOT the old operator-asserted 0.6.
+        let card = memory_concept(&db, &json!({"action":"show","handle":"ostk-recall"})).unwrap();
+        let edges = card["edges_from"].as_array().unwrap();
+        let edge = edges
+            .iter()
+            .find(|e| e["to"] == json!("ostk"))
+            .expect("north-star edge on the card");
+        assert_eq!(edge["source"], json!("authored"));
+        assert_eq!(edge["by"], json!("claude"));
+        let conf = edge["confidence"].as_f64().unwrap();
+        assert!(
+            (conf - f64::from(AUTHORED_EDGE_CONFIDENCE)).abs() < 1e-6,
+            "authored edge enters at the low prior, got {conf}"
+        );
     }
 }

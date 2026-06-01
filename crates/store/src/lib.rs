@@ -12,13 +12,13 @@ pub mod schema;
 pub mod threads;
 
 pub use activation::{
-    ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy, default_since,
-    default_since_now,
+    ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy, EDGE_TAU_HOURS,
+    default_since, default_since_now, edge_conductance,
 };
 pub use concepts::{
-    AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote, ConceptRecord,
-    ConceptStatus, EdgeDirection, EvidenceAttach, EvidenceReconcileRow, EvidenceState,
-    ExtractedTerm, GLOBAL_PROJECT, HitView, ReconcileStats, extract_concept_terms,
+    AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote,
+    ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource, EvidenceAttach, EvidenceReconcileRow,
+    EvidenceState, ExtractedTerm, GLOBAL_PROJECT, HitView, ReconcileStats, extract_concept_terms,
     reconcile_concept_evidence, slugify,
 };
 pub use corpus::{ActivityBurst, CorpusStore, StoreError};
