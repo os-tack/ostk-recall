@@ -1,5 +1,6 @@
 //! ostk-recall-mcp — MCP server exposing the query engine over stdio.
 
+pub mod memory;
 pub mod protocol;
 pub mod resources;
 pub mod server;

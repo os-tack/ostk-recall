@@ -1172,7 +1172,7 @@ impl ThreadsDb {
         Ok(())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1267,7 +1267,193 @@ CREATE TABLE IF NOT EXISTS thread_thread_links (
 
 CREATE INDEX IF NOT EXISTS idx_thread_thread_from ON thread_thread_links(from_thread);
 CREATE INDEX IF NOT EXISTS idx_thread_thread_to ON thread_thread_links(to_thread);
+
+-- concept ledger (memory-tool-surface.md): use-driven, durable concept
+-- object permanence. The successor to the shelved emergent-clustering P8.
+-- A concept is minted from recall events as a low-trust `candidate`,
+-- promoted through `proposed` to `active` only on repeated use / multi-
+-- source evidence / operator confirmation. Provenance is mandatory:
+-- every concept carries source-tagged aliases + chunk-id evidence so a
+-- model belief with no support stays a visible, correctable candidate.
+-- Only `active` concepts are ever eligible to bias recall (enforced by
+-- the future rank feature, not here). v0 is recoverable from these
+-- tables directly; ChainEvent integration is a documented follow-up,
+-- mirroring thread_thread_links v0.
+-- `project` namespaces concept identity. '' (empty) = global concept
+-- (cross-project, e.g. mish/slipstream/ostk). A non-empty value scopes
+-- the concept to one project so fresh-project handles (auth, client,
+-- kernel, memory, …) don't collide. Lookups prefer (project, handle)
+-- then fall back to the global ('' , handle) row.
+CREATE TABLE IF NOT EXISTS concepts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL DEFAULT '',
+    handle      TEXT NOT NULL,
+    summary     TEXT,
+    status      TEXT NOT NULL DEFAULT 'candidate',
+    confidence  REAL NOT NULL DEFAULT 0.0,
+    merged_into TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE(project, handle)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concepts_status ON concepts(status);
+
+CREATE TABLE IF NOT EXISTS concept_aliases (
+    concept_id    INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    alias         TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    confidence    REAL NOT NULL DEFAULT 0.0,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    touch_count   INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(concept_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_aliases_alias ON concept_aliases(alias);
+
+-- Evidence is anchored on the DURABLE coordinate (source, source_id) —
+-- never the volatile chunk_id (a coordinate hash that churns on
+-- re-chunk / move / reingest). `last_resolved_chunk_id` is a
+-- re-resolvable cache, `content_sha256` drives change detection, and
+-- `anchor_vec` (the chunk embedding) lets the reconciler re-point to the
+-- nearest current chunk after a re-chunk — mirroring the thread-anchor
+-- `anchor_vec` fix. `relation_state` gates (active|moved|orphaned)
+-- rather than deleting, so a concept keeps its provenance trail even
+-- when the underlying file is gone.
+CREATE TABLE IF NOT EXISTS concept_evidence (
+    concept_id    INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    project       TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL,
+    source_id     TEXT NOT NULL,
+    last_resolved_chunk_id TEXT,
+    content_sha256 TEXT,
+    anchor_vec    BLOB,
+    score         REAL,
+    reason        TEXT,
+    relation_state TEXT NOT NULL DEFAULT 'active',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    touch_count   INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(concept_id, source, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_evidence_concept ON concept_evidence(concept_id);
+-- NB: the coordinate indexes (source / last_resolved_chunk_id) are created
+-- AFTER the rebuild guards below, not here — on a legacy DB this batch runs
+-- against the old chunk_id-shaped table where `source` does not yet exist.
+
+CREATE TABLE IF NOT EXISTS concept_edges (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_concept  INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    relation      TEXT NOT NULL,
+    to_concept    INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    confidence    REAL NOT NULL DEFAULT 0.0,
+    evidence_json TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    touch_count   INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(from_concept, relation, to_concept),
+    CHECK (from_concept <> to_concept)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_edges_from ON concept_edges(from_concept);
+CREATE INDEX IF NOT EXISTS idx_concept_edges_to ON concept_edges(to_concept);
 ",
+        )?;
+
+        // --- concept-ledger hardening rebuilds (concept-ledger-hardening) ---
+        // The concept tables shipped this cycle with a global-unique handle
+        // and a chunk_id-keyed evidence table. Both are wrong for durability:
+        // concepts need project scope, and evidence must key on the stable
+        // (source, source_id) coordinate, not the volatile chunk_id. These two
+        // FK-safe table rebuilds upgrade any DB created with the old shape,
+        // preserving rows (the standard SQLite 12-step ALTER pattern: toggle
+        // foreign_keys off, copy into a new table, drop+rename). `CREATE TABLE
+        // IF NOT EXISTS` above is a no-op on an existing old-shape table, so
+        // these run exactly once per DB (guarded by a column probe).
+        if !column_exists(conn, "concepts", "project")? {
+            conn.execute_batch(
+                r"
+PRAGMA foreign_keys=OFF;
+BEGIN;
+CREATE TABLE concepts_new (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL DEFAULT '',
+    handle      TEXT NOT NULL,
+    summary     TEXT,
+    status      TEXT NOT NULL DEFAULT 'candidate',
+    confidence  REAL NOT NULL DEFAULT 0.0,
+    merged_into TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE(project, handle)
+);
+INSERT INTO concepts_new
+    (id, project, handle, summary, status, confidence, merged_into, created_at, updated_at)
+    SELECT id, '', handle, summary, status, confidence, merged_into, created_at, updated_at
+    FROM concepts;
+DROP TABLE concepts;
+ALTER TABLE concepts_new RENAME TO concepts;
+CREATE INDEX IF NOT EXISTS idx_concepts_status ON concepts(status);
+COMMIT;
+PRAGMA foreign_keys=ON;
+",
+            )?;
+        }
+        if column_exists(conn, "concept_evidence", "chunk_id")?
+            && !column_exists(conn, "concept_evidence", "source")?
+        {
+            // Legacy rows carry only `chunk_id`. Preserve them: source='' is
+            // the "coordinate unknown — needs backfill" sentinel, source_id is
+            // seeded to the chunk_id so the UNIQUE(concept_id, source,
+            // source_id) holds (the old key was (concept_id, chunk_id)); the
+            // reconciler later resolves the real coordinate from
+            // last_resolved_chunk_id via the corpus.
+            conn.execute_batch(
+                r"
+PRAGMA foreign_keys=OFF;
+BEGIN;
+CREATE TABLE concept_evidence_new (
+    concept_id    INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    project       TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL,
+    source_id     TEXT NOT NULL,
+    last_resolved_chunk_id TEXT,
+    content_sha256 TEXT,
+    anchor_vec    BLOB,
+    score         REAL,
+    reason        TEXT,
+    relation_state TEXT NOT NULL DEFAULT 'active',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    touch_count   INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(concept_id, source, source_id)
+);
+INSERT OR IGNORE INTO concept_evidence_new
+    (concept_id, project, source, source_id, last_resolved_chunk_id, content_sha256,
+     anchor_vec, score, reason, relation_state, first_seen_at, last_seen_at, touch_count)
+    SELECT concept_id, '', '', chunk_id, chunk_id, NULL,
+           NULL, score, reason, 'active', first_seen_at, last_seen_at, touch_count
+    FROM concept_evidence;
+DROP TABLE concept_evidence;
+ALTER TABLE concept_evidence_new RENAME TO concept_evidence;
+CREATE INDEX IF NOT EXISTS idx_concept_evidence_concept ON concept_evidence(concept_id);
+COMMIT;
+PRAGMA foreign_keys=ON;
+",
+            )?;
+        }
+        // Coordinate indexes — created here (not in the canonical batch
+        // above) because on a legacy DB that batch runs before the rebuild
+        // adds the `source` / `last_resolved_chunk_id` columns. By this point
+        // `concept_evidence` has the coordinate shape (fresh or rebuilt).
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_concept_evidence_source
+                 ON concept_evidence(source, source_id);
+             CREATE INDEX IF NOT EXISTS idx_concept_evidence_chunk
+                 ON concept_evidence(last_resolved_chunk_id)
+                 WHERE last_resolved_chunk_id IS NOT NULL;",
         )?;
 
         // --- idempotent column adds (P11b-full: edge activation) ---
@@ -2469,7 +2655,7 @@ fn to_sql_err(e: StoreError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
 
-fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for f in v {
         out.extend_from_slice(&f.to_le_bytes());
@@ -2477,7 +2663,7 @@ fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
-fn bytes_to_f32_vec(b: &[u8]) -> Result<Vec<f32>> {
+pub(crate) fn bytes_to_f32_vec(b: &[u8]) -> Result<Vec<f32>> {
     if b.len() % 4 != 0 {
         return Err(StoreError::Lance(lancedb::Error::Other {
             message: format!("centroid_vec blob length {} not multiple of 4", b.len()),

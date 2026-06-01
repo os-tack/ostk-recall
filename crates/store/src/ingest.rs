@@ -338,6 +338,21 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
         self.count_by_source()
     }
 
+    /// Current chunk ids registered for a `(source, source_id)` coordinate,
+    /// across every `source_config_id`. Used by the concept-evidence
+    /// reconciler to re-resolve a churned `chunk_id`: given the durable
+    /// coordinate, find the chunks that occupy it now. Read-only.
+    pub fn chunk_ids_for_source_id(&self, source: &str, source_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_id FROM ingest_chunks WHERE source = ? AND source_id = ? ORDER BY chunk_index",
+        )?;
+        let ids = stmt
+            .query_map(params![source, source_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(ids)
+    }
+
     pub fn count_for_source(&self, source: Source) -> Result<u64> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM ingest_chunks WHERE source = ?")?;

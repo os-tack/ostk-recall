@@ -335,6 +335,9 @@ impl Server {
     fn handle_tools_list(&self) -> Value {
         let mut tools = tool_list(self.engine.has_audit());
         if self.attention.is_some() {
+            // memory_* is the primary, intent-shaped surface; attention_* /
+            // thread_* remain as the debug/admin surface beneath it.
+            tools.extend(crate::memory::memory_tools());
             tools.extend(attention_tools());
             tools.extend(thread_tools());
         }
@@ -447,8 +450,131 @@ impl Server {
                     .map_err(|e| JsonRpcError::internal(format!("serialize page: {e}")))?;
                 json!({ "pages": named })
             }
+            "memory_recall" => {
+                // Recall + learn (memory-tool-surface.md). Runs hybrid
+                // recall, logs the access (ExplicitRecall per hit, same as
+                // `recall`), then — when learn=true — runs the deterministic
+                // concept observer to turn the event into durable concept
+                // candidates. Returns hits + a memory_delta receipt.
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| JsonRpcError::invalid_params("memory_recall: missing query"))?
+                    .to_string();
+                let learn = args.get("learn").and_then(Value::as_bool).unwrap_or(true);
+                // Build RecallParams from the known recall fields only, so
+                // the extra `learn` flag doesn't trip deserialization.
+                let mut recall_args = json!({ "query": query });
+                for f in ["project", "source", "limit", "max_per_source_id"] {
+                    if let Some(v) = args.get(f) {
+                        recall_args[f] = v.clone();
+                    }
+                }
+                let project = args
+                    .get("project")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let p: RecallParams = serde_json::from_value(recall_args).map_err(|e| {
+                    JsonRpcError::invalid_params(format!("memory_recall args: {e}"))
+                })?;
+                let query_hash = query_hash(&p.query);
+                let mut hits = self.engine.recall(p).await.map_err(query_error_to_rpc)?;
+                // Auto-apply the active focus pin (the fix for "memory_focus
+                // did not affect memory_recall"): if a pin is set on the
+                // default scope, bias the hits toward it and return a `lens`
+                // block, mirroring the low-level `recall` tool — but sourced
+                // from the live pin rather than a caller-supplied bias.
+                let mut lens = None;
+                if let Some(dispatch) = self.attention.as_ref() {
+                    let scope = ostk_recall_core::attention::AttentionScope::default();
+                    let bias = AttentionBiasParams {
+                        scope: scope.clone(),
+                        thread_weight: 1.0,
+                        embedding_weight: 1.0,
+                    };
+                    if let Ok(status) = dispatch.attention.focus_status(&scope).await {
+                        lens = build_recall_lens(&bias, Some(&status));
+                        if lens.is_some() {
+                            apply_attention_bias(&mut hits, &bias, dispatch).await;
+                        }
+                    }
+                }
+                let now = chrono::Utc::now();
+                let events: Vec<ChainEvent> = hits
+                    .iter()
+                    .map(|h| ChainEvent::ExplicitRecall {
+                        chunk_id: h.chunk_id.clone(),
+                        query_hash: query_hash.clone(),
+                        ts: now,
+                    })
+                    .collect();
+                self.log_access_events(&events);
+                let memory_delta = if learn {
+                    match self.attention.as_ref() {
+                        Some(d) => {
+                            crate::memory::observe_recall(
+                                d.threads.as_ref(),
+                                Some(self.engine.store().as_ref()),
+                                &project,
+                                &query,
+                                &hits,
+                            )
+                            .await
+                        }
+                        None => Value::Null,
+                    }
+                } else {
+                    Value::Null
+                };
+                let mut out = json!({
+                    "hits": hits, "memory_delta": memory_delta, "learned": learn,
+                });
+                if let Some(lens) = lens {
+                    out["lens"] = lens;
+                }
+                out
+            }
+            "memory_reflect" => {
+                // Consolidation: promote corroborated candidates + reconcile
+                // evidence whose chunk ids churned (re-point or orphan). Needs
+                // the corpus + ingest handles, so it lives here, not in
+                // dispatch_memory.
+                let dispatch = self.attention.as_ref().ok_or_else(|| {
+                    JsonRpcError::invalid_params("memory_reflect requires the attention substrate")
+                })?;
+                let (examined, promoted) =
+                    crate::memory::reflect_promote(dispatch.threads.as_ref())?;
+                let recon = ostk_recall_store::reconcile_concept_evidence(
+                    dispatch.threads.as_ref(),
+                    self.engine.store().as_ref(),
+                    self.engine.ingest().as_ref(),
+                )
+                .await
+                .map_err(|e| JsonRpcError::internal(format!("reconcile: {e}")))?;
+                json!({
+                    "candidates_examined": examined,
+                    "promoted_to_proposed": promoted,
+                    "evidence_reconcile": {
+                        "checked": recon.checked,
+                        "still_valid": recon.still_valid,
+                        "backfilled": recon.backfilled,
+                        "re_resolved": recon.re_resolved,
+                        "orphaned": recon.orphaned,
+                    },
+                })
+            }
             other => {
                 if let Some(d) = self.attention.as_ref() {
+                    if crate::memory::is_memory_tool(other) {
+                        let out = crate::memory::dispatch_memory(d.as_ref(), other, args).await?;
+                        let text = serde_json::to_string(&out)
+                            .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
+                        return Ok(json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": false,
+                        }));
+                    }
                     if is_attention_tool(other) {
                         let out = d
                             .dispatch(other, args)

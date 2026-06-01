@@ -236,6 +236,19 @@ async fn tools_list_includes_attention_when_wired() {
     assert!(names.contains(&"attention_fold"));
     assert!(names.contains(&"thread_create"));
     assert!(names.contains(&"thread_list"));
+    // memory_* is the primary surface and must advertise alongside the
+    // low-level admin tools when the attention substrate is wired.
+    for m in [
+        "memory_recall",
+        "memory_surface",
+        "memory_focus",
+        "memory_remember",
+        "memory_concept",
+        "memory_connect",
+        "memory_reflect",
+    ] {
+        assert!(names.contains(&m), "tools/list missing {m}");
+    }
 }
 
 #[tokio::test]
