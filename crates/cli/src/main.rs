@@ -437,7 +437,30 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("build tokio runtime: {e}"))?;
-    rt.block_on(async_main(cli, workers))
+    let result = rt.block_on(async_main(cli, workers));
+
+    // Shutdown discipline: a multi-thread `Runtime`'s `Drop` blocks
+    // *indefinitely* on any outstanding blocking work or detached OS
+    // thread. The worst offender is the `serve --watch` notify/FSEvents
+    // teardown, which can wedge in the kernel over a large watched tree
+    // (`~/.claude/projects`, a million-file `target/`, …) — surfacing as
+    // "logged 'exited cleanly' but Ctrl-C won't actually kill it." The
+    // daemon has nothing to drain on exit, so we bound the wait instead
+    // of inheriting `Drop`'s unbounded one: `shutdown_timeout` lets
+    // in-flight blocking IO (e.g. a Lance commit / index optimize)
+    // finish for a few seconds — protecting corpus integrity — then
+    // detaches whatever is still stuck. `process::exit` reaps the
+    // detached threads immediately. The `.serve.lock` flock releases on
+    // process exit regardless. In the common (non-wedged) case teardown
+    // completes in well under the timeout, so exit stays prompt.
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
