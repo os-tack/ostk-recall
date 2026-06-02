@@ -106,6 +106,22 @@ bash run.sh
 mention-linking, and promotion all happen *inside* `scan`; the script deletes the generated
 `priya.md` afterward so the example stays re-runnable.
 
+## Latent bridges + promotion (slice 2b)
+
+The edges above are all *reified* — drawn from frontmatter or prose. The graph also has a
+**latent** half: two nodes whose chunks sit near each other in embedding space, with no edge
+between them. When you focus a node, recall walks one hop into that latent half too, so an
+*off-diagonal* neighbour (semantically near, relationally un-linked) can **surface in the
+`relational` lens slot** even though no edge connects them. If that bridge keeps proving
+relevant, a `memory_reflect` consolidation pass **promotes** it into a weak reified edge
+(`source = promoted`, `by = diffusion`, confidence `0.1`) — which then has to earn its
+conductance through reuse, or decay. `memory_reflect`'s response reports
+`latent_promotion: { seeds_examined, edges_promoted, edges_retouched }`.
+
+This is corpus- and embedding-dependent (it needs two genuinely-near documents), so it isn't
+part of the deterministic `run.sh`; the mechanism is proven end-to-end with controlled vectors
+in `crates/cli/tests/latent_promotion_e2e.rs`.
+
 ## Query the live graph
 
 Start the daemon and connect a client (see the top-level

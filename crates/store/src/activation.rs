@@ -32,7 +32,9 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::concepts::{ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection, EvidenceState};
+use crate::concepts::{
+    ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource, EvidenceState,
+};
 use crate::corpus::Result;
 use crate::threads::ThreadsDb;
 
@@ -108,6 +110,33 @@ pub struct ConceptSupport {
     pub activation: f32,
 }
 
+/// One attention-active seed's latent-hop anchor (relational-substrate slice 2b).
+///
+/// Carries the seed's identity + scope (for the promoted-edge audit event and the
+/// same-project tiebreak), the chunk whose vector anchors the ANN query, and the
+/// seed's **hard** (authored/observed) neighbours — the off-diagonal filter
+/// shared by the read augmenter and the promoter. A concept linked to the seed
+/// by a hard edge is not off-diagonal, so it is neither latent-surfaced nor
+/// promoted; a `promoted` neighbour is left out of that set on purpose (see
+/// the `hard_neighbor_ids` field doc).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedAnchor {
+    pub concept_id: i64,
+    pub project: String,
+    pub handle: String,
+    pub weight: f32,
+    pub anchor_chunk_id: String,
+    /// Direct neighbours connected by an **authored or observed** edge — the
+    /// off-diagonal filter for *both* the read augmenter and the promoter.
+    /// `promoted` neighbours are deliberately *excluded*: the promoter can then
+    /// re-touch them (keeping conductance warm), and the read path keeps
+    /// surfacing a freshly-promoted bridge (confidence `0.1`, too weak for
+    /// reified diffusion to lift for an ordinary seed) via the latent hop until
+    /// its conductance clears the floor. An operator-asserted / co-occurrence
+    /// link is owned by the reified path — never latent-surfaced or re-promoted.
+    pub hard_neighbor_ids: HashSet<i64>,
+}
+
 /// Diffusion output (relational-substrate slice 2): spreading activation over
 /// the concept edge graph from attention-lit seeds, bridged to chunk
 /// coordinates plus the resolved chunk ids worth injecting as lens candidates.
@@ -119,6 +148,10 @@ pub struct RelationalSupport {
     /// Resolved chunk ids of diffused-neighbour evidence, to inject as lens
     /// candidates so neighbour chunks can *surface*, not merely be re-ranked.
     pub inject_chunk_ids: Vec<String>,
+    /// Attention-active seeds with a usable evidence-chunk anchor, for the
+    /// slice-2b latent hop (ANN over chunk vectors). Empty on the reified-only
+    /// path; the query layer runs the Lance query per anchor.
+    pub seed_anchors: Vec<SeedAnchor>,
 }
 
 /// Diffusion knobs (slice 2), tunable. Hops kept shallow + frontier capped so
@@ -133,6 +166,25 @@ pub const REL_MIN_ACTIVATION: f32 = 0.05;
 /// A concept seeds diffusion only if its dynamic (attention) signal exceeds
 /// this — keeps diffusion attention-shaped, not a global graph glow.
 pub const REL_SEED_THRESHOLD: f32 = 0.05;
+
+/// Latent hop (slice 2b): nearest chunks kept per seed anchor after filtering.
+/// The Lance query fetches this plus slack to absorb the anchor itself +
+/// same-document chunks before they are dropped.
+pub const REL_LATENT_K: usize = 8;
+/// Cosine floor a latent (chunk↔chunk) neighbour must clear to count as an
+/// off-diagonal bridge. Chunk↔chunk similarity is a *different* distribution
+/// than the attention-vec↔anchor resonance discussed in
+/// `membrane-connector-gap.md`, so this is set conservatively pending the
+/// corpus bench — do **not** inherit the 0.30/0.7 resonance constants.
+pub const REL_LATENT_SIM_FLOOR: f32 = 0.55;
+/// Max promoted edges written per seed per consolidation pass (hairball guard).
+pub const REL_PROMOTE_TOP_K: usize = 4;
+/// Weak prior a promoted (latent→reified) edge enters at — like authored /
+/// observed edges, it must earn conductance through re-walking, or decay.
+pub const PROMOTED_EDGE_CONFIDENCE: f32 = 0.1;
+/// Generic relation kind for promoted edges (the verb is the deferred OpenIE
+/// seam; the edge `gloss` carries cosine + chunk coords for the frame).
+pub const REL_PROMOTED_RELATION: &str = "related";
 
 /// ACT-R base activation `B = ln(1 + Σ age_hours^{-d})`. `ln_1p` is the
 /// accurate small-sum form; ages are pre-floored by the caller.
@@ -187,6 +239,20 @@ pub trait ConceptActivationReader: Send + Sync {
     /// skips). [`ThreadsDb`] overrides it.
     fn relational_support(&self, _since: DateTime<Utc>) -> Result<RelationalSupport> {
         Ok(RelationalSupport::default())
+    }
+
+    /// Reverse lookup (relational-substrate slice 2b): for each chunk id, the
+    /// active-evidence concepts that cite it, as `(concept_id, project, handle)`
+    /// where `project` / `handle` are the **authoritative concept-row** scope
+    /// (not the evidence row's, which is provenance/context). Powers the
+    /// latent-hop reverse map (chunk similarity → concept). Terminal concepts
+    /// are excluded. Default impl is empty so non-ledger readers degrade
+    /// cleanly; [`ThreadsDb`] overrides it.
+    fn concepts_for_chunks(
+        &self,
+        _chunk_ids: &[String],
+    ) -> Result<HashMap<String, Vec<(i64, String, String)>>> {
+        Ok(HashMap::new())
     }
 }
 
@@ -485,22 +551,22 @@ impl ConceptActivationReader for ThreadsDb {
         //    (decayed_access + focus_lift), never durable `confidence` — diffuse
         //    from what attention is touching now, not from every Active concept
         //    (which would glow the whole graph).
-        let seeds: Vec<(i64, f32)> = self
+        let seed_recs: Vec<(i64, f32, String, String)> = self
             .activations_internal(None, since)?
             .into_iter()
             .filter_map(|(rec, act)| {
                 let dynamic = act.why.decayed_access + act.why.focus_lift;
-                (dynamic > REL_SEED_THRESHOLD).then_some((rec.id, dynamic))
+                (dynamic > REL_SEED_THRESHOLD).then_some((rec.id, dynamic, rec.project, rec.handle))
             })
             .collect();
-        if seeds.is_empty() {
+        if seed_recs.is_empty() {
             return Ok(RelationalSupport::default());
         }
 
         // 2. Spreading activation in id-space (cross-scope safe).
         let now = Utc::now();
-        let seed_ids: HashSet<i64> = seeds.iter().map(|(id, _)| *id).collect();
-        let mut weight: HashMap<i64, f32> = seeds.into_iter().collect();
+        let seed_ids: HashSet<i64> = seed_recs.iter().map(|(id, ..)| *id).collect();
+        let mut weight: HashMap<i64, f32> = seed_recs.iter().map(|(id, w, ..)| (*id, *w)).collect();
         let mut frontier: Vec<i64> = weight.keys().copied().collect();
         for _hop in 0..REL_MAX_HOPS {
             // Expand the strongest FRONTIER_K nodes by their *current* weight.
@@ -580,10 +646,83 @@ impl ConceptActivationReader for ThreadsDb {
                 }
             }
         }
+        // 4. Seed anchors for the slice-2b latent hop: each seed's identity +
+        //    scope, the chunk that anchors its ANN query (first active evidence
+        //    with a resolvable chunk — highest-score by the evidence ordering),
+        //    and its direct reified neighbours (the off-diagonal oracle). A seed
+        //    with no resolvable evidence chunk contributes no anchor (no hop).
+        let mut seed_anchors: Vec<SeedAnchor> = Vec::new();
+        for (id, w, project, handle) in &seed_recs {
+            let Some(anchor_chunk_id) = self
+                .list_concept_evidence(*id)?
+                .into_iter()
+                .find(|ev| {
+                    ev.relation_state == EvidenceState::Active
+                        && ev.last_resolved_chunk_id.is_some()
+                })
+                .and_then(|ev| ev.last_resolved_chunk_id)
+            else {
+                continue;
+            };
+            let hard_neighbor_ids: HashSet<i64> = self
+                .neighbor_sources(*id)?
+                .into_iter()
+                .filter(|(_, s)| matches!(s, EdgeSource::Authored | EdgeSource::Observed))
+                .map(|(nbr, _)| nbr)
+                .collect();
+            seed_anchors.push(SeedAnchor {
+                concept_id: *id,
+                project: project.clone(),
+                handle: handle.clone(),
+                weight: *w,
+                anchor_chunk_id,
+                hard_neighbor_ids,
+            });
+        }
+
         Ok(RelationalSupport {
             coord_activation,
             inject_chunk_ids,
+            seed_anchors,
         })
+    }
+
+    fn concepts_for_chunks(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<HashMap<String, Vec<(i64, String, String)>>> {
+        if chunk_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.lock();
+        let placeholders = vec!["?"; chunk_ids.len()].join(",");
+        // Authoritative concept-row project/handle (c.project, not ce.project);
+        // active evidence only; terminal concepts excluded.
+        let sql = format!(
+            "SELECT ce.last_resolved_chunk_id, ce.concept_id, c.project, c.handle
+             FROM concept_evidence ce
+             JOIN concepts c ON c.id = ce.concept_id
+             WHERE ce.last_resolved_chunk_id IN ({placeholders})
+               AND ce.relation_state = 'active'
+               AND c.status NOT IN ('merged', 'rejected')"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk_ids.iter()), |row| {
+                let chunk_id: String = row.get(0)?;
+                let concept_id: i64 = row.get(1)?;
+                let project: String = row.get(2)?;
+                let handle: String = row.get(3)?;
+                Ok((chunk_id, concept_id, project, handle))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+        for (chunk_id, concept_id, project, handle) in rows {
+            out.entry(chunk_id)
+                .or_default()
+                .push((concept_id, project, handle));
+        }
+        Ok(out)
     }
 }
 
@@ -828,6 +967,21 @@ mod tests {
         db.get_concept(project, handle).unwrap().unwrap().id
     }
 
+    fn ev_in(db: &ThreadsDb, id: i64, project: &str, source_id: &str, chunk: Option<&str>) {
+        db.attach_concept_evidence(&EvidenceAttach {
+            concept_id: id,
+            project,
+            source: "code",
+            source_id,
+            chunk_id: chunk,
+            content_sha256: None,
+            anchor_vec: None,
+            score: Some(0.5),
+            reason: Some("test"),
+        })
+        .unwrap();
+    }
+
     #[test]
     fn neighbors_by_id_both_directions_by_id_not_handle() {
         let (_t, db) = db();
@@ -905,6 +1059,73 @@ mod tests {
             sup.coord_activation
                 .contains_key(&("code".to_string(), "or-unresolved".to_string())),
             "unresolved evidence still scores by coord, just isn't injected"
+        );
+    }
+
+    // --- Slice 2b: reverse lookup + seed anchors ---------------------------
+
+    #[test]
+    fn concepts_for_chunks_reverse_maps_active_authoritative_scope() {
+        let (_t, db) = db();
+        let (a, _) = db
+            .ensure_concept("memories", "alpha", ConceptStatus::Active)
+            .unwrap();
+        // A terminal concept citing the SAME chunk must be excluded.
+        let (b, _) = db
+            .ensure_concept("memories", "beta", ConceptStatus::Rejected)
+            .unwrap();
+        ev_in(&db, a.id, "memories", "a-src", Some("cx"));
+        ev_in(&db, b.id, "memories", "b-src", Some("cx"));
+        let map = db.concepts_for_chunks(&["cx".to_string()]).unwrap();
+        let hits = map.get("cx").expect("chunk present");
+        assert_eq!(hits.len(), 1, "terminal concept excluded from reverse map");
+        assert_eq!(
+            hits[0],
+            (a.id, "memories".to_string(), "alpha".to_string()),
+            "authoritative concept-row project + handle"
+        );
+        assert!(
+            db.concepts_for_chunks(&[]).unwrap().is_empty(),
+            "empty input → empty map"
+        );
+    }
+
+    #[test]
+    fn relational_support_populates_seed_anchor() {
+        let (_t, db) = db();
+        active(&db, "tori");
+        active(&db, "ostk-recall");
+        db.record_concept_accessed(G, "tori", "recall:path", "qh-1")
+            .unwrap();
+        let (tori, orec) = (id_of(&db, G, "tori"), id_of(&db, G, "ostk-recall"));
+        db.add_concept_edge_by_id(
+            tori,
+            "works_on",
+            orec,
+            1.0,
+            EdgeSource::Authored,
+            None,
+            None,
+        )
+        .unwrap();
+        // First active evidence has no chunk (skipped); the second is the anchor.
+        ev(&db, tori, "tori-nochunk", None);
+        ev(&db, tori, "tori-src", Some("tori-chunk"));
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        let anchor = sup
+            .seed_anchors
+            .iter()
+            .find(|s| s.concept_id == tori)
+            .expect("tori is an anchored seed");
+        assert_eq!(
+            anchor.anchor_chunk_id, "tori-chunk",
+            "first active evidence WITH a resolvable chunk"
+        );
+        assert_eq!(anchor.handle, "tori");
+        assert_eq!(anchor.project, G);
+        assert!(
+            anchor.hard_neighbor_ids.contains(&orec),
+            "the authored neighbour is captured as a hard (off-diagonal) exclusion"
         );
     }
 

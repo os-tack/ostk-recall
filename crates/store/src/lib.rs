@@ -13,7 +13,9 @@ pub mod threads;
 
 pub use activation::{
     ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy, EDGE_TAU_HOURS,
-    RelationalSupport, default_since, default_since_now, edge_conductance,
+    PROMOTED_EDGE_CONFIDENCE, REL_HOP_DECAY, REL_LATENT_K, REL_LATENT_SIM_FLOOR, REL_PROMOTE_TOP_K,
+    REL_PROMOTED_RELATION, RelationalSupport, SeedAnchor, default_since, default_since_now,
+    edge_conductance,
 };
 pub use concepts::{
     AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote,

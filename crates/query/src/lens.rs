@@ -193,9 +193,18 @@ pub async fn build_lens(
         if engine.feature_weight("relational_lift") > 0.0 {
             match attn_ctx.concept_reader.as_ref() {
                 Some(reader) => {
-                    let support = std::sync::Arc::new(
-                        reader.relational_support(ostk_recall_store::default_since_now())?,
-                    );
+                    let mut support =
+                        reader.relational_support(ostk_recall_store::default_since_now())?;
+                    // Slice 2b: also walk the latent (Lance similarity) half, so
+                    // off-diagonal neighbour chunks surface through this same lane
+                    // + the relational_lift feature (additive, read-only).
+                    crate::relational::augment_relational_support_latent(
+                        corpus,
+                        reader.as_ref(),
+                        &mut support,
+                    )
+                    .await?;
+                    let support = std::sync::Arc::new(support);
                     let injected = relational_candidates(corpus, &support).await?;
                     if !injected.is_empty() {
                         let have: HashSet<String> = candidates

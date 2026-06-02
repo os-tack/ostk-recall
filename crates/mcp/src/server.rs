@@ -579,6 +579,22 @@ impl Server {
                 )
                 .await
                 .map_err(|e| JsonRpcError::internal(format!("reconcile: {e}")))?;
+                // Slice 2b: promote off-diagonal latent bridges (Lance similarity
+                // with no reified edge) from the currently attention-active seeds
+                // into weak `Promoted` edges — use sets conductance, decay
+                // adjudicates. Deliberate consolidation, never write-on-read.
+                let support = ostk_recall_store::ConceptActivationReader::relational_support(
+                    dispatch.threads.as_ref(),
+                    ostk_recall_store::default_since_now(),
+                )
+                .map_err(|e| JsonRpcError::internal(format!("relational support: {e}")))?;
+                let promotion = ostk_recall_query::promote_latent_edges(
+                    self.engine.store().as_ref(),
+                    dispatch.threads.as_ref(),
+                    &support,
+                )
+                .await
+                .map_err(|e| JsonRpcError::internal(format!("latent promotion: {e}")))?;
                 json!({
                     "candidates_examined": examined,
                     "promoted_to_proposed": promoted,
@@ -588,6 +604,11 @@ impl Server {
                         "backfilled": recon.backfilled,
                         "re_resolved": recon.re_resolved,
                         "orphaned": recon.orphaned,
+                    },
+                    "latent_promotion": {
+                        "seeds_examined": promotion.examined_seeds,
+                        "edges_promoted": promotion.promoted,
+                        "edges_retouched": promotion.retouched,
                     },
                 })
             }

@@ -22,8 +22,11 @@ cross-encoder reranker.
   Reciprocal Rank Fusion, with an optional cross-encoder rerank pass.
 - **A concept ledger** — typed nodes and attributed, directed edges, durable in
   SQLite. Grow them from markdown frontmatter at scan time, or write them
-  directly over MCP. Each edge records its origin (authored / observed) and
-  derives a conductance from confidence and recency rather than storing a weight.
+  directly over MCP. Each edge records its origin (authored / observed /
+  promoted) and derives a conductance from confidence and recency rather than
+  storing a weight. Diffusion also walks the latent (vector-similarity) half of
+  the graph; an off-diagonal bridge walked during consolidation is promoted into
+  a weak reified edge that must then earn its conductance through use, or decay.
 - **A live attention runtime** — a turn observer, an auto-weaver that links new
   chunks to thread anchors, and an idle curator that fades inactive threads. It
   also maintains an ambient "memory lens" (an MCP resource) aligned to whatever
@@ -178,7 +181,7 @@ global scope.
 | `memory_remember` | `{ kind: concept_seed\|note\|decision\|fact\|open_question, text, concept?, project? }` |
 | `memory_connect` | `{ from, relation, to, project?, evidence? }` — author a concept edge |
 | `memory_focus` | `{ target, project? }` — pin a focus that biases recall |
-| `memory_reflect` | `{}` — consolidation pass: promote corroborated candidates, re-resolve evidence |
+| `memory_reflect` | `{}` — consolidation pass: promote corroborated candidates, re-resolve evidence, and promote off-diagonal latent bridges into weak `promoted` edges |
 
 ### Attention — live scope runtime (9)
 

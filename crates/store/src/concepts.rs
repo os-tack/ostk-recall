@@ -168,8 +168,9 @@ impl AliasSource {
 ///
 /// `authored` = an operator drew it (a low-weight topology prior, see
 /// [`AUTHORED_EDGE_CONFIDENCE`]); `observed` = co-occurrence the system
-/// noticed; `promoted` = a latent (similarity) edge walked enough to be
-/// reified (no writer yet — slice 2's diffusion produces it). Origin is
+/// noticed; `promoted` = a latent (Lance-similarity) bridge reified by the
+/// slice-2b consolidation promoter (`query::promote_latent_edges`, run from
+/// `memory_reflect`) at a weak prior that must then earn conductance. Origin is
 /// immutable: re-observation is *use*, not re-authoring, so this never
 /// changes once set (relational-substrate.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1008,6 +1009,74 @@ impl ThreadsDb {
             out.push((
                 nbr,
                 crate::activation::conductance_of(confidence, last_seen_at, now),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Neighbour concept **ids** of `concept_id` paired with each incident
+    /// edge's [`EdgeSource`] (both directions, terminal neighbours excluded —
+    /// same filter as [`Self::neighbors_by_id`]). One row per edge, so a pair
+    /// connected by several edges surfaces several times. Lets diffusion
+    /// distinguish *hard* topology (authored / observed) from `promoted` edges
+    /// it may itself re-touch (relational-substrate slice 2b).
+    pub fn neighbor_sources(&self, concept_id: i64) -> Result<Vec<(i64, EdgeSource)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT CASE WHEN e.from_concept = ?1 THEN e.to_concept ELSE e.from_concept END AS nbr,
+                    e.source
+             FROM concept_edges e
+             JOIN concepts c
+               ON c.id = (CASE WHEN e.from_concept = ?1 THEN e.to_concept ELSE e.from_concept END)
+             WHERE (e.from_concept = ?1 OR e.to_concept = ?1)
+               AND c.status NOT IN ('merged', 'rejected')",
+        )?;
+        let rows = stmt
+            .query_map(params![concept_id], |row| {
+                let nbr: i64 = row.get(0)?;
+                let source: String = row.get(1)?;
+                Ok((nbr, source))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (nbr, source) in rows {
+            if nbr == concept_id {
+                continue;
+            }
+            out.push((nbr, EdgeSource::parse(&source)?));
+        }
+        Ok(out)
+    }
+
+    /// All edges directly between two concept ids, **either direction**, as
+    /// `(from_concept, to_concept, relation, source)`. The fresh recheck the
+    /// latent-edge promoter uses at write time (relational-substrate slice 2b):
+    /// skip a pair an operator already linked (authored / observed), and
+    /// re-touch an existing `promoted` edge in its own direction rather than
+    /// writing a reciprocal duplicate.
+    pub fn edges_between(&self, a: i64, b: i64) -> Result<Vec<(i64, i64, String, EdgeSource)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT from_concept, to_concept, relation, source FROM concept_edges
+             WHERE (from_concept = ?1 AND to_concept = ?2)
+                OR (from_concept = ?2 AND to_concept = ?1)",
+        )?;
+        let rows = stmt
+            .query_map(params![a, b], |row| {
+                let from_concept: i64 = row.get(0)?;
+                let to_concept: i64 = row.get(1)?;
+                let relation: String = row.get(2)?;
+                let source: String = row.get(3)?;
+                Ok((from_concept, to_concept, relation, source))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (from_concept, to_concept, relation, source) in rows {
+            out.push((
+                from_concept,
+                to_concept,
+                relation,
+                EdgeSource::parse(&source)?,
             ));
         }
         Ok(out)

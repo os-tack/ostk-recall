@@ -17,14 +17,20 @@
 //! ([`crate::lanes::relational_candidates`]); this feature then scores the
 //! unioned pool.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
+use ostk_recall_store::{
+    CORPUS_TABLE, ConceptActivationReader, CorpusStore, EdgeSource, PROMOTED_EDGE_CONFIDENCE,
+    REL_HOP_DECAY, REL_LATENT_K, REL_LATENT_SIM_FLOOR, REL_PROMOTE_TOP_K, REL_PROMOTED_RELATION,
+    RelationalSupport, SeedAnchor, ThreadsDb,
+};
 
 use crate::candidate::Candidate;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
-use crate::rank::{RankFeatureFactory, RankFeatureInstance};
+use crate::lanes::lane_dense;
+use crate::rank::{RankFeatureFactory, RankFeatureInstance, cosine_similarity};
 
 /// Immutable config for the `relational_lift` feature; cheap to `Arc`-share.
 ///
@@ -112,6 +118,306 @@ impl RankFeatureInstance for RelationalLiftInstance {
         }
         (raw - self.pool_min) / (self.pool_max - self.pool_min)
     }
+}
+
+/// A latent (similarity) neighbour of a seed concept (relational-substrate
+/// slice 2b): a concept whose evidence chunk is ANN-near the seed's anchor chunk
+/// but has **no reified edge** to the seed — an off-diagonal bridge. Carries the
+/// full coordinate `relational_lift` scores by, plus the concept's authoritative
+/// scope for the same-project tiebreak and the promoted-edge audit event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatentNeighbor {
+    pub concept_id: i64,
+    pub project: String,
+    pub handle: String,
+    pub chunk_id: String,
+    pub source: String,
+    pub source_id: String,
+    pub cosine: f32,
+}
+
+/// Extra ANN results fetched beyond `k` to absorb the anchor itself + same-
+/// document chunks before they are filtered out.
+const LATENT_SLACK: usize = 8;
+
+/// One seed's latent hop: ANN over chunk vectors from its anchor chunk, mapped
+/// back to off-diagonal neighbour concepts. Shared by the read augmenter
+/// (Part A) and the promoter (Part B).
+///
+/// Order matters — the concept filters need the reverse map first:
+/// 1. fetch the anchor embedding; absent → no hop;
+/// 2. `nearest_to` with `k + slack` (the anchor + same-doc chunks come back);
+///    drop the anchor chunk id;
+/// 3. fetch candidate chunks + embeddings, cosine vs the anchor, drop below floor;
+/// 4. reverse-map survivors to `(chunk, concept)` associations;
+/// 5. drop associations whose concept is the seed's own or in `exclude` (the
+///    caller's off-diagonal filter — the seed's authored/observed neighbours;
+///    `promoted` neighbours are intentionally *not* excluded so they stay
+///    latent-readable and the promoter can re-touch them);
+/// 6. emit one `LatentNeighbor` per surviving association; sort by cosine
+///    (same-project, then id/chunk as deterministic tiebreaks) and take top-`k`.
+///
+/// # Errors
+/// Propagates corpus (Lance) and ledger read errors.
+// `exclude` is always a default-hasher set built here in the crate; no need to
+// generalize the public signature over `BuildHasher`.
+#[allow(clippy::implicit_hasher)]
+pub async fn latent_neighbors(
+    store: &CorpusStore,
+    reader: &dyn ConceptActivationReader,
+    anchor: &SeedAnchor,
+    exclude: &HashSet<i64>,
+    k: usize,
+) -> Result<Vec<LatentNeighbor>> {
+    // 1. anchor embedding (skip the seed if it has no vector in Lance).
+    let embs = store
+        .fetch_embeddings(std::slice::from_ref(&anchor.anchor_chunk_id))
+        .await?;
+    let Some(anchor_vec) = embs.get(&anchor.anchor_chunk_id).cloned() else {
+        return Ok(Vec::new());
+    };
+
+    // 2. nearest chunks (k + slack for the anchor + same-document chunks).
+    let table = store
+        .connection()
+        .open_table(CORPUS_TABLE)
+        .execute()
+        .await?;
+    let near = lane_dense(&table, &anchor_vec, None, k + LATENT_SLACK).await?;
+    let near_ids: Vec<String> = near
+        .into_iter()
+        .map(|e| e.0)
+        .filter(|id| *id != anchor.anchor_chunk_id)
+        .collect();
+    if near_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 3. fetch candidate chunks + embeddings; cosine vs the anchor; drop below floor.
+    let fetched = store.fetch_chunks_by_ids(&near_ids).await?;
+    let mut kept: Vec<(String, String, String, f32)> = Vec::new();
+    for (chunk_id, (chunk, emb)) in &fetched {
+        let Some(emb) = emb.as_ref() else { continue };
+        let cos = cosine_similarity(&anchor_vec, emb);
+        if cos < REL_LATENT_SIM_FLOOR {
+            continue;
+        }
+        kept.push((
+            chunk_id.clone(),
+            chunk.source.as_str().to_string(),
+            chunk.source_id.clone(),
+            cos,
+        ));
+    }
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 4. reverse-map to (chunk, concept) associations.
+    let kept_ids: Vec<String> = kept.iter().map(|(id, ..)| id.clone()).collect();
+    let by_chunk = reader.concepts_for_chunks(&kept_ids)?;
+
+    // 5 + 6. drop the seed itself and any concept in `exclude` (the caller's
+    // hard off-diagonal set); emit one neighbour per surviving association.
+    let mut out: Vec<LatentNeighbor> = Vec::new();
+    for (chunk_id, source, source_id, cos) in kept {
+        let Some(concepts) = by_chunk.get(&chunk_id) else {
+            continue;
+        };
+        for (cid, project, handle) in concepts {
+            if *cid == anchor.concept_id || exclude.contains(cid) {
+                continue;
+            }
+            out.push(LatentNeighbor {
+                concept_id: *cid,
+                project: project.clone(),
+                handle: handle.clone(),
+                chunk_id: chunk_id.clone(),
+                source: source.clone(),
+                source_id: source_id.clone(),
+                cosine: cos,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.cosine
+            .partial_cmp(&a.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Deterministic tiebreaks on equal cosine: same-project as the seed
+            // first, then concept id, then chunk id (map/SQL order is unstable).
+            .then_with(|| {
+                let a_same = a.project == anchor.project;
+                let b_same = b.project == anchor.project;
+                b_same.cmp(&a_same)
+            })
+            .then_with(|| a.concept_id.cmp(&b.concept_id))
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+    out.truncate(k);
+    Ok(out)
+}
+
+/// Part A: fold each seed's latent neighbours into the reified-diffusion
+/// [`RelationalSupport`].
+///
+/// Off-diagonal chunks then **surface** through the same lens slot + injection
+/// lane slice 2 built. Additive and read-only: the reified payload is unchanged
+/// where the two overlap (max-merge per coordinate).
+///
+/// # Errors
+/// Propagates corpus (Lance) and ledger read errors.
+pub async fn augment_relational_support_latent(
+    store: &CorpusStore,
+    reader: &dyn ConceptActivationReader,
+    support: &mut RelationalSupport,
+) -> Result<()> {
+    if support.seed_anchors.is_empty() {
+        return Ok(());
+    }
+    let anchors = support.seed_anchors.clone();
+    let mut seen: HashSet<String> = support.inject_chunk_ids.iter().cloned().collect();
+    for anchor in &anchors {
+        // Exclude only HARD (authored/observed) neighbours — those are owned by
+        // the reified path. A `promoted` neighbour stays latent-readable so a
+        // freshly-promoted bridge (conf 0.1, too weak for reified diffusion to
+        // lift for an ordinary seed) doesn't vanish from the lens the moment it
+        // is promoted; it keeps surfacing via the latent hop until its reified
+        // conductance clears the floor.
+        for n in latent_neighbors(
+            store,
+            reader,
+            anchor,
+            &anchor.hard_neighbor_ids,
+            REL_LATENT_K,
+        )
+        .await?
+        {
+            let lift = anchor.weight * n.cosine * REL_HOP_DECAY;
+            support
+                .coord_activation
+                .entry((n.source, n.source_id))
+                .and_modify(|cur| {
+                    if lift > *cur {
+                        *cur = lift;
+                    }
+                })
+                .or_insert(lift);
+            if seen.insert(n.chunk_id.clone()) {
+                support.inject_chunk_ids.push(n.chunk_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Summary of one latent→reified promotion pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromotionReport {
+    /// Seeds with a usable anchor that were examined.
+    pub examined_seeds: usize,
+    /// Newly-created promoted edges.
+    pub promoted: usize,
+    /// Already-existing edges re-touched (kept warm, not re-created).
+    pub retouched: usize,
+}
+
+/// Part B: promote each active seed's top off-diagonal latent neighbours into
+/// weak [`EdgeSource::Promoted`] edges.
+///
+/// A weak prior that conductance/decay then adjudicates. The promoter excludes
+/// only *hard* (authored/observed) neighbours, so a `promoted` edge passes the
+/// filter and is **re-touched** (kept warm) on a later pass — that is what keeps
+/// a still-relevant bridge alive. A fresh [`ThreadsDb::edges_between`] recheck
+/// skips a pair an operator already linked and re-touches an existing promoted
+/// edge in its own direction; an in-pass pair set settles reciprocal active
+/// seeds once. The audit event fires only on creation, stamped under the seed's
+/// scope (the by-id row is authoritative — matches slice-4 cross-scope edges).
+///
+/// # Errors
+/// Propagates corpus (Lance) and ledger read/write errors.
+pub async fn promote_latent_edges(
+    store: &CorpusStore,
+    threads: &ThreadsDb,
+    support: &RelationalSupport,
+) -> Result<PromotionReport> {
+    let mut report = PromotionReport::default();
+    // Unordered pairs settled this pass — so two reciprocal active seeds
+    // (A near B and B near A) settle their shared edge once, not twice.
+    let mut handled: HashSet<(i64, i64)> = HashSet::new();
+    for anchor in &support.seed_anchors {
+        report.examined_seeds += 1;
+        // Promoter excludes only *hard* (authored/observed) neighbours — a
+        // `promoted` neighbour passes through so it can be re-touched (warmed).
+        let neighbors = latent_neighbors(
+            store,
+            threads,
+            anchor,
+            &anchor.hard_neighbor_ids,
+            REL_LATENT_K,
+        )
+        .await?;
+        let mut per_seed: HashSet<i64> = HashSet::new();
+        for n in neighbors {
+            if per_seed.len() >= REL_PROMOTE_TOP_K {
+                break;
+            }
+            // One edge per neighbour concept (reached via several chunks → once).
+            if !per_seed.insert(n.concept_id) {
+                continue;
+            }
+            let pair = (
+                anchor.concept_id.min(n.concept_id),
+                anchor.concept_id.max(n.concept_id),
+            );
+            if !handled.insert(pair) {
+                continue;
+            }
+            // Fresh recheck (both directions): an operator/observed link is never
+            // re-promoted; an existing `promoted` edge is re-touched in its own
+            // direction rather than written reciprocally.
+            let existing = threads.edges_between(anchor.concept_id, n.concept_id)?;
+            if existing
+                .iter()
+                .any(|(_, _, _, s)| matches!(s, EdgeSource::Authored | EdgeSource::Observed))
+            {
+                continue;
+            }
+            let (from_id, to_id) = existing
+                .iter()
+                .find(|(_, _, rel, s)| *s == EdgeSource::Promoted && rel == REL_PROMOTED_RELATION)
+                .map_or((anchor.concept_id, n.concept_id), |(f, t, _, _)| (*f, *t));
+            let gloss = serde_json::json!({
+                "via": "latent-promotion",
+                "cosine": n.cosine,
+                "anchor_chunk": anchor.anchor_chunk_id,
+                "near_chunk": n.chunk_id,
+            })
+            .to_string();
+            let (_edge_id, created) = threads.add_concept_edge_by_id(
+                from_id,
+                REL_PROMOTED_RELATION,
+                to_id,
+                PROMOTED_EDGE_CONFIDENCE,
+                EdgeSource::Promoted,
+                Some("diffusion"),
+                Some(&gloss),
+            )?;
+            if created {
+                report.promoted += 1;
+                threads.record_concept_connected(
+                    &anchor.project,
+                    &anchor.handle,
+                    REL_PROMOTED_RELATION,
+                    &n.handle,
+                    EdgeSource::Promoted,
+                    Some("diffusion"),
+                )?;
+            } else {
+                report.retouched += 1;
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -206,6 +512,7 @@ mod tests {
         let support = RelationalSupport {
             coord_activation: coord,
             inject_chunk_ids: vec!["reached".to_string()],
+            seed_anchors: Vec::new(),
         };
         let reader: Arc<dyn ConceptActivationReader> = Arc::new(StubReader(support));
         let attn = AttentionContext::empty().with_concept_reader(reader);
@@ -237,6 +544,7 @@ mod tests {
         let support = RelationalSupport {
             coord_activation: coord,
             inject_chunk_ids: Vec::new(),
+            seed_anchors: Vec::new(),
         };
         let reader: Arc<dyn ConceptActivationReader> = Arc::new(StubReader(support));
         let attn = AttentionContext::empty().with_concept_reader(reader);

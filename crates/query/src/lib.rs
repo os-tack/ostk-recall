@@ -47,7 +47,10 @@ pub use rank::{
     FeatureAttribution, FnFactory, RankEngine, RankFeatureFactory, RankFeatureInstance, RankedHit,
     build_engine_from_weights,
 };
-pub use relational::{RelationalLiftFactory, RelationalLiftInstance};
+pub use relational::{
+    LatentNeighbor, PromotionReport, RelationalLiftFactory, RelationalLiftInstance,
+    augment_relational_support_latent, latent_neighbors, promote_latent_edges,
+};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
 pub use rerank::{RerankerError, RerankerLike};
