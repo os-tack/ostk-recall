@@ -331,6 +331,14 @@ pub fn default_profile_weights(profile: RankProfile) -> std::collections::BTreeM
             // candidate, so the slot skips cleanly on a fresh corpus. Tunable
             // via `[ranking.weights.lens]`; not yet bench-validated.
             m.insert("concept_support".to_string(), 0.5);
+            // relational_lift (relational-substrate slice 2) lights the
+            // relational slot: a chunk reached by spreading activation from the
+            // attention-lit seeds (diffusion neighbour, raw→1.0) contributes
+            // 0.5, clearing the dominance bar. Degrades to 0 when no
+            // concept_reader is wired or diffusion reaches no candidate, so the
+            // slot skips cleanly. Tunable via `[ranking.weights.lens]`; not yet
+            // bench-validated.
+            m.insert("relational_lift".to_string(), 0.5);
         }
     }
     m
@@ -1263,15 +1271,17 @@ mode = "burst"
         assert_eq!(ambient.get("attention_affinity").copied(), Some(1.0));
         assert_eq!(ambient.len(), 1, "ambient default is attention only");
         // The lens profile carries the salience portfolio (attention +
-        // freshness + concept_support) while ambient stays attention-only.
+        // freshness + concept_support + relational_lift) while ambient stays
+        // attention-only.
         let lens = cfg.effective_ranking_weights(RankProfile::Lens);
         assert_eq!(lens.get("attention_affinity").copied(), Some(1.0));
         assert_eq!(lens.get("freshness").copied(), Some(0.5));
         assert_eq!(lens.get("concept_support").copied(), Some(0.5));
+        assert_eq!(lens.get("relational_lift").copied(), Some(0.5));
         assert_eq!(
             lens.len(),
-            3,
-            "lens default is attention + freshness + concept_support"
+            4,
+            "lens default is attention + freshness + concept_support + relational_lift"
         );
     }
 

@@ -221,6 +221,17 @@ impl RankEngine {
         self.factories.iter().map(|(f, _)| f.name())
     }
 
+    /// The registered weight for `name`, or `0.0` if the feature isn't present.
+    /// Lets a caller gate work on whether a feature is actually active (e.g. the
+    /// lens skips the relational candidate lane when `relational_lift` is off).
+    #[must_use]
+    pub fn feature_weight(&self, name: &str) -> f32 {
+        self.factories
+            .iter()
+            .find(|(f, _)| f.name() == name)
+            .map_or(0.0, |(_, w)| *w)
+    }
+
     /// Score `candidates` and return them sorted by descending `total`.
     ///
     /// Phase 1: build a per-query instance from each factory and run its
@@ -424,6 +435,14 @@ pub fn build_engine_from_weights(weights: &BTreeMap<String, f32>) -> RankEngine 
             // dormant concept portfolio slot with zero allocator changes.
             "concept_support" => engine.with_factory(
                 Arc::new(crate::concept::ConceptSupportFactory::default()),
+                weight,
+            ),
+            // `relational_lift` — lens relational slot (relational-substrate
+            // slice 2). Spreading activation over the concept edge graph from
+            // attention-lit seeds; reads `attn.concept_reader` when present,
+            // else degrades to a zero contribution (slot skips).
+            "relational_lift" => engine.with_factory(
+                Arc::new(crate::relational::RelationalLiftFactory::default()),
                 weight,
             ),
             // Unknown id: a feature not (yet) known to this builder. Ignore

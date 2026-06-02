@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use ostk_recall_store::{ChainLogReader, ConceptActivationReader};
+use ostk_recall_store::{ChainLogReader, ConceptActivationReader, RelationalSupport};
 
 /// The query side of a rank call.
 ///
@@ -93,6 +93,13 @@ pub struct AttentionContext {
     /// lens loop wires the reader; the feature degrades to a zero
     /// contribution (the concept slot skips cleanly) when absent.
     pub concept_reader: Option<Arc<dyn ConceptActivationReader>>,
+    /// Per-lens-build cache of the diffusion result (relational-substrate
+    /// slice 2). `build_lens` computes `relational_support` ONCE (for the
+    /// candidate-injection lane) and stashes it here so the `relational_lift`
+    /// feature reuses it instead of re-running the BFS + evidence reads during
+    /// ranking. `None` on the standalone-feature path (the feature then
+    /// computes it from `concept_reader`).
+    pub relational_support: Option<Arc<RelationalSupport>>,
     /// P9b-full — `true` when an operator pin is driving ranking. The lens
     /// loop sets this explicitly from its pin-fingerprint detection;
     /// [`crate::lens`]'s `pinned()` heuristic (scope ≠ rolling) is the
@@ -130,6 +137,13 @@ impl std::fmt::Debug for AttentionContext {
                 "concept_reader",
                 &self.concept_reader.as_ref().map_or("none", |_| "set"),
             )
+            .field(
+                "relational_support",
+                &self
+                    .relational_support
+                    .as_ref()
+                    .map_or("none", |_| "cached"),
+            )
             .field("pinned", &self.pinned)
             .field("recent_entities", &self.recent_entities)
             .field("dominant_concept_label", &self.dominant_concept_label)
@@ -146,6 +160,7 @@ impl AttentionContext {
             rolling_vec: None,
             chain_log: None,
             concept_reader: None,
+            relational_support: None,
             pinned: false,
             recent_entities: Vec::new(),
             dominant_concept_label: None,
@@ -176,6 +191,15 @@ impl AttentionContext {
     #[must_use]
     pub fn with_concept_reader(mut self, reader: Arc<dyn ConceptActivationReader>) -> Self {
         self.concept_reader = Some(reader);
+        self
+    }
+
+    /// Stash a precomputed diffusion result so the `relational_lift` feature
+    /// reuses it instead of recomputing (slice 2). `build_lens` calls this
+    /// after running the diffusion once for the candidate-injection lane.
+    #[must_use]
+    pub fn with_relational_support(mut self, support: Arc<RelationalSupport>) -> Self {
+        self.relational_support = Some(support);
         self
     }
 
@@ -228,6 +252,7 @@ impl AttentionContext {
             rolling_vec,
             chain_log,
             concept_reader,
+            relational_support: None,
             pinned,
             recent_entities,
             dominant_concept_label,

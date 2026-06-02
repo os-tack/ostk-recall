@@ -967,6 +967,52 @@ impl ThreadsDb {
         Ok(out)
     }
 
+    /// Neighbour concept **ids** of `concept_id` (both edge directions), each
+    /// paired with the edge's derived conductance as of `now` — the id-space
+    /// traversal read for diffusion (relational-substrate slice 2).
+    ///
+    /// Works entirely in id-space (never re-resolving handles), so a
+    /// cross-scope edge authored by id (slice 4) traverses to the exact
+    /// endpoint rather than a same-handle look-alike in another scope. One
+    /// indexed scan over `concept_edges` (both endpoint indexes). Self-loops
+    /// are excluded (the table CHECK bars them anyway). **Terminal neighbours**
+    /// (`merged` / `rejected`) are excluded — diffusion must not flow into or
+    /// surface a tombstoned/anti-pattern concept (terminal states are never
+    /// touched). Multiple edges between the same pair surface as separate rows;
+    /// the caller's max-accumulation collapses them.
+    pub fn neighbors_by_id(&self, concept_id: i64, now: DateTime<Utc>) -> Result<Vec<(i64, f32)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT CASE WHEN e.from_concept = ?1 THEN e.to_concept ELSE e.from_concept END AS nbr,
+                    e.confidence, e.last_seen_at
+             FROM concept_edges e
+             JOIN concepts c
+               ON c.id = (CASE WHEN e.from_concept = ?1 THEN e.to_concept ELSE e.from_concept END)
+             WHERE (e.from_concept = ?1 OR e.to_concept = ?1)
+               AND c.status NOT IN ('merged', 'rejected')",
+        )?;
+        let rows = stmt
+            .query_map(params![concept_id], |row| {
+                let nbr: i64 = row.get(0)?;
+                let confidence: f32 = row.get(1)?;
+                let last_seen_at: String = row.get(2)?;
+                Ok((nbr, confidence, last_seen_at))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (nbr, confidence, lsa) in rows {
+            if nbr == concept_id {
+                continue; // defensive: the CHECK already bars self-edges
+            }
+            let last_seen_at = parse_ts(&lsa)?;
+            out.push((
+                nbr,
+                crate::activation::conductance_of(confidence, last_seen_at, now),
+            ));
+        }
+        Ok(out)
+    }
+
     /// Merge `from_handle` into `into_handle` (both resolved within
     /// `project`): move aliases + evidence to the canonical concept,
     /// **rewrite incident edges** onto the canonical (dropping duplicates

@@ -23,6 +23,7 @@ pub mod lanes;
 pub mod lens;
 pub mod link;
 pub mod rank;
+pub mod relational;
 pub mod rerank;
 mod row;
 pub mod stats;
@@ -35,7 +36,7 @@ pub use context::{AttentionContext, QueryContext};
 pub use error::{QueryError, Result};
 pub use freshness::{FreshnessFactory, FreshnessInstance};
 pub use hybrid::recall;
-pub use lanes::{ambient_candidates, explicit_candidates};
+pub use lanes::{ambient_candidates, explicit_candidates, relational_candidates};
 pub use ostk_recall_core::{
     AuditResult, Chunk, Links, RecallHit, RecallIntent, RecallLinkResult, RecallParams,
     RecallStats, RerankerStats, Source, SourceCount, SynthesizedPage,
@@ -46,6 +47,7 @@ pub use rank::{
     FeatureAttribution, FnFactory, RankEngine, RankFeatureFactory, RankFeatureInstance, RankedHit,
     build_engine_from_weights,
 };
+pub use relational::{RelationalLiftFactory, RelationalLiftInstance};
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;
 pub use rerank::{RerankerError, RerankerLike};

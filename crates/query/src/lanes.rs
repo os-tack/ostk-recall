@@ -272,6 +272,31 @@ pub async fn ambient_candidates(
     finalize_candidates(store, &[], &dense).await
 }
 
+/// Relational candidate lane (relational-substrate slice 2): inject the chunks
+/// of diffusion-reached neighbour concepts so they can **surface** in the lens,
+/// not merely be re-ranked. Takes a precomputed [`RelationalSupport`] (the
+/// caller runs the diffusion once and shares it with the `relational_lift`
+/// feature). Empty when no neighbour evidence resolved to a chunk. Built
+/// candidates carry their dense embedding (so `attention_affinity` can still
+/// score them) but no dense/bm25 lane rank — they did not come from a
+/// similarity query; `relational_lift` scores them by coordinate.
+pub async fn relational_candidates(
+    store: &CorpusStore,
+    support: &ostk_recall_store::RelationalSupport,
+) -> Result<Vec<Candidate>> {
+    if support.inject_chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fetched = store.fetch_chunks_by_ids(&support.inject_chunk_ids).await?;
+    let mut out = Vec::with_capacity(fetched.len());
+    for (_id, (chunk, emb)) in fetched {
+        let mut c = Candidate::for_chunk(chunk);
+        c.dense_embedding = emb;
+        out.push(c);
+    }
+    Ok(out)
+}
+
 /// Explicit candidate generation — BM25 + dense lanes.
 ///
 /// Only `QueryContext::Explicit { text, embedding }` is valid here;

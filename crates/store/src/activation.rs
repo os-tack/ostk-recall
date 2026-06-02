@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::concepts::{ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection};
+use crate::concepts::{ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection, EvidenceState};
 use crate::corpus::Result;
 use crate::threads::ThreadsDb;
 
@@ -108,6 +108,32 @@ pub struct ConceptSupport {
     pub activation: f32,
 }
 
+/// Diffusion output (relational-substrate slice 2): spreading activation over
+/// the concept edge graph from attention-lit seeds, bridged to chunk
+/// coordinates plus the resolved chunk ids worth injecting as lens candidates.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RelationalSupport {
+    /// `(source, source_id)` → max diffused activation of a concept whose
+    /// evidence cites that coordinate. The scoring map for `relational_lift`.
+    pub coord_activation: HashMap<(String, String), f32>,
+    /// Resolved chunk ids of diffused-neighbour evidence, to inject as lens
+    /// candidates so neighbour chunks can *surface*, not merely be re-ranked.
+    pub inject_chunk_ids: Vec<String>,
+}
+
+/// Diffusion knobs (slice 2), tunable. Hops kept shallow + frontier capped so
+/// one lens refresh is a handful of indexed adjacency reads.
+pub const REL_MAX_HOPS: usize = 2;
+/// Max nodes expanded per hop (strongest-weight first).
+pub const REL_FRONTIER_K: usize = 16;
+/// Per-hop multiplicative decay applied on top of edge conductance.
+pub const REL_HOP_DECAY: f32 = 0.5;
+/// Inflow below this is not propagated (prunes the long dim tail).
+pub const REL_MIN_ACTIVATION: f32 = 0.05;
+/// A concept seeds diffusion only if its dynamic (attention) signal exceeds
+/// this — keeps diffusion attention-shaped, not a global graph glow.
+pub const REL_SEED_THRESHOLD: f32 = 0.05;
+
 /// ACT-R base activation `B = ln(1 + Σ age_hours^{-d})`. `ln_1p` is the
 /// accurate small-sum form; ages are pre-floored by the caller.
 #[must_use]
@@ -153,6 +179,15 @@ pub trait ConceptActivationReader: Send + Sync {
         &self,
         since: DateTime<Utc>,
     ) -> Result<HashMap<(String, String), ConceptSupport>>;
+
+    /// Diffusion (relational-substrate slice 2): spreading activation from
+    /// attention-lit seed concepts over the edge graph, bridged to chunk
+    /// coordinates + injectable chunk ids. Default impl is empty so non-graph
+    /// readers and the explicit path degrade cleanly (the relational lens slot
+    /// skips). [`ThreadsDb`] overrides it.
+    fn relational_support(&self, _since: DateTime<Utc>) -> Result<RelationalSupport> {
+        Ok(RelationalSupport::default())
+    }
 }
 
 /// Per-concept signals harvested from one chain scan, keyed `(project, handle)`.
@@ -393,8 +428,17 @@ fn recency_lift(now: DateTime<Utc>, ts: DateTime<Utc>, tau_hours: f32) -> f32 {
 /// [`AUTHORED_EDGE_CONFIDENCE`]: crate::concepts::AUTHORED_EDGE_CONFIDENCE
 #[must_use]
 pub fn edge_conductance(edge: &ConceptEdge, now: DateTime<Utc>) -> f32 {
-    let recency = recency_lift(now, edge.last_seen_at, EDGE_TAU_HOURS);
-    (edge.confidence.max(0.0) * recency).clamp(0.0, 1.0)
+    conductance_of(edge.confidence, edge.last_seen_at, now)
+}
+
+/// Conductance from the raw `(confidence, last_seen_at)` pair — lets the
+/// id-space traversal read ([`crate::ThreadsDb::neighbors_by_id`]) compute it
+/// without materializing a full [`ConceptEdge`]. Same formula as
+/// [`edge_conductance`].
+#[must_use]
+pub fn conductance_of(confidence: f32, last_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> f32 {
+    let recency = recency_lift(now, last_seen_at, EDGE_TAU_HOURS);
+    (confidence.max(0.0) * recency).clamp(0.0, 1.0)
 }
 
 impl ConceptActivationReader for ThreadsDb {
@@ -434,6 +478,112 @@ impl ConceptActivationReader for ThreadsDb {
             }
         }
         Ok(out)
+    }
+
+    fn relational_support(&self, since: DateTime<Utc>) -> Result<RelationalSupport> {
+        // 1. Seeds = attention-lit concepts. Weight on the DYNAMIC signal only
+        //    (decayed_access + focus_lift), never durable `confidence` — diffuse
+        //    from what attention is touching now, not from every Active concept
+        //    (which would glow the whole graph).
+        let seeds: Vec<(i64, f32)> = self
+            .activations_internal(None, since)?
+            .into_iter()
+            .filter_map(|(rec, act)| {
+                let dynamic = act.why.decayed_access + act.why.focus_lift;
+                (dynamic > REL_SEED_THRESHOLD).then_some((rec.id, dynamic))
+            })
+            .collect();
+        if seeds.is_empty() {
+            return Ok(RelationalSupport::default());
+        }
+
+        // 2. Spreading activation in id-space (cross-scope safe).
+        let now = Utc::now();
+        let seed_ids: HashSet<i64> = seeds.iter().map(|(id, _)| *id).collect();
+        let mut weight: HashMap<i64, f32> = seeds.into_iter().collect();
+        let mut frontier: Vec<i64> = weight.keys().copied().collect();
+        for _hop in 0..REL_MAX_HOPS {
+            // Expand the strongest FRONTIER_K nodes by their *current* weight.
+            frontier.sort_by(|a, b| {
+                weight[b]
+                    .partial_cmp(&weight[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            frontier.truncate(REL_FRONTIER_K);
+            // Aggregate the best inflow each neighbour receives THIS hop (max
+            // across all expanding sources), then commit + re-queue only the
+            // neighbours whose weight strictly improves. Taking the per-hop max
+            // (not the first-seen value) means a node reached weakly and then
+            // strongly expands with its strongest inflow, and re-queue-on-improve
+            // lets a stronger later path correct an earlier weak one. Weights
+            // strictly increase and each hop's inflow is < its source's weight,
+            // so this converges (and REL_MAX_HOPS bounds it regardless).
+            let mut best: HashMap<i64, f32> = HashMap::new();
+            for src_id in &frontier {
+                let src_w = weight[src_id];
+                for (nbr_id, cond) in self.neighbors_by_id(*src_id, now)? {
+                    let inflow = src_w * cond * REL_HOP_DECAY;
+                    if inflow < REL_MIN_ACTIVATION {
+                        continue;
+                    }
+                    let e = best.entry(nbr_id).or_insert(0.0);
+                    if inflow > *e {
+                        *e = inflow;
+                    }
+                }
+            }
+            let mut next: Vec<i64> = Vec::new();
+            for (nbr_id, inflow) in best {
+                let cur = weight.get(&nbr_id).copied().unwrap_or(0.0);
+                if inflow > cur {
+                    weight.insert(nbr_id, inflow);
+                    next.push(nbr_id);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+
+        // 3. Bridge each diffused concept to its evidence coordinates and the
+        //    resolved chunk ids to inject (max activation per coordinate).
+        let mut coord_activation: HashMap<(String, String), f32> = HashMap::new();
+        let mut inject_chunk_ids: Vec<String> = Vec::new();
+        let mut seen_chunks: HashSet<String> = HashSet::new();
+        for (cid, w) in &weight {
+            // Seeds are the *current focus*; their own chunks already surface
+            // via attention. relational_lift is the NEIGHBOUR signal — emitting
+            // seed coords here would let the (highest-weight) seed dominate the
+            // feature's min-max normalization and push real neighbours to ~0.
+            if seed_ids.contains(cid) {
+                continue;
+            }
+            for ev in self.list_concept_evidence(*cid)? {
+                // Only live evidence bridges — skip orphaned / inactive rows so
+                // diffusion can't inject a chunk an evidence link has retired.
+                if ev.relation_state != EvidenceState::Active {
+                    continue;
+                }
+                coord_activation
+                    .entry((ev.source.clone(), ev.source_id.clone()))
+                    .and_modify(|cur| {
+                        if *w > *cur {
+                            *cur = *w;
+                        }
+                    })
+                    .or_insert(*w);
+                if let Some(chunk_id) = ev.last_resolved_chunk_id {
+                    if seen_chunks.insert(chunk_id.clone()) {
+                        inject_chunk_ids.push(chunk_id);
+                    }
+                }
+            }
+        }
+        Ok(RelationalSupport {
+            coord_activation,
+            inject_chunk_ids,
+        })
     }
 }
 
@@ -654,6 +804,299 @@ mod tests {
         assert_eq!(
             support.handle, "high",
             "winner is the higher-activation concept"
+        );
+    }
+
+    // --- Slice 2: diffusion (neighbors_by_id + relational_support) ----------
+
+    fn ev(db: &ThreadsDb, id: i64, source_id: &str, chunk: Option<&str>) {
+        db.attach_concept_evidence(&EvidenceAttach {
+            concept_id: id,
+            project: G,
+            source: "code",
+            source_id,
+            chunk_id: chunk,
+            content_sha256: None,
+            anchor_vec: None,
+            score: Some(0.5),
+            reason: Some("test"),
+        })
+        .unwrap();
+    }
+
+    fn id_of(db: &ThreadsDb, project: &str, handle: &str) -> i64 {
+        db.get_concept(project, handle).unwrap().unwrap().id
+    }
+
+    #[test]
+    fn neighbors_by_id_both_directions_by_id_not_handle() {
+        let (_t, db) = db();
+        for h in ["a", "b", "c"] {
+            active(&db, h);
+        }
+        // A decoy in another scope sharing handle "b" — must never be returned.
+        db.ensure_concept("memories", "b", ConceptStatus::Active)
+            .unwrap();
+        let (a, b, c) = (id_of(&db, G, "a"), id_of(&db, G, "b"), id_of(&db, G, "c"));
+        let decoy = id_of(&db, "memories", "b");
+        db.add_concept_edge_by_id(a, "rel", b, 1.0, EdgeSource::Observed, None, None)
+            .unwrap(); // outgoing
+        db.add_concept_edge_by_id(c, "rel", a, 1.0, EdgeSource::Observed, None, None)
+            .unwrap(); // incoming
+        let nbrs = db.neighbors_by_id(a, Utc::now()).unwrap();
+        let ids: Vec<i64> = nbrs.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&b) && ids.contains(&c), "both directions");
+        assert!(!ids.contains(&a), "excludes self");
+        assert!(
+            !ids.contains(&decoy),
+            "traverses by id, never the same-handle decoy in another scope"
+        );
+        assert!(
+            nbrs.iter().all(|(_, cond)| *cond > 0.0),
+            "conductance paired"
+        );
+    }
+
+    #[test]
+    fn relational_support_lights_neighbor_with_decayed_inflow() {
+        let (_t, db) = db();
+        active(&db, "tori");
+        active(&db, "ostk-recall");
+        // A recent access gives `tori` dynamic (attention) activation → a seed.
+        db.record_concept_accessed(G, "tori", "recall:path", "qh-1")
+            .unwrap();
+        let (tori, orec) = (id_of(&db, G, "tori"), id_of(&db, G, "ostk-recall"));
+        // Strong fresh edge so the neighbour clears the prune floor.
+        db.add_concept_edge_by_id(
+            tori,
+            "works_on",
+            orec,
+            1.0,
+            EdgeSource::Authored,
+            None,
+            None,
+        )
+        .unwrap();
+        ev(&db, tori, "tori-src", Some("tori-chunk"));
+        ev(&db, orec, "or-src", Some("or-chunk"));
+        ev(&db, orec, "or-unresolved", None); // unresolved → not injectable
+
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        // The seed's own coord is NOT emitted — it surfaces via attention; the
+        // relational signal is purely the diffused neighbour.
+        assert!(
+            !sup.coord_activation
+                .contains_key(&("code".to_string(), "tori-src".to_string())),
+            "seed coord is excluded from the relational map"
+        );
+        let nbr_w = *sup
+            .coord_activation
+            .get(&("code".to_string(), "or-src".to_string()))
+            .expect("neighbour coord present (diffusion reached it)");
+        assert!(nbr_w > REL_MIN_ACTIVATION, "neighbour lit above the floor");
+        assert!(
+            (0.18..0.22).contains(&nbr_w),
+            "≈ seed_dyn × conductance × HOP_DECAY, got {nbr_w}"
+        );
+        // Injection: the neighbour's resolved chunk only — not the seed's
+        // (excluded), not the unresolved row (no chunk to inject).
+        assert_eq!(sup.inject_chunk_ids, vec!["or-chunk".to_string()]);
+        assert!(
+            sup.coord_activation
+                .contains_key(&("code".to_string(), "or-unresolved".to_string())),
+            "unresolved evidence still scores by coord, just isn't injected"
+        );
+    }
+
+    #[test]
+    fn relational_support_seeds_on_dynamic_signal_not_durable() {
+        let (_t, db) = db();
+        // Active (durable confidence) but no access/focus → NOT a seed.
+        active(&db, "lonely");
+        active(&db, "x");
+        let (lonely, x) = (id_of(&db, G, "lonely"), id_of(&db, G, "x"));
+        db.add_concept_edge_by_id(lonely, "rel", x, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        ev(&db, x, "x-src", Some("x-chunk"));
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        assert!(
+            sup.coord_activation.is_empty(),
+            "a durable-only Active concept does not seed diffusion (no global glow)"
+        );
+        assert!(sup.inject_chunk_ids.is_empty());
+    }
+
+    #[test]
+    fn relational_support_two_hops_not_three() {
+        let (_t, db) = db();
+        for h in ["a", "b", "c", "d"] {
+            active(&db, h);
+        }
+        db.record_concept_accessed(G, "a", "recall:path", "qh-1")
+            .unwrap();
+        let ids: Vec<i64> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|h| id_of(&db, G, h))
+            .collect();
+        // Strong fresh chain a→b→c→d.
+        for w in ids.windows(2) {
+            db.add_concept_edge_by_id(w[0], "rel", w[1], 1.0, EdgeSource::Observed, None, None)
+                .unwrap();
+        }
+        ev(&db, ids[1], "b-src", Some("b-chunk"));
+        ev(&db, ids[2], "c-src", Some("c-chunk"));
+        ev(&db, ids[3], "d-src", Some("d-chunk"));
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        assert!(
+            sup.coord_activation
+                .contains_key(&("code".to_string(), "b-src".to_string())),
+            "hop 1 reached"
+        );
+        assert!(
+            sup.coord_activation
+                .contains_key(&("code".to_string(), "c-src".to_string())),
+            "hop 2 reached"
+        );
+        assert!(
+            !sup.coord_activation
+                .contains_key(&("code".to_string(), "d-src".to_string())),
+            "hop 3 NOT reached (MAX_HOPS = 2)"
+        );
+    }
+
+    #[test]
+    fn relational_support_empty_without_active_seeds() {
+        let (_t, db) = db();
+        db.ensure_concept(G, "cand", ConceptStatus::Candidate)
+            .unwrap();
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        assert!(sup.coord_activation.is_empty() && sup.inject_chunk_ids.is_empty());
+    }
+
+    #[test]
+    fn neighbors_by_id_excludes_terminal() {
+        let (_t, db) = db();
+        active(&db, "a");
+        active(&db, "ok");
+        db.ensure_concept(G, "ghost", ConceptStatus::Active)
+            .unwrap();
+        let (a, ok, ghost) = (
+            id_of(&db, G, "a"),
+            id_of(&db, G, "ok"),
+            id_of(&db, G, "ghost"),
+        );
+        db.add_concept_edge_by_id(a, "rel", ok, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        db.add_concept_edge_by_id(a, "rel", ghost, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        db.set_concept_status(G, "ghost", ConceptStatus::Rejected, None)
+            .unwrap();
+        let ids: Vec<i64> = db
+            .neighbors_by_id(a, Utc::now())
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&ok), "live neighbour present");
+        assert!(
+            !ids.contains(&ghost),
+            "rejected (terminal) neighbour excluded"
+        );
+    }
+
+    #[test]
+    fn relational_support_excludes_terminal_neighbour() {
+        let (_t, db) = db();
+        active(&db, "tori");
+        db.ensure_concept(G, "ghost", ConceptStatus::Active)
+            .unwrap();
+        db.record_concept_accessed(G, "tori", "recall:path", "qh-1")
+            .unwrap();
+        let (tori, ghost) = (id_of(&db, G, "tori"), id_of(&db, G, "ghost"));
+        db.add_concept_edge_by_id(tori, "rel", ghost, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        ev(&db, ghost, "ghost-src", Some("ghost-chunk"));
+        db.set_concept_status(G, "ghost", ConceptStatus::Rejected, None)
+            .unwrap();
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        assert!(
+            sup.coord_activation.is_empty() && sup.inject_chunk_ids.is_empty(),
+            "diffusion does not flow into a terminal (rejected) neighbour"
+        );
+    }
+
+    #[test]
+    fn relational_support_skips_orphaned_evidence() {
+        let (_t, db) = db();
+        active(&db, "tori");
+        active(&db, "x");
+        db.record_concept_accessed(G, "tori", "recall:path", "qh-1")
+            .unwrap();
+        let (tori, x) = (id_of(&db, G, "tori"), id_of(&db, G, "x"));
+        db.add_concept_edge_by_id(tori, "rel", x, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        ev(&db, x, "x-src", Some("x-chunk"));
+        // Orphan the neighbour's only evidence row.
+        let rows = db.evidence_to_reconcile().unwrap();
+        let rowid = rows.iter().find(|r| r.source_id == "x-src").unwrap().rowid;
+        db.mark_evidence_orphaned(rowid).unwrap();
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        assert!(
+            sup.coord_activation.is_empty() && sup.inject_chunk_ids.is_empty(),
+            "orphaned evidence is not bridged"
+        );
+    }
+
+    #[test]
+    fn relational_support_neighbour_inflow_is_max_not_summed() {
+        // Two seeds both reach neighbour `c` in one hop. `c` takes the MAX
+        // inflow (the stronger seed), never the sum.
+        let (_t, db) = db();
+        active(&db, "s1");
+        active(&db, "s2");
+        active(&db, "c");
+        // s1 is the stronger seed (3 distinct accesses vs s2's 1).
+        for qh in ["q1", "q2", "q3"] {
+            db.record_concept_accessed(G, "s1", "recall:path", qh)
+                .unwrap();
+        }
+        db.record_concept_accessed(G, "s2", "recall:path", "q9")
+            .unwrap();
+        let (s1, s2, c) = (id_of(&db, G, "s1"), id_of(&db, G, "s2"), id_of(&db, G, "c"));
+        db.add_concept_edge_by_id(s1, "rel", c, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        db.add_concept_edge_by_id(s2, "rel", c, 1.0, EdgeSource::Observed, None, None)
+            .unwrap();
+        ev(&db, c, "c-src", Some("c-chunk"));
+
+        // s1's dynamic seed weight, to compare against.
+        let acts = db
+            .concept_activations(None, default_since(Utc::now()))
+            .unwrap();
+        let s1_dyn = {
+            let a = acts.iter().find(|a| a.handle == "s1").unwrap();
+            a.why.decayed_access + a.why.focus_lift
+        };
+        let s2_dyn = {
+            let a = acts.iter().find(|a| a.handle == "s2").unwrap();
+            a.why.decayed_access + a.why.focus_lift
+        };
+        assert!(s1_dyn > s2_dyn, "s1 is the stronger seed");
+
+        let sup = db.relational_support(default_since(Utc::now())).unwrap();
+        let c_w = *sup
+            .coord_activation
+            .get(&("code".to_string(), "c-src".to_string()))
+            .expect("neighbour reached");
+        // conductance ≈ 1 on the fresh edges, so the max path ≈ s1_dyn × 0.5.
+        let expected_max = s1_dyn * REL_HOP_DECAY;
+        assert!(
+            (c_w - expected_max).abs() < 0.03,
+            "neighbour took the MAX source inflow ≈ {expected_max}, got {c_w}"
+        );
+        assert!(
+            c_w < (s1_dyn + s2_dyn) * REL_HOP_DECAY - 0.05,
+            "neighbour inflow is NOT the sum of both sources"
         );
     }
 }

@@ -37,7 +37,7 @@ use ostk_recall_store::{AccessKind, ChainLogReader};
 
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
-use crate::lanes::ambient_candidates;
+use crate::lanes::{ambient_candidates, relational_candidates};
 use crate::rank::{FeatureAttribution, RankEngine, RankedHit, cosine_similarity};
 
 // ---------------------------------------------------------------------
@@ -179,11 +179,45 @@ pub async fn build_lens(
     corpus: &CorpusStore,
     config: &LensConfig,
 ) -> Result<Lens> {
-    let candidates =
+    let mut candidates =
         ambient_candidates(corpus, attn_ctx, None, config.candidate_k_per_lane).await?;
 
+    // Relational lane + cache (slice 2). Gated on the relational_lift feature
+    // being active — if an operator zeroes its weight, the lane is off too, so
+    // injection can't smuggle chunks into another slot. When active, run the
+    // diffusion ONCE: inject the neighbour chunks here AND stash the result on a
+    // cloned context so the relational_lift feature reuses it during ranking
+    // instead of recomputing the BFS + evidence reads. Union by chunk_id; a
+    // chunk already in the dense pool keeps its dense lane evidence.
+    let lens_attn: std::borrow::Cow<'_, AttentionContext> =
+        if engine.feature_weight("relational_lift") > 0.0 {
+            match attn_ctx.concept_reader.as_ref() {
+                Some(reader) => {
+                    let support = std::sync::Arc::new(
+                        reader.relational_support(ostk_recall_store::default_since_now())?,
+                    );
+                    let injected = relational_candidates(corpus, &support).await?;
+                    if !injected.is_empty() {
+                        let have: HashSet<String> = candidates
+                            .iter()
+                            .map(|c| c.chunk.chunk_id.clone())
+                            .collect();
+                        candidates.extend(
+                            injected
+                                .into_iter()
+                                .filter(|c| !have.contains(&c.chunk.chunk_id)),
+                        );
+                    }
+                    std::borrow::Cow::Owned(attn_ctx.clone().with_relational_support(support))
+                }
+                None => std::borrow::Cow::Borrowed(attn_ctx),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(attn_ctx)
+        };
+
     let ranked = engine
-        .rank(candidates, &QueryContext::Ambient, attn_ctx)
+        .rank(candidates, &QueryContext::Ambient, lens_attn.as_ref())
         .await?;
 
     // Refractory: decay chunks surfaced in a recent lens so the portfolio
@@ -271,6 +305,13 @@ pub fn default_slots() -> Vec<SlotDef> {
             name: "concept",
             kind: SlotKind::Dominance {
                 feature: "concept_support",
+            },
+            count: 1,
+        },
+        SlotDef {
+            name: "relational",
+            kind: SlotKind::Dominance {
+                feature: "relational_lift",
             },
             count: 1,
         },
