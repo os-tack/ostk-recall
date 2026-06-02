@@ -6,7 +6,7 @@ use ostk_recall_attention_mcp::{
     AttentionDispatch, AttentionHandlersError, DefaultAttentionHandlers, attention_tools,
     thread_tools,
 };
-use ostk_recall_core::AttentionBiasParams;
+use ostk_recall_core::{AttentionBiasParams, Config};
 use ostk_recall_query::{
     QueryEngine, QueryError, RecallHit, RecallParams, SynthesizedPage, Synthesizer,
 };
@@ -40,6 +40,12 @@ pub struct Server {
     engine: Arc<QueryEngine>,
     attention: Option<Arc<AttentionDispatch>>,
     resources: Arc<ResourceRegistry>,
+    /// Loaded config, when the daemon has one. Required by the
+    /// `memory_concept` `crystallize` action (it resolves the target dir from
+    /// the `[[sources]]` block declaring the node's `entity_type`); absent on
+    /// the `--stdio`/test paths, where crystallize returns an error rather than
+    /// panicking.
+    config: Option<Arc<Config>>,
 }
 
 impl Server {
@@ -49,6 +55,7 @@ impl Server {
             engine: Arc::new(engine),
             attention: None,
             resources: Arc::new(ResourceRegistry::new()),
+            config: None,
         }
     }
 
@@ -58,7 +65,17 @@ impl Server {
             engine,
             attention: None,
             resources: Arc::new(ResourceRegistry::new()),
+            config: None,
         }
+    }
+
+    /// Attach the loaded config so the `memory_concept` `crystallize` action can
+    /// resolve a typed node's stub-file directory. Without it, crystallize is
+    /// rejected (`invalid_request`); all other verbs are unaffected.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<Config>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Attach an `AttentionDispatch` so the attention/thread MCP tools
@@ -577,7 +594,13 @@ impl Server {
             other => {
                 if let Some(d) = self.attention.as_ref() {
                     if crate::memory::is_memory_tool(other) {
-                        let out = crate::memory::dispatch_memory(d.as_ref(), other, args).await?;
+                        let out = crate::memory::dispatch_memory(
+                            d.as_ref(),
+                            self.config.as_deref(),
+                            other,
+                            args,
+                        )
+                        .await?;
                         let text = serde_json::to_string(&out)
                             .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
                         return Ok(json!({

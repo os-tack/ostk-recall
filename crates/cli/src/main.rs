@@ -159,6 +159,17 @@ enum Command {
         #[command(subcommand)]
         verb: LensVerb,
     },
+    /// Slice 5: crystallize a proposed typed concept into a stub markdown
+    /// file under the `[[sources]]` directory declaring its `entity_type` —
+    /// the human "confirm" step of automagic promotion. Never overwrites an
+    /// existing file.
+    Crystallize {
+        /// Handle of the typed concept to crystallize.
+        handle: String,
+        /// Project scope of the concept (default: global `""`).
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -680,6 +691,9 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
         Command::Lens { verb } => {
             run_lens(&config_path, verb)?;
         }
+        Command::Crystallize { handle, project } => {
+            run_crystallize(&config_path, &handle, project.as_deref().unwrap_or(""))?;
+        }
     }
 
     Ok(())
@@ -792,6 +806,47 @@ async fn run_manifest(config_path: &Path, verb: ManifestVerb) -> Result<()> {
             println!("rebuilt {n} chunks into ingest.sqlite (run_id={run_id})");
             println!("next step: run a full `ostk-recall scan` to refresh mtime/size metadata.");
         }
+    }
+    Ok(())
+}
+
+/// Slice 5: crystallize a typed concept into a stub markdown file. Resolves
+/// the concept (alias/merge/global-aware) so the file lands under the source
+/// declaring the *resolved* record's `entity_type`/project; never overwrites.
+fn run_crystallize(config_path: &std::path::Path, handle: &str, project: &str) -> Result<()> {
+    let cfg = ostk_recall_core::Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    let threads =
+        ThreadsDb::open(&root).map_err(|e| anyhow::anyhow!("open threads ledger: {e}"))?;
+    let rec = threads
+        .resolve_concept(project, handle)
+        .map_err(|e| anyhow::anyhow!("resolve concept: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("no concept resolves for handle `{handle}` in project `{project}`")
+        })?;
+    if rec.status != ostk_recall_store::ConceptStatus::Proposed {
+        anyhow::bail!(
+            "crystallize requires a proposed concept; `{}` is {}",
+            rec.handle,
+            rec.status.as_str()
+        );
+    }
+    let kind = rec.kind.clone().ok_or_else(|| {
+        anyhow::anyhow!("concept `{}` has no kind; cannot crystallize", rec.handle)
+    })?;
+    let req = ostk_recall_mcp::crystallize::CrystallizeRequest {
+        project: &rec.project,
+        kind: &kind,
+        slug: &rec.handle,
+        summary: rec.summary.as_deref(),
+    };
+    let out = ostk_recall_mcp::crystallize::crystallize(&cfg, &req)
+        .map_err(|e| anyhow::anyhow!("crystallize: {e}"))?;
+    if out.created {
+        println!("crystallized {} → {}", rec.handle, out.path.display());
+    } else {
+        println!("exists (unchanged): {}", out.path.display());
     }
     Ok(())
 }

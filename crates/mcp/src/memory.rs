@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use ostk_recall_attention_mcp::{AttentionDispatch, DefaultAttentionHandlers};
-use ostk_recall_core::RecallHit;
+use ostk_recall_core::{Config, RecallHit};
 use ostk_recall_store::concepts::HitView;
 use ostk_recall_store::{
     AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptActivation, ConceptActivationReader,
@@ -129,11 +129,11 @@ pub fn memory_tools() -> Vec<Value> {
         }),
         json!({
             "name": "memory_concept",
-            "description": "Front door for durable concept cards. Actions: show | list | promote | reject | merge | alias | summarize. Concepts are use-driven (candidate→proposed→active) with mandatory evidence; only `active` concepts may bias recall.",
+            "description": "Front door for durable concept cards. Actions: show | list | promote | reject | merge | alias | summarize | crystallize. Concepts are use-driven (candidate→proposed→active) with mandatory evidence; only `active` concepts may bias recall. `crystallize` writes a stub `.md` file for a proposed typed node under its source's directory (human confirm; never overwrites).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["show", "list", "promote", "reject", "merge", "alias", "summarize"] },
+                    "action": { "type": "string", "enum": ["show", "list", "promote", "reject", "merge", "alias", "summarize", "crystallize"] },
                     "handle": { "type": "string" },
                     "project": project_prop(),
                     "status": { "type": "string", "enum": ["candidate", "proposed", "active", "rejected", "merged"], "description": "Filter for action=list." },
@@ -476,6 +476,7 @@ pub fn reflect_promote(threads: &ThreadsDb) -> Result<(usize, Vec<String>), Json
 /// (those need the `QueryEngine` and are handled in `server.rs`).
 pub async fn dispatch_memory(
     dispatch: &AttentionDispatch,
+    config: Option<&Config>,
     name: &str,
     args: Value,
 ) -> Result<Value, JsonRpcError> {
@@ -484,7 +485,7 @@ pub async fn dispatch_memory(
         "memory_surface" => memory_surface(dispatch, &args).await,
         "memory_focus" => memory_focus(dispatch, args).await,
         "memory_remember" => memory_remember(threads, &args),
-        "memory_concept" => memory_concept(threads, &args),
+        "memory_concept" => memory_concept(threads, config, &args),
         "memory_connect" => memory_connect(threads, &args),
         other => Err(JsonRpcError::method_not_found(&format!(
             "tools/call/{other}"
@@ -512,6 +513,10 @@ fn map_store_err(e: ostk_recall_store::StoreError) -> JsonRpcError {
 }
 
 fn concept_to_json(rec: &ostk_recall_store::ConceptRecord) -> Value {
+    // Slice 5: a proposed *typed* node can be crystallized into a stub file —
+    // surface that as an action handle so the frame can offer it. Crystallize is
+    // idempotent (no-op if the file exists), so no fs probe is needed here.
+    let crystallizable = rec.kind.is_some() && matches!(rec.status, ConceptStatus::Proposed);
     json!({
         "project": rec.project,
         "handle": rec.handle,
@@ -520,6 +525,7 @@ fn concept_to_json(rec: &ostk_recall_store::ConceptRecord) -> Value {
         "confidence": rec.confidence,
         "merged_into": rec.merged_into,
         "kind": rec.kind,
+        "crystallizable": crystallizable,
         "created_at": rec.created_at.to_rfc3339(),
         "updated_at": rec.updated_at.to_rfc3339(),
     })
@@ -767,7 +773,11 @@ fn memory_remember(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcEr
     }
 }
 
-fn memory_concept(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcError> {
+fn memory_concept(
+    threads: &ThreadsDb,
+    config: Option<&Config>,
+    args: &Value,
+) -> Result<Value, JsonRpcError> {
     let action = str_arg(args, "action")?;
     let project = project_arg(args);
     match action.as_str() {
@@ -870,6 +880,44 @@ fn memory_concept(threads: &ThreadsDb, args: &Value) -> Result<Value, JsonRpcErr
                 .set_concept_summary(&rec.project, &rec.handle, &summary)
                 .map_err(map_store_err)?;
             concept_card(threads, &rec.project, &rec.handle)
+        }
+        "crystallize" => {
+            // Slice 5: reify a proposed typed node into a stub `.md` file (human
+            // confirm — never auto-write). Built from the RESOLVED record's own
+            // scope, since `resolve_concept` may fall back to a global concept.
+            let handle = str_arg(args, "handle")?;
+            let rec = resolve_or_err(threads, &project, &handle)?;
+            // Crystallize is the confirm step for a *proposed* typed node — the
+            // same gate the `crystallizable` surface flag advertises. Refuse
+            // candidate/active/rejected/merged so a stub is never written for a
+            // non-proposed (e.g. rejected) concept.
+            if rec.status != ConceptStatus::Proposed {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "crystallize requires a proposed concept; `{}` is {}",
+                    rec.handle,
+                    rec.status.as_str()
+                )));
+            }
+            let kind = rec.kind.clone().ok_or_else(|| {
+                JsonRpcError::invalid_params("concept has no `kind`; cannot crystallize")
+            })?;
+            let cfg = config.ok_or_else(|| {
+                JsonRpcError::invalid_request("crystallize requires server config")
+            })?;
+            let req = crate::crystallize::CrystallizeRequest {
+                project: &rec.project,
+                kind: &kind,
+                slug: &rec.handle,
+                summary: rec.summary.as_deref(),
+            };
+            let out = crate::crystallize::crystallize(cfg, &req)
+                .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+            Ok(json!({
+                "path": out.path.display().to_string(),
+                "created": out.created,
+                "handle": rec.handle,
+                "kind": kind,
+            }))
         }
         "split" => Err(JsonRpcError::invalid_params(
             "memory_concept split is deferred to a follow-up; use merge + alias for now",
@@ -1019,11 +1067,12 @@ mod tests {
             .unwrap();
         let promoted = memory_concept(
             &db,
+            None,
             &json!({"action":"promote","handle":"mish","to":"active"}),
         )
         .unwrap();
         assert_eq!(promoted["concept"]["status"], json!("active"));
-        let card = memory_concept(&db, &json!({"action":"show","handle":"mish"})).unwrap();
+        let card = memory_concept(&db, None, &json!({"action":"show","handle":"mish"})).unwrap();
         assert_eq!(card["concept"]["handle"], json!("mish"));
 
         let conn = memory_connect(
@@ -1039,12 +1088,13 @@ mod tests {
         let (_t, db) = db();
         db.ensure_typed_concept("", "tori", ConceptStatus::Proposed, Some("person"))
             .unwrap();
-        let card = memory_concept(&db, &json!({"action":"show","handle":"tori"})).unwrap();
+        let card = memory_concept(&db, None, &json!({"action":"show","handle":"tori"})).unwrap();
         assert_eq!(card["concept"]["kind"], json!("person"));
         // An untyped concept reports null kind.
         db.ensure_concept("", "slipstream", ConceptStatus::Active)
             .unwrap();
-        let card2 = memory_concept(&db, &json!({"action":"show","handle":"slipstream"})).unwrap();
+        let card2 =
+            memory_concept(&db, None, &json!({"action":"show","handle":"slipstream"})).unwrap();
         assert_eq!(card2["concept"]["kind"], serde_json::Value::Null);
     }
 
@@ -1110,7 +1160,8 @@ mod tests {
 
         // The concept card surfaces the edge with authored provenance and the
         // low prior — NOT the old operator-asserted 0.6.
-        let card = memory_concept(&db, &json!({"action":"show","handle":"ostk-recall"})).unwrap();
+        let card =
+            memory_concept(&db, None, &json!({"action":"show","handle":"ostk-recall"})).unwrap();
         let edges = card["edges_from"].as_array().unwrap();
         let edge = edges
             .iter()
@@ -1123,5 +1174,78 @@ mod tests {
             (conf - f64::from(AUTHORED_EDGE_CONFIDENCE)).abs() < 1e-6,
             "authored edge enters at the low prior, got {conf}"
         );
+    }
+
+    #[test]
+    fn memory_concept_schema_lists_crystallize() {
+        let specs = memory_tools();
+        let mc = specs
+            .iter()
+            .find(|t| t["name"] == json!("memory_concept"))
+            .expect("memory_concept tool spec");
+        let actions = mc["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(actions.iter().any(|a| a == &json!("crystallize")));
+    }
+
+    #[test]
+    fn crystallize_action_writes_file_and_requires_config() {
+        let (tmp, db) = db();
+        let people = tmp.path().join("people");
+        std::fs::create_dir_all(&people).unwrap();
+        db.ensure_typed_concept("memories", "sarah", ConceptStatus::Proposed, Some("person"))
+            .unwrap();
+
+        // A proposed typed node surfaces `crystallizable: true` on its card.
+        let rec = db.resolve_concept("memories", "sarah").unwrap().unwrap();
+        assert_eq!(concept_to_json(&rec)["crystallizable"], json!(true));
+
+        // Real config with a person markdown source (via the TOML load path).
+        let toml = format!(
+            "[corpus]\nroot = \"{root}/corpus\"\n[embedder]\nmodel = \"m\"\n\
+             [[sources]]\nkind = \"markdown\"\nproject = \"memories\"\n\
+             paths = [\"{people}\"]\nextensions = [\"md\"]\nentity_type = \"person\"\n\
+             edges = [\"families\"]\n",
+            root = tmp.path().display(),
+            people = people.display(),
+        );
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, toml).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+
+        // With config → writes the stub.
+        let out = memory_concept(
+            &db,
+            Some(&cfg),
+            &json!({"action":"crystallize","handle":"sarah","project":"memories"}),
+        )
+        .unwrap();
+        assert_eq!(out["created"], json!(true));
+        assert!(out["path"].as_str().unwrap().ends_with("people/sarah.md"));
+        assert!(people.join("sarah.md").exists());
+
+        // Without config → invalid_request, never panics.
+        assert!(
+            memory_concept(
+                &db,
+                None,
+                &json!({"action":"crystallize","handle":"sarah","project":"memories"}),
+            )
+            .is_err()
+        );
+
+        // Status gate: a non-proposed typed concept (here Active) is refused.
+        db.ensure_typed_concept("memories", "mallory", ConceptStatus::Active, Some("person"))
+            .unwrap();
+        assert!(
+            memory_concept(
+                &db,
+                Some(&cfg),
+                &json!({"action":"crystallize","handle":"mallory","project":"memories"}),
+            )
+            .is_err()
+        );
+        assert!(!people.join("mallory.md").exists());
     }
 }

@@ -15,7 +15,7 @@
 //! ingest `Pipeline` has no ledger handle. Idempotent: re-seeding ensures
 //! (never duplicates) and re-touches edges (bumps recency = use).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -333,6 +333,197 @@ pub struct MentionStats {
     /// Distinct surface forms dropped because they were ambiguous within a
     /// scope tier (named, not silent — the disambiguation seam).
     pub ambiguous_skipped: u64,
+    /// Slice 5: recurring unresolved prose names materialized as context-typed
+    /// `Proposed` nodes (born this pass, gate-crossed).
+    pub candidates_materialized: u64,
+    /// Slice 5: recurring prose names dropped because their dominant containing
+    /// kind was a tie at/above the recurrence gate (can't context-type — named,
+    /// not silent).
+    pub candidates_ambiguous: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Relational-substrate slice 5: automagic promotion.
+//
+// During the mention phase (above), prose tokens that the gazetteer does NOT
+// resolve are conservative proper-name CANDIDATES. We aggregate them in memory
+// across the whole full-scan, then materialize only those recurring across
+// `PROSE_RECURRENCE_MIN_DOCS` distinct docs of one dominant `entity_type` — born
+// `Candidate`, promoted in-pass to `Proposed` (conf 0.4, scoped — no global
+// reflect sweep), and connected via observed `mentions` edges so the new node
+// joins the diffusible graph. A human later confirms a `crystallize` to write a
+// stub file. Propose, never auto-write.
+// ---------------------------------------------------------------------------
+
+/// Distinct docs of the dominant kind a prose name must recur across before it
+/// is materialized as a context-typed node. `>= REFLECT_EVIDENCE_THRESHOLD` (2)
+/// by construction, so a materialized node already clears the reflect gate.
+const PROSE_RECURRENCE_MIN_DOCS: usize = 3;
+
+/// Lowercased non-name words that survive the capitalized-mid-sentence rule too
+/// often (sentence openers that recur mid-sentence, weekday/month names). A
+/// candidate whose normalized form is here is dropped before aggregation.
+const STOPWORDS: &[&str] = &[
+    "the",
+    "and",
+    "but",
+    "for",
+    "nor",
+    "yet",
+    "with",
+    "from",
+    "into",
+    "this",
+    "that",
+    "these",
+    "those",
+    "your",
+    "their",
+    "our",
+    "his",
+    "her",
+    "its",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "today",
+    "tomorrow",
+    "yesterday",
+    "okay",
+];
+
+/// A conservative proper-name candidate extracted from raw prose: `display` is
+/// the cased form (for the eventual handle), `norm` its normalized key (for
+/// dedup + known-form lookup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProseCandidate {
+    norm: String,
+    display: String,
+}
+
+/// One doc that contributed a prose mention of a candidate: the doc's node id +
+/// handle (for the audit `ConceptConnected`) and its source `entity_type` (for
+/// the dominant-kind gate + context-typing).
+#[derive(Debug, Clone)]
+struct DocHit {
+    doc_id: i64,
+    doc_handle: String,
+    kind: String,
+}
+
+/// In-memory aggregate for one normalized candidate within a project: a
+/// representative display form + the distinct docs that named it. This map IS
+/// the candidate stage — only gate-crossers get reified.
+#[derive(Debug, Default)]
+struct CandidateAgg {
+    display: String,
+    hits: Vec<DocHit>,
+}
+
+/// True for a name-token char: ASCII/unicode letter, or an internal `'`/`-`
+/// (trimmed at the edges by [`refine_token`]).
+fn is_name_char(c: char) -> bool {
+    c.is_alphabetic() || c == '\'' || c == '-'
+}
+
+/// Strip a leading markdown line marker (`#`/`>`/`-`/`*`/`N.`) and surrounding
+/// whitespace so the word that follows is treated as sentence-start.
+fn strip_line_marker(line: &str) -> &str {
+    let t = line.trim_start();
+    // ATX heading / blockquote / bullet markers.
+    let t = t.trim_start_matches(['#', '>', '-', '*', '+']).trim_start();
+    // Ordered-list `N.` / `N)` marker.
+    let bytes = t.as_bytes();
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && matches!(bytes.get(digits), Some(b'.' | b')')) {
+        t[digits + 1..].trim_start()
+    } else {
+        t
+    }
+}
+
+/// Trim edge `'`/`-`, then strip a trailing possessive (`'s`/`'S`/`'`) so
+/// `Sarah's` and `Sarah` fold to the same word. Returns `None` if nothing
+/// alphabetic remains.
+fn refine_token(token: &str) -> Option<String> {
+    let core = token.trim_matches(|c| c == '\'' || c == '-');
+    let core = core
+        .strip_suffix("'s")
+        .or_else(|| core.strip_suffix("'S"))
+        .or_else(|| core.strip_suffix('\''))
+        .unwrap_or(core);
+    let core = core.trim_matches(|c| c == '\'' || c == '-');
+    (!core.is_empty() && core.chars().any(char::is_alphabetic)).then(|| core.to_string())
+}
+
+/// Extract conservative capitalized-unigram proper-name candidates from raw
+/// `body` (case-preserving). Pure: sentence-position + stoplist + length
+/// heuristics only, no NER and no DB. A token qualifies iff its first char is
+/// uppercase AND it is not at a sentence start (sentence-initial capitals are
+/// ambiguous; a recurring real name appears mid-sentence in ≥1 doc). Deduped by
+/// normalized form within the call.
+fn extract_prose_name_candidates(body: &str) -> Vec<ProseCandidate> {
+    let mut out: Vec<ProseCandidate> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw_line in body.lines() {
+        let line = strip_line_marker(raw_line);
+        let chars: Vec<char> = line.chars().collect();
+        let mut sentence_start = true;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if is_name_char(c) {
+                let start = i;
+                while i < chars.len() && is_name_char(chars[i]) {
+                    i += 1;
+                }
+                let token: String = chars[start..i].iter().collect();
+                let at_start = sentence_start;
+                sentence_start = false;
+                if at_start {
+                    continue; // sentence-initial capital is ambiguous — drop
+                }
+                let Some(word) = refine_token(&token) else {
+                    continue;
+                };
+                if !word.chars().next().is_some_and(char::is_uppercase) {
+                    continue;
+                }
+                let norm = normalize(&word);
+                if norm.chars().count() < MIN_MENTION_CHARS || STOPWORDS.contains(&norm.as_str()) {
+                    continue;
+                }
+                if seen.insert(norm.clone()) {
+                    out.push(ProseCandidate {
+                        norm,
+                        display: word,
+                    });
+                }
+            } else {
+                if c == '.' || c == '!' || c == '?' {
+                    sentence_start = true;
+                }
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Surface-form claims, split into the four tiers `resolve_concept` consults
@@ -385,6 +576,13 @@ struct Gazetteer {
     ids: Vec<i64>,
     /// Canonical handle per concept id (for the `ConceptConnected` event).
     handles: HashMap<i64, String>,
+    /// Slice 5: normalized handle + alias forms of EVERY concept in
+    /// project∪global — including terminal (`rejected`/`merged`), ambiguous, and
+    /// the file's own forms. The "already known" oracle for prose candidates:
+    /// unlike [`Gazetteer::matches`] (which excludes self and drops ambiguous),
+    /// a hit here means the name is already accounted for and must not become a
+    /// duplicate latent node.
+    known: HashSet<String>,
 }
 
 impl Gazetteer {
@@ -451,7 +649,21 @@ fn build_gazetteer(threads: &ThreadsDb, project: &str) -> (Gazetteer, u64) {
         .unwrap_or_default();
     let mut claims: HashMap<String, FormClaims> = HashMap::new();
     let mut handles: HashMap<i64, String> = HashMap::new();
+    let mut known: HashSet<String> = HashSet::new();
     for c in &concepts {
+        let aliases = threads.list_aliases(c.id).unwrap_or_default();
+        // Slice-5 known-form oracle: capture handle + alias forms of EVERY
+        // concept (incl. terminal/ambiguous/self) BEFORE the terminal skip and
+        // the ambiguity drop below, so a rejected name is not re-proposed and a
+        // self/ambiguous alias does not re-materialize as a duplicate.
+        if let Some(norm) = gaz_form(&c.handle) {
+            known.insert(norm);
+        }
+        for a in &aliases {
+            if let Some(norm) = gaz_form(&a.alias) {
+                known.insert(norm);
+            }
+        }
         if c.status.is_terminal() {
             continue;
         }
@@ -467,15 +679,13 @@ fn build_gazetteer(threads: &ThreadsDb, project: &str) -> (Gazetteer, u64) {
             }
         }
         // Alias claims (lower precedence than any handle).
-        if let Ok(aliases) = threads.list_aliases(c.id) {
-            for a in aliases {
-                if let Some(norm) = gaz_form(&a.alias) {
-                    let entry = claims.entry(norm).or_default();
-                    if project_scoped {
-                        entry.project_alias.insert(c.id);
-                    } else {
-                        entry.global_alias.insert(c.id);
-                    }
+        for a in &aliases {
+            if let Some(norm) = gaz_form(&a.alias) {
+                let entry = claims.entry(norm).or_default();
+                if project_scoped {
+                    entry.project_alias.insert(c.id);
+                } else {
+                    entry.global_alias.insert(c.id);
                 }
             }
         }
@@ -503,7 +713,15 @@ fn build_gazetteer(threads: &ThreadsDb, project: &str) -> (Gazetteer, u64) {
             .build(&patterns)
             .ok()
     };
-    (Gazetteer { ac, ids, handles }, ambiguous)
+    (
+        Gazetteer {
+            ac,
+            ids,
+            handles,
+            known,
+        },
+        ambiguous,
+    )
 }
 
 /// Scan one markdown file's body for gazetteer mentions and write observed
@@ -514,6 +732,7 @@ fn link_file_mentions(
     cfg: &SourceConfig,
     project: &str,
     path: &Path,
+    agg: Option<&mut HashMap<String, CandidateAgg>>,
     stats: &mut MentionStats,
 ) {
     stats.files_scanned += 1;
@@ -544,6 +763,13 @@ fn link_file_mentions(
     };
     // Body only — frontmatter `edges` fields are slice 3's job.
     let body = split_front_matter(&text).map_or(text.as_str(), |(_, b)| b);
+    // Slice 5: fold unresolved prose-name candidates into the per-project
+    // aggregate (the in-memory candidate stage; the driver materializes
+    // gate-crossers after the file loop). Runs regardless of gazetteer hits.
+    // `None` on incremental scans, which never materialize.
+    if let Some(agg) = agg {
+        collect_prose_candidates(gaz, cfg, &self_rec, body, agg);
+    }
     let body_norm = normalize(body);
     let targets = gaz.matches(&body_norm, self_rec.id);
     if targets.is_empty() {
@@ -592,15 +818,165 @@ fn link_file_mentions(
     }
 }
 
+/// Slice 5: fold the file's unresolved prose-name candidates into the
+/// per-project `agg`. A token survives only if it is not a known surface form
+/// (`gaz.known` — handles/aliases of every concept, the right oracle vs.
+/// `gaz.matches`) and not the file naming its own handle. Each surviving
+/// candidate records one [`DocHit`] per distinct doc.
+fn collect_prose_candidates(
+    gaz: &Gazetteer,
+    cfg: &SourceConfig,
+    self_rec: &ConceptRecord,
+    body: &str,
+    agg: &mut HashMap<String, CandidateAgg>,
+) {
+    let kind = cfg.entity_type.as_deref().unwrap_or_default();
+    for cand in extract_prose_name_candidates(body) {
+        if gaz.known.contains(&cand.norm) {
+            continue; // already a known handle/alias (any status) — not a candidate
+        }
+        let Some(slug) = slugify(&cand.display) else {
+            continue;
+        };
+        if slug == self_rec.handle {
+            continue; // the doc naming its own handle
+        }
+        let entry = agg.entry(cand.norm).or_insert_with(|| CandidateAgg {
+            display: cand.display.clone(),
+            hits: Vec::new(),
+        });
+        if !entry.hits.iter().any(|h| h.doc_id == self_rec.id) {
+            entry.hits.push(DocHit {
+                doc_id: self_rec.id,
+                doc_handle: self_rec.handle.clone(),
+                kind: kind.to_string(),
+            });
+        }
+    }
+}
+
+/// Slice 5: reify the gate-crossing prose candidates for one project. A
+/// candidate is materialized iff it recurs across `>= PROSE_RECURRENCE_MIN_DOCS`
+/// distinct docs of a single **dominant** `entity_type` (a tie at/above the gate
+/// is dropped as ambiguous — it cannot be context-typed). Each materialized name
+/// is born `Candidate` then promoted in-pass to `Proposed` (conf 0.4, scoped —
+/// no global reflect sweep) and connected via observed `mentions` edges from
+/// every contributing doc so it joins the diffusible graph this scan.
+fn materialize_prose_candidates(
+    threads: &ThreadsDb,
+    project: &str,
+    agg: &HashMap<String, CandidateAgg>,
+    stats: &mut MentionStats,
+) {
+    for cand in agg.values() {
+        // Distinct docs per containing kind.
+        let mut by_kind: HashMap<&str, BTreeSet<i64>> = HashMap::new();
+        for hit in &cand.hits {
+            by_kind
+                .entry(hit.kind.as_str())
+                .or_default()
+                .insert(hit.doc_id);
+        }
+        let max = by_kind.values().map(BTreeSet::len).max().unwrap_or(0);
+        if max < PROSE_RECURRENCE_MIN_DOCS {
+            continue; // below the recurrence gate
+        }
+        let tops: Vec<&str> = by_kind
+            .iter()
+            .filter(|(_, docs)| docs.len() == max)
+            .map(|(k, _)| *k)
+            .collect();
+        if tops.len() != 1 {
+            stats.candidates_ambiguous += 1; // tie at/above gate — can't context-type
+            continue;
+        }
+        let kind = tops[0];
+        let Some(slug) = slugify(&cand.display) else {
+            continue;
+        };
+        // Idempotency / race guard: skip if the name now resolves to a node.
+        if matches!(threads.resolve_concept(project, &slug), Ok(Some(_))) {
+            continue;
+        }
+        let (rec, created) = match threads.ensure_typed_concept(
+            project,
+            &slug,
+            ConceptStatus::Candidate,
+            Some(kind),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(handle = %slug, error = %e, "prose-promotion: ensure candidate failed");
+                continue;
+            }
+        };
+        // Gate crossed → promote to Proposed, scoped to this handle (no global
+        // reflect sweep). `set_concept_status` carries the 0.4 confidence that
+        // `ensure_typed_concept` only sets for a Candidate birth.
+        if let Err(e) =
+            threads.set_concept_status(project, &slug, ConceptStatus::Proposed, Some(0.4))
+        {
+            tracing::warn!(handle = %slug, error = %e, "prose-promotion: promote to proposed failed");
+        }
+        if created {
+            // Single chain event: the "proposed" advancement (candidate birth is
+            // silent). Mirrors slice-3's creation event; audit-only.
+            let _ = threads.record_concept_promoted(project, &slug, "proposed");
+        }
+        stats.candidates_materialized += 1;
+
+        // Connect to every contributing doc (all kinds — a real mention is a
+        // real mention, and the next gazetteer scan would write these anyway).
+        let evidence = json!({ "via": "prose-promotion" }).to_string();
+        let mut linked: BTreeSet<i64> = BTreeSet::new();
+        for hit in &cand.hits {
+            if !linked.insert(hit.doc_id) {
+                continue;
+            }
+            match threads.add_concept_edge_by_id(
+                hit.doc_id,
+                MENTION_RELATION,
+                rec.id,
+                OBSERVED_MENTION_CONFIDENCE,
+                EdgeSource::Observed,
+                Some("scanner"),
+                Some(&evidence),
+            ) {
+                Ok((_, edge_created)) => {
+                    stats.mentions_linked += 1;
+                    if edge_created {
+                        if let Err(e) = threads.record_concept_connected(
+                            project,
+                            &hit.doc_handle,
+                            MENTION_RELATION,
+                            &rec.handle,
+                            EdgeSource::Observed,
+                            Some("scanner"),
+                        ) {
+                            tracing::warn!(error = %e, "prose-promotion: ConceptConnected emit failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(to = %slug, from_id = hit.doc_id, error = %e, "prose-promotion edge skipped");
+                }
+            }
+        }
+    }
+}
+
 /// Full-scan driver: link prose mentions for every markdown file under each
-/// `entity_type` source.
+/// `entity_type` source, then materialize recurring unresolved prose names.
 ///
 /// Runs AFTER node-seeding for all sources so the gazetteer is complete (a
 /// person can mention a meeting). The gazetteer is built once per project and
-/// reused across sources sharing that project.
+/// reused across sources sharing that project. Candidate aggregation spans the
+/// whole scan, so cross-doc recurrence is exact; materialization runs per
+/// project after the file loop.
 pub fn link_mentions_from_sources(threads: &ThreadsDb, sources: &[&SourceConfig]) -> MentionStats {
     let mut stats = MentionStats::default();
     let mut gaz_cache: HashMap<String, Gazetteer> = HashMap::new();
+    let mut agg_cache: HashMap<String, HashMap<String, CandidateAgg>> = HashMap::new();
     for cfg in sources {
         if cfg.entity_type.is_none() {
             continue;
@@ -612,14 +988,18 @@ pub fn link_mentions_from_sources(threads: &ThreadsDb, sources: &[&SourceConfig]
             gaz_cache.insert(project.to_string(), gaz);
         }
         let gaz = &gaz_cache[project];
+        let agg = agg_cache.entry(project.to_string()).or_default();
         for root in cfg.expanded_paths().unwrap_or_default() {
             for entry in walk_filtered(&root, &cfg.ignore) {
                 let p = entry.path();
                 if is_md(p) {
-                    link_file_mentions(threads, gaz, cfg, project, p, &mut stats);
+                    link_file_mentions(threads, gaz, cfg, project, p, Some(&mut *agg), &mut stats);
                 }
             }
         }
+    }
+    for (project, agg) in &agg_cache {
+        materialize_prose_candidates(threads, project, agg, &mut stats);
     }
     stats
 }
@@ -638,6 +1018,10 @@ pub fn link_mentions_for_paths(
 ) -> MentionStats {
     let mut stats = MentionStats::default();
     let mut gaz_cache: HashMap<String, Gazetteer> = HashMap::new();
+    // Slice 5: an incremental scan sees one changed file at a time, so it can
+    // never observe the cross-doc recurrence gate. It passes `None` for the
+    // candidate aggregate (no materialization) — new-candidate detection rides
+    // full scans; the slice-4 gazetteer path still maintains edges to known nodes.
     for cfg in sources {
         if cfg.entity_type.is_none() {
             continue;
@@ -665,7 +1049,7 @@ pub fn link_mentions_for_paths(
             }
             if let Some(root) = roots.iter().find(|r| pc.starts_with(r)) {
                 if path_seedable(root, &cfg.ignore, &pc) {
-                    link_file_mentions(threads, gaz, cfg, project, &pc, &mut stats);
+                    link_file_mentions(threads, gaz, cfg, project, &pc, None, &mut stats);
                 }
             }
         }
@@ -1362,5 +1746,179 @@ mod tests {
         let m = mentions_from(&db, PROJ, "tori");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].0, "mike");
+    }
+
+    // ── Slice 5: prose-name extraction + automagic promotion ──────────────
+
+    fn mentions_to(db: &ThreadsDb, project: &str, handle: &str) -> Vec<(String, EdgeSource, f32)> {
+        db.list_concept_edges(project, handle, EdgeDirection::To)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.relation == "mentions")
+            .map(|e| (e.from_handle, e.source, e.confidence))
+            .collect()
+    }
+
+    #[test]
+    fn extractor_keeps_midsentence_drops_start_and_lowercase() {
+        let c = extract_prose_name_candidates("We met Sarah today. Bob waved.");
+        let norms: Vec<&str> = c.iter().map(|p| p.norm.as_str()).collect();
+        assert!(norms.contains(&"sarah"), "mid-sentence capital kept");
+        assert!(!norms.contains(&"bob"), "sentence-start capital dropped");
+        assert!(!norms.contains(&"today"), "lowercase ignored");
+    }
+
+    #[test]
+    fn extractor_folds_possessive() {
+        let c = extract_prose_name_candidates("I saw Sarah's car and Sarah again.");
+        let n: Vec<&str> = c.iter().map(|p| p.norm.as_str()).collect();
+        assert_eq!(
+            n.iter().filter(|x| **x == "sarah").count(),
+            1,
+            "Sarah's and Sarah fold to one `sarah`"
+        );
+    }
+
+    #[test]
+    fn extractor_drops_stopwords_and_months() {
+        let c = extract_prose_name_candidates("We met in December and on Monday.");
+        let n: Vec<&str> = c.iter().map(|p| p.norm.as_str()).collect();
+        assert!(!n.contains(&"december"));
+        assert!(!n.contains(&"monday"));
+    }
+
+    #[test]
+    fn prose_promotion_materializes_recurring_person() {
+        let tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+        let dir = tmp.path().join("people");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sarah recurs mid-sentence across 3 person docs; Quentin in 1; December
+        // is a stopword/month. Sentence-initial doc names (Alice/Bob/Carol) are
+        // dropped by the sentence-start rule.
+        write_md(&dir, "alice.md", "We met. Alice spoke with Sarah today.\n");
+        write_md(&dir, "bob.md", "Notes. Bob saw Sarah at lunch.\n");
+        write_md(&dir, "carol.md", "Recap. Carol called Sarah in December.\n");
+        write_md(&dir, "dave.md", "Aside. Dave mentioned Quentin once.\n");
+        // An unrelated candidate in another project must stay untouched (no global sweep).
+        db.ensure_concept("other", "ghost", ConceptStatus::Candidate)
+            .unwrap();
+        let cfg = src(&dir, Some("person"), &[], &[]);
+        seed_nodes_from_source(&db, &cfg);
+        let stats = link_mentions_from_sources(&db, &[&cfg]);
+
+        let rec = db
+            .resolve_concept(PROJ, "sarah")
+            .unwrap()
+            .expect("sarah materialized");
+        assert_eq!(rec.kind.as_deref(), Some("person"));
+        assert_eq!(rec.status, ConceptStatus::Proposed);
+        assert!((rec.confidence - 0.4).abs() < 1e-3, "born proposed at 0.4");
+        assert_eq!(stats.candidates_materialized, 1);
+
+        let inbound = mentions_to(&db, PROJ, "sarah");
+        assert_eq!(
+            inbound.len(),
+            3,
+            "one observed mentions edge per contributing doc"
+        );
+        assert!(inbound.iter().all(|(_, s, c)| *s == EdgeSource::Observed
+            && (*c - OBSERVED_MENTION_CONFIDENCE).abs() < 1e-6));
+
+        // No one-off bloat.
+        assert!(db.get_concept(PROJ, "quentin").unwrap().is_none());
+        assert!(db.get_concept(PROJ, "december").unwrap().is_none());
+        // Scoping: the unrelated candidate is untouched.
+        assert_eq!(
+            db.get_concept("other", "ghost").unwrap().unwrap().status,
+            ConceptStatus::Candidate
+        );
+
+        // Chain: exactly one ConceptPromoted{sarah,"proposed"}, never "candidate".
+        let promotions: Vec<String> = db
+            .iter_chain()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e {
+                ChainEvent::ConceptPromoted {
+                    handle, to_status, ..
+                } if handle == "sarah" => Some(to_status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(promotions, vec!["proposed".to_string()]);
+
+        // Idempotent re-scan: sarah is now known, edges re-touch (no dup), no new event.
+        let stats2 = link_mentions_from_sources(&db, &[&cfg]);
+        assert_eq!(stats2.candidates_materialized, 0);
+        assert_eq!(mentions_to(&db, PROJ, "sarah").len(), 3);
+    }
+
+    #[test]
+    fn prose_promotion_dominant_kind_tie_dropped() {
+        // Robin recurs across 3 person + 3 meeting docs → tie at the gate → can't
+        // context-type → dropped as ambiguous (not materialized).
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let pdir = tmp.path().join("people");
+        let mdir = tmp.path().join("meetings");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::create_dir_all(&mdir).unwrap();
+        for n in ["alpha", "bravo", "gamma"] {
+            write_md(&pdir, &format!("{n}.md"), "Notes. We saw Robin here.\n");
+        }
+        for n in ["delta", "sigma", "omega"] {
+            write_md(&mdir, &format!("{n}.md"), "Recap. They met Robin again.\n");
+        }
+        let pcfg = src(&pdir, Some("person"), &[], &[]);
+        let mcfg = src(&mdir, Some("meeting"), &[], &[]);
+        seed_nodes_from_source(&db, &pcfg);
+        seed_nodes_from_source(&db, &mcfg);
+        let stats = link_mentions_from_sources(&db, &[&pcfg, &mcfg]);
+        assert!(db.get_concept(PROJ, "robin").unwrap().is_none());
+        assert_eq!(stats.candidates_ambiguous, 1);
+        assert_eq!(stats.candidates_materialized, 0);
+    }
+
+    #[test]
+    fn prose_promotion_skips_ambiguous_and_rejected_known_forms() {
+        // Forms that `gaz.matches` would MISS — an ambiguous alias (dropped from
+        // the matcher) and a rejected node's form (terminal, excluded from the
+        // matcher) — must still be recognized as known via `known_forms`, so a
+        // recurring prose mention never re-materializes them as duplicates.
+        let tmp = TempDir::new().unwrap();
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let dir = tmp.path().join("people");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (r1, _) = db
+            .ensure_typed_concept(PROJ, "robin-a", ConceptStatus::Active, Some("person"))
+            .unwrap();
+        let (r2, _) = db
+            .ensure_typed_concept(PROJ, "robin-b", ConceptStatus::Active, Some("person"))
+            .unwrap();
+        db.touch_alias(r1.id, "Robin", AliasSource::User).unwrap(); // ambiguous: two
+        db.touch_alias(r2.id, "Robin", AliasSource::User).unwrap(); // ids share "robin"
+        db.ensure_typed_concept(PROJ, "trent", ConceptStatus::Rejected, Some("person"))
+            .unwrap();
+        for n in ["memo1", "memo2", "memo3"] {
+            write_md(
+                &dir,
+                &format!("{n}.md"),
+                "Notes. We saw Robin and Trent here.\n",
+            );
+        }
+        let cfg = src(&dir, Some("person"), &[], &[]);
+        seed_nodes_from_source(&db, &cfg);
+        let stats = link_mentions_from_sources(&db, &[&cfg]);
+        assert_eq!(
+            stats.candidates_materialized, 0,
+            "ambiguous + rejected known forms never re-materialize"
+        );
+        assert!(db.get_concept(PROJ, "robin").unwrap().is_none());
+        assert_eq!(
+            db.get_concept(PROJ, "trent").unwrap().unwrap().status,
+            ConceptStatus::Rejected
+        );
     }
 }

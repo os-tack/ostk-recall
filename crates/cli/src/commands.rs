@@ -1358,7 +1358,12 @@ pub async fn serve(
         Some(d) => Server::new(engine).with_attention(d),
         None => Server::new(engine),
     };
-    let server = server_base.with_resources(lens_registry);
+    let server = server_base
+        .with_resources(lens_registry)
+        // Slice 5: hand the daemon's config to the server so the
+        // `memory_concept` `crystallize` action can resolve a typed node's
+        // stub-file directory from its `[[sources]]` block.
+        .with_config(Arc::new(cfg.clone()));
     if stdio {
         // Direct stdio transport: this process IS the MCP server, talking
         // JSON-RPC over its own stdin/stdout. Used by a client that spawns
