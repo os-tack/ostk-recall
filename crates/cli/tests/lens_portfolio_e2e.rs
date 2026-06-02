@@ -125,6 +125,7 @@ async fn lens_engine_wires_freshness_and_refractory_rows() {
         None,
         &corpus,
         &config,
+        false,
     )
     .await;
 
@@ -176,6 +177,7 @@ async fn refractory_demotes_recently_included_chunk_end_to_end() {
         None,
         &corpus,
         &config,
+        false,
     )
     .await;
 

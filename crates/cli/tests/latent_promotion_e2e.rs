@@ -154,6 +154,7 @@ async fn refresh(
         Some(reader),
         corpus,
         &config,
+        false,
     )
     .await;
     match decision {

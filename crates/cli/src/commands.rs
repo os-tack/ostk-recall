@@ -25,7 +25,7 @@ use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport}
 use ostk_recall_query::lens::LensConfig;
 use ostk_recall_query::{QueryEngine, Reranker, RerankerLike};
 
-use crate::lens_loop::{MemoryLensResource, run_lens_loop};
+use crate::lens_loop::{MemoryLensResource, load_lens_markdown, run_lens_loop};
 use crate::lens_state::load_lens_state;
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
 use ostk_recall_scan::code::CodeScanner;
@@ -1282,7 +1282,23 @@ pub async fn serve(
     // with_resources so `resources/list` advertises the memory-lens
     // URI even before any refresh has rendered content.
     let lens_registry = Arc::new(ResourceRegistry::new());
-    let lens_resource = Arc::new(MemoryLensResource::new(String::new()));
+    // Seed the resource body from the persisted lens.md side-copy so a
+    // serve restart restores the last-rendered lens immediately. lens.md
+    // and lens_state.json are a persisted pair; reloading only the state
+    // (below) while leaving the body empty desyncs them — the gate then
+    // reads "nothing changed" against the restored fingerprints and never
+    // re-renders. The daemon loop additionally forces one live re-render
+    // on its first qualifying tick to supersede a stale seed. Absent file
+    // or read error → empty body (logged), never a wedged startup.
+    let initial_lens_body = match load_lens_markdown(&root) {
+        Ok(Some(body)) => body,
+        Ok(None) => String::new(),
+        Err(err) => {
+            tracing::warn!(error = %err, "lens.md load failed; serving empty body");
+            String::new()
+        }
+    };
+    let lens_resource = Arc::new(MemoryLensResource::new(initial_lens_body));
     lens_registry.register(Arc::clone(&lens_resource) as Arc<dyn ostk_recall_mcp::Resource>);
 
     let lens_disabled = std::env::var_os("OSTK_RECALL_LENS_DISABLED").is_some();

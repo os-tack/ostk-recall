@@ -142,6 +142,7 @@ async fn refresh(
         Some(reader), // concept_reader — drives diffusion
         corpus,
         &config,
+        false,
     )
     .await;
     match decision {

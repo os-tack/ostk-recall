@@ -54,6 +54,34 @@ pub const MEMORY_LENS_DESCRIPTION: &str = "Ambient memory lens — automatically
      Resource content is markdown; subscribe for `notifications/resources/updated` to be \
      told when to re-read.";
 
+/// Read the daemon's side-of-disk markdown copy at `{dir}/lens.md`.
+///
+/// Mirrors [`load_lens_state`](crate::lens_state::load_lens_state)'s
+/// contract: `Ok(None)` only when the file is **absent** (fresh
+/// install, or the loop has never reached a refresh), `Err` when it
+/// exists but can't be read. Keeping "missing" distinct from "exists
+/// but unreadable" lets `lens show` print its "no lens yet" message
+/// for the former while surfacing the latter, and lets `serve` log +
+/// fall back to an empty body without wedging startup.
+///
+/// Used to seed [`MemoryLensResource`] on `serve` startup. The
+/// rendered body and `lens_state.json` are a persisted *pair*, so a
+/// restart must restore both — otherwise the gate sees "nothing
+/// changed" against the reloaded fingerprints and never re-renders
+/// the freshly-empty in-memory body.
+pub fn load_lens_markdown(dir: &Path) -> std::io::Result<Option<String>> {
+    let path = dir.join(LENS_MARKDOWN_FILE);
+    // Read directly and map only NotFound → Ok(None). A `path.exists()`
+    // pre-check would fold permission/metadata errors into `false`,
+    // silently reporting an inaccessible file as "absent" and breaking
+    // the absent-vs-unreadable contract `lens show` relies on.
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(Some(body)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 // ---------------------------------------------------------------------
 // MemoryLensResource
 // ---------------------------------------------------------------------
@@ -205,8 +233,12 @@ pub async fn try_refresh_lens(
     concept_reader: Option<Arc<dyn ConceptActivationReader>>,
     corpus: &CorpusStore,
     config: &LensConfig,
+    force: bool,
 ) -> LensRefreshDecision {
-    // 1. Empty-mind skip — C2.
+    // 1. Empty-mind skip — C2. `force` does NOT override this: with no
+    //    pin and no rolling there is nothing to render, so a forced
+    //    first tick on a cold scope still yields EmptyMind (and the
+    //    caller keeps its force flag set to retry once attention lands).
     let pinned = snapshot.pin_fingerprint.is_some();
     if snapshot.rolling_vec.is_none() && !pinned {
         return LensRefreshDecision::EmptyMind;
@@ -232,7 +264,7 @@ pub async fn try_refresh_lens(
         (None, _) => false,      // no rolling channel → only pin change can trigger
     };
 
-    if !(pin_changed || rolling_drifted) {
+    if !force && !(pin_changed || rolling_drifted) {
         return LensRefreshDecision::NoTrigger;
     }
 
@@ -263,10 +295,17 @@ pub async fn try_refresh_lens(
     let rendered = lens.to_markdown();
     let content_fp = blake3::hash(rendered.as_bytes()).as_bytes().to_vec();
 
-    // 6. Unchanged-content skip — only when the pin didn't change.
-    //    Pin changes always force a re-emit so the operator can
-    //    see they're now driving the lens.
-    if !pin_changed && last_state.last_content_fp.as_deref() == Some(content_fp.as_slice()) {
+    // 6. Unchanged-content skip — only when the pin didn't change and
+    //    we're not on a forced tick. Pin changes always force a re-emit
+    //    so the operator can see they're now driving the lens; a forced
+    //    tick (first poll after restart) must write the body even if the
+    //    rendered bytes match the persisted fingerprint, because the
+    //    in-memory body was seeded stale (or empty) and needs the live
+    //    render to supersede it.
+    if !force
+        && !pin_changed
+        && last_state.last_content_fp.as_deref() == Some(content_fp.as_slice())
+    {
         // Advance the rolling baseline + pin fingerprint so the
         // next poll's drift check compares against *this* tick, not
         // the original baseline. Without this, accumulated drift
@@ -397,6 +436,14 @@ pub async fn run_lens_loop(
     cancel: CancellationToken,
 ) {
     let mut state = initial_state;
+    // Force the first qualifying tick to re-render regardless of the
+    // reloaded gating fingerprints. The resource body is seeded from
+    // lens.md at startup (see `serve`), but the persisted state can make
+    // the normal gate return NoTrigger/UnchangedContent forever — so we
+    // force one live render to supersede the (possibly stale) seed with
+    // current-attention content. Cleared only once a Refresh actually
+    // fires, so a forced tick that hits EmptyMind/BuildFailed retries.
+    let mut force_refresh = true;
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -421,8 +468,15 @@ pub async fn run_lens_loop(
                     Some(Arc::clone(&concept_reader)),
                     &corpus,
                     &config,
+                    force_refresh,
                 )
                 .await;
+                // Consume the forced-render flag only once a Refresh
+                // actually lands; EmptyMind/BuildFailed keep it armed so
+                // the next tick retries.
+                if matches!(decision, LensRefreshDecision::Refresh { .. }) {
+                    force_refresh = false;
+                }
                 apply_decision(
                     decision,
                     &mut state,
@@ -608,6 +662,7 @@ mod tests {
             None,
             &corpus,
             &config,
+            false,
         ));
         assert!(matches!(d, LensRefreshDecision::EmptyMind));
     }
@@ -641,6 +696,7 @@ mod tests {
             None,
             &corpus,
             &config,
+            false,
         ));
         assert!(matches!(d, LensRefreshDecision::NoTrigger), "got {d:?}");
     }
@@ -672,6 +728,7 @@ mod tests {
             None,
             &corpus,
             &config,
+            false,
         ));
         assert!(
             matches!(d, LensRefreshDecision::Refresh { .. }),
@@ -710,6 +767,7 @@ mod tests {
             None,
             &corpus,
             &config,
+            false,
         ));
         assert!(matches!(d, LensRefreshDecision::NoTrigger), "got {d:?}");
     }
@@ -743,12 +801,177 @@ mod tests {
             None,
             &corpus,
             &config,
+            false,
         ));
         // Empty corpus → empty lens → Refresh (UnchangedContent
         // requires a prior fingerprint that matches).
         assert!(
             matches!(d, LensRefreshDecision::Refresh { .. }),
             "got {d:?}"
+        );
+    }
+
+    // ---- load_lens_markdown ----
+
+    #[test]
+    fn load_lens_markdown_returns_some_when_present() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(LENS_MARKDOWN_FILE), "# Memory lens\nbody").unwrap();
+        let body = load_lens_markdown(tmp.path()).unwrap();
+        assert_eq!(body.as_deref(), Some("# Memory lens\nbody"));
+    }
+
+    #[test]
+    fn load_lens_markdown_returns_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let body = load_lens_markdown(tmp.path()).unwrap();
+        assert!(body.is_none(), "missing file → Ok(None), not error");
+    }
+
+    #[test]
+    fn load_lens_markdown_returns_err_when_unreadable() {
+        // A path that exists but is not a readable file (a directory
+        // named lens.md) must surface as Err, not Ok(None) — `lens show`
+        // distinguishes "no lens yet" from a genuine read failure, and
+        // collapsing the two would regress that. Mirrors lens_state.rs's
+        // corrupted_file_returns_err.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(LENS_MARKDOWN_FILE)).unwrap();
+        assert!(
+            load_lens_markdown(tmp.path()).is_err(),
+            "present-but-unreadable must surface as Err"
+        );
+    }
+
+    // ---- force-refresh (first tick after restart) ----
+
+    #[test]
+    fn force_refresh_overrides_no_trigger() {
+        // Identical rolling vec vs last_state ⇒ drift 0, no pin ⇒ the
+        // normal gate would return NoTrigger. force=true bypasses the
+        // gate (and the unchanged-content skip), so an empty corpus still
+        // yields Refresh — this is the first-tick-after-restart render
+        // that repopulates the (seeded-but-possibly-stale) resource body.
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let snap = LensTickSnapshot {
+            rolling_vec: Some(v.clone()),
+            scope_vector: Some(v.clone()),
+            pin_fingerprint: None,
+        };
+        let state = LensState {
+            last_rolling_vec: Some(v),
+            ..LensState::default()
+        };
+        let config = LensConfig::default();
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let corpus =
+            rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            None,
+            &corpus,
+            &config,
+            true,
+        ));
+        assert!(
+            matches!(d, LensRefreshDecision::Refresh { .. }),
+            "force must override NoTrigger; got {d:?}"
+        );
+    }
+
+    #[test]
+    fn force_refresh_does_not_override_empty_mind() {
+        // No pin, no rolling ⇒ nothing to render. force does NOT override
+        // EmptyMind — the caller keeps its flag armed and retries once
+        // attention actually lands.
+        let snap = LensTickSnapshot {
+            rolling_vec: None,
+            scope_vector: None,
+            pin_fingerprint: None,
+        };
+        let state = LensState::default();
+        let config = LensConfig::default();
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let corpus =
+            rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
+        let d = rt.block_on(try_refresh_lens(
+            &snap,
+            &state,
+            &RankEngine::new(),
+            None,
+            None,
+            &corpus,
+            &config,
+            true,
+        ));
+        assert!(
+            matches!(d, LensRefreshDecision::EmptyMind),
+            "force must not override EmptyMind; got {d:?}"
+        );
+    }
+
+    #[test]
+    fn forced_refresh_then_normal_gate_returns_to_no_trigger() {
+        // Models the loop's one-shot force flag: the first tick forces a
+        // Refresh (repopulating the body), and once its advanced state is
+        // adopted, a subsequent unforced tick on the same attention falls
+        // back to NoTrigger — i.e. the forced render is exactly one-shot.
+        let v = vec![1.0_f32, 0.0, 0.0];
+        let snap = LensTickSnapshot {
+            rolling_vec: Some(v.clone()),
+            scope_vector: Some(v),
+            pin_fingerprint: None,
+        };
+        let config = LensConfig::default();
+        let tmp = TempDir::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let corpus =
+            rt.block_on(async { CorpusStore::open_or_create(tmp.path(), 3).await.unwrap() });
+
+        // Forced first tick → Refresh, carrying the advanced state.
+        let forced = rt.block_on(try_refresh_lens(
+            &snap,
+            &LensState::default(),
+            &RankEngine::new(),
+            None,
+            None,
+            &corpus,
+            &config,
+            true,
+        ));
+        let LensRefreshDecision::Refresh { new_state, .. } = forced else {
+            panic!("forced first tick must Refresh; got {forced:?}");
+        };
+
+        // Unforced second tick on the same attention, with the advanced
+        // state adopted → NoTrigger (no drift, no pin change).
+        let next = rt.block_on(try_refresh_lens(
+            &snap,
+            &new_state,
+            &RankEngine::new(),
+            None,
+            None,
+            &corpus,
+            &config,
+            false,
+        ));
+        assert!(
+            matches!(next, LensRefreshDecision::NoTrigger),
+            "after the one-shot forced render, normal gating resumes; got {next:?}"
         );
     }
 

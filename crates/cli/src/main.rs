@@ -740,16 +740,21 @@ fn run_lens(config_path: &Path, verb: LensVerb) -> Result<()> {
             let cfg = ostk_recall_core::Config::load(config_path)
                 .with_context(|| format!("loading config from {}", config_path.display()))?;
             let root = cfg.expanded_root()?;
-            let lens_md = root.join(ostk_recall_cli::lens_loop::LENS_MARKDOWN_FILE);
-            if !lens_md.exists() {
+            let body =
+                ostk_recall_cli::lens_loop::load_lens_markdown(&root).with_context(|| {
+                    format!(
+                        "reading {}",
+                        root.join(ostk_recall_cli::lens_loop::LENS_MARKDOWN_FILE)
+                            .display()
+                    )
+                })?;
+            let Some(body) = body else {
                 println!(
                     "_No lens rendered yet._ Start `ostk-recall serve --stdio` and wait for the first refresh.\n\
                      (Empty-mind boot, OSTK_RECALL_LENS_DISABLED, or simply no attention drift since the daemon started.)"
                 );
                 return Ok(());
-            }
-            let body = std::fs::read_to_string(&lens_md)
-                .with_context(|| format!("reading {}", lens_md.display()))?;
+            };
             print!("{body}");
             if !body.ends_with('\n') {
                 println!();
