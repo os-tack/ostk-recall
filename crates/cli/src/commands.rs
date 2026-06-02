@@ -471,6 +471,9 @@ pub async fn scan_with_context(
 
     let mut per_source = Vec::new();
     let mut totals = PipelineStats::default();
+    // Slice-4 mention-linking runs after the loop over the sources that were
+    // actually scanned (honoring `--source`), so the gazetteer is complete.
+    let mut scanned_entity_sources: Vec<&SourceConfig> = Vec::new();
     for (i, source_cfg) in cfg.sources.iter().enumerate() {
         if let Some(filter) = source_filter {
             if source_cfg.project.as_deref() != Some(filter) {
@@ -506,15 +509,35 @@ pub async fn scan_with_context(
         // from this source's markdown files (only when it declares an
         // `entity_type`). Synchronous ledger pass — the Pipeline has no
         // ThreadsDb. Idempotent, so re-scans are safe.
-        if !dry_run && source_cfg.entity_type.is_some() {
-            if let Some(threads) = threads_db.as_ref() {
-                let s = crate::seed::seed_nodes_from_source(threads, source_cfg);
-                if s.nodes_seeded + s.edges_seeded > 0 {
-                    tracing::info!(
-                        source = %label, nodes = s.nodes_seeded, edges = s.edges_seeded,
-                        "seeded graph nodes/edges"
-                    );
+        if source_cfg.entity_type.is_some() {
+            scanned_entity_sources.push(source_cfg);
+            if !dry_run {
+                if let Some(threads) = threads_db.as_ref() {
+                    let s = crate::seed::seed_nodes_from_source(threads, source_cfg);
+                    if s.nodes_seeded + s.edges_seeded > 0 {
+                        tracing::info!(
+                            source = %label, nodes = s.nodes_seeded, edges = s.edges_seeded,
+                            "seeded graph nodes/edges"
+                        );
+                    }
                 }
+            }
+        }
+    }
+
+    // Relational-substrate slice 4: link prose mentions once node-seeding has
+    // run for every scanned source, so the gazetteer is complete (e.g. a
+    // person doc can mention a meeting defined in another source).
+    if !dry_run && !scanned_entity_sources.is_empty() {
+        if let Some(threads) = threads_db.as_ref() {
+            let m = crate::seed::link_mentions_from_sources(threads, &scanned_entity_sources);
+            if m.mentions_linked > 0 {
+                tracing::info!(
+                    files = m.files_scanned,
+                    mentions = m.mentions_linked,
+                    ambiguous = m.ambiguous_skipped,
+                    "linked prose mentions"
+                );
             }
         }
     }
@@ -733,8 +756,10 @@ pub async fn scan_paths_with_context(
     // scoped to `paths` so live edits seed without rewalking every dir.
     if !dry_run {
         if let Some(threads) = threads_db.as_ref() {
+            let mut scanned_entity_sources: Vec<&SourceConfig> = Vec::new();
             for (_, source_cfg) in &pairs {
                 if source_cfg.entity_type.is_some() {
+                    scanned_entity_sources.push(*source_cfg);
                     let s = crate::seed::seed_nodes_for_paths(threads, source_cfg, paths);
                     if s.nodes_seeded + s.edges_seeded > 0 {
                         tracing::info!(
@@ -743,6 +768,20 @@ pub async fn scan_paths_with_context(
                             "seeded graph nodes/edges (incremental)"
                         );
                     }
+                }
+            }
+            // Slice 4: link prose mentions for the changed paths against the
+            // now-complete gazetteer (reuses the same delete/ignore guards).
+            if !scanned_entity_sources.is_empty() {
+                let m =
+                    crate::seed::link_mentions_for_paths(threads, &scanned_entity_sources, paths);
+                if m.mentions_linked > 0 {
+                    tracing::info!(
+                        files = m.files_scanned,
+                        mentions = m.mentions_linked,
+                        ambiguous = m.ambiguous_skipped,
+                        "linked prose mentions (incremental)"
+                    );
                 }
             }
         }

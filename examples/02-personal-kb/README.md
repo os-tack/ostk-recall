@@ -42,6 +42,19 @@ guess about where attention *might* flow; it earns conductance only as real work
 and decays if it doesn't. Re-scanning is idempotent — nodes aren't duplicated and edges are
 re-touched (their `touch_count` bumps, origin preserved).
 
+## Prose mentions (observed edges)
+
+Beyond frontmatter, plain prose in a file's **body** that *names* a known node lights an
+`observed` `mentions` edge automatically — no markup. After a scan, `mike.md`'s body (“He and
+Tori both…”) yields `mike --mentions--> tori` even though Mike's frontmatter never declares it,
+and the standup's body yields `2026-05-20-standup --mentions--> ostk-recall`. These coexist
+with the slice-3 authored edges to the same targets (different `relation`). The match is against
+a **gazetteer** of every known node's handle + aliases, matched in resolution order — a handle
+before an alias, and the file's project before global within each — so it agrees with how
+`memory_*` resolves the same name; ambiguous names (one surface form, two nodes in the same
+tier) are skipped rather than guessed. `run.sh` prints the observed
+edges alongside the authored ones.
+
 ## Run + inspect
 
 ```sh

@@ -60,6 +60,15 @@ pub const CANDIDATE_CONFIDENCE: f32 = 0.1;
 /// sets the conductance" (relational-substrate.md).
 pub const AUTHORED_EDGE_CONFIDENCE: f32 = 0.1;
 
+/// Confidence stamped on an `observed` edge minted from a gazetteer prose
+/// mention (relational-substrate slice 4).
+///
+/// Flat low prior, like an authored edge: a bare prose mention is evidence of
+/// *use*, but conductance is still earned through re-observation, not asserted
+/// at full strength. (Lift-weighting of observed edges — "observed weighted by
+/// lift" — is a later refinement; this is the flat placeholder.)
+pub const OBSERVED_MENTION_CONFIDENCE: f32 = 0.1;
+
 /// The global (cross-project) namespace. `project = ""` concepts are
 /// visible from every project's resolution fallback.
 pub const GLOBAL_PROJECT: &str = "";

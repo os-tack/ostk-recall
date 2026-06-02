@@ -4698,6 +4698,7 @@ dependencies = [
 name = "ostk-recall"
 version = "0.7.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "blake3",
  "chrono",

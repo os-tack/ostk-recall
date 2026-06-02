@@ -18,8 +18,8 @@ pub use activation::{
 pub use concepts::{
     AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote,
     ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource, EvidenceAttach, EvidenceReconcileRow,
-    EvidenceState, ExtractedTerm, GLOBAL_PROJECT, HitView, ReconcileStats, extract_concept_terms,
-    reconcile_concept_evidence, slugify,
+    EvidenceState, ExtractedTerm, GLOBAL_PROJECT, HitView, OBSERVED_MENTION_CONFIDENCE,
+    ReconcileStats, extract_concept_terms, reconcile_concept_evidence, slugify,
 };
 pub use corpus::{ActivityBurst, CorpusStore, StoreError};
 pub use events::{AuditEventRow, EventsDb};

@@ -13,7 +13,7 @@ echo "=== concepts (typed nodes) ==="
 sqlite3 "$DB" "select project, handle, kind, status from concepts order by handle;"
 
 echo
-echo "=== authored edges ==="
+echo "=== edges (authored from frontmatter + observed from prose) ==="
 sqlite3 "$DB" \
   "select c1.handle, e.relation, c2.handle, e.source, e.[by], e.confidence, e.touch_count
      from concept_edges e
@@ -24,14 +24,18 @@ sqlite3 "$DB" \
 cat <<EOF
 
 Expect: tori|person, sarah|person, mike|person, office|place, the standup meeting node,
-and ostk-recall (untyped — it is only an edge target, no file of its own). Edges (all
-source=authored, by=scanner, confidence~0.1):
-  tori --families--> sarah
-  sarah --families--> tori
-  tori --works_on--> ostk-recall
-  mike --works_on--> ostk-recall
-  <standup> --people--> tori, mike
-  <standup> --places--> office
+and ostk-recall (untyped — it is only an edge target, no file of its own).
+
+Authored edges (from frontmatter; source=authored, by=scanner, confidence~0.1):
+  tori --families--> sarah        sarah --families--> tori
+  tori --works_on--> ostk-recall  mike --works_on--> ostk-recall
+  <standup> --people--> tori, mike    <standup> --places--> office
+
+Observed edges (slice 4 — bare prose mentions; source=observed, relation=mentions):
+  tori --mentions--> sarah, ostk-recall
+  sarah --mentions--> tori
+  mike --mentions--> tori, ostk-recall      # mike->tori has no authored counterpart
+  <standup> --mentions--> tori, mike, office, ostk-recall
 
 Then query the live graph — see smoke.md.
 EOF

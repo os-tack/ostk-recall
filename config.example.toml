@@ -308,9 +308,11 @@ entity_type = "place"               # typed nodes with no outgoing edge
                                     # vocabulary of their own (meetings point
                                     # at them; they accrue incoming edges).
 
-# Prose mention-linking against a gazetteer of known nodes (a bare mention of
-# `ostk` or `sarah` lighting an edge with no frontmatter) is the next slice;
-# until then, edges come from the `edges` frontmatter fields above.
+# Beyond the typed frontmatter edges above, plain prose in a file's BODY that
+# *names* a known node (its handle or an alias) lights an `observed` `mentions`
+# edge automatically — no frontmatter, no wiki-links. Authored edges are the
+# topology hypothesis; observed mentions are evidence of use. Both start at a
+# low confidence and earn conductance only through repeated use.
 
 # ── `id`: disambiguating same-shape blocks ──────────────────────────────────
 # Physical identity is derived from (kind, paths, extensions, ignore). Two

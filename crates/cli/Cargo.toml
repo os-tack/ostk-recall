@@ -46,6 +46,7 @@ serde_yaml = { workspace = true }
 notify-debouncer-full = { workspace = true }
 fs4 = { workspace = true }
 ignore = { workspace = true }
+aho-corasick = { workspace = true }
 
 
 [dev-dependencies]
