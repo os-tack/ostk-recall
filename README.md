@@ -173,7 +173,7 @@ global scope.
 | tool | input (one-line) |
 | --- | --- |
 | `memory_recall` | `{ query, project?, limit?, source?, learn? }` — recall, optionally learning concept candidates |
-| `memory_concept` | `{ action: show\|list\|promote\|reject\|merge\|alias\|summarize, handle?, project?, ... }` |
+| `memory_concept` | `{ action: show\|list\|promote\|reject\|merge\|alias\|summarize\|crystallize, handle?, project?, ... }` — inspect/correct a concept card; `crystallize` writes a proposed typed node's stub file |
 | `memory_surface` | `{ view?: now\|concepts\|open_loops, project?, limit? }` — working-memory view |
 | `memory_remember` | `{ kind: concept_seed\|note\|decision\|fact\|open_question, text, concept?, project? }` |
 | `memory_connect` | `{ from, relation, to, project?, evidence? }` — author a concept edge |

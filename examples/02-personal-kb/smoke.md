@@ -27,7 +27,31 @@ memory_surface(view="now", project="memories")        # current focus + active t
 their `kind`. (`now` may be sparse on a fresh corpus — nothing has been *used* yet; that's the
 point of derived conductance.)
 
-## 3. Recall reads, it does not mutate
+## 3. Prose-name promotion + crystallize (slice 5)
+
+`Priya` was named in three `person` bodies but had no file, so the scan minted a context-typed
+proposal:
+
+```
+memory_concept(action="show", handle="priya", project="memories")
+```
+
+**Assert:**
+- `concept.kind == "person"`, `concept.status == "proposed"`, `concept.crystallizable == true`
+- `edges_to` contains observed `mentions` edges from `mike`, `sarah`, and `tori`
+  (`source == "observed"`)
+
+Confirm it into a file — propose, then confirm, **never auto-write**:
+
+```
+memory_concept(action="crystallize", handle="priya", project="memories")
+```
+
+**Assert:** returns `{created: true, path: "…/content/people/priya.md"}` and the file now exists
+with `kind: person` frontmatter. A second call returns `created: false` (never overwrites). A
+non-proposed concept (e.g. an `active` one) is refused — crystallize is gated to proposals.
+
+## 4. Recall reads, it does not mutate
 
 ```
 memory_recall(query="tori sarah office", learn=false)
