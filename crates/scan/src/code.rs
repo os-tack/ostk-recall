@@ -274,6 +274,7 @@ mod tests {
     fn cfg_with(root: &Path, exts: &[&str]) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("code".into()),
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],

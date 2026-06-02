@@ -116,6 +116,7 @@ mod tests {
         let scanner = DirYieldingScanner { dir: dir.clone() };
         let cfg = SourceConfig {
             kind: SourceKind::OstkProject,
+            graph_only: false,
             project: Some("scratch".into()),
             paths: vec![dir.to_string_lossy().into_owned()],
             ignore: vec![],
@@ -147,6 +148,7 @@ mod tests {
         let scanner = DirYieldingScanner { dir: dir.clone() };
         let cfg = SourceConfig {
             kind: SourceKind::OstkProject,
+            graph_only: false,
             project: Some("scratch".into()),
             paths: vec![dir.to_string_lossy().into_owned()],
             ignore: vec![],

@@ -19,12 +19,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, MatchKind};
-use ostk_recall_core::SourceConfig;
+use ostk_recall_core::{Source, SourceConfig};
 use ostk_recall_scan::threads::split_front_matter;
 use ostk_recall_scan::walk::walk_filtered;
 use ostk_recall_store::{
-    AUTHORED_EDGE_CONFIDENCE, ConceptRecord, ConceptStatus, EdgeSource,
-    OBSERVED_MENTION_CONFIDENCE, ThreadsDb, slugify,
+    AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptRecord, ConceptStatus, EdgeSource,
+    EvidenceAttach, IngestDb, OBSERVED_MENTION_CONFIDENCE, ThreadsDb, slugify,
 };
 use serde_json::json;
 
@@ -1057,13 +1057,471 @@ pub fn link_mentions_for_paths(
     stats
 }
 
+// ---------------------------------------------------------------------
+// Graph-only doc-topology harvest (relational-substrate; graph-growth plan)
+// ---------------------------------------------------------------------
+//
+// A `graph_only` source seeds the *active docs' authorial link graph* as
+// concept topology WITHOUT ingesting/embedding — the chunks are already owned
+// by an ingesting source (e.g. `ostk_project` over the same tree). Each `.md`
+// becomes an `Active` `doc` concept with a **path-stable** handle; inline
+// markdown links → `references` edges; frontmatter `relates-to` → `relates_to`
+// edges. Prose mentions are deliberately NOT harvested here (the gazetteer is
+// skipped for graph-only sources — doc handles like `read`/`index` would match
+// common prose and manufacture frequency-noise). Evidence is attached to the
+// chunk an ingesting source already produced (by coordinate), never re-embedded.
+
+/// Per-run doc-graph harvest counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DocGraphStats {
+    /// `doc` concept nodes freshly created.
+    pub nodes_seeded: u64,
+    /// `doc` concept nodes that already existed (re-ensured).
+    pub nodes_touched: u64,
+    /// `references` / `relates_to` edges written or re-touched.
+    pub edges_seeded: u64,
+    /// Evidence rows attached to already-ingested chunks (no re-embed).
+    pub evidence_attached: u64,
+    /// Markdown files visited.
+    pub files_scanned: u64,
+    /// Link targets dropped (external, anchor-only, out-of-root, non-doc).
+    pub links_skipped: u64,
+}
+
+/// Relation minted for an inline `[..](other.md)` link.
+const DOC_LINK_RELATION: &str = "references";
+/// Relation minted for a frontmatter `relates-to:` reference.
+const DOC_FRONTMATTER_RELATION: &str = "relates_to";
+
+/// Slug-normalize without `slugify`'s length cap (lowercase, keep
+/// `[a-z0-9_]`, collapse other runs to `-`, trim trailing `-`).
+fn slug_norm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for ch in s.trim().chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Path-stable doc handle from a docs-root-relative path.
+/// `spec/agent-lifecycle.md` → `spec-agent-lifecycle`. Documents are nodes,
+/// not titles, so identity is the *path* (stems collide: many `INDEX.md`).
+/// Results over `slugify`'s 40-char ceiling collapse to a readable prefix +
+/// short blake3 hash, so distinct deep paths never alias on truncation.
+fn doc_handle(rel: &Path) -> Option<String> {
+    let mut raw = String::new();
+    for comp in rel.with_extension("").components() {
+        if let std::path::Component::Normal(s) = comp {
+            if !raw.is_empty() {
+                raw.push('-');
+            }
+            raw.push_str(&s.to_string_lossy());
+        }
+    }
+    let norm = slug_norm(&raw);
+    if norm.len() < 3 {
+        return None;
+    }
+    if norm.len() <= 40 {
+        return Some(norm);
+    }
+    let short = &blake3::hash(norm.as_bytes()).to_hex()[..8];
+    let prefix = norm.chars().take(31).collect::<String>();
+    let prefix = prefix.trim_end_matches('-');
+    Some(format!("{prefix}-{short}"))
+}
+
+/// Resolve an inline-link target to a docs-root-relative path, applying the
+/// skip/strip rules. `from_rel` is the source doc's docs-root-relative path.
+/// Returns `None` for anything that isn't an in-root `.md` document.
+fn resolve_link_rel(from_rel: &Path, raw: &str) -> Option<String> {
+    // Markdown allows `](url "title")` — take the URL token only.
+    let url = raw.split_whitespace().next().unwrap_or("");
+    // Strip `#fragment` / `?query`.
+    let url = url.split(['#', '?']).next().unwrap_or("");
+    if url.is_empty()
+        || url.contains("://")
+        || url.starts_with("mailto:")
+        || url.starts_with("//")
+        || url.starts_with('/')
+    {
+        return None; // empty / pure-anchor / scheme / absolute → skip
+    }
+    if !url.to_ascii_lowercase().ends_with(".md") {
+        return None; // only document links
+    }
+    // Base = the source doc's directory (docs-root-relative).
+    let mut stack: Vec<String> = from_rel
+        .parent()
+        .map(|p| {
+            p.components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for comp in Path::new(url).components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                stack.pop()?; // underflow ⇒ escapes the doc root ⇒ skip
+            }
+            std::path::Component::Normal(s) => stack.push(s.to_string_lossy().into_owned()),
+            _ => return None, // RootDir / Prefix ⇒ absolute ⇒ skip
+        }
+    }
+    if stack.is_empty() {
+        return None;
+    }
+    Some(stack.join("/"))
+}
+
+/// Find inline markdown link targets (`](target)`) in a body.
+fn extract_md_link_targets(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b']' && bytes[i + 1] == b'(' {
+            let start = i + 2;
+            if let Some(close) = body[start..].find(')') {
+                out.push(body[start..start + close].to_string());
+                i = start + close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// First non-empty `# Heading` line (the doc title), for an alias.
+fn doc_title(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find_map(|l| {
+            l.strip_prefix("# ")
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+        })
+        .map(ToString::to_string)
+}
+
+/// A seeded doc node, carried from the node pass to the edge pass.
+struct DocNode {
+    rel: PathBuf,
+    handle: String,
+    id: i64,
+    body: String,
+}
+
+/// Seed one doc node (`Active`, kind from `entity_type`), its stem/title
+/// aliases, and coordinate evidence to an already-ingested chunk (no
+/// re-embed). Returns the concept id on success.
+#[allow(clippy::too_many_arguments)] // cohesive per-doc seed inputs; a struct would just relocate them
+fn seed_doc_node(
+    threads: &ThreadsDb,
+    ingest: &IngestDb,
+    project: &str,
+    kind: &str,
+    root_name: &str,
+    rel: &Path,
+    handle: &str,
+    body: &str,
+    stats: &mut DocGraphStats,
+) -> Option<i64> {
+    let (rec, created) =
+        match threads.ensure_typed_concept(project, handle, ConceptStatus::Active, Some(kind)) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(handle, error = %e, "doc-graph: ensure node failed");
+                return None;
+            }
+        };
+    if created {
+        stats.nodes_seeded += 1;
+        if let Err(e) = threads.record_concept_promoted(project, handle, "active") {
+            tracing::debug!(handle, error = %e, "doc-graph: ConceptPromoted emit failed");
+        }
+    } else {
+        stats.nodes_touched += 1;
+    }
+    // Aliases: bare stem + `# Title` (documents are reachable by their name,
+    // even though identity is the path).
+    if let Some(stem) = rel.file_stem().and_then(|s| s.to_str()) {
+        let _ = threads.touch_alias(rec.id, stem, AliasSource::Path);
+    }
+    if let Some(title) = doc_title(body) {
+        let _ = threads.touch_alias(rec.id, &title, AliasSource::Path);
+    }
+    // Evidence: map docs-root-relative `rel` → the ingesting source's
+    // project-root coordinate (`<root_name>/<rel>`, e.g. `docs/spec/foo.md`)
+    // and anchor on the first chunk (lowest `chunk_index`). No re-embed.
+    let source_id = format!("{root_name}/{}", rel.to_string_lossy());
+    if let Ok(chunks) = ingest.chunk_ids_for_source_id(Source::OstkSpec.as_str(), &source_id) {
+        if let Some(anchor) = chunks.first() {
+            let attached = threads.attach_concept_evidence(&EvidenceAttach {
+                concept_id: rec.id,
+                project,
+                source: Source::OstkSpec.as_str(),
+                source_id: &source_id,
+                chunk_id: Some(anchor),
+                content_sha256: None,
+                anchor_vec: None,
+                score: None,
+                reason: Some("doc-graph harvest"),
+            });
+            match attached {
+                Ok(()) => stats.evidence_attached += 1,
+                Err(e) => tracing::debug!(handle, error = %e, "doc-graph: evidence attach failed"),
+            }
+        }
+    }
+    Some(rec.id)
+}
+
+/// Harvest edges out of one doc body, resolving targets via `resolve`
+/// (handle → concept id). `references` from inline links, `relates_to` from
+/// frontmatter `relates-to:` `.md` tokens.
+#[allow(clippy::too_many_arguments)] // cohesive per-doc edge-harvest inputs
+fn harvest_doc_edges(
+    threads: &ThreadsDb,
+    project: &str,
+    from_handle: &str,
+    from_id: i64,
+    from_rel: &Path,
+    body: &str,
+    resolve: &dyn Fn(&str) -> Option<i64>,
+    stats: &mut DocGraphStats,
+) {
+    let mut add = |to_handle: &str, to_id: i64, relation: &str| {
+        if to_id == from_id {
+            return;
+        }
+        match threads.add_concept_edge_by_id(
+            from_id,
+            relation,
+            to_id,
+            OBSERVED_MENTION_CONFIDENCE,
+            EdgeSource::Observed,
+            Some("scanner"),
+            Some(&json!({ "via": "doc-graph" }).to_string()),
+        ) {
+            Ok((_, created)) => {
+                stats.edges_seeded += 1;
+                // Audit-only cognition event, on first creation only (the
+                // by-id row above is authoritative; re-touch is silent use).
+                if created {
+                    if let Err(e) = threads.record_concept_connected(
+                        project,
+                        from_handle,
+                        relation,
+                        to_handle,
+                        EdgeSource::Observed,
+                        Some("scanner"),
+                    ) {
+                        tracing::debug!(error = %e, "doc-graph: ConceptConnected emit failed");
+                    }
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "doc-graph: edge skipped"),
+        }
+    };
+
+    // Inline links (file-relative) → references.
+    for raw in extract_md_link_targets(body) {
+        match resolve_link_rel(from_rel, &raw) {
+            Some(rel) => match doc_handle(Path::new(&rel)) {
+                Some(h) => match resolve(&h) {
+                    Some(to_id) => add(&h, to_id, DOC_LINK_RELATION),
+                    None => stats.links_skipped += 1, // in-root path, not a seeded doc
+                },
+                None => stats.links_skipped += 1,
+            },
+            None => stats.links_skipped += 1, // external / anchor / out-of-root
+        }
+    }
+
+    // Frontmatter `relates-to:` → relates_to. Best-effort over the free-text
+    // value, handling both the inline form (`relates-to: a.md, b.md`) and the
+    // YAML block-list form (`relates-to:` then indented `- a.md` lines). Each
+    // `.md` token is resolved docs-root-relative after stripping a leading
+    // `docs/` or `./` (frontmatter paths are often project-root-relative).
+    if let Some((yaml, _)) = split_front_matter(body) {
+        let mut resolve_tokens = |src: &str| {
+            for tok in src.split([' ', ',', '(', ')', '\t']) {
+                let tok = tok.trim_matches(|c: char| {
+                    !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                });
+                if !tok.to_ascii_lowercase().ends_with(".md") {
+                    continue;
+                }
+                let stripped = tok.trim_start_matches("./");
+                let stripped = stripped.strip_prefix("docs/").unwrap_or(stripped);
+                if let Some(h) = doc_handle(Path::new(stripped)) {
+                    if let Some(to_id) = resolve(&h) {
+                        add(&h, to_id, DOC_FRONTMATTER_RELATION);
+                    }
+                }
+            }
+        };
+        let mut in_relates = false;
+        for line in yaml.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("relates-to:")
+                .or_else(|| trimmed.strip_prefix("relates_to:"))
+            {
+                in_relates = true;
+                resolve_tokens(rest); // inline values on the key line
+            } else if in_relates && trimmed.starts_with('-') {
+                resolve_tokens(trimmed.trim_start_matches('-')); // block-list item
+            } else if !trimmed.is_empty() {
+                in_relates = false; // a new key ends the relates-to block
+            }
+        }
+    }
+}
+
+/// Full-scan driver: harvest the doc-topology graph for one `graph_only` source.
+///
+/// Two passes — seed every node first (so link targets resolve), then harvest
+/// edges. No-op unless `entity_type` is set (config-validated).
+pub fn harvest_doc_graph_from_source(
+    threads: &ThreadsDb,
+    ingest: &IngestDb,
+    cfg: &SourceConfig,
+) -> DocGraphStats {
+    let mut stats = DocGraphStats::default();
+    let project = cfg.project.as_deref().unwrap_or("");
+    let Some(kind) = cfg.entity_type.as_deref() else {
+        return stats;
+    };
+    let roots = cfg.expanded_paths().unwrap_or_default();
+    for root in &roots {
+        let root_name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        // Pass 1 — seed nodes; build handle→id for in-root link resolution.
+        let mut docs: Vec<DocNode> = Vec::new();
+        let mut seeded: HashMap<String, i64> = HashMap::new();
+        for entry in walk_filtered(root, &cfg.ignore).filter(|e| is_md(e.path())) {
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let Some(handle) = doc_handle(rel) else {
+                continue;
+            };
+            stats.files_scanned += 1;
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            if let Some(id) = seed_doc_node(
+                threads, ingest, project, kind, root_name, rel, &handle, &body, &mut stats,
+            ) {
+                seeded.insert(handle.clone(), id);
+                docs.push(DocNode {
+                    rel: rel.to_path_buf(),
+                    handle,
+                    id,
+                    body,
+                });
+            }
+        }
+        // Pass 2 — edges, resolved against the now-complete node set.
+        let resolve = |h: &str| seeded.get(h).copied();
+        for doc in &docs {
+            harvest_doc_edges(
+                threads,
+                project,
+                &doc.handle,
+                doc.id,
+                &doc.rel,
+                &doc.body,
+                &resolve,
+                &mut stats,
+            );
+        }
+    }
+    stats
+}
+
+/// Incremental driver: harvest only the changed `paths` for a `graph_only` source.
+///
+/// Built for a future watch wiring (not exposed via the project-scoped
+/// `--source` in this phase). Targets resolve against the existing ledger (a
+/// full scan seeds the complete node set).
+pub fn harvest_doc_graph_for_paths(
+    threads: &ThreadsDb,
+    ingest: &IngestDb,
+    cfg: &SourceConfig,
+    paths: &[PathBuf],
+) -> DocGraphStats {
+    let mut stats = DocGraphStats::default();
+    let project = cfg.project.as_deref().unwrap_or("");
+    let Some(kind) = cfg.entity_type.as_deref() else {
+        return stats;
+    };
+    let roots = cfg.expanded_paths().unwrap_or_default();
+    let resolve = |h: &str| {
+        threads
+            .resolve_concept(project, h)
+            .ok()
+            .flatten()
+            .map(|r| r.id)
+    };
+    for pc in paths {
+        if !is_md(pc) {
+            continue;
+        }
+        let Some(root) = roots.iter().find(|r| pc.starts_with(r)) else {
+            continue;
+        };
+        let root_name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let Ok(rel) = pc.strip_prefix(root) else {
+            continue;
+        };
+        let Some(handle) = doc_handle(rel) else {
+            continue;
+        };
+        stats.files_scanned += 1;
+        let body = std::fs::read_to_string(pc).unwrap_or_default();
+        if let Some(id) = seed_doc_node(
+            threads, ingest, project, kind, root_name, rel, &handle, &body, &mut stats,
+        ) {
+            harvest_doc_edges(
+                threads, project, &handle, id, rel, &body, &resolve, &mut stats,
+            );
+        }
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
     use ostk_recall_core::SourceKind;
-    use ostk_recall_store::{AliasSource, ChainEvent, ChainSink, EdgeDirection, SqliteChainSink};
+    use ostk_recall_store::{
+        AliasSource, ChainEvent, ChainSink, EdgeDirection, IngestChunkRow, SqliteChainSink,
+    };
     use tempfile::TempDir;
 
     const PROJ: &str = "memories";
@@ -1071,6 +1529,7 @@ mod tests {
     fn src(dir: &Path, entity_type: Option<&str>, edges: &[&str], ignore: &[&str]) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some(PROJ.into()),
             paths: vec![dir.to_string_lossy().into_owned()],
             ignore: ignore.iter().map(ToString::to_string).collect(),
@@ -1919,6 +2378,281 @@ mod tests {
         assert_eq!(
             db.get_concept(PROJ, "trent").unwrap().unwrap().status,
             ConceptStatus::Rejected
+        );
+    }
+
+    // ---- doc-graph harvest: pure helpers ----
+
+    #[test]
+    fn doc_handle_is_path_based() {
+        assert_eq!(
+            doc_handle(Path::new("spec/agent-lifecycle.md")).as_deref(),
+            Some("spec-agent-lifecycle")
+        );
+        // Stems collide; paths don't.
+        assert_eq!(
+            doc_handle(Path::new("spec/index.md")).as_deref(),
+            Some("spec-index")
+        );
+        assert_eq!(
+            doc_handle(Path::new("draft/index.md")).as_deref(),
+            Some("draft-index")
+        );
+        assert_ne!(
+            doc_handle(Path::new("spec/index.md")),
+            doc_handle(Path::new("draft/index.md")),
+            "same stem in different dirs must not collide"
+        );
+    }
+
+    #[test]
+    fn doc_handle_long_path_uses_prefix_plus_hash() {
+        let long = Path::new("spec/a-very-very-long-document-name-that-blows-past-forty-chars.md");
+        let h = doc_handle(long).expect("long path still yields a handle");
+        assert!(
+            h.len() <= 40,
+            "handle within slug ceiling: {} ({})",
+            h,
+            h.len()
+        );
+        assert!(h.contains('-'), "prefix-hash shape");
+        // Deterministic + collision-resistant: a different long path → different handle.
+        let other = Path::new("spec/a-very-very-long-document-name-that-blows-past-forty-OTHER.md");
+        assert_ne!(doc_handle(long), doc_handle(other));
+        assert_eq!(doc_handle(long), doc_handle(long), "deterministic");
+    }
+
+    #[test]
+    fn resolve_link_rel_in_root_paths() {
+        let from = Path::new("spec/foo.md");
+        assert_eq!(
+            resolve_link_rel(from, "bar.md").as_deref(),
+            Some("spec/bar.md")
+        );
+        assert_eq!(
+            resolve_link_rel(from, "./bar.md").as_deref(),
+            Some("spec/bar.md")
+        );
+        assert_eq!(
+            resolve_link_rel(from, "../draft/x.md").as_deref(),
+            Some("draft/x.md")
+        );
+        // Fragment + query are stripped.
+        assert_eq!(
+            resolve_link_rel(from, "bar.md#sec").as_deref(),
+            Some("spec/bar.md")
+        );
+        assert_eq!(
+            resolve_link_rel(from, "bar.md?v=1").as_deref(),
+            Some("spec/bar.md")
+        );
+        // `](url "title")` — only the URL token is used.
+        assert_eq!(
+            resolve_link_rel(from, "bar.md \"A Title\"").as_deref(),
+            Some("spec/bar.md")
+        );
+    }
+
+    #[test]
+    fn resolve_link_rel_skips_non_doc_targets() {
+        let from = Path::new("spec/foo.md");
+        for skip in [
+            "https://example.com/x.md", // absolute URL
+            "http://example.com",       // absolute URL, non-md
+            "mailto:a@b.md",            // mailto scheme
+            "#section",                 // pure anchor
+            "/abs/x.md",                // absolute fs path
+            "image.png",                // non-doc extension
+            "../../outside.md",         // escapes the doc root (from spec/foo.md)
+            "",                         // empty
+        ] {
+            assert!(
+                resolve_link_rel(from, skip).is_none(),
+                "should skip {skip:?}"
+            );
+        }
+        // From a top-level doc, a single `../` already escapes the root.
+        assert!(resolve_link_rel(Path::new("foo.md"), "../bar.md").is_none());
+    }
+
+    #[test]
+    fn extract_md_link_targets_finds_inline_links() {
+        let body = "see [a](./a.md) and [b](b.md \"title\") plus [c](https://x).";
+        let got = extract_md_link_targets(body);
+        assert_eq!(got, vec!["./a.md", "b.md \"title\"", "https://x"]);
+    }
+
+    // ---- doc-graph harvest: integration ----
+
+    fn write_doc(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn harvest_seeds_active_doc_nodes_and_reference_edges() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let ing_dir = TempDir::new().unwrap();
+        let db = ThreadsDb::open(db_dir.path()).unwrap();
+        let ingest = IngestDb::open(ing_dir.path()).unwrap();
+        let root = tmp.path();
+
+        // a → b (in-root), plus external/anchor/out-of-root links that must skip.
+        write_doc(
+            root,
+            "spec/a.md",
+            "# Doc A\nlinks [to b](b.md), [ext](https://x.com/y.md), [anc](#s), [out](../../o.md)",
+        );
+        write_doc(root, "spec/b.md", "# Doc B\nleaf");
+
+        let cfg = src(root, Some("doc"), &[], &[]);
+        let stats = harvest_doc_graph_from_source(&db, &ingest, &cfg);
+
+        assert_eq!(stats.nodes_seeded, 2, "two doc nodes");
+        // Both nodes are Active + kind=doc.
+        for h in ["spec-a", "spec-b"] {
+            let rec = db.get_concept(PROJ, h).unwrap().unwrap();
+            assert_eq!(rec.status, ConceptStatus::Active, "{h} active");
+            assert_eq!(rec.kind.as_deref(), Some("doc"), "{h} kind=doc");
+        }
+        // Exactly one references edge a→b; the external/anchor/out-of-root skipped.
+        assert_eq!(
+            stats.edges_seeded, 1,
+            "only the in-root .md link becomes an edge"
+        );
+        assert!(
+            stats.links_skipped >= 3,
+            "external/anchor/out-of-root skipped"
+        );
+        let edges = db
+            .list_concept_edges(PROJ, "spec-a", EdgeDirection::From)
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].relation, "references");
+        assert_eq!(edges[0].to_handle, "spec-b");
+        assert!(matches!(edges[0].source, EdgeSource::Observed));
+
+        // Re-harvest is idempotent (no new nodes/edges; re-touch only).
+        let again = harvest_doc_graph_from_source(&db, &ingest, &cfg);
+        assert_eq!(again.nodes_seeded, 0, "existing nodes not re-created");
+        let edges2 = db
+            .list_concept_edges(PROJ, "spec-a", EdgeDirection::From)
+            .unwrap();
+        assert_eq!(edges2.len(), 1, "edge re-touched, not duplicated");
+    }
+
+    #[test]
+    fn harvest_attaches_evidence_to_already_ingested_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let ing_dir = TempDir::new().unwrap();
+        let db = ThreadsDb::open(db_dir.path()).unwrap();
+        let ingest = IngestDb::open(ing_dir.path()).unwrap();
+        let root = tmp.path();
+        let root_name = root.file_name().unwrap().to_str().unwrap();
+
+        write_doc(root, "spec/a.md", "# Doc A\nbody");
+        // Pre-seed the ingesting source's chunk at the mapped coordinate
+        // (project-root-relative `<root_name>/spec/a.md`), two chunks so the
+        // anchor must be the first by chunk_index.
+        for idx in [1_u32, 0] {
+            ingest
+                .record_chunk(
+                    &IngestChunkRow {
+                        chunk_id: format!("chunk-{idx}"),
+                        source: Source::OstkSpec.as_str().to_string(),
+                        source_id: format!("{root_name}/spec/a.md"),
+                        source_config_id: "test".into(),
+                        chunk_index: idx,
+                        content_sha256: format!("sha-{idx}"),
+                        embedding_input_sha256: String::new(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+
+        let cfg = src(root, Some("doc"), &[], &[]);
+        let stats = harvest_doc_graph_from_source(&db, &ingest, &cfg);
+        assert_eq!(
+            stats.evidence_attached, 1,
+            "one evidence anchor for the ingested doc"
+        );
+    }
+
+    #[test]
+    fn harvest_emits_concept_connected_on_creation_only() {
+        let tmp = TempDir::new().unwrap();
+        let ing_dir = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+        let ingest = IngestDb::open(ing_dir.path()).unwrap();
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_doc(&root, "spec/a.md", "# A\nsee [b](b.md)");
+        write_doc(&root, "spec/b.md", "# B\nleaf");
+
+        let cfg = src(&root, Some("doc"), &[], &[]);
+        harvest_doc_graph_from_source(&db, &ingest, &cfg);
+        let kinds: Vec<String> = db
+            .iter_chain()
+            .unwrap()
+            .iter()
+            .map(|e| ChainEvent::kind_str(e).to_string())
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "concept_connected").count(),
+            1,
+            "the a→b references edge emits one ConceptConnected"
+        );
+        // Idempotent re-harvest: no new chain events (re-touch is silent use).
+        let before = db.iter_chain().unwrap().len();
+        harvest_doc_graph_from_source(&db, &ingest, &cfg);
+        assert_eq!(
+            db.iter_chain().unwrap().len(),
+            before,
+            "rescan emits nothing"
+        );
+    }
+
+    #[test]
+    fn harvest_relates_to_handles_yaml_block_list() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let ing_dir = TempDir::new().unwrap();
+        let db = ThreadsDb::open(db_dir.path()).unwrap();
+        let ingest = IngestDb::open(ing_dir.path()).unwrap();
+        let root = tmp.path();
+        // Block-list frontmatter form (not inline) — the codex Low finding.
+        write_doc(
+            root,
+            "spec/a.md",
+            "---\nrelates-to:\n  - spec/b.md\n  - docs/spec/c.md\nstatus: live\n---\n# A\nbody",
+        );
+        write_doc(root, "spec/b.md", "# B");
+        write_doc(root, "spec/c.md", "# C");
+
+        let cfg = src(root, Some("doc"), &[], &[]);
+        harvest_doc_graph_from_source(&db, &ingest, &cfg);
+        let edges = db
+            .list_concept_edges(PROJ, "spec-a", EdgeDirection::From)
+            .unwrap();
+        let relates: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.relation == "relates_to")
+            .map(|e| e.to_handle.as_str())
+            .collect();
+        // `spec/b.md` (docs-root-relative) and `docs/spec/c.md` (docs/-prefixed)
+        // both resolve; `status: live` ends the block and is ignored.
+        assert!(
+            relates.contains(&"spec-b"),
+            "block-list item resolved: {relates:?}"
+        );
+        assert!(
+            relates.contains(&"spec-c"),
+            "docs/-prefixed item resolved: {relates:?}"
         );
     }
 }

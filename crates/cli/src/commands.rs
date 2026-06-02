@@ -426,9 +426,13 @@ pub async fn scan_with_context(
     ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
-        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder))
-            .with_dry_run(dry_run)
-            .with_record_rules(compile_record_rules(&cfg)?),
+        Pipeline::new(
+            Arc::clone(&store),
+            Arc::clone(&ingest),
+            Arc::clone(&embedder),
+        )
+        .with_dry_run(dry_run)
+        .with_record_rules(compile_record_rules(&cfg)?),
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
@@ -485,6 +489,35 @@ pub async fn scan_with_context(
             .project
             .clone()
             .unwrap_or_else(|| format!("{}[{i}]", source_cfg.kind.as_str()));
+
+        // Graph-only source (relational-substrate doc-topology harvest): never
+        // ingested/embedded (an ingesting source already owns these chunks) and
+        // never added to the gazetteer mention pass. Harvest the doc nodes +
+        // authorial link graph straight into the ledger, then skip ingest.
+        //
+        // Full-scan only: `--source` filters by project, and a graph-only docs
+        // source shares its project with the ingesting source over the same
+        // tree, so a project-scoped `--source <project>` would mutate the doc
+        // graph as a side-effect of an unrelated scan. Gate on no filter;
+        // always `continue` so the source never ingests regardless.
+        if source_cfg.graph_only {
+            if source_filter.is_none() && !dry_run {
+                if let Some(threads) = threads_db.as_ref() {
+                    let s =
+                        crate::seed::harvest_doc_graph_from_source(threads, &ingest, source_cfg);
+                    if s.nodes_seeded + s.edges_seeded > 0 {
+                        tracing::info!(
+                            source = %label,
+                            nodes = s.nodes_seeded,
+                            edges = s.edges_seeded,
+                            evidence = s.evidence_attached,
+                            "harvested doc-topology graph"
+                        );
+                    }
+                }
+            }
+            continue;
+        }
 
         let scanner: &dyn Scanner = match source_cfg.kind {
             SourceKind::Markdown => &markdown,
@@ -680,9 +713,13 @@ pub async fn scan_paths_with_context(
     ensure_corpus_indexes(&store).await?;
     let ingest = Arc::new(IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?);
     let pipeline = Arc::new(
-        Pipeline::new(Arc::clone(&store), ingest, Arc::clone(&embedder))
-            .with_dry_run(dry_run)
-            .with_record_rules(compile_record_rules(&cfg)?),
+        Pipeline::new(
+            Arc::clone(&store),
+            Arc::clone(&ingest),
+            Arc::clone(&embedder),
+        )
+        .with_dry_run(dry_run)
+        .with_record_rules(compile_record_rules(&cfg)?),
     );
 
     let threads_db = resolve_threads_db(ctx, &root);
@@ -726,6 +763,10 @@ pub async fn scan_paths_with_context(
     let pairs: Vec<(&dyn Scanner, &SourceConfig)> = cfg
         .sources
         .iter()
+        // Graph-only doc-topology sources never ingest, and Phase 1 does not
+        // auto-harvest them on the incremental path (full-scan only); exclude
+        // them from the changed-path ingest fan-out entirely.
+        .filter(|source_cfg| !source_cfg.graph_only)
         .map(|source_cfg| {
             let scanner: &dyn Scanner = match source_cfg.kind {
                 // Membrane sources are in-process synthetic ingest only

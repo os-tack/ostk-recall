@@ -329,6 +329,7 @@ mod tests {
     fn cfg_glob(pat: &str) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::ZipExport,
+            graph_only: false,
             project: Some("export".into()),
             paths: vec![pat.into()],
             ignore: vec![],

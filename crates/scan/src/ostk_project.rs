@@ -1593,6 +1593,7 @@ mod tests {
     fn cfg_for(root: &Path, project: Option<&str>) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::OstkProject,
+            graph_only: false,
             project: project.map(str::to_string),
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],

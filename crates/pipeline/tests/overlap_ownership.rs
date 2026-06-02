@@ -87,6 +87,7 @@ async fn two_configs_same_dir_do_not_collide() {
     let blocks = vec![
         SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("alpha".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -99,6 +100,7 @@ async fn two_configs_same_dir_do_not_collide() {
         },
         SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("beta".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -139,6 +141,7 @@ async fn dropping_one_block_sweeps_only_its_chunks() {
     let blocks = vec![
         SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("alpha".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -151,6 +154,7 @@ async fn dropping_one_block_sweeps_only_its_chunks() {
         },
         SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("beta".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],

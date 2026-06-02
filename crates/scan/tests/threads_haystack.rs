@@ -21,6 +21,7 @@ fn dumps_extra_for_haystack_thread() {
 
     let cfg = SourceConfig {
         kind: SourceKind::Thread,
+        graph_only: false,
         project: Some("haystack".into()),
         paths: vec![root.to_string_lossy().into_owned()],
         ignore: vec![],

@@ -72,6 +72,7 @@ fn make_cfg(fixtures_dir: &Path, facets_override: &[(&str, &[&str])]) -> SourceC
         },
         sources: vec![SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("notes".into()),
             paths: vec![fixtures_dir.to_string_lossy().into_owned()],
             ignore: vec![],

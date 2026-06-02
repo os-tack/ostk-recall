@@ -137,6 +137,7 @@ mod tests {
     fn cfg_with(root: &Path, project: Option<&str>) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::ClaudeCode,
+            graph_only: false,
             project: project.map(str::to_string),
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],

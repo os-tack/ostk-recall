@@ -1216,6 +1216,7 @@ mod tests {
     fn cfg_for(root: &Path) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("test".into()),
             paths: vec![root.to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1261,6 +1262,7 @@ mod tests {
         let scanner = CodeScanner;
         let cfg = SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("commit-batch-test".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1375,6 +1377,7 @@ mod tests {
         let scanner = CodeScanner;
         let cfg = SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("code-test".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1471,6 +1474,7 @@ mod tests {
         let code_scanner = CodeScanner;
         let md_cfg = SourceConfig {
             kind: SourceKind::Markdown,
+            graph_only: false,
             project: Some("md-proj".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1483,6 +1487,7 @@ mod tests {
         };
         let code_cfg = SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("code-proj".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1630,6 +1635,7 @@ mod tests {
         let scanner = CodeScanner;
         let cfg = SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("code-test".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1698,6 +1704,7 @@ mod tests {
         let scanner = CodeScanner;
         let cfg = SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("rename-test".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],
@@ -1756,6 +1763,7 @@ mod tests {
         let scanner = CodeScanner;
         let cfg = SourceConfig {
             kind: SourceKind::Code,
+            graph_only: false,
             project: Some("noop-test".into()),
             paths: vec![fixtures.path().to_string_lossy().into_owned()],
             ignore: vec![],

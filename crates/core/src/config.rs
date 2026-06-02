@@ -645,6 +645,16 @@ pub struct SourceConfig {
     /// `[a-z0-9_-]+`.
     #[serde(default)]
     pub edges: Vec<String>,
+    /// Graph-only source (relational-substrate doc-topology harvest). When
+    /// `true`, this source is **excluded from pipeline ingest** (it emits no
+    /// chunks/embeddings) and is processed ONLY by the doc-graph harvest pass:
+    /// it seeds typed `entity_type` concept *nodes* + edges (harvested from the
+    /// docs' own markdown link graph) into the ledger, and attaches evidence to
+    /// chunks an *ingesting* source already produced. It is NOT added to the
+    /// gazetteer prose-mention pass. Requires `entity_type`. NOT part of
+    /// physical identity. See `relational-substrate.md` / the graph-growth plan.
+    #[serde(default)]
+    pub graph_only: bool,
     /// Computed at config parse from `(kind, paths, extensions, ignore,
     /// optional legacy project)` via [`compute_source_config_id`]. Always
     /// non-empty after `Config::load` / `Config::validate` returns. Never
@@ -709,6 +719,15 @@ impl Config {
                         s.kind.as_str()
                     )));
                 }
+            }
+            // A graph-only source seeds nodes/edges but never ingests, so it
+            // is meaningless without a node type to seed.
+            if s.graph_only && s.entity_type.is_none() {
+                return Err(Error::Config(format!(
+                    "sources[{i}] (kind={}) sets `graph_only` but no `entity_type` \
+                     (a graph-only source seeds typed nodes; it needs a kind)",
+                    s.kind.as_str()
+                )));
             }
             let mut seen_edges = std::collections::HashSet::new();
             for e in &s.edges {
@@ -1013,6 +1032,27 @@ paths = []
         let mut cfg = cfg_with_source("entity_type = \"  \"");
         let err = cfg.validate_and_seal().unwrap_err();
         assert!(err.to_string().contains("entity_type"));
+    }
+
+    #[test]
+    fn rejects_graph_only_without_entity_type() {
+        // A graph-only source seeds typed nodes; it is meaningless without a
+        // node kind to seed.
+        let mut cfg = cfg_with_source("graph_only = true");
+        let err = cfg.validate_and_seal().unwrap_err();
+        assert!(
+            err.to_string().contains("graph_only") && err.to_string().contains("entity_type"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_graph_only_with_entity_type() {
+        let mut cfg = cfg_with_source("graph_only = true\nentity_type = \"doc\"");
+        cfg.validate_and_seal()
+            .expect("graph_only + entity_type is valid");
+        assert!(cfg.sources[0].graph_only);
+        assert_eq!(cfg.sources[0].entity_type.as_deref(), Some("doc"));
     }
 
     #[test]

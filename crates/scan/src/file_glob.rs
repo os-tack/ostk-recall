@@ -311,6 +311,7 @@ mod tests {
     fn cfg_glob(pat: &str, project: &str) -> SourceConfig {
         SourceConfig {
             kind: SourceKind::FileGlob,
+            graph_only: false,
             project: Some(project.into()),
             paths: vec![pat.into()],
             ignore: vec![],
