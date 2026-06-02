@@ -21,8 +21,8 @@ use ostk_recall_cli::lens_state::LensState;
 use ostk_recall_core::{Chunk, FacetSet, Links, Source};
 use ostk_recall_query::lens::Lens;
 use ostk_recall_query::lens::LensConfig;
-use ostk_recall_query::promote_latent_edges;
 use ostk_recall_query::rank::{RankEngine, build_engine_from_weights};
+use ostk_recall_query::{ConceptCodebook, PromotionReport, promote_latent_edges};
 use ostk_recall_store::corpus::CorpusStore;
 use ostk_recall_store::threads::ThreadsDb;
 use ostk_recall_store::{
@@ -32,6 +32,17 @@ use ostk_recall_store::{
 
 const DIM: usize = 8;
 const G: &str = GLOBAL_PROJECT;
+/// Test floor: admits the cosine-1.0 same-axis bridge, rejects the orthogonal
+/// (cosine-0) far neighbour.
+const TEST_FLOOR: f32 = 0.5;
+
+/// Build the codebook + support fresh and run one promotion pass — the real
+/// `memory_reflect` shape (support + codebook recomputed each pass).
+async fn promote(corpus: &CorpusStore, db: &ThreadsDb) -> PromotionReport {
+    let support = db.relational_support(default_since(Utc::now())).unwrap();
+    let codebook = ConceptCodebook::build(corpus, db).await.unwrap();
+    promote_latent_edges(&codebook, db, &support, TEST_FLOOR, 4).unwrap()
+}
 
 /// A one-hot unit vector on `axis`.
 fn axis(a: usize) -> Vec<f32> {
@@ -189,9 +200,7 @@ async fn focus_surfaces_off_diagonal_latent_chunk_via_relational_slot() {
 #[tokio::test]
 async fn reflect_promotes_off_diagonal_bridge_to_weak_promoted_edge() {
     let (_tmp, corpus, db) = build(1).await;
-    let support = db.relational_support(default_since(Utc::now())).unwrap();
-
-    let report = promote_latent_edges(&corpus, &db, &support).await.unwrap();
+    let report = promote(&corpus, &db).await;
     assert_eq!(report.promoted, 1, "one off-diagonal bridge promoted");
     assert_eq!(report.retouched, 0);
 
@@ -215,8 +224,8 @@ async fn reflect_promotes_off_diagonal_bridge_to_weak_promoted_edge() {
     // freshly-promoted edge as a reified neighbour (the promoted edge is NOT in
     // the seed's hard set, so the bridge passes the filter and is re-touched,
     // keeping conductance warm) — never duplicated.
-    let support2 = db.relational_support(default_since(Utc::now())).unwrap();
-    let again = promote_latent_edges(&corpus, &db, &support2).await.unwrap();
+    // Recompute support + codebook (the real path) and promote again.
+    let again = promote(&corpus, &db).await;
     assert_eq!(again.promoted, 0, "no new edge on re-run");
     assert_eq!(
         again.retouched, 1,
@@ -240,8 +249,7 @@ async fn pair_with_existing_edge_is_not_re_promoted() {
     db.add_concept_edge_by_id(a, "works_on", b, 1.0, EdgeSource::Authored, None, None)
         .unwrap();
 
-    let support = db.relational_support(default_since(Utc::now())).unwrap();
-    let report = promote_latent_edges(&corpus, &db, &support).await.unwrap();
+    let report = promote(&corpus, &db).await;
     assert_eq!(
         report.promoted, 0,
         "off-diagonal only — existing pair skipped"
@@ -259,11 +267,36 @@ async fn pair_with_existing_edge_is_not_re_promoted() {
 #[tokio::test]
 async fn far_neighbour_below_floor_is_not_promoted() {
     let (_tmp, corpus, db) = build(2).await; // beta orthogonal to the anchor (cosine 0)
-    let support = db.relational_support(default_since(Utc::now())).unwrap();
-    let report = promote_latent_edges(&corpus, &db, &support).await.unwrap();
+    let report = promote(&corpus, &db).await;
     assert_eq!(
         report.promoted, 0,
         "a sub-floor latent neighbour is not a bridge"
+    );
+}
+
+#[tokio::test]
+async fn same_chunk_co_citation_is_not_a_bridge() {
+    // active `alpha` and proposed `beta` cite the SAME evidence chunk — they
+    // cosine at 1.0, but co-citation of one chunk is not a discovered latent
+    // bridge, so nothing is promoted.
+    let tmp = TempDir::new().unwrap();
+    let corpus = CorpusStore::open_or_create(tmp.path(), DIM).await.unwrap();
+    corpus.upsert(&[chunk("shared")], &[axis(1)]).await.unwrap();
+    let sink = SqliteChainSink::open(tmp.path()).unwrap();
+    let db = ThreadsDb::open_with_sink(tmp.path(), Arc::new(sink)).unwrap();
+    db.ensure_concept(G, "alpha", ConceptStatus::Active)
+        .unwrap();
+    db.ensure_concept(G, "beta", ConceptStatus::Proposed)
+        .unwrap();
+    db.record_concept_accessed(G, "alpha", "recall:path", "qh-a")
+        .unwrap();
+    evidence(&db, id_of(&db, "alpha"), "shared");
+    evidence(&db, id_of(&db, "beta"), "shared");
+
+    let report = promote(&corpus, &db).await;
+    assert_eq!(
+        report.promoted, 0,
+        "co-citation of one chunk is not a latent bridge"
     );
 }
 
@@ -293,8 +326,7 @@ async fn reciprocal_active_seeds_promote_a_single_edge() {
     evidence(&db, id_of(&db, "alpha"), "alpha-anchor");
     evidence(&db, id_of(&db, "beta"), "beta-anchor");
 
-    let support = db.relational_support(default_since(Utc::now())).unwrap();
-    let report = promote_latent_edges(&corpus, &db, &support).await.unwrap();
+    let report = promote(&corpus, &db).await;
     assert_eq!(
         report.promoted, 1,
         "exactly one shared edge, not two reciprocal"
@@ -323,8 +355,7 @@ async fn promoted_bridge_still_surfaces_after_promotion() {
     // treating the (now-promoted) neighbour as latent-readable, or the bridge
     // would surface before reflect, get promoted, then vanish from the lens.
     let (_tmp, corpus, db) = build(1).await;
-    let support = db.relational_support(default_since(Utc::now())).unwrap();
-    let report = promote_latent_edges(&corpus, &db, &support).await.unwrap();
+    let report = promote(&corpus, &db).await;
     assert_eq!(report.promoted, 1);
 
     // Rebuild the lens against the post-promotion graph.

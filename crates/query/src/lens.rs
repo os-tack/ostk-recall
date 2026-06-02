@@ -88,6 +88,10 @@ pub struct LensConfig {
     /// Peak refractory penalty (subtracted from `total_score` for a chunk
     /// surfaced just now). `0.0` disables the refractory stage. P9b-full.
     pub refractory_weight: f32,
+    /// Latent-promotion cosine floor (slice 2cA), mapped from
+    /// `[relational] latent_sim_floor`. Part A surfaces off-diagonal concept
+    /// neighbours clearing this; `serve()` populates it from `RelationalConfig`.
+    pub latent_sim_floor: f32,
 }
 
 impl Default for LensConfig {
@@ -112,6 +116,8 @@ impl Default for LensConfig {
             // defaults; the CLI guard test pins them together.
             refractory_tau_secs: 3600,
             refractory_weight: 0.5,
+            // Canonical default lives in core (the single source of truth).
+            latent_sim_floor: ostk_recall_core::RelationalConfig::default().latent_sim_floor,
         }
     }
 }
@@ -195,15 +201,20 @@ pub async fn build_lens(
                 Some(reader) => {
                     let mut support =
                         reader.relational_support(ostk_recall_store::default_since_now())?;
-                    // Slice 2b: also walk the latent (Lance similarity) half, so
-                    // off-diagonal neighbour chunks surface through this same lane
-                    // + the relational_lift feature (additive, read-only).
-                    crate::relational::augment_relational_support_latent(
-                        corpus,
-                        reader.as_ref(),
-                        &mut support,
-                    )
-                    .await?;
+                    // Slice 2cA: walk the latent half via the concept codebook
+                    // (exact concept↔concept cosine, no corpus ANN). Skip the
+                    // build entirely on no-seed passes — no seeds → no latent
+                    // hop, so the codebook is wasted corpus work.
+                    if !support.seed_anchors.is_empty() {
+                        let codebook =
+                            crate::relational::ConceptCodebook::build(corpus, reader.as_ref())
+                                .await?;
+                        crate::relational::augment_relational_support_latent(
+                            &codebook,
+                            &mut support,
+                            config.latent_sim_floor,
+                        );
+                    }
                     let support = std::sync::Arc::new(support);
                     let injected = relational_candidates(corpus, &support).await?;
                     if !injected.is_empty() {

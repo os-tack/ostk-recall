@@ -157,6 +157,22 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id; als
 
 
 # ============================================================================
+# RELATIONAL  —  latent→reified edge promotion (relational-substrate slice 2cA)
+# ============================================================================
+# Omit this block to accept the calibrated defaults. `memory_reflect` promotes
+# off-diagonal "latent" bridges — concept pairs whose anchor embeddings are
+# similar but that have no authored/observed edge — into weak `promoted` edges
+# that must then earn conductance through use, or decay.
+[relational]
+# Cosine floor a concept↔concept pair must clear to be promoted. Calibrated for
+# the embedder's chunk↔chunk distribution (potion-retrieval-32M sits low — run
+# `cargo run -p ostk-recall --example latent_floor_bench` to measure yours).
+# Lower it (e.g. 0.20) on a sparse concept graph to admit weaker bridges.
+latent_sim_floor = 0.35
+# Max promoted edges written per attention-active seed per reflect (hairball cap).
+promote_top_k = 4
+
+# ============================================================================
 # SOURCES  —  one [[sources]] table per logical corpus slice
 # ============================================================================
 # Every block needs `kind` + `paths`. `project` is a free-text tag — namespace

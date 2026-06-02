@@ -17,8 +17,8 @@ use ostk_recall_attention::{
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
-    CompiledRecordRules, Config, LensSettings, RerankerConfig, Scanner, SourceConfig, SourceKind,
-    WatchMode, WeaverSettings,
+    CompiledRecordRules, Config, LensSettings, RelationalConfig, RerankerConfig, Scanner,
+    SourceConfig, SourceKind, WatchMode, WeaverSettings,
 };
 use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
@@ -1026,8 +1026,13 @@ fn events_db_if_wanted(
 /// `LensConfig`. `None` (no `[lens]` block) yields the daemon
 /// defaults. Kept as a free function so the mapping is unit-testable
 /// without spinning up `serve`.
-fn resolve_lens_config(settings: Option<&LensSettings>) -> LensConfig {
-    settings.map_or_else(LensConfig::default, |l| LensConfig {
+fn resolve_lens_config(
+    settings: Option<&LensSettings>,
+    relational: Option<&RelationalConfig>,
+) -> LensConfig {
+    // The latent floor comes from `[relational]`, not `[lens]` — fold it in
+    // after mapping the lens block (default from the canonical core config).
+    let mut cfg = settings.map_or_else(LensConfig::default, |l| LensConfig {
         token_budget: l.token_budget,
         min_excerpt_tokens: l.min_excerpt_tokens,
         drift_threshold: l.drift_threshold,
@@ -1037,7 +1042,12 @@ fn resolve_lens_config(settings: Option<&LensSettings>) -> LensConfig {
         dominance_threshold: l.dominance_threshold,
         refractory_tau_secs: l.refractory_tau_secs,
         refractory_weight: l.refractory_weight,
-    })
+        latent_sim_floor: RelationalConfig::default().latent_sim_floor,
+    });
+    if let Some(r) = relational {
+        cfg.latent_sim_floor = r.latent_sim_floor;
+    }
+    cfg
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1322,7 +1332,7 @@ pub async fn serve(
         let state_dir = lens_state_dir.clone();
         // Map the optional `[lens]` config block onto the daemon's
         // runtime LensConfig; absent block → defaults.
-        let lens_config = resolve_lens_config(cfg.lens.as_ref());
+        let lens_config = resolve_lens_config(cfg.lens.as_ref(), cfg.relational.as_ref());
         tokio::spawn(async move {
             run_lens_loop(
                 attention,
@@ -2811,6 +2821,8 @@ mod watch_mode_tests {
 
 #[cfg(test)]
 mod lens_config_tests {
+    use ostk_recall_core::RelationalConfig;
+
     use super::{LensSettings, resolve_lens_config};
 
     /// The `[lens]` config defaults are duplicated in `core` (serde
@@ -2819,7 +2831,7 @@ mod lens_config_tests {
     /// users who omit the block.
     #[test]
     fn lens_settings_default_matches_query_default() {
-        let mapped = resolve_lens_config(Some(&LensSettings::default()));
+        let mapped = resolve_lens_config(Some(&LensSettings::default()), None);
         let dflt = ostk_recall_query::lens::LensConfig::default();
         assert_eq!(mapped.token_budget, dflt.token_budget);
         assert_eq!(mapped.min_excerpt_tokens, dflt.min_excerpt_tokens);
@@ -2835,10 +2847,15 @@ mod lens_config_tests {
     /// Absent `[lens]` block resolves to the daemon default verbatim.
     #[test]
     fn resolve_lens_config_none_is_default() {
-        let mapped = resolve_lens_config(None);
+        let mapped = resolve_lens_config(None, None);
         let dflt = ostk_recall_query::lens::LensConfig::default();
         assert_eq!(mapped.token_budget, dflt.token_budget);
         assert_eq!(mapped.poll_interval_secs, dflt.poll_interval_secs);
+        // No `[relational]` block → the canonical core default floor.
+        assert!(
+            (mapped.latent_sim_floor - RelationalConfig::default().latent_sim_floor).abs()
+                < f32::EPSILON
+        );
     }
 
     /// Explicit overrides flow through.
@@ -2850,10 +2867,21 @@ mod lens_config_tests {
             exclude_facets: vec!["status:archived".into()],
             ..LensSettings::default()
         };
-        let mapped = resolve_lens_config(Some(&settings));
+        let mapped = resolve_lens_config(Some(&settings), None);
         assert_eq!(mapped.token_budget, 1234);
         assert_eq!(mapped.poll_interval_secs, 9);
         assert_eq!(mapped.exclude_facets, vec!["status:archived".to_string()]);
+    }
+
+    /// The `[relational]` floor maps onto `LensConfig.latent_sim_floor`.
+    #[test]
+    fn resolve_lens_config_maps_relational_floor() {
+        let rel = RelationalConfig {
+            latent_sim_floor: 0.2,
+            promote_top_k: 4,
+        };
+        let mapped = resolve_lens_config(None, Some(&rel));
+        assert!((mapped.latent_sim_floor - 0.2).abs() < f32::EPSILON);
     }
 }
 

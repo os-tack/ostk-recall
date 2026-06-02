@@ -54,6 +54,11 @@ pub struct Config {
     /// [`ProfileWeights::effective`].
     #[serde(default)]
     pub ranking: Option<RankingConfig>,
+    /// Optional relational-substrate tuning (slice 2cA). Omit the
+    /// `[relational]` block to accept the calibrated defaults; `serve` /
+    /// `memory_reflect` map this onto the latent-promotion floor + top-K.
+    #[serde(default)]
+    pub relational: Option<RelationalConfig>,
 }
 
 /// Runtime resource caps. Each field is the upper bound on the
@@ -130,6 +135,46 @@ impl Default for RerankerConfig {
         Self {
             enabled: default_reranker_enabled(),
             model: default_reranker_model(),
+        }
+    }
+}
+
+/// Relational-substrate latent-promotion tuning (slice 2cA). Omit the
+/// `[relational]` block to accept the calibrated defaults. This is the **single
+/// canonical source** of the floor / top-K (store/query take them as parameters;
+/// no store-side const is authoritative).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationalConfig {
+    /// Cosine floor a concept↔concept latent pair must clear to be an
+    /// off-diagonal bridge (codebook adjacency). Calibrated for the chunk↔chunk
+    /// distribution; lower it (e.g. `0.20`) on a sparse concept graph to admit
+    /// weaker bridges.
+    #[serde(default = "default_latent_sim_floor")]
+    pub latent_sim_floor: f32,
+    /// Max promoted edges written per attention-active seed per consolidation
+    /// pass (the hairball guard).
+    #[serde(default = "default_promote_top_k")]
+    pub promote_top_k: usize,
+}
+
+fn default_latent_sim_floor() -> f32 {
+    0.35
+}
+
+const fn default_promote_top_k() -> usize {
+    4
+}
+
+/// Upper bound on `[relational] promote_top_k` — keeps the per-seed hairball
+/// guard meaningful no matter what the operator configures.
+pub const RELATIONAL_PROMOTE_TOP_K_MAX: usize = 64;
+
+impl Default for RelationalConfig {
+    fn default() -> Self {
+        Self {
+            latent_sim_floor: default_latent_sim_floor(),
+            promote_top_k: default_promote_top_k(),
         }
     }
 }
@@ -723,6 +768,20 @@ impl Config {
                     a.paths,
                     a.extensions,
                     a.ignore,
+                )));
+            }
+        }
+        if let Some(r) = &self.relational {
+            if !r.latent_sim_floor.is_finite() || !(0.0..=1.0).contains(&r.latent_sim_floor) {
+                return Err(Error::Config(format!(
+                    "[relational] latent_sim_floor must be a finite cosine in [0.0, 1.0], got {}",
+                    r.latent_sim_floor
+                )));
+            }
+            if r.promote_top_k == 0 || r.promote_top_k > RELATIONAL_PROMOTE_TOP_K_MAX {
+                return Err(Error::Config(format!(
+                    "[relational] promote_top_k must be in 1..={RELATIONAL_PROMOTE_TOP_K_MAX}, got {}",
+                    r.promote_top_k
                 )));
             }
         }

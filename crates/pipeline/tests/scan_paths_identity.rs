@@ -62,6 +62,7 @@ fn make_cfg(fixtures_dir: &Path) -> SourceConfig {
         watch: None,
         runtime: None,
         ranking: None,
+        relational: None,
         lens: None,
         record_rules: None,
         weaver: None,

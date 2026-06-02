@@ -33,7 +33,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::concepts::{
-    ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource, EvidenceState,
+    ConceptAnchor, ConceptEdge, ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource,
+    EvidenceState,
 };
 use crate::corpus::Result;
 use crate::threads::ThreadsDb;
@@ -171,14 +172,9 @@ pub const REL_SEED_THRESHOLD: f32 = 0.05;
 /// The Lance query fetches this plus slack to absorb the anchor itself +
 /// same-document chunks before they are dropped.
 pub const REL_LATENT_K: usize = 8;
-/// Cosine floor a latent (chunk↔chunk) neighbour must clear to count as an
-/// off-diagonal bridge. Chunk↔chunk similarity is a *different* distribution
-/// than the attention-vec↔anchor resonance discussed in
-/// `membrane-connector-gap.md`, so this is set conservatively pending the
-/// corpus bench — do **not** inherit the 0.30/0.7 resonance constants.
-pub const REL_LATENT_SIM_FLOOR: f32 = 0.55;
-/// Max promoted edges written per seed per consolidation pass (hairball guard).
-pub const REL_PROMOTE_TOP_K: usize = 4;
+// The latent floor + per-seed promote cap moved to `RelationalConfig`
+// (ostk-recall-core) in slice 2cA — core owns the canonical defaults and the
+// values are threaded as parameters, so no store-side const is authoritative.
 /// Weak prior a promoted (latent→reified) edge enters at — like authored /
 /// observed edges, it must earn conductance through re-walking, or decay.
 pub const PROMOTED_EDGE_CONFIDENCE: f32 = 0.1;
@@ -241,18 +237,14 @@ pub trait ConceptActivationReader: Send + Sync {
         Ok(RelationalSupport::default())
     }
 
-    /// Reverse lookup (relational-substrate slice 2b): for each chunk id, the
-    /// active-evidence concepts that cite it, as `(concept_id, project, handle)`
-    /// where `project` / `handle` are the **authoritative concept-row** scope
-    /// (not the evidence row's, which is provenance/context). Powers the
-    /// latent-hop reverse map (chunk similarity → concept). Terminal concepts
-    /// are excluded. Default impl is empty so non-ledger readers degrade
-    /// cleanly; [`ThreadsDb`] overrides it.
-    fn concepts_for_chunks(
-        &self,
-        _chunk_ids: &[String],
-    ) -> Result<HashMap<String, Vec<(i64, String, String)>>> {
-        Ok(HashMap::new())
+    /// Concept codebook source (relational-substrate slice 2cA): one anchor per
+    /// **non-terminal** concept (Candidate / Proposed / Active) that has a
+    /// resolvable active-evidence chunk — identity + scope + the coordinate whose
+    /// chunk vector anchors concept↔concept similarity. The query layer fetches
+    /// the embeddings of these chunks into the codebook. Default impl is empty so
+    /// non-ledger readers degrade cleanly; [`ThreadsDb`] overrides it.
+    fn concept_anchors(&self) -> Result<Vec<ConceptAnchor>> {
+        Ok(Vec::new())
     }
 }
 
@@ -687,40 +679,30 @@ impl ConceptActivationReader for ThreadsDb {
         })
     }
 
-    fn concepts_for_chunks(
-        &self,
-        chunk_ids: &[String],
-    ) -> Result<HashMap<String, Vec<(i64, String, String)>>> {
-        if chunk_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let conn = self.lock();
-        let placeholders = vec!["?"; chunk_ids.len()].join(",");
-        // Authoritative concept-row project/handle (c.project, not ce.project);
-        // active evidence only; terminal concepts excluded.
-        let sql = format!(
-            "SELECT ce.last_resolved_chunk_id, ce.concept_id, c.project, c.handle
-             FROM concept_evidence ce
-             JOIN concepts c ON c.id = ce.concept_id
-             WHERE ce.last_resolved_chunk_id IN ({placeholders})
-               AND ce.relation_state = 'active'
-               AND c.status NOT IN ('merged', 'rejected')"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(chunk_ids.iter()), |row| {
-                let chunk_id: String = row.get(0)?;
-                let concept_id: i64 = row.get(1)?;
-                let project: String = row.get(2)?;
-                let handle: String = row.get(3)?;
-                Ok((chunk_id, concept_id, project, handle))
-            })?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-        let mut out: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
-        for (chunk_id, concept_id, project, handle) in rows {
-            out.entry(chunk_id)
-                .or_default()
-                .push((concept_id, project, handle));
+    fn concept_anchors(&self) -> Result<Vec<ConceptAnchor>> {
+        // One anchor per non-terminal concept: its first active evidence row with
+        // a resolvable chunk (the evidence is already active-first, score-desc).
+        let mut out = Vec::new();
+        for c in self.list_concepts(None, None)? {
+            if c.status.is_terminal() {
+                continue;
+            }
+            let Some(ev) = self.list_concept_evidence(c.id)?.into_iter().find(|ev| {
+                ev.relation_state == EvidenceState::Active && ev.last_resolved_chunk_id.is_some()
+            }) else {
+                continue;
+            };
+            let Some(chunk_id) = ev.last_resolved_chunk_id else {
+                continue; // unreachable: filtered to is_some above
+            };
+            out.push(ConceptAnchor {
+                concept_id: c.id,
+                project: c.project,
+                handle: c.handle,
+                source: ev.source,
+                source_id: ev.source_id,
+                chunk_id,
+            });
         }
         Ok(out)
     }
@@ -1062,32 +1044,49 @@ mod tests {
         );
     }
 
-    // --- Slice 2b: reverse lookup + seed anchors ---------------------------
+    // --- Slice 2cA: concept anchors / 2b: seed anchors ---------------------
 
     #[test]
-    fn concepts_for_chunks_reverse_maps_active_authoritative_scope() {
+    fn concept_anchors_one_per_non_terminal_with_coords() {
         let (_t, db) = db();
         let (a, _) = db
             .ensure_concept("memories", "alpha", ConceptStatus::Active)
             .unwrap();
-        // A terminal concept citing the SAME chunk must be excluded.
-        let (b, _) = db
-            .ensure_concept("memories", "beta", ConceptStatus::Rejected)
+        let (p, _) = db
+            .ensure_concept("memories", "prop", ConceptStatus::Proposed)
             .unwrap();
-        ev_in(&db, a.id, "memories", "a-src", Some("cx"));
-        ev_in(&db, b.id, "memories", "b-src", Some("cx"));
-        let map = db.concepts_for_chunks(&["cx".to_string()]).unwrap();
-        let hits = map.get("cx").expect("chunk present");
-        assert_eq!(hits.len(), 1, "terminal concept excluded from reverse map");
-        assert_eq!(
-            hits[0],
-            (a.id, "memories".to_string(), "alpha".to_string()),
-            "authoritative concept-row project + handle"
+        let (r, _) = db
+            .ensure_concept("memories", "rej", ConceptStatus::Rejected)
+            .unwrap();
+        let (n, _) = db
+            .ensure_concept("memories", "nochunk", ConceptStatus::Active)
+            .unwrap();
+        ev_in(&db, a.id, "memories", "a-src", Some("ax"));
+        ev_in(&db, p.id, "memories", "p-src", Some("px"));
+        ev_in(&db, r.id, "memories", "r-src", Some("rx"));
+        ev_in(&db, n.id, "memories", "n-src", None); // no resolvable chunk
+
+        let anchors = db.concept_anchors().unwrap();
+        let by_handle: std::collections::HashMap<_, _> =
+            anchors.iter().map(|a| (a.handle.clone(), a)).collect();
+        assert!(by_handle.contains_key("alpha"), "Active included");
+        assert!(
+            by_handle.contains_key("prop"),
+            "Proposed included (non-terminal — the 2b active-seed→Proposed-target path)"
         );
         assert!(
-            db.concepts_for_chunks(&[]).unwrap().is_empty(),
-            "empty input → empty map"
+            !by_handle.contains_key("rej"),
+            "terminal (rejected) excluded"
         );
+        assert!(
+            !by_handle.contains_key("nochunk"),
+            "concept without a resolvable chunk excluded"
+        );
+        let anchor = by_handle.get("alpha").unwrap();
+        assert_eq!(anchor.project, "memories");
+        assert_eq!(anchor.chunk_id, "ax");
+        assert_eq!(anchor.source, "code"); // ev_in uses source "code"
+        assert_eq!(anchor.source_id, "a-src");
     }
 
     #[test]

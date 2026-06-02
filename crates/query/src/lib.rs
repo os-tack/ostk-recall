@@ -48,8 +48,9 @@ pub use rank::{
     build_engine_from_weights,
 };
 pub use relational::{
-    LatentNeighbor, PromotionReport, RelationalLiftFactory, RelationalLiftInstance,
-    augment_relational_support_latent, latent_neighbors, promote_latent_edges,
+    CodebookEntry, ConceptCodebook, LatentNeighbor, PromotionReport, RelationalLiftFactory,
+    RelationalLiftInstance, augment_relational_support_latent, latent_neighbors,
+    promote_latent_edges,
 };
 #[cfg(feature = "reranker")]
 pub use rerank::Reranker;

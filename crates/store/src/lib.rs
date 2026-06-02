@@ -13,15 +13,15 @@ pub mod threads;
 
 pub use activation::{
     ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy, EDGE_TAU_HOURS,
-    PROMOTED_EDGE_CONFIDENCE, REL_HOP_DECAY, REL_LATENT_K, REL_LATENT_SIM_FLOOR, REL_PROMOTE_TOP_K,
-    REL_PROMOTED_RELATION, RelationalSupport, SeedAnchor, default_since, default_since_now,
-    edge_conductance,
+    PROMOTED_EDGE_CONFIDENCE, REL_HOP_DECAY, REL_LATENT_K, REL_PROMOTED_RELATION,
+    RelationalSupport, SeedAnchor, default_since, default_since_now, edge_conductance,
 };
 pub use concepts::{
-    AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptAlias, ConceptEdge, ConceptEvidence, ConceptNote,
-    ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource, EvidenceAttach, EvidenceReconcileRow,
-    EvidenceState, ExtractedTerm, GLOBAL_PROJECT, HitView, OBSERVED_MENTION_CONFIDENCE,
-    ReconcileStats, extract_concept_terms, reconcile_concept_evidence, slugify,
+    AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptAlias, ConceptAnchor, ConceptEdge,
+    ConceptEvidence, ConceptNote, ConceptRecord, ConceptStatus, EdgeDirection, EdgeSource,
+    EvidenceAttach, EvidenceReconcileRow, EvidenceState, ExtractedTerm, GLOBAL_PROJECT, HitView,
+    OBSERVED_MENTION_CONFIDENCE, ReconcileStats, extract_concept_terms, reconcile_concept_evidence,
+    slugify,
 };
 pub use corpus::{ActivityBurst, CorpusStore, StoreError};
 pub use events::{AuditEventRow, EventsDb};

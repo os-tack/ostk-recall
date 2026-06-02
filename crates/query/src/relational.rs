@@ -21,15 +21,13 @@ use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use ostk_recall_store::{
-    CORPUS_TABLE, ConceptActivationReader, CorpusStore, EdgeSource, PROMOTED_EDGE_CONFIDENCE,
-    REL_HOP_DECAY, REL_LATENT_K, REL_LATENT_SIM_FLOOR, REL_PROMOTE_TOP_K, REL_PROMOTED_RELATION,
-    RelationalSupport, SeedAnchor, ThreadsDb,
+    ConceptActivationReader, CorpusStore, EdgeSource, PROMOTED_EDGE_CONFIDENCE, REL_HOP_DECAY,
+    REL_LATENT_K, REL_PROMOTED_RELATION, RelationalSupport, SeedAnchor, ThreadsDb,
 };
 
 use crate::candidate::Candidate;
 use crate::context::{AttentionContext, QueryContext};
 use crate::error::Result;
-use crate::lanes::lane_dense;
 use crate::rank::{RankFeatureFactory, RankFeatureInstance, cosine_similarity};
 
 /// Immutable config for the `relational_lift` feature; cheap to `Arc`-share.
@@ -136,115 +134,118 @@ pub struct LatentNeighbor {
     pub cosine: f32,
 }
 
-/// Extra ANN results fetched beyond `k` to absorb the anchor itself + same-
-/// document chunks before they are filtered out.
-const LATENT_SLACK: usize = 8;
+/// One concept's codebook entry (relational-substrate slice 2cA): its anchor
+/// embedding + identity/scope + the coordinate Part A surfaces / injects.
+#[derive(Debug, Clone)]
+pub struct CodebookEntry {
+    pub project: String,
+    pub handle: String,
+    pub source: String,
+    pub source_id: String,
+    pub chunk_id: String,
+    pub sem: Vec<f32>,
+}
 
-/// One seed's latent hop: ANN over chunk vectors from its anchor chunk, mapped
-/// back to off-diagonal neighbour concepts. Shared by the read augmenter
-/// (Part A) and the promoter (Part B).
+/// The concept codebook: every non-terminal concept's anchor embedding, held in
+/// its own small space. Concept↔concept latent adjacency is **exact cosine over
+/// this map** — no ANN over the bulk corpus, so concept neighbours are never
+/// swamped by the ~0.001%-dense transcript chunks (the slice-2b production
+/// failure surfaced by the live bench).
+#[derive(Debug, Clone, Default)]
+pub struct ConceptCodebook {
+    pub by_id: HashMap<i64, CodebookEntry>,
+}
+
+impl ConceptCodebook {
+    /// Build from the reader's `concept_anchors` + the corpus embeddings of their
+    /// anchor chunks. Entries whose anchor chunk has no vector in Lance are
+    /// dropped. Bounded by concept count, not corpus size.
+    ///
+    /// # Errors
+    /// Propagates ledger + corpus (Lance) read errors.
+    pub async fn build(store: &CorpusStore, reader: &dyn ConceptActivationReader) -> Result<Self> {
+        let anchors = reader.concept_anchors()?;
+        if anchors.is_empty() {
+            return Ok(Self::default());
+        }
+        let ids: Vec<String> = anchors.iter().map(|a| a.chunk_id.clone()).collect();
+        let embs = store.fetch_embeddings(&ids).await?;
+        let mut by_id = HashMap::with_capacity(anchors.len());
+        for a in anchors {
+            let Some(sem) = embs.get(&a.chunk_id).cloned() else {
+                continue;
+            };
+            by_id.insert(
+                a.concept_id,
+                CodebookEntry {
+                    project: a.project,
+                    handle: a.handle,
+                    source: a.source,
+                    source_id: a.source_id,
+                    chunk_id: a.chunk_id,
+                    sem,
+                },
+            );
+        }
+        Ok(Self { by_id })
+    }
+}
+
+/// One seed's latent hop over the concept codebook (relational-substrate slice
+/// 2cA): exact cosine between the seed's anchor embedding and every *other*
+/// concept's anchor — no ANN over the bulk corpus.
 ///
-/// Order matters — the concept filters need the reverse map first:
-/// 1. fetch the anchor embedding; absent → no hop;
-/// 2. `nearest_to` with `k + slack` (the anchor + same-doc chunks come back);
-///    drop the anchor chunk id;
-/// 3. fetch candidate chunks + embeddings, cosine vs the anchor, drop below floor;
-/// 4. reverse-map survivors to `(chunk, concept)` associations;
-/// 5. drop associations whose concept is the seed's own or in `exclude` (the
-///    caller's off-diagonal filter — the seed's authored/observed neighbours;
-///    `promoted` neighbours are intentionally *not* excluded so they stay
-///    latent-readable and the promoter can re-touch them);
-/// 6. emit one `LatentNeighbor` per surviving association; sort by cosine
-///    (same-project, then id/chunk as deterministic tiebreaks) and take top-`k`.
-///
-/// # Errors
-/// Propagates corpus (Lance) and ledger read errors.
+/// `exclude` is the caller's off-diagonal filter — the seed's authored/observed
+/// neighbours; `promoted` neighbours are intentionally *not* excluded so they
+/// stay latent-readable and the promoter can re-touch them. Drops self +
+/// excluded + below `floor`; sorts by cosine with deterministic tiebreaks
+/// (same-project, then concept id, then chunk id); takes top-`k`. Empty if the
+/// seed has no codebook entry (no resolvable anchor embedding).
 // `exclude` is always a default-hasher set built here in the crate; no need to
 // generalize the public signature over `BuildHasher`.
 #[allow(clippy::implicit_hasher)]
-pub async fn latent_neighbors(
-    store: &CorpusStore,
-    reader: &dyn ConceptActivationReader,
+#[must_use]
+pub fn latent_neighbors(
+    codebook: &ConceptCodebook,
     anchor: &SeedAnchor,
     exclude: &HashSet<i64>,
+    floor: f32,
     k: usize,
-) -> Result<Vec<LatentNeighbor>> {
-    // 1. anchor embedding (skip the seed if it has no vector in Lance).
-    let embs = store
-        .fetch_embeddings(std::slice::from_ref(&anchor.anchor_chunk_id))
-        .await?;
-    let Some(anchor_vec) = embs.get(&anchor.anchor_chunk_id).cloned() else {
-        return Ok(Vec::new());
+) -> Vec<LatentNeighbor> {
+    let Some(seed) = codebook.by_id.get(&anchor.concept_id) else {
+        return Vec::new();
     };
-
-    // 2. nearest chunks (k + slack for the anchor + same-document chunks).
-    let table = store
-        .connection()
-        .open_table(CORPUS_TABLE)
-        .execute()
-        .await?;
-    let near = lane_dense(&table, &anchor_vec, None, k + LATENT_SLACK).await?;
-    let near_ids: Vec<String> = near
-        .into_iter()
-        .map(|e| e.0)
-        .filter(|id| *id != anchor.anchor_chunk_id)
-        .collect();
-    if near_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 3. fetch candidate chunks + embeddings; cosine vs the anchor; drop below floor.
-    let fetched = store.fetch_chunks_by_ids(&near_ids).await?;
-    let mut kept: Vec<(String, String, String, f32)> = Vec::new();
-    for (chunk_id, (chunk, emb)) in &fetched {
-        let Some(emb) = emb.as_ref() else { continue };
-        let cos = cosine_similarity(&anchor_vec, emb);
-        if cos < REL_LATENT_SIM_FLOOR {
-            continue;
-        }
-        kept.push((
-            chunk_id.clone(),
-            chunk.source.as_str().to_string(),
-            chunk.source_id.clone(),
-            cos,
-        ));
-    }
-    if kept.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 4. reverse-map to (chunk, concept) associations.
-    let kept_ids: Vec<String> = kept.iter().map(|(id, ..)| id.clone()).collect();
-    let by_chunk = reader.concepts_for_chunks(&kept_ids)?;
-
-    // 5 + 6. drop the seed itself and any concept in `exclude` (the caller's
-    // hard off-diagonal set); emit one neighbour per surviving association.
     let mut out: Vec<LatentNeighbor> = Vec::new();
-    for (chunk_id, source, source_id, cos) in kept {
-        let Some(concepts) = by_chunk.get(&chunk_id) else {
+    for (cid, entry) in &codebook.by_id {
+        // Skip self, hard (off-diagonal) neighbours, and any concept anchored to
+        // the SAME chunk as the seed — co-citation cosines at 1.0 but is not a
+        // latent *bridge* (it's the same evidence, not a discovered link).
+        if *cid == anchor.concept_id
+            || exclude.contains(cid)
+            || entry.chunk_id == anchor.anchor_chunk_id
+        {
             continue;
-        };
-        for (cid, project, handle) in concepts {
-            if *cid == anchor.concept_id || exclude.contains(cid) {
-                continue;
-            }
-            out.push(LatentNeighbor {
-                concept_id: *cid,
-                project: project.clone(),
-                handle: handle.clone(),
-                chunk_id: chunk_id.clone(),
-                source: source.clone(),
-                source_id: source_id.clone(),
-                cosine: cos,
-            });
         }
+        let cosine = cosine_similarity(&seed.sem, &entry.sem);
+        if cosine < floor {
+            continue;
+        }
+        out.push(LatentNeighbor {
+            concept_id: *cid,
+            project: entry.project.clone(),
+            handle: entry.handle.clone(),
+            chunk_id: entry.chunk_id.clone(),
+            source: entry.source.clone(),
+            source_id: entry.source_id.clone(),
+            cosine,
+        });
     }
     out.sort_by(|a, b| {
         b.cosine
             .partial_cmp(&a.cosine)
             .unwrap_or(std::cmp::Ordering::Equal)
             // Deterministic tiebreaks on equal cosine: same-project as the seed
-            // first, then concept id, then chunk id (map/SQL order is unstable).
+            // first, then concept id, then chunk id (map order is unstable).
             .then_with(|| {
                 let a_same = a.project == anchor.project;
                 let b_same = b.project == anchor.project;
@@ -254,25 +255,20 @@ pub async fn latent_neighbors(
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
     out.truncate(k);
-    Ok(out)
+    out
 }
 
 /// Part A: fold each seed's latent neighbours into the reified-diffusion
-/// [`RelationalSupport`].
-///
-/// Off-diagonal chunks then **surface** through the same lens slot + injection
-/// lane slice 2 built. Additive and read-only: the reified payload is unchanged
-/// where the two overlap (max-merge per coordinate).
-///
-/// # Errors
-/// Propagates corpus (Lance) and ledger read errors.
-pub async fn augment_relational_support_latent(
-    store: &CorpusStore,
-    reader: &dyn ConceptActivationReader,
+/// [`RelationalSupport`] so off-diagonal chunks **surface** through the same lens
+/// slot + injection lane slice 2 built. Additive, read-only, and sync (the
+/// `codebook` is prebuilt once per pass).
+pub fn augment_relational_support_latent(
+    codebook: &ConceptCodebook,
     support: &mut RelationalSupport,
-) -> Result<()> {
+    floor: f32,
+) {
     if support.seed_anchors.is_empty() {
-        return Ok(());
+        return;
     }
     let anchors = support.seed_anchors.clone();
     let mut seen: HashSet<String> = support.inject_chunk_ids.iter().cloned().collect();
@@ -280,18 +276,15 @@ pub async fn augment_relational_support_latent(
         // Exclude only HARD (authored/observed) neighbours — those are owned by
         // the reified path. A `promoted` neighbour stays latent-readable so a
         // freshly-promoted bridge (conf 0.1, too weak for reified diffusion to
-        // lift for an ordinary seed) doesn't vanish from the lens the moment it
-        // is promoted; it keeps surfacing via the latent hop until its reified
-        // conductance clears the floor.
+        // lift for an ordinary seed) doesn't vanish from the lens; it keeps
+        // surfacing via the latent hop until its reified conductance clears.
         for n in latent_neighbors(
-            store,
-            reader,
+            codebook,
             anchor,
             &anchor.hard_neighbor_ids,
+            floor,
             REL_LATENT_K,
-        )
-        .await?
-        {
+        ) {
             let lift = anchor.weight * n.cosine * REL_HOP_DECAY;
             support
                 .coord_activation
@@ -307,7 +300,6 @@ pub async fn augment_relational_support_latent(
             }
         }
     }
-    Ok(())
 }
 
 /// Summary of one latent→reified promotion pass.
@@ -334,11 +326,13 @@ pub struct PromotionReport {
 /// scope (the by-id row is authoritative — matches slice-4 cross-scope edges).
 ///
 /// # Errors
-/// Propagates corpus (Lance) and ledger read/write errors.
-pub async fn promote_latent_edges(
-    store: &CorpusStore,
+/// Propagates ledger read/write errors.
+pub fn promote_latent_edges(
+    codebook: &ConceptCodebook,
     threads: &ThreadsDb,
     support: &RelationalSupport,
+    floor: f32,
+    top_k: usize,
 ) -> Result<PromotionReport> {
     let mut report = PromotionReport::default();
     // Unordered pairs settled this pass — so two reciprocal active seeds
@@ -346,25 +340,12 @@ pub async fn promote_latent_edges(
     let mut handled: HashSet<(i64, i64)> = HashSet::new();
     for anchor in &support.seed_anchors {
         report.examined_seeds += 1;
-        // Promoter excludes only *hard* (authored/observed) neighbours — a
-        // `promoted` neighbour passes through so it can be re-touched (warmed).
-        let neighbors = latent_neighbors(
-            store,
-            threads,
-            anchor,
-            &anchor.hard_neighbor_ids,
-            REL_LATENT_K,
-        )
-        .await?;
-        let mut per_seed: HashSet<i64> = HashSet::new();
+        // Excludes only *hard* (authored/observed) neighbours — a `promoted`
+        // neighbour passes through so it can be re-touched (warmed). `top_k` is
+        // the cap: the codebook holds one anchor per concept, so neighbours are
+        // already distinct concepts (no per-seed dedup needed).
+        let neighbors = latent_neighbors(codebook, anchor, &anchor.hard_neighbor_ids, floor, top_k);
         for n in neighbors {
-            if per_seed.len() >= REL_PROMOTE_TOP_K {
-                break;
-            }
-            // One edge per neighbour concept (reached via several chunks → once).
-            if !per_seed.insert(n.concept_id) {
-                continue;
-            }
             let pair = (
                 anchor.concept_id.min(n.concept_id),
                 anchor.concept_id.max(n.concept_id),

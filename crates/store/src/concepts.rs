@@ -283,6 +283,20 @@ pub struct ConceptEvidence {
     pub touch_count: u32,
 }
 
+/// One concept's chosen latent-hop anchor (relational-substrate slice 2cA):
+/// identity + scope + the evidence coordinate whose chunk vector anchors
+/// concept↔concept similarity. Built for every **non-terminal** concept that has
+/// a resolvable active-evidence chunk; the concept codebook is the set of these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConceptAnchor {
+    pub concept_id: i64,
+    pub project: String,
+    pub handle: String,
+    pub source: String,
+    pub source_id: String,
+    pub chunk_id: String,
+}
+
 /// Parameters for [`ThreadsDb::attach_concept_evidence`]. Grouped into a
 /// struct so the durable coordinate, the resolvable pointer, and the
 /// optional embedding/hash travel together (and to keep the arg count sane).

@@ -579,22 +579,42 @@ impl Server {
                 )
                 .await
                 .map_err(|e| JsonRpcError::internal(format!("reconcile: {e}")))?;
-                // Slice 2b: promote off-diagonal latent bridges (Lance similarity
-                // with no reified edge) from the currently attention-active seeds
-                // into weak `Promoted` edges — use sets conductance, decay
-                // adjudicates. Deliberate consolidation, never write-on-read.
+                // Slice 2cA: promote off-diagonal latent bridges (concept↔concept
+                // codebook cosine, no reified edge) from the currently
+                // attention-active seeds into weak `Promoted` edges — use sets
+                // conductance, decay adjudicates. Deliberate consolidation only.
                 let support = ostk_recall_store::ConceptActivationReader::relational_support(
                     dispatch.threads.as_ref(),
                     ostk_recall_store::default_since_now(),
                 )
                 .map_err(|e| JsonRpcError::internal(format!("relational support: {e}")))?;
-                let promotion = ostk_recall_query::promote_latent_edges(
-                    self.engine.store().as_ref(),
-                    dispatch.threads.as_ref(),
-                    &support,
-                )
-                .await
-                .map_err(|e| JsonRpcError::internal(format!("latent promotion: {e}")))?;
+                // No attention-active seeds → no latent hop; skip the codebook
+                // build (wasted corpus work) and report a no-op.
+                let promotion = if support.seed_anchors.is_empty() {
+                    ostk_recall_query::PromotionReport::default()
+                } else {
+                    // Resolve the floor/top-K from `[relational]`, defaulting when
+                    // no config is wired (stdio/test paths) — never panic.
+                    let rel_cfg = self
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.relational.clone())
+                        .unwrap_or_default();
+                    let codebook = ostk_recall_query::ConceptCodebook::build(
+                        self.engine.store().as_ref(),
+                        dispatch.threads.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| JsonRpcError::internal(format!("concept codebook: {e}")))?;
+                    ostk_recall_query::promote_latent_edges(
+                        &codebook,
+                        dispatch.threads.as_ref(),
+                        &support,
+                        rel_cfg.latent_sim_floor,
+                        rel_cfg.promote_top_k,
+                    )
+                    .map_err(|e| JsonRpcError::internal(format!("latent promotion: {e}")))?
+                };
                 json!({
                     "candidates_examined": examined,
                     "promoted_to_proposed": promoted,
