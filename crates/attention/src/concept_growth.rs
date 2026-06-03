@@ -17,9 +17,12 @@
 //! - [`select_survivors`] — gazetteer matches → resonance-gated, top-K survivors.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use ostk_recall_store::{ConceptStatus, ThreadsDb};
+use tokio::sync::RwLock;
 
 /// Relation minted for an ambient co-occurrence. Distinct from `mentions`
 /// (directional doc→entity) and `related` (reserved by the latent promoter) so
@@ -106,6 +109,26 @@ pub(crate) struct TermRecurrence {
     /// Co-resonant existing concepts (id→handle) gathered across the resonant
     /// turns that grew this term — the mint-time connection targets.
     pub co_resonant: BTreeMap<i64, String>,
+}
+
+/// The cross-turn concept-growth state a `TurnObserver` accumulates: the
+/// anchor/gazetteer cache, its rebuild-cadence counter, and the streaming
+/// node-recurrence accumulator.
+///
+/// **Why this is separable.** In `serve`, each watch trigger spawns a *fresh*
+/// `TurnObserver` (the daemon is scan-scoped for drain ordering), so this
+/// in-memory state would reset every trigger — and a term recurring across
+/// *separate* live turns would never reach the recurrence gate (the node-minting
+/// half would be inert). Hoisting it into `ServeContext` and sharing it across
+/// triggers via [`crate::TurnObserver::with_concept_growth_runtime`] makes
+/// recurrence (and the codebook cache) persist for the daemon's life. The
+/// per-session node-mint cap stays on the observer (a per-trigger burst guard),
+/// not here. Cheap to clone — all `Arc`.
+#[derive(Clone, Default)]
+pub struct ConceptGrowthRuntime {
+    pub(crate) growth_cache: Arc<RwLock<ConceptGrowthCache>>,
+    pub(crate) turns_since_build: Arc<AtomicU64>,
+    pub(crate) term_recurrence: Arc<RwLock<HashMap<String, TermRecurrence>>>,
 }
 
 // --- gazetteer (mirrors cli::seed, minus the self-node exclusion) -----

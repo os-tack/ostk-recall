@@ -26,7 +26,7 @@ pub mod query;
 pub mod weaver;
 
 pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
-pub use concept_growth::ConceptGrowthConfig;
+pub use concept_growth::{ConceptGrowthConfig, ConceptGrowthRuntime};
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
 pub use observer::{
     ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default,

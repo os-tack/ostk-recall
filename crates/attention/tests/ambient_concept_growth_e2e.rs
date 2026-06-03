@@ -20,7 +20,8 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use ostk_recall_attention::{
-    AttentionForwardStore, ConceptGrowthConfig, InMemoryAttention, TurnObserver,
+    AttentionForwardStore, ConceptGrowthConfig, ConceptGrowthRuntime, InMemoryAttention,
+    TurnObserver,
 };
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{Chunk, FacetSet, Links, Source};
@@ -528,5 +529,133 @@ async fn candidate_concepts_do_not_earn_co_occurs_edges() {
         co_occurs_count(&db, "candidate-three"),
         0,
         "candidate earns no co_occurs edge"
+    );
+}
+
+/// Corpus + ledger with `alpha`/`beta` active on the resonant axis + a shared
+/// attention store — but NO observer. Lets a test build several observers
+/// against the same substrate, mirroring the per-trigger fresh observers in
+/// `serve`.
+async fn growth_fixture() -> (
+    TempDir,
+    Arc<CorpusStore>,
+    Arc<ThreadsDb>,
+    Arc<dyn AttentionForwardStore>,
+) {
+    let tmp = TempDir::new().unwrap();
+    let corpus = Arc::new(CorpusStore::open_or_create(tmp.path(), DIM).await.unwrap());
+    corpus
+        .upsert(
+            &[anchor_chunk("alpha-anchor"), anchor_chunk("beta-anchor")],
+            &[axis(RESONANT_AXIS), axis(RESONANT_AXIS)],
+        )
+        .await
+        .unwrap();
+    let db = Arc::new(
+        ThreadsDb::open_with_sink(tmp.path(), Arc::new(RecordingSink::default())).unwrap(),
+    );
+    db.ensure_concept(G, "alpha", ConceptStatus::Active)
+        .unwrap();
+    db.ensure_concept(G, "beta", ConceptStatus::Active).unwrap();
+    attach_anchor(&db, "alpha", "alpha-anchor");
+    attach_anchor(&db, "beta", "beta-anchor");
+    let attn: Arc<dyn AttentionForwardStore> =
+        Arc::new(InMemoryAttention::with_embedder(Arc::new(AxisEmbedder)));
+    (tmp, corpus, db, attn)
+}
+
+/// Build a fresh observer over a shared corpus/ledger/attention, sharing the
+/// given concept-growth runtime — the production shape: each `serve` watch
+/// trigger spawns a new observer but `ServeContext` shares the runtime.
+fn observer_sharing(
+    tmp: &TempDir,
+    corpus: &Arc<CorpusStore>,
+    db: &Arc<ThreadsDb>,
+    attn: &Arc<dyn AttentionForwardStore>,
+    runtime: ConceptGrowthRuntime,
+) -> TurnObserver {
+    let ingest = Arc::new(IngestDb::open(tmp.path()).unwrap());
+    let pipeline = Arc::new(Pipeline::new(
+        Arc::clone(corpus),
+        ingest,
+        Arc::new(AxisEmbedder) as Arc<dyn ChunkEmbedder>,
+    ));
+    TurnObserver::new(pipeline, Arc::clone(db))
+        .with_attention(Arc::clone(attn))
+        .with_chain_sink(db.chain_sink())
+        .with_concept_growth(test_cfg())
+        .with_corpus(Arc::clone(corpus))
+        .with_concept_growth_runtime(runtime)
+}
+
+const RECUR_TURN: &str = "alpha beta with cross-scan-term RESONATE";
+
+/// Regression for the scan-local node-recurrence bug: in `serve`, each watch
+/// trigger spawns a fresh observer, so an unknown term recurring across
+/// *separate* live turns would never reach the recurrence gate. With a shared
+/// `ConceptGrowthRuntime`, recurrence persists across the observer boundary and
+/// the node mints.
+#[tokio::test]
+async fn node_recurrence_accumulates_across_observers_via_shared_runtime() {
+    let (tmp, corpus, db, attn) = growth_fixture().await;
+    let runtime = ConceptGrowthRuntime::default();
+
+    // Observer A (scan 1): two resonant turns — recurrence reaches 2, no mint.
+    let obs_a = observer_sharing(&tmp, &corpus, &db, &attn, runtime.clone());
+    for seq in 0..2 {
+        let r = obs_a
+            .observe(&scope(), RECUR_TURN, seq, "s", None)
+            .await
+            .unwrap();
+        assert_eq!(r.concept_nodes_minted, 0, "below the recurrence gate");
+    }
+    drop(obs_a); // scan 1 ends; the observer is torn down
+
+    // Observer B (scan 2): SAME runtime → recurrence continues 2 → 3 → mint.
+    let obs_b = observer_sharing(&tmp, &corpus, &db, &attn, runtime.clone());
+    let r = obs_b
+        .observe(&scope(), RECUR_TURN, 2, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.concept_nodes_minted, 1,
+        "shared runtime carries recurrence across the observer (scan) boundary"
+    );
+    assert!(
+        db.resolve_concept(G, "cross-scan-term").unwrap().is_some(),
+        "the cross-scan term minted a node"
+    );
+}
+
+/// Control: without the shared runtime, the second observer starts fresh and
+/// the recurrence resets — proving the runtime is what carries the state (the
+/// bug's failure mode).
+#[tokio::test]
+async fn node_recurrence_resets_without_shared_runtime() {
+    let (tmp, corpus, db, attn) = growth_fixture().await;
+
+    // Observer A: two resonant turns on its OWN runtime.
+    let obs_a = observer_sharing(&tmp, &corpus, &db, &attn, ConceptGrowthRuntime::default());
+    for seq in 0..2 {
+        obs_a
+            .observe(&scope(), RECUR_TURN, seq, "s", None)
+            .await
+            .unwrap();
+    }
+    drop(obs_a);
+
+    // Observer B: a DIFFERENT fresh runtime → recurrence resets to 1 → no mint.
+    let obs_b = observer_sharing(&tmp, &corpus, &db, &attn, ConceptGrowthRuntime::default());
+    let r = obs_b
+        .observe(&scope(), RECUR_TURN, 2, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.concept_nodes_minted, 0,
+        "fresh runtime loses the accumulation"
+    );
+    assert!(
+        db.resolve_concept(G, "cross-scan-term").unwrap().is_none(),
+        "no node minted without shared recurrence"
     );
 }

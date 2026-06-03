@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::concept_growth::{
     self, AMBIENT_EDGE_BY, CO_MENTION_RELATION, ConceptGrowthCache, ConceptGrowthConfig,
-    TermRecurrence,
+    ConceptGrowthRuntime, TermRecurrence,
 };
 
 // --- public types -----------------------------------------------------
@@ -252,6 +252,22 @@ impl TurnObserver {
     #[must_use]
     pub fn with_concept_growth(mut self, cfg: ConceptGrowthConfig) -> Self {
         self.concept_growth = cfg;
+        self
+    }
+
+    /// Share the cross-turn concept-growth state (anchor/gazetteer cache,
+    /// rebuild cadence, node-recurrence accumulator) with a long-lived
+    /// [`ConceptGrowthRuntime`]. `serve` holds one in `ServeContext` and passes
+    /// it to every per-trigger observer, so node-recurrence persists across the
+    /// fresh observers each watch trigger spawns (without this, the node-minting
+    /// half is inert in production — a term never recurs within one short scan).
+    /// The per-session node-mint cap stays per-observer (a per-trigger burst
+    /// guard). One-shot scans skip this and keep fresh state.
+    #[must_use]
+    pub fn with_concept_growth_runtime(mut self, runtime: ConceptGrowthRuntime) -> Self {
+        self.growth_cache = runtime.growth_cache;
+        self.turns_since_build = runtime.turns_since_build;
+        self.term_recurrence = runtime.term_recurrence;
         self
     }
 
@@ -648,15 +664,6 @@ impl TurnObserver {
                             if !event.is_turn_end() {
                                 continue;
                             }
-                            let scope = AttentionScope {
-                                project: event
-                                    .project
-                                    .clone()
-                                    .or_else(|| scope_default.project.clone()),
-                                session_id: scope_default.session_id.clone(),
-                                agent: scope_default.agent.clone(),
-                                privacy_tier: scope_default.privacy_tier,
-                            };
                             // Refresh in case threads have been added since
                             // the daemon started. Cheap (read all rows; bounded).
                             if let Err(err) = self.refresh_known_handles().await {
@@ -664,7 +671,7 @@ impl TurnObserver {
                                 continue;
                             }
                             let texts = match corpus
-                                .fetch_texts(&event.chunk_ids_upserted)
+                                .fetch_texts_with_project(&event.chunk_ids_upserted)
                                 .await
                             {
                                 Ok(t) => t,
@@ -673,7 +680,17 @@ impl TurnObserver {
                                     continue;
                                 }
                             };
-                            for (chunk_id, text) in texts {
+                            for (chunk_id, (text, chunk_project)) in texts {
+                                // Per-chunk scope: derived-project transcript
+                                // sources (e.g. claude_code under a project-less
+                                // source config) carry their project on the
+                                // chunk, not the event — so the concept-growth
+                                // gazetteer scopes to the chunk's own project.
+                                let scope = ambient_chunk_scope(
+                                    chunk_project,
+                                    event.project.as_deref(),
+                                    &scope_default,
+                                );
                                 let s = seq.fetch_add(1, Ordering::Relaxed);
                                 let session = format!("ambient:{chunk_id}");
                                 if let Err(err) = self
@@ -702,23 +719,20 @@ impl TurnObserver {
                         if !event.is_turn_end() {
                             continue;
                         }
-                        let scope = AttentionScope {
-                            project: event
-                                .project
-                                .clone()
-                                .or_else(|| scope_default.project.clone()),
-                            session_id: scope_default.session_id.clone(),
-                            agent: scope_default.agent.clone(),
-                            privacy_tier: scope_default.privacy_tier,
-                        };
                         if self.refresh_known_handles().await.is_err() {
                             break;
                         }
-                        let Ok(texts) = corpus.fetch_texts(&event.chunk_ids_upserted).await
+                        let Ok(texts) =
+                            corpus.fetch_texts_with_project(&event.chunk_ids_upserted).await
                         else {
                             continue;
                         };
-                        for (chunk_id, text) in texts {
+                        for (chunk_id, (text, chunk_project)) in texts {
+                            let scope = ambient_chunk_scope(
+                                chunk_project,
+                                event.project.as_deref(),
+                                &scope_default,
+                            );
                             let s = seq.fetch_add(1, Ordering::Relaxed);
                             let session = format!("ambient:{chunk_id}");
                             let _ = self
@@ -1069,6 +1083,30 @@ pub fn ambient_scope_default() -> AttentionScope {
         session_id: Some("ambient".into()),
         agent: Some("substrate".into()),
         privacy_tier: PrivacyTier::T1Project,
+    }
+}
+
+/// Resolve the `AttentionScope` for a single observed chunk.
+///
+/// Project precedence (most specific wins): the **chunk's own** `project` — a
+/// derived-project transcript source carries it per chunk — then the
+/// `IngestEvent`'s project (the source config's), then the ambient default's.
+/// `session_id` / `agent` / `privacy_tier` always come from the ambient default.
+/// Without this, a project-less source config makes every turn use the
+/// all-projects gazetteer, bypassing the per-project scoping.
+#[must_use]
+fn ambient_chunk_scope(
+    chunk_project: Option<String>,
+    event_project: Option<&str>,
+    scope_default: &AttentionScope,
+) -> AttentionScope {
+    AttentionScope {
+        project: chunk_project
+            .or_else(|| event_project.map(ToString::to_string))
+            .or_else(|| scope_default.project.clone()),
+        session_id: scope_default.session_id.clone(),
+        agent: scope_default.agent.clone(),
+        privacy_tier: scope_default.privacy_tier,
     }
 }
 
@@ -1475,6 +1513,22 @@ mod tests {
         assert_eq!(got, vec!["fresh-term".to_string()]);
         // Non-kebab words (no hyphen) are not candidates.
         assert!(raw_unknown_kebab("alpha and beta plain words", &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn ambient_chunk_scope_prefers_chunk_then_event_then_default() {
+        let default = ambient_scope_default(); // (None, "ambient", "substrate")
+        // Chunk project wins over event + default (the derived-project case).
+        let s = ambient_chunk_scope(Some("mish".into()), Some("haystack"), &default);
+        assert_eq!(s.project.as_deref(), Some("mish"));
+        assert_eq!(s.session_id.as_deref(), Some("ambient"));
+        assert_eq!(s.agent.as_deref(), Some("substrate"));
+        // Falls back to the event/config project when the chunk has none.
+        let s = ambient_chunk_scope(None, Some("haystack"), &default);
+        assert_eq!(s.project.as_deref(), Some("haystack"));
+        // Falls back to the ambient default (None here) when neither is set.
+        let s = ambient_chunk_scope(None, None, &default);
+        assert_eq!(s.project, None);
     }
 
     // ---- (1) recognition regex positive cases ----

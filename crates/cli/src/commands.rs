@@ -11,8 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ostk_recall_attention::{
-    AttentionForwardStore, AutoWeaver, ConceptGrowthConfig, CuratorConfig, IdleCurator,
-    InMemoryAttention, ReplayEvent, TurnObserver, WeaverThresholds, ambient_scope_default,
+    AttentionForwardStore, AutoWeaver, ConceptGrowthConfig, ConceptGrowthRuntime, CuratorConfig,
+    IdleCurator, InMemoryAttention, ReplayEvent, TurnObserver, WeaverThresholds,
+    ambient_scope_default,
 };
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
@@ -250,6 +251,11 @@ fn force_wipe_corpus(root: &Path) -> Result<()> {
 pub struct ServeContext {
     pub threads: Arc<ThreadsDb>,
     pub attention: Arc<InMemoryAttention>,
+    /// Long-lived concept-growth state, shared across every per-trigger
+    /// `TurnObserver` so node-recurrence accumulates across separate live
+    /// turns (each watch trigger spawns a fresh observer). Created once at
+    /// `serve` boot; threaded into `spawn_ambient_daemons`.
+    pub concept_growth: ConceptGrowthRuntime,
 }
 
 /// Resolve the `Arc<ThreadsDb>` a scan should use.
@@ -333,6 +339,7 @@ fn spawn_ambient_daemons(
     attention: Option<Arc<dyn AttentionForwardStore>>,
     weaver_exclude_facets: Vec<String>,
     concept_growth: ConceptGrowthConfig,
+    growth_runtime: Option<ConceptGrowthRuntime>,
 ) -> AmbientHandles {
     let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads));
     if let Some(attn) = attention {
@@ -351,6 +358,12 @@ fn spawn_ambient_daemons(
     observer = observer
         .with_corpus(Arc::clone(corpus))
         .with_concept_growth(concept_growth);
+    // Share the long-lived concept-growth state (from `ServeContext`) so
+    // node-recurrence persists across the fresh observer each watch trigger
+    // spawns. `None` on one-shot scan paths → fresh per-scan state.
+    if let Some(runtime) = growth_runtime {
+        observer = observer.with_concept_growth_runtime(runtime);
+    }
     let observer = Arc::new(observer);
     let weaver = Arc::new(
         AutoWeaver::new(
@@ -453,6 +466,7 @@ pub async fn scan_with_context(
             attention_dyn.clone(),
             WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
             resolve_concept_growth(cfg.ambient_growth.as_ref()),
+            ctx.map(|c| c.concept_growth.clone()),
         )
     });
 
@@ -741,6 +755,7 @@ pub async fn scan_paths_with_context(
             attention_dyn.clone(),
             WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
             resolve_concept_growth(cfg.ambient_growth.as_ref()),
+            ctx.map(|c| c.concept_growth.clone()),
         )
     });
 
@@ -1275,6 +1290,7 @@ pub async fn serve(
             Some(ServeContext {
                 threads: threads_arc,
                 attention: attention_arc,
+                concept_growth: ConceptGrowthRuntime::default(),
             })
         }
         Err(e) => {

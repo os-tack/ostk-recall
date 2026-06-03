@@ -630,6 +630,98 @@ impl CorpusStore {
         Ok(out)
     }
 
+    /// Like [`Self::fetch_texts`] but also returns each chunk's `project`.
+    ///
+    /// Used by the ambient `TurnObserver`: a turn's concept-growth gazetteer is
+    /// scoped to the chunk's *own* project, and derived-project transcript
+    /// sources (e.g. claude_code sessions under a project-less source config)
+    /// carry their project **per chunk**, not on the `IngestEvent` (which only
+    /// has the source config's `project`). Returns `chunk_id -> (text, project)`;
+    /// `project` is `None` when the row's column is null.
+    pub async fn fetch_texts_with_project(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, Option<String>)>> {
+        use std::collections::HashMap;
+
+        use arrow_array::Array;
+
+        let mut out: HashMap<String, (String, Option<String>)> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let ids_joined = ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("chunk_id IN ({ids_joined})");
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(Select::Columns(vec![
+                "chunk_id".into(),
+                "text".into(),
+                "project".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        for batch in &batches {
+            let id_col = batch.column_by_name("chunk_id").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "chunk_id column missing in projection".into(),
+                ))
+            })?;
+            let ids_arr = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "chunk_id expected to be Utf8".into(),
+                    ))
+                })?;
+            let text_col = batch.column_by_name("text").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "text column missing in projection".into(),
+                ))
+            })?;
+            let text_arr = text_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "text expected to be Utf8".into(),
+                    ))
+                })?;
+            let proj_col = batch.column_by_name("project").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "project column missing in projection".into(),
+                ))
+            })?;
+            let proj_arr = proj_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    StoreError::Arrow(arrow::error::ArrowError::CastError(
+                        "project expected to be Utf8".into(),
+                    ))
+                })?;
+            for i in 0..batch.num_rows() {
+                if text_arr.is_null(i) {
+                    continue;
+                }
+                let project = (!proj_arr.is_null(i)).then(|| proj_arr.value(i).to_string());
+                out.insert(
+                    ids_arr.value(i).to_string(),
+                    (text_arr.value(i).to_string(), project),
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// Batch-fetch full `Chunk` rows plus their dense embeddings.
     ///
     /// Returns `chunk_id -> (Chunk, Option<embedding>)`. Ids absent
@@ -1830,6 +1922,35 @@ mod tests {
         // Re-upsert same ids → still 2 rows (merge_insert).
         store.upsert(&chunks, &embs).await.unwrap();
         assert_eq!(store.row_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_texts_with_project_returns_per_chunk_project() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        let mut a = sample_chunk("a", "alpha text");
+        a.project = Some("proja".into());
+        let mut b = sample_chunk("b", "beta text");
+        b.project = Some("projb".into());
+        let mut c = sample_chunk("c", "gamma text");
+        c.project = None; // null project column
+        let embs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        store.upsert(&[a, b, c], &embs).await.unwrap();
+
+        let got = store
+            .fetch_texts_with_project(&["a".into(), "b".into(), "c".into()])
+            .await
+            .unwrap();
+        assert_eq!(got["a"].0, "alpha text");
+        assert_eq!(got["a"].1.as_deref(), Some("proja"));
+        assert_eq!(got["b"].1.as_deref(), Some("projb"));
+        assert_eq!(got["c"].0, "gamma text");
+        assert_eq!(got["c"].1, None, "null project column → None");
     }
 
     #[tokio::test]
