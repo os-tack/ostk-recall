@@ -69,6 +69,7 @@ fn map_source(s: &str) -> Result<Source> {
     Ok(match s {
         "claude_code" => Source::ClaudeCode,
         "gemini" => Source::Gemini,
+        "codex" => Source::Codex,
         "markdown" => Source::Markdown,
         "membrane" => Source::Membrane,
         "ostk_spec" => Source::OstkSpec,
@@ -84,6 +85,7 @@ fn source_kind_for(source: Source) -> SourceKind {
     match source {
         Source::ClaudeCode => SourceKind::ClaudeCode,
         Source::Gemini => SourceKind::Gemini,
+        Source::Codex => SourceKind::Codex,
         Source::Markdown => SourceKind::Markdown,
         Source::Membrane => SourceKind::Membrane,
         Source::OstkSpec | Source::OstkSession => SourceKind::OstkProject,

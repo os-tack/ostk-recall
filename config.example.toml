@@ -222,6 +222,11 @@ kind = "gemini"
 project = "gemini-cli-history"
 paths = ["~/.gemini/tmp"]           # walks every <hash>/chats/session-*.json
 
+[[sources]]
+kind = "codex"
+project = "codex-cli-history"
+paths = ["~/.codex/sessions"]       # walks every YYYY/MM/DD/rollout-*.jsonl
+
 # ── Tier 2: knowledge — notes, code, papers, exports, design docs ────────────
 
 [[sources]]
@@ -383,8 +388,8 @@ entity_type = "place"               # typed nodes with no outgoing edge
 # and `ostk-recall watch` exits at startup with a clear message.
 #
 # Recommended sources (v0.6 TurnEnd gate):
-#   INCLUDE transcripts — `claude_code` / `gemini`. As of v0.6 these are the
-#     ONLY sources that drive live cognition: a watched transcript append is a
+#   INCLUDE transcripts — `claude_code` / `gemini` / `codex`. These are the
+#     sources that drive live cognition: a watched transcript append is a
 #     "TurnEnd" that wakes the turn observer (familiarity, membrane), the
 #     auto-weaver (evidence links), and the ambient lens. Safe now — appends
 #     dedup to only-new turns, commits are batched, and non-transcript sources

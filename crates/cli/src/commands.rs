@@ -30,6 +30,7 @@ use crate::lens_loop::{MemoryLensResource, load_lens_markdown, run_lens_loop};
 use crate::lens_state::load_lens_state;
 use ostk_recall_scan::claude_code::ClaudeCodeScanner;
 use ostk_recall_scan::code::CodeScanner;
+use ostk_recall_scan::codex::CodexScanner;
 use ostk_recall_scan::file_glob::FileGlobScanner;
 use ostk_recall_scan::gemini::GeminiScanner;
 use ostk_recall_scan::markdown::MarkdownScanner;
@@ -473,6 +474,7 @@ pub async fn scan_with_context(
     let markdown = MarkdownScanner;
     let code = CodeScanner;
     let claude_code = ClaudeCodeScanner;
+    let codex = CodexScanner;
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
     let gemini = GeminiScanner;
@@ -545,6 +547,7 @@ pub async fn scan_with_context(
             SourceKind::Markdown => &markdown,
             SourceKind::Code => &code,
             SourceKind::ClaudeCode => &claude_code,
+            SourceKind::Codex => &codex,
             SourceKind::FileGlob => &file_glob,
             SourceKind::ZipExport => &zip_export,
             SourceKind::OstkProject => &ostk_project,
@@ -762,6 +765,7 @@ pub async fn scan_paths_with_context(
     let markdown = MarkdownScanner;
     let code = CodeScanner;
     let claude_code = ClaudeCodeScanner;
+    let codex = CodexScanner;
     let file_glob = FileGlobScanner;
     let zip_export = ZipExportScanner;
     let gemini = GeminiScanner;
@@ -801,6 +805,7 @@ pub async fn scan_paths_with_context(
                 SourceKind::Markdown | SourceKind::Membrane => &markdown,
                 SourceKind::Code => &code,
                 SourceKind::ClaudeCode => &claude_code,
+                SourceKind::Codex => &codex,
                 SourceKind::FileGlob => &file_glob,
                 SourceKind::ZipExport => &zip_export,
                 SourceKind::OstkProject => &ostk_project,
@@ -1568,6 +1573,12 @@ async fn replay_chain_into_attention(
         (Option<String>, Option<String>, Option<String>),
         (AttentionScope, Vec<f32>),
     > = std::collections::HashMap::new();
+    // Aggregate (project-agnostic) ambient rolling vector for the scope the
+    // memory-lens polls (`ambient_scope_default()`). The live observer
+    // mirrors each turn into that scope but emits NO aggregate snapshot, so
+    // on restart we re-derive it from the most recent ambient per-project
+    // snapshot (the last one in chronological chain order).
+    let mut latest_ambient: Option<Vec<f32>> = None;
     for ev in events {
         match ev {
             ChainEvent::FamiliarityBatch { entries, .. } => {
@@ -1599,6 +1610,21 @@ async fn replay_chain_into_attention(
                 vec,
                 ..
             } => {
+                // Derive the aggregate ambient rolling vector from the most
+                // recent ambient snapshot, so a restart restores the lens's
+                // read scope immediately. The observer's ambient turns carry
+                // `session_id="ambient"` / `agent="substrate"`; the last such
+                // row in chronological order is the most recent — the same
+                // "later row supersedes" rule `latest_rolling` relies on per
+                // scope above (`iter_chain` yields seq-ASC = chronological).
+                // The original wall-clock `ts` is intentionally NOT used:
+                // `ChainEvent::from_row` synthesizes a decode-time `ts`, so it
+                // is unavailable here and would only restate the seq order.
+                if ev_scope.session_id.as_deref() == Some("ambient")
+                    && ev_scope.agent.as_deref() == Some("substrate")
+                {
+                    latest_ambient = Some(vec.clone());
+                }
                 let key = (
                     ev_scope.project.clone(),
                     ev_scope.session_id.clone(),
@@ -1662,10 +1688,25 @@ async fn replay_chain_into_attention(
             tracing::warn!(error = %err, "rolling_vector_snapshot replay skipped");
         }
     }
+    // Seed the project-agnostic aggregate scope the memory-lens reads, so
+    // the lens has live ambient attention the moment serve restarts —
+    // before any new turn (the lens loop's forced first tick then renders
+    // it). The running observer keeps this scope fresh via its per-turn
+    // mirror; here we restore it from the persisted ambient snapshots.
+    let aggregate_seeded = latest_ambient.is_some();
+    if let Some(vec) = latest_ambient {
+        if let Err(err) = attention
+            .seed_rolling_vec(&ambient_scope_default(), vec)
+            .await
+        {
+            tracing::warn!(error = %err, "aggregate ambient rolling seed skipped");
+        }
+    }
     tracing::info!(
         events = n,
         focus_events = focus_n,
         rolling_snapshots = rolling_n,
+        aggregate_seeded,
         "chain replay applied to in-memory attention"
     );
     Ok(())
@@ -3135,5 +3176,85 @@ mod daemon_transport_tests {
         let mut got = Vec::new();
         stdout_r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"pong\n", "daemon reply reached client stdout");
+    }
+}
+
+#[cfg(test)]
+mod replay_aggregate_tests {
+    //! Replay must seed the project-agnostic AGGREGATE ambient scope the
+    //! memory-lens polls (`ambient_scope_default()`) from the most recent
+    //! ambient `RollingVectorSnapshot`, so a restarted daemon restores live
+    //! lens attention immediately (before any new turn). The original
+    //! wall-clock `ts` is not recoverable via `iter_chain`
+    //! (`ChainEvent::from_row` synthesizes a decode-time `ts`), so "most
+    //! recent" is the last ambient row in chronological chain order — the
+    //! same supersede rule the per-scope `latest_rolling` map relies on.
+    use super::*;
+    use chrono::Utc;
+    use ostk_recall_store::ChainEvent;
+    use tempfile::TempDir;
+
+    fn ambient_project_scope(project: &str) -> AttentionScope {
+        AttentionScope {
+            project: Some(project.into()),
+            session_id: Some("ambient".into()),
+            agent: Some("substrate".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        }
+    }
+
+    fn snapshot(scope: AttentionScope, vec: Vec<f32>) -> ChainEvent {
+        ChainEvent::RollingVectorSnapshot {
+            scope,
+            vec,
+            lambda: 0.3,
+            ts: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_seeds_aggregate_from_latest_ambient_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        // `ThreadsDb::open` installs a Noop sink; write chain rows through a
+        // real `SqliteChainSink` on the same file so `iter_chain()` reads them
+        // back (it decodes payloads only, in seq-ASC = chronological order).
+        let db = ThreadsDb::open(tmp.path()).unwrap();
+        let sink = SqliteChainSink::open(tmp.path()).unwrap();
+
+        let vec_a = vec![0.0_f32, 1.0, 0.0];
+        let vec_b = vec![1.0_f32, 0.0, 0.0];
+        let vec_other = vec![0.0_f32, 0.0, 1.0];
+
+        // Two ambient snapshots under DIFFERENT projects (proves the aggregate
+        // is cross-project), proj-b last → most recent ambient. Then a
+        // NON-ambient snapshot appended LAST overall: it must be ignored even
+        // though it is the final row, proving the session/agent filter.
+        sink.append(&snapshot(ambient_project_scope("proj-a"), vec_a))
+            .unwrap();
+        sink.append(&snapshot(ambient_project_scope("proj-b"), vec_b.clone()))
+            .unwrap();
+        let non_ambient = AttentionScope {
+            project: Some("proj-c".into()),
+            session_id: Some("interactive".into()),
+            agent: Some("operator".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        };
+        sink.append(&snapshot(non_ambient, vec_other)).unwrap();
+
+        let attention = InMemoryAttention::new();
+        replay_chain_into_attention(&Arc::new(db), &attention)
+            .await
+            .unwrap();
+
+        let aggregate = attention
+            .rolling_vec(&ambient_scope_default())
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate,
+            Some(vec_b),
+            "aggregate must seed from the most recent ambient snapshot (cross-project), \
+             ignoring the later non-ambient row"
+        );
     }
 }

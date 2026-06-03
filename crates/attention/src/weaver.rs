@@ -40,7 +40,8 @@ pub struct WeaverThresholds {
     /// Cosine cut-off for `SourceKind::Code` chunks (lower → permissive).
     pub code: f32,
     /// Cosine cut-off for transcript-shaped sources
-    /// (`ClaudeCode`, `Gemini`, `ZipExport`) — set high to filter chatter.
+    /// (`ClaudeCode`, `Gemini`, `Codex`, `ZipExport`) — set high to filter
+    /// chatter.
     pub transcript: f32,
     /// Cosine cut-off for source kinds not listed above.
     pub default: f32,
@@ -64,7 +65,10 @@ impl WeaverThresholds {
         match source {
             SourceKind::Markdown => self.prose,
             SourceKind::Code => self.code,
-            SourceKind::ClaudeCode | SourceKind::Gemini | SourceKind::ZipExport => self.transcript,
+            SourceKind::ClaudeCode
+            | SourceKind::Gemini
+            | SourceKind::Codex
+            | SourceKind::ZipExport => self.transcript,
             _ => self.default,
         }
     }
@@ -878,7 +882,9 @@ const fn source_kind_to_category(source: SourceKind) -> &'static str {
     match source {
         SourceKind::Code => "code",
         SourceKind::Markdown => "doc",
-        SourceKind::ClaudeCode | SourceKind::Gemini | SourceKind::ZipExport => "transcript",
+        SourceKind::ClaudeCode | SourceKind::Gemini | SourceKind::Codex | SourceKind::ZipExport => {
+            "transcript"
+        }
         _ => "other",
     }
 }
@@ -1365,6 +1371,7 @@ mod tests {
         assert!((t.for_source(SourceKind::Markdown) - 0.82).abs() < 1e-6);
         assert!((t.for_source(SourceKind::ClaudeCode) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::Gemini) - 0.85).abs() < 1e-6);
+        assert!((t.for_source(SourceKind::Codex) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::ZipExport) - 0.85).abs() < 1e-6);
         assert!((t.for_source(SourceKind::FileGlob) - 0.80).abs() < 1e-6);
     }

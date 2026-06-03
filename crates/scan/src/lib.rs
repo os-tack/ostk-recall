@@ -5,6 +5,7 @@
 //! Phase C adds the remaining five:
 //!
 //! * [`claude_code`]  — `~/.claude/projects/*.jsonl` session logs
+//! * [`codex`]        — `~/.codex/sessions/**/rollout-*.jsonl` session logs
 //! * [`code`]         — source-code trees (line-window chunks)
 //! * [`gemini`]       — Gemini session logs
 //! * [`file_glob`]    — generic text files by glob
@@ -17,6 +18,7 @@
 pub mod anthropic_session;
 pub mod claude_code;
 pub mod code;
+pub mod codex;
 pub mod file_glob;
 pub mod gemini;
 pub mod markdown;

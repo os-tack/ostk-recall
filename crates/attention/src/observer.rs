@@ -337,6 +337,31 @@ impl TurnObserver {
         if let Some(attn) = &self.attention {
             match attn.attend(scope, turn_text).await {
                 Ok(outcome) => {
+                    // Mirror the ambient rolling EMA into the project-agnostic
+                    // aggregate scope so the ambient memory-lens — which polls
+                    // the unprojected `ambient_scope_default()` — tracks live
+                    // drift. `e16587a` routed this `attend()` through the
+                    // per-chunk *project* scope (correct for the concept
+                    // gazetteer), which sharded the rolling vector away from the
+                    // lens's read scope and froze the lens. Attention is the
+                    // ambient AGGREGATE; only memory (gazetteer/membrane) stays
+                    // project-scoped. When `scope.project` is already `None`,
+                    // `attend()` wrote the aggregate directly — nothing to
+                    // mirror. Best-effort: a mirror failure must never abort the
+                    // durable observation (matches the `attend`/`familiarize`
+                    // handling below).
+                    if let crate::AttendOutcome::Updated { rolling_vec, .. } = &outcome {
+                        if scope.project.is_some() {
+                            let agg = ambient_aggregate_scope(scope);
+                            if let Err(err) = attn.seed_rolling_vec(&agg, rolling_vec.clone()).await
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    "ambient-lens: aggregate rolling mirror failed"
+                                );
+                            }
+                        }
+                    }
                     // P6A — observer owns chain emission. Direct
                     // `attend()` calls (tests) bypass this path and
                     // emit no chain rows; only the observer-mediated
@@ -1117,6 +1142,26 @@ fn ambient_chunk_scope(
         session_id: scope_default.session_id.clone(),
         agent: scope_default.agent.clone(),
         privacy_tier: scope_default.privacy_tier,
+    }
+}
+
+/// The project-agnostic ambient *attention* scope for a per-chunk memory
+/// scope: same `session_id` / `agent` / `privacy_tier`, but `project`
+/// stripped to `None`.
+///
+/// Attention (the ambient rolling EMA) is the collective AGGREGATE — one
+/// vector per substrate, exactly the key the ambient memory-lens polls
+/// (`ambient_scope_default()`). `scope.project` keeps scoping shared
+/// *memory* (the concept gazetteer, membrane chunks); it must not shard
+/// the rolling vector the lens reads. Mirrors `ambient_scope_default()`
+/// when `scope` was built from it via [`ambient_chunk_scope`].
+#[must_use]
+fn ambient_aggregate_scope(scope: &AttentionScope) -> AttentionScope {
+    AttentionScope {
+        project: None,
+        session_id: scope.session_id.clone(),
+        agent: scope.agent.clone(),
+        privacy_tier: scope.privacy_tier,
     }
 }
 

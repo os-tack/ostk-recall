@@ -197,6 +197,13 @@ enum ManifestVerb {
     /// `source_config_id` column (P0); `mtime/size` are stamped as 0
     /// and refresh on the next scan.
     Rebuild,
+    /// Repair small Lance-vs-SQLite count drift by inserting only missing
+    /// `ingest_chunks` rows from `corpus.lance`.
+    RepairDrift {
+        /// Diagnose drift without writing to `ingest.sqlite`.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -810,6 +817,60 @@ async fn run_manifest(config_path: &Path, verb: ManifestVerb) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("rebuild_ingest_manifest: {e}"))?;
             println!("rebuilt {n} chunks into ingest.sqlite (run_id={run_id})");
             println!("next step: run a full `ostk-recall scan` to refresh mtime/size metadata.");
+        }
+        ManifestVerb::RepairDrift { dry_run } => {
+            let cfg = ostk_recall_core::Config::load(config_path)
+                .with_context(|| format!("loading config from {}", config_path.display()))?;
+            let root = cfg.expanded_root()?;
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating corpus root {}", root.display()))?;
+            let config_path_buf = config_path.to_path_buf();
+            let embedder = resolve_embedder(Some(&config_path_buf))?;
+            let store = ostk_recall_store::CorpusStore::open_or_create(&root, embedder.dim())
+                .await
+                .map_err(|e| anyhow::anyhow!("open corpus: {e}"))?;
+            let ingest = ostk_recall_store::IngestDb::open(&root)
+                .map_err(|e| anyhow::anyhow!("open ingest ledger: {e}"))?;
+            let run_id = format!(
+                "manifest-repair-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            let report =
+                ostk_recall_store::repair_ingest_manifest_drift(&store, &ingest, &run_id, dry_run)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("repair_ingest_manifest_drift: {e}"))?;
+            println!(
+                "manifest repair-drift: corpus_rows={} corpus_unique_chunk_ids={} ingest_rows={} missing_ingest_rows={} extra_ingest_rows={} duplicate_corpus_chunk_ids={} duplicate_corpus_rows={} unrepairable_missing_rows={} unrepairable_duplicate_chunk_ids={} written_ingest_rows={} deduped_corpus_chunk_ids={} deleted_corpus_rows={} reinserted_corpus_rows={} dry_run={}",
+                report.corpus_rows,
+                report.corpus_unique_chunk_ids,
+                report.ingest_rows,
+                report.missing_ingest_rows,
+                report.extra_ingest_rows,
+                report.duplicate_corpus_chunk_ids,
+                report.duplicate_corpus_rows,
+                report.unrepairable_missing_rows,
+                report.unrepairable_duplicate_chunk_ids,
+                report.written_ingest_rows,
+                report.deduped_corpus_chunk_ids,
+                report.deleted_corpus_rows,
+                report.reinserted_corpus_rows,
+                report.dry_run
+            );
+            if !report.repairable_without_ingest_delete() {
+                anyhow::bail!(
+                    "drift is not repairable by manifest repair; inspect extra ingest rows, legacy rows, or duplicate rows without embeddings"
+                );
+            }
+            if dry_run {
+                println!(
+                    "dry run only; rerun without --dry-run to insert missing manifest rows and/or deduplicate duplicate corpus rows."
+                );
+            } else {
+                println!("run_id={run_id}");
+            }
         }
     }
     Ok(())

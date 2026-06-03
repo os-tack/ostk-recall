@@ -26,7 +26,7 @@ pub use concepts::{
 pub use corpus::{ActivityBurst, CorpusStore, StoreError};
 pub use events::{AuditEventRow, EventsDb};
 pub use ingest::{IngestChunkRow, IngestDb};
-pub use manifest::rebuild_ingest_manifest;
+pub use manifest::{ManifestRepairReport, rebuild_ingest_manifest, repair_ingest_manifest_drift};
 pub use schema::{CORPUS_TABLE, corpus_schema};
 pub use threads::{
     AccessKind, AccessWeights, AssociationType, ChainEvent, ChainLogReader, ChainSink,

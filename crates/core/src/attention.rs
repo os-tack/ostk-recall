@@ -483,6 +483,7 @@ mod tests {
         // The one true case: a watched conversation transcript.
         assert!(mk(IngestOrigin::Watch, SourceKind::ClaudeCode).is_turn_end());
         assert!(mk(IngestOrigin::Watch, SourceKind::Gemini).is_turn_end());
+        assert!(mk(IngestOrigin::Watch, SourceKind::Codex).is_turn_end());
         // Bulk scan of a transcript → library load, not live cognition.
         assert!(!mk(IngestOrigin::Bulk, SourceKind::ClaudeCode).is_turn_end());
         // Synthetic (membrane) → never re-observed (feedback guard).

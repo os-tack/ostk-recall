@@ -595,6 +595,7 @@ mod tests {
         assert_eq!(rules.digest_for(SourceKind::Markdown), "");
         assert_eq!(rules.digest_for(SourceKind::Code), "");
         assert_eq!(rules.digest_for(SourceKind::Gemini), "");
+        assert_eq!(rules.digest_for(SourceKind::Codex), "");
         assert!(!rules.digest_for(SourceKind::ClaudeCode).is_empty());
         assert!(!rules.digest_for(SourceKind::OstkProject).is_empty());
     }

@@ -338,6 +338,19 @@ CREATE INDEX IF NOT EXISTS idx_ingest_chunks_source_cfg_id
         self.count_by_source()
     }
 
+    /// Return every chunk id currently present in the ingest ledger.
+    ///
+    /// Used by manifest drift repair to compare the SQLite ledger against the
+    /// Lance corpus without rewriting already-good rows.
+    pub fn all_chunk_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT chunk_id FROM ingest_chunks")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(ids)
+    }
+
     /// Current chunk ids registered for a `(source, source_id)` coordinate,
     /// across every `source_config_id`. Used by the concept-evidence
     /// reconciler to re-resolve a churned `chunk_id`: given the durable

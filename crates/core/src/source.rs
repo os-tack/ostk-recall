@@ -22,6 +22,7 @@ pub enum SourceKind {
     FileGlob,
     ZipExport,
     Gemini,
+    Codex,
     Thread,
     /// In-process "recognition moments" emitted by the turn observer.
     /// No scanner; chunks land via `Pipeline::ingest_synthetic`.
@@ -39,6 +40,7 @@ impl SourceKind {
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
+            Self::Codex => "codex",
             Self::Thread => "thread",
             Self::Membrane => "membrane",
         }
@@ -58,6 +60,7 @@ impl SourceKind {
             "file_glob" => Self::FileGlob,
             "zip_export" => Self::ZipExport,
             "gemini" => Self::Gemini,
+            "codex" => Self::Codex,
             "thread" => Self::Thread,
             "membrane" => Self::Membrane,
             _ => return None,
@@ -84,6 +87,7 @@ impl SourceKind {
             Self::FileGlob => vec![Source::FileGlob],
             Self::ZipExport => vec![Source::ZipExport],
             Self::Gemini => vec![Source::Gemini],
+            Self::Codex => vec![Source::Codex],
             Self::Thread => vec![Source::Thread],
             Self::Membrane => vec![Source::Membrane],
         }
@@ -110,7 +114,7 @@ impl SourceKind {
     /// content to index, not turns to observe.
     #[must_use]
     pub const fn is_conversation_transcript(self) -> bool {
-        matches!(self, Self::ClaudeCode | Self::Gemini)
+        matches!(self, Self::ClaudeCode | Self::Gemini | Self::Codex)
     }
 }
 
@@ -133,6 +137,7 @@ pub enum Source {
     FileGlob,
     ZipExport,
     Gemini,
+    Codex,
     Thread,
     /// In-process "recognition moments" emitted by the turn observer.
     Membrane,
@@ -155,6 +160,7 @@ impl Source {
             Self::FileGlob => "file_glob",
             Self::ZipExport => "zip_export",
             Self::Gemini => "gemini",
+            Self::Codex => "codex",
             Self::Thread => "thread",
             Self::Membrane => "membrane",
         }
@@ -180,6 +186,7 @@ impl Source {
             "file_glob" => Self::FileGlob,
             "zip_export" => Self::ZipExport,
             "gemini" => Self::Gemini,
+            "codex" => Self::Codex,
             "thread" => Self::Thread,
             "membrane" => Self::Membrane,
             _ => return None,
@@ -207,6 +214,7 @@ mod tests {
             SourceKind::FileGlob,
             SourceKind::ZipExport,
             SourceKind::Gemini,
+            SourceKind::Codex,
             SourceKind::Thread,
             SourceKind::Membrane,
         ] {
@@ -221,6 +229,9 @@ mod tests {
     fn source_str_matches_serde() {
         for source in [
             Source::Markdown,
+            Source::ClaudeCode,
+            Source::Gemini,
+            Source::Codex,
             Source::OstkDecision,
             Source::OstkAuditSignificant,
         ] {

@@ -468,6 +468,21 @@ pub trait AttentionForwardStore: Send + Sync {
         Ok(None)
     }
 
+    /// Seed the per-scope rolling vector directly (no EMA blend),
+    /// overwriting any prior value. Default no-op keeps the trait
+    /// additive for stores without per-scope state; `InMemoryAttention`
+    /// overrides it. Used by the ambient observer to mirror the rolling
+    /// EMA into the project-agnostic aggregate scope the memory-lens
+    /// reads (so attention is the ambient *aggregate*, not sharded per
+    /// project), and by chain replay to restore rolling state on boot.
+    async fn seed_rolling_vec(
+        &self,
+        _scope: &AttentionScope,
+        _rolling: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        Ok(())
+    }
+
     // --- focus pin (Phase C/D) ----------------------------------------
     // Default impls fall through to an empty outcome so stores without
     // per-scope state remain trait-compatible; the in-memory runtime
@@ -1696,6 +1711,14 @@ impl AttentionForwardStore for InMemoryAttention {
 
     async fn focus_status(&self, scope: &AttentionScope) -> Result<FocusStatus, AttentionError> {
         Self::focus_status(self, scope).await
+    }
+
+    async fn seed_rolling_vec(
+        &self,
+        scope: &AttentionScope,
+        rolling: Vec<f32>,
+    ) -> Result<(), AttentionError> {
+        Self::seed_rolling_vec(self, scope, rolling).await
     }
 }
 

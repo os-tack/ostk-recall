@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 use ostk_recall_attention::{
     AttentionForwardStore, ConceptGrowthConfig, ConceptGrowthRuntime, InMemoryAttention,
-    TurnObserver,
+    TurnObserver, ambient_scope_default,
 };
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{Chunk, FacetSet, Links, Source};
@@ -162,6 +162,7 @@ async fn harness(
     Arc<ThreadsDb>,
     Arc<RecordingSink>,
     TurnObserver,
+    Arc<InMemoryAttention>,
 ) {
     let tmp = TempDir::new().unwrap();
     let corpus = Arc::new(CorpusStore::open_or_create(tmp.path(), DIM).await.unwrap());
@@ -186,8 +187,8 @@ async fn harness(
     let emb: Arc<dyn ChunkEmbedder> = Arc::new(AxisEmbedder);
     let pipeline = Arc::new(Pipeline::new(Arc::clone(&corpus), ingest, emb));
 
-    let attn: Arc<dyn AttentionForwardStore> =
-        Arc::new(InMemoryAttention::with_embedder(Arc::new(AxisEmbedder)));
+    let attention = Arc::new(InMemoryAttention::with_embedder(Arc::new(AxisEmbedder)));
+    let attn: Arc<dyn AttentionForwardStore> = attention.clone();
     let mut observer = TurnObserver::new(pipeline, Arc::clone(&db))
         .with_attention(attn)
         .with_chain_sink(db.chain_sink())
@@ -195,7 +196,7 @@ async fn harness(
     if with_corpus {
         observer = observer.with_corpus(Arc::clone(&corpus));
     }
-    (tmp, corpus, db, recorder, observer)
+    (tmp, corpus, db, recorder, observer, attention)
 }
 
 /// Count distinct `co_occurs` edges incident on a concept handle (either
@@ -224,7 +225,7 @@ fn connected_audit_count(recorder: &RecordingSink) -> usize {
 
 #[tokio::test]
 async fn resonant_co_mention_mints_a_co_occurs_edge() {
-    let (_t, _c, db, rec, observer) = harness(true).await;
+    let (_t, _c, db, rec, observer, _attention) = harness(true).await;
     let res = observer
         .observe(
             &scope(),
@@ -247,7 +248,7 @@ async fn resonant_co_mention_mints_a_co_occurs_edge() {
 
 #[tokio::test]
 async fn non_resonant_co_mention_mints_nothing() {
-    let (_t, _c, db, _rec, observer) = harness(true).await;
+    let (_t, _c, db, _rec, observer, _attention) = harness(true).await;
     // Names both concepts, but no RESONATE marker → rolling lands on the quiet
     // axis, cosine 0 < floor → no survivors → no edge.
     let res = observer
@@ -266,7 +267,7 @@ async fn non_resonant_co_mention_mints_nothing() {
 
 #[tokio::test]
 async fn idempotent_re_touch_does_not_duplicate_edge_or_audit() {
-    let (_t, _c, db, rec, observer) = harness(true).await;
+    let (_t, _c, db, rec, observer, _attention) = harness(true).await;
     let turn = "alpha beta together RESONATE";
     let first = observer
         .observe(&scope(), turn, 0, "s", None)
@@ -289,7 +290,7 @@ async fn idempotent_re_touch_does_not_duplicate_edge_or_audit() {
 
 #[tokio::test]
 async fn resonant_recurrence_mints_a_proposed_node() {
-    let (_t, _c, db, rec, observer) = harness(true).await;
+    let (_t, _c, db, rec, observer, _attention) = harness(true).await;
     // The unknown kebab term appears ONCE per turn across 3 resonant turns
     // (each turn names alpha+beta and resonates) → resonance reaches the gate.
     for seq in 0..3 {
@@ -328,7 +329,7 @@ async fn resonant_recurrence_mints_a_proposed_node() {
 
 #[tokio::test]
 async fn high_frequency_low_resonance_term_never_mints() {
-    let (_t, _c, db, _rec, observer) = harness(true).await;
+    let (_t, _c, db, _rec, observer, _attention) = harness(true).await;
     // The term recurs across MANY turns, but none resonate (no RESONATE marker,
     // so no survivors) → mentions climb, resonance stays 0 → never mints.
     for seq in 0..6 {
@@ -346,7 +347,7 @@ async fn high_frequency_low_resonance_term_never_mints() {
 
 #[tokio::test]
 async fn observer_without_corpus_grows_nothing() {
-    let (_t, _c, db, _rec, observer) = harness(false).await;
+    let (_t, _c, db, _rec, observer, _attention) = harness(false).await;
     let res = observer
         .observe(&scope(), "alpha beta together RESONATE", 0, "s", None)
         .await
@@ -363,6 +364,54 @@ fn project_scope(project: &str) -> AttentionScope {
         agent: Some("substrate".into()),
         privacy_tier: PrivacyTier::T1Project,
     }
+}
+
+/// Regression (attention-is-sovereign slice #2): a project-bearing ambient
+/// turn must mirror its rolling EMA into the project-agnostic AGGREGATE scope
+/// the memory-lens polls (`ambient_scope_default()`), while preserving the
+/// per-project channel concept-growth reads. Before the fix, `e16587a` routed
+/// `attend()` through the chunk's project scope, sharding the rolling vector
+/// away from the lens's read scope (`project=None`) — the lens saw
+/// `rolling_vec=None` and froze on `EmptyMind`.
+#[tokio::test]
+async fn project_scoped_turn_mirrors_rolling_into_aggregate_scope() {
+    let (_t, _c, _db, _rec, observer, attention) = harness(true).await;
+    observer
+        .observe(
+            &project_scope("some-project"),
+            "alpha and beta RESONATE",
+            0,
+            "s",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The memory-lens reads the project-agnostic aggregate scope — populated.
+    let aggregate = attention
+        .rolling_vec(&ambient_scope_default())
+        .await
+        .unwrap();
+    assert!(
+        aggregate.is_some(),
+        "aggregate (project=None) rolling vec must be populated for the memory-lens"
+    );
+
+    // The per-project channel concept-growth reads is preserved (unchanged).
+    let per_project = attention
+        .rolling_vec(&project_scope("some-project"))
+        .await
+        .unwrap();
+    assert!(
+        per_project.is_some(),
+        "per-project rolling vec must remain populated (concept-growth channel)"
+    );
+
+    // For a single project the aggregate mirrors that project's rolling EMA.
+    assert_eq!(
+        aggregate, per_project,
+        "aggregate must mirror the per-project rolling EMA"
+    );
 }
 
 /// Regression: one observer streaming turns from project A then project B
