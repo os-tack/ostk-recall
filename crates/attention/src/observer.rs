@@ -757,25 +757,43 @@ impl TurnObserver {
     ) -> (usize, usize) {
         let cfg = self.concept_growth;
 
-        // Maybe-rebuild the anchor codebook + gazetteer. Build the new maps
-        // OUTSIDE the cache write lock (the embedding fetch is async) and swap
-        // them in under the lock — never hold the guard across `.await`.
+        // Maybe-rebuild the (project-agnostic) anchor codebook on the turn
+        // cadence. Build OUTSIDE the cache write lock (the embedding fetch is
+        // async) and swap it in under the lock — never hold the guard across
+        // `.await`. A rebuild also clears the per-project gazetteers so they
+        // refresh with any concepts added since.
         let prev_turns = self.turns_since_build.fetch_add(1, Ordering::Relaxed);
-        let need_build = {
+        let need_anchor_build = {
             let g = self.growth_cache.read().await;
-            !g.built || prev_turns >= cfg.codebook_rebuild_turns
+            !g.anchors_built || prev_turns >= cfg.codebook_rebuild_turns
         };
-        if need_build {
+        if need_anchor_build {
             let anchors = Self::build_anchor_map(&self.store, corpus).await;
-            let gazetteer =
-                concept_growth::build_ambient_gazetteer(&self.store, scope.project.as_deref());
             {
                 let mut g = self.growth_cache.write().await;
                 g.anchors = anchors;
-                g.gazetteer = gazetteer;
-                g.built = true;
+                g.anchors_built = true;
+                g.gazetteers.clear();
             }
             self.turns_since_build.store(0, Ordering::Relaxed);
+        }
+
+        // Ensure a gazetteer for THIS turn's project scope. Keyed by
+        // `scope.project` so an observer streaming turns from different projects
+        // never reuses the wrong project's matcher/`known` oracle. Built lazily
+        // (sync — no `.await`); insert under the write lock if absent.
+        let proj_key = scope.project.clone();
+        {
+            let have = {
+                let g = self.growth_cache.read().await;
+                g.gazetteers.contains_key(&proj_key)
+            };
+            if !have {
+                let gaz =
+                    concept_growth::build_ambient_gazetteer(&self.store, scope.project.as_deref());
+                let mut g = self.growth_cache.write().await;
+                g.gazetteers.entry(proj_key.clone()).or_insert(gaz);
+            }
         }
 
         // Read-side work under the guard, captured into owned data so the store
@@ -785,7 +803,12 @@ impl TurnObserver {
         let raw_candidates = raw_unknown_kebab(turn_text, &known_threads);
         let (survivors, fresh_candidates): (Vec<(i64, f32, String)>, Vec<String>) = {
             let g = self.growth_cache.read().await;
-            let matched = g.gazetteer.matches(&body_norm);
+            // The active project's gazetteer was just ensured above; if a
+            // concurrent rebuild cleared it, skip this turn (best-effort).
+            let Some(gaz) = g.gazetteers.get(&proj_key) else {
+                return (0, 0);
+            };
+            let matched = gaz.matches(&body_norm);
             let survivors = concept_growth::select_survivors(
                 &matched,
                 &g.anchors,
@@ -794,14 +817,14 @@ impl TurnObserver {
                 cfg.edge_top_k,
             )
             .into_iter()
-            .filter_map(|(id, res)| g.gazetteer.handles.get(&id).map(|h| (id, res, h.clone())))
+            .filter_map(|(id, res)| gaz.handles.get(&id).map(|h| (id, res, h.clone())))
             .collect();
             // Exclude any raw candidate that is already a known concept form
             // (the gazetteer `known` oracle) so existing concepts never
             // re-materialize as fresh nodes.
             let fresh = raw_candidates
                 .into_iter()
-                .filter(|p| !g.gazetteer.known.contains(&concept_growth::normalize(p)))
+                .filter(|p| !gaz.known.contains(&concept_growth::normalize(p)))
                 .collect();
             (survivors, fresh)
         };

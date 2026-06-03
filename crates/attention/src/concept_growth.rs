@@ -72,17 +72,26 @@ impl Default for ConceptGrowthConfig {
     }
 }
 
-/// The observer's concept-growth read cache: anchor codebook + gazetteer.
+/// The observer's concept-growth read cache: anchor codebook + per-project
+/// gazetteers.
 ///
 /// `anchors` maps `concept_id` → anchor-chunk embedding (the latent half of the
-/// resonance gate); the gazetteer is the lexical half. Rebuilt together on a
-/// turn-count cadence. `built` distinguishes "never built" from "built but
-/// empty graph".
+/// resonance gate) and is **project-agnostic** (`concept_anchors` spans all
+/// projects), rebuilt on a turn-count cadence; `anchors_built` distinguishes
+/// "never built" from "built but empty graph".
+///
+/// `gazetteers` is the lexical half and **is** scope-sensitive: keyed by
+/// `scope.project` (project + globals, or all-projects when `None`). A single
+/// observer instance streams turns from different `event.project`s
+/// (`run_subscribed`), so reusing one project's matcher/`known` oracle for
+/// another would miss the active project's concepts and re-mint existing ones.
+/// Built lazily per project and cleared whenever the anchor codebook rebuilds,
+/// so each refreshes on the same cadence.
 #[derive(Default)]
 pub(crate) struct ConceptGrowthCache {
     pub anchors: HashMap<i64, Vec<f32>>,
-    pub gazetteer: AmbientGazetteer,
-    pub built: bool,
+    pub anchors_built: bool,
+    pub gazetteers: HashMap<Option<String>, AmbientGazetteer>,
 }
 
 /// Streaming recurrence accumulator for one unknown term — the mentions-vs-

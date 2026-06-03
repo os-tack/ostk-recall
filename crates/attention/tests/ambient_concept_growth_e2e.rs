@@ -109,11 +109,11 @@ fn anchor_chunk(id: &str) -> Chunk {
     }
 }
 
-fn attach_anchor(db: &ThreadsDb, handle: &str, chunk_id: &str) {
-    let id = db.get_concept(G, handle).unwrap().unwrap().id;
+fn attach_anchor_in(db: &ThreadsDb, project: &str, handle: &str, chunk_id: &str) {
+    let id = db.get_concept(project, handle).unwrap().unwrap().id;
     db.attach_concept_evidence(&EvidenceAttach {
         concept_id: id,
-        project: G,
+        project,
         source: "markdown",
         source_id: &format!("{chunk_id}.md"),
         chunk_id: Some(chunk_id),
@@ -123,6 +123,10 @@ fn attach_anchor(db: &ThreadsDb, handle: &str, chunk_id: &str) {
         reason: Some("test"),
     })
     .unwrap();
+}
+
+fn attach_anchor(db: &ThreadsDb, handle: &str, chunk_id: &str) {
+    attach_anchor_in(db, G, handle, chunk_id);
 }
 
 fn scope() -> AttentionScope {
@@ -349,4 +353,108 @@ async fn observer_without_corpus_grows_nothing() {
     assert_eq!(res.concept_edges_minted, 0, "phase is gated on with_corpus");
     assert_eq!(res.concept_nodes_minted, 0);
     assert_eq!(co_occurs_count(&db, "alpha"), 0);
+}
+
+fn project_scope(project: &str) -> AttentionScope {
+    AttentionScope {
+        project: Some(project.into()),
+        session_id: Some("ambient".into()),
+        agent: Some("substrate".into()),
+        privacy_tier: PrivacyTier::T1Project,
+    }
+}
+
+/// Regression: one observer streaming turns from project A then project B
+/// (before the rebuild cadence) must resolve EACH turn's own project's
+/// concepts. The earlier single-gazetteer cache let the first project seen win
+/// until the next codebook rebuild, so project B's turn would miss B's
+/// concepts. Gazetteers are now keyed per `scope.project`.
+#[tokio::test]
+async fn gazetteer_is_keyed_per_project_not_first_project_wins() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = Arc::new(CorpusStore::open_or_create(tmp.path(), DIM).await.unwrap());
+    corpus
+        .upsert(
+            &[
+                anchor_chunk("a-one"),
+                anchor_chunk("a-two"),
+                anchor_chunk("b-one"),
+                anchor_chunk("b-two"),
+            ],
+            &[
+                axis(RESONANT_AXIS),
+                axis(RESONANT_AXIS),
+                axis(RESONANT_AXIS),
+                axis(RESONANT_AXIS),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let recorder: Arc<RecordingSink> = Arc::new(RecordingSink::default());
+    let sink: Arc<dyn ChainSink> = recorder.clone();
+    let db = Arc::new(ThreadsDb::open_with_sink(tmp.path(), sink).unwrap());
+    // Two project-scoped concepts per project (≥3-char handles so the gazetteer
+    // floor admits them).
+    for (proj, h, chunk) in [
+        ("proja", "alpha-one", "a-one"),
+        ("proja", "alpha-two", "a-two"),
+        ("projb", "delta-one", "b-one"),
+        ("projb", "delta-two", "b-two"),
+    ] {
+        db.ensure_concept(proj, h, ConceptStatus::Active).unwrap();
+        attach_anchor_in(&db, proj, h, chunk);
+    }
+
+    let ingest = Arc::new(IngestDb::open(tmp.path()).unwrap());
+    let emb: Arc<dyn ChunkEmbedder> = Arc::new(AxisEmbedder);
+    let pipeline = Arc::new(Pipeline::new(Arc::clone(&corpus), ingest, emb));
+    let attn: Arc<dyn AttentionForwardStore> =
+        Arc::new(InMemoryAttention::with_embedder(Arc::new(AxisEmbedder)));
+    let observer = TurnObserver::new(pipeline, Arc::clone(&db))
+        .with_attention(attn)
+        .with_chain_sink(db.chain_sink())
+        .with_concept_growth(test_cfg()) // codebook_rebuild_turns = 32
+        .with_corpus(Arc::clone(&corpus));
+
+    // Turn 1 — project A.
+    let ra = observer
+        .observe(
+            &project_scope("proja"),
+            "alpha-one with alpha-two RESONATE",
+            0,
+            "s",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ra.concept_edges_minted, 1, "project A concepts resolve");
+
+    // Turn 2 — project B, BEFORE the rebuild cadence (turns_since_build ≪ 32).
+    let rb = observer
+        .observe(
+            &project_scope("projb"),
+            "delta-one with delta-two RESONATE",
+            1,
+            "s",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rb.concept_edges_minted, 1,
+        "project B concepts resolve via B's own gazetteer, not A's (regression)"
+    );
+    // The B edge is real and scoped to B's concepts.
+    let b_edges = db
+        .list_concept_edges("projb", "delta-one", EdgeDirection::From)
+        .unwrap()
+        .into_iter()
+        .chain(
+            db.list_concept_edges("projb", "delta-one", EdgeDirection::To)
+                .unwrap(),
+        )
+        .filter(|e| e.relation == "co_occurs")
+        .count();
+    assert_eq!(b_edges, 1);
 }
