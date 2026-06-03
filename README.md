@@ -16,8 +16,8 @@ cross-encoder reranker.
 ## What it does
 
 - **Ingests many source kinds into one corpus** — markdown trees, source code,
-  Claude Code and Gemini session logs, arbitrary globs, Claude.ai `.zip`
-  exports, and ostk `.ostk/` directories.
+  Claude Code, Gemini, and Codex CLI session logs, arbitrary globs, Claude.ai
+  `.zip` exports, and ostk `.ostk/` directories.
 - **Hybrid retrieval** — model2vec dense vectors and Tantivy BM25, fused with
   Reciprocal Rank Fusion, with an optional cross-encoder rerank pass.
 - **A concept ledger** — typed nodes and attributed, directed edges, durable in
@@ -40,7 +40,6 @@ Pre-alpha but functional; the maintainer runs it as a daily driver.
 
 Not yet built:
 
-- ChatGPT export scanner (its zip layout differs from Claude.ai exports).
 - Per-file offset cursors for `claude_code` / `gemini` incremental scan
   (append-only JSONL currently falls back to a full-source rescan when poked by
   the watcher; content-addressed chunk ids keep that idempotent, just wasteful).
@@ -139,6 +138,7 @@ never touches your real corpus.
 | `code` | source files filtered by `extensions = [...]` | tree-sitter symbol chunks (rs/py/ts/js/go); line-window fallback |
 | `claude_code` | Claude Code session logs (`<slug>/*.jsonl`) | one chunk per user / assistant turn |
 | `gemini` | Gemini CLI session JSON (`session-*.json`, recursive) | one chunk per user/gemini exchange |
+| `codex` | Codex CLI session logs (`~/.codex/sessions/**/rollout-*.jsonl`) | one chunk per user turn |
 | `file_glob` | an arbitrary glob, as plain text | paragraph split, soft-wrap ~400 tokens |
 | `zip_export` | Claude.ai data-export `.zip` bundles | per-conversation-turn chunks |
 | `ostk_project` | ostk `.ostk/` dirs — decisions, needles, audit, specs, code | composite; one chunk per record |

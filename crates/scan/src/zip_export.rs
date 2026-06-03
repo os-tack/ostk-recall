@@ -17,9 +17,6 @@
 //!   }
 //! ]
 //! ```
-//!
-//! TODO(phase-d): Support `ChatGPT` `conversations.json` (different schema —
-//! `mapping` tree of messages). Not in scope for Phase C.
 
 use std::fs::File;
 use std::io::{BufReader, Read};
