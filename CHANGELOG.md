@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-06-03
+### Added
+- **Relational substrate — ambient salience-gated concept-growth (Phase 1 + 2).**
+  The `TurnObserver` now grows the *concept* graph from the live conversation
+  stream, not just the thread graph: resonance-gated `co_occurs` edges among
+  scope-visible concepts named in a turn (trust-gated to `Active`/`Proposed`
+  endpoints), plus `Proposed` node minting for novel kebab terms that recur
+  across resonant turns (`occurrence ≠ salience`). Recurrence + per-session
+  mint caps persist across scan triggers via a shared `ConceptGrowthRuntime`;
+  gazetteer lookup is scoped per chunk project. Phase 1 seeds a graph-only
+  doc-topology harvest (markdown link graph → `doc` concept nodes/edges, zero
+  corpus duplication).
+- **Concept-codebook latent adjacency** — latent-similarity union +
+  latent→reified promotion, with a config-exposed similarity floor.
+- **Codex CLI history ingest** — initial `SourceKind::Codex` scanner source.
+### Fixed
+- **Ambient memory-lens froze across restart.** The observer's `attend()` was
+  routed through the per-chunk *project* scope (correct for the concept
+  gazetteer) but that sharded the rolling-attention vector away from the
+  project-agnostic `ambient_scope_default()` the lens reads — so the lens saw
+  `rolling_vec=None` → `EmptyMind` every tick and never re-rendered. Attention
+  is now mirrored into the project-agnostic *aggregate* scope (memory stays
+  project-scoped), and chain replay seeds that aggregate on boot so the lens is
+  live immediately after a restart.
+- **memory-lens resource repopulates across `serve` restart** (seeded from the
+  persisted `lens.md` + a forced first re-render).
+
+## [0.7.1] - 2026-06-02
+### Added
+- **Relational substrate — diffusion read (slice 2).** `relational_lift` lens
+  lane + slot: recall diffuses over the salient concept graph.
+- **Gazetteer prose mention-linking (slice 4)** — prose mentions of known
+  concepts earn evidence links.
+- **Automagic promotion (slice 5)** — recurring prose names promote to typed
+  nodes; `crystallize` writes stub files for proposed typed nodes.
+### Fixed
+- **`serve` shutdown is bounded** so Ctrl-C reliably kills the daemon.
+
+## [0.7.0] - 2026-06-01
+### Added
+- **Concept ledger + `memory_*` MCP façade** — durable concept cards
+  (candidate→proposed→active) with mandatory evidence; only `active` concepts
+  bias recall.
+- **Relational substrate foundations** — edge provenance + earned conductance
+  (slice 1); scanner config → typed-node + authored-edge seeding (slice 3).
+- **Concept activation on the chain** — lens concept slot + frame "why surfaced".
+- Runnable examples for distinct memory concerns; docs for indexing private
+  `.ostk/` design docs.
+### Fixed
+- Alias resolution + merge-forward, coherent evidence, scope, and provenance
+  hardening in the concept façade.
+- `watch`: add `.pnpm` / `.turbo` to `NOISE_PATH_SEGMENTS`.
+
 ## [0.6.0] - 2026-05-31
 
 ### Added
