@@ -458,3 +458,75 @@ async fn gazetteer_is_keyed_per_project_not_first_project_wins() {
         .count();
     assert_eq!(b_edges, 1);
 }
+
+/// Trust gate (daemon path): a turn co-mentions an Active, a Proposed, and a
+/// Candidate concept — all anchored on the resonant axis, so all *would* resonate
+/// — but only the Active↔Proposed pair may mint. A Candidate is "known enough to
+/// avoid duplicate minting, not trusted enough to shape topology": minting it
+/// would let recurring operational lexis re-touch low-trust noise into durable
+/// structure.
+#[tokio::test]
+async fn candidate_concepts_do_not_earn_co_occurs_edges() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = Arc::new(CorpusStore::open_or_create(tmp.path(), DIM).await.unwrap());
+    corpus
+        .upsert(
+            &[
+                anchor_chunk("act"),
+                anchor_chunk("prop"),
+                anchor_chunk("cand"),
+            ],
+            &[
+                axis(RESONANT_AXIS),
+                axis(RESONANT_AXIS),
+                axis(RESONANT_AXIS),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let recorder: Arc<RecordingSink> = Arc::new(RecordingSink::default());
+    let sink: Arc<dyn ChainSink> = recorder.clone();
+    let db = Arc::new(ThreadsDb::open_with_sink(tmp.path(), sink).unwrap());
+    db.ensure_concept(G, "active-one", ConceptStatus::Active)
+        .unwrap();
+    db.ensure_concept(G, "proposed-two", ConceptStatus::Proposed)
+        .unwrap();
+    db.ensure_concept(G, "candidate-three", ConceptStatus::Candidate)
+        .unwrap();
+    attach_anchor(&db, "active-one", "act");
+    attach_anchor(&db, "proposed-two", "prop");
+    attach_anchor(&db, "candidate-three", "cand");
+
+    let ingest = Arc::new(IngestDb::open(tmp.path()).unwrap());
+    let emb: Arc<dyn ChunkEmbedder> = Arc::new(AxisEmbedder);
+    let pipeline = Arc::new(Pipeline::new(Arc::clone(&corpus), ingest, emb));
+    let attn: Arc<dyn AttentionForwardStore> =
+        Arc::new(InMemoryAttention::with_embedder(Arc::new(AxisEmbedder)));
+    let observer = TurnObserver::new(pipeline, Arc::clone(&db))
+        .with_attention(attn)
+        .with_chain_sink(db.chain_sink())
+        .with_concept_growth(test_cfg())
+        .with_corpus(Arc::clone(&corpus));
+
+    let res = observer
+        .observe(
+            &scope(),
+            "active-one with proposed-two beside candidate-three RESONATE",
+            0,
+            "s",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Only the Active↔Proposed pair mints — the Candidate is trust-gated out.
+    assert_eq!(res.concept_edges_minted, 1, "only active↔proposed mints");
+    assert_eq!(co_occurs_count(&db, "active-one"), 1);
+    assert_eq!(co_occurs_count(&db, "proposed-two"), 1);
+    assert_eq!(
+        co_occurs_count(&db, "candidate-three"),
+        0,
+        "candidate earns no co_occurs edge"
+    );
+}

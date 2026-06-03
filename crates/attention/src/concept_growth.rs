@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use aho_corasick::{AhoCorasick, MatchKind};
-use ostk_recall_store::ThreadsDb;
+use ostk_recall_store::{ConceptStatus, ThreadsDb};
 
 /// Relation minted for an ambient co-occurrence. Distinct from `mentions`
 /// (directional doc→entity) and `related` (reserved by the latent promoter) so
@@ -142,10 +142,13 @@ impl FormClaims {
     }
 }
 
-/// A matcher over the scope-visible concept surface forms (handles + aliases),
-/// plus the id→handle map for audit events and the `known` oracle (normalized
-/// forms of *every* concept incl. terminal/ambiguous) that keeps node-minting
-/// from re-materializing an existing concept. Empty matches nothing.
+/// A matcher over the scope-visible concept surface forms (handles + aliases).
+///
+/// Match targets are TRUST-gated to `Active`/`Proposed` concepts (a `Candidate`
+/// is too low-trust to shape topology). The `known` oracle is broader —
+/// normalized forms of *every* concept incl. `Candidate`/terminal/ambiguous —
+/// so node-minting never re-materializes an existing name regardless of status.
+/// `handles` maps id→handle for audit events. Empty matches nothing.
 #[derive(Default)]
 pub(crate) struct AmbientGazetteer {
     ac: Option<AhoCorasick>,
@@ -210,10 +213,10 @@ fn gaz_form(raw: &str) -> Option<String> {
 
 /// Build the gazetteer over concepts visible from `project_filter`
 /// (`None` = all projects; `Some("")` = globals only; `Some("p")` = p + globals
-/// — the `list_concepts` contract). Terminal concepts are excluded as match
-/// targets, but their forms still populate `known` so a rejected/merged name is
-/// not re-minted. Best-effort: a ledger error yields an empty (matches-nothing)
-/// gazetteer.
+/// — the `list_concepts` contract). Only `Active`/`Proposed` concepts become
+/// match targets (trust gate); `Candidate` and terminal concepts still populate
+/// `known` so their names are never re-minted. Best-effort: a ledger error
+/// yields an empty (matches-nothing) gazetteer.
 pub(crate) fn build_ambient_gazetteer(
     threads: &ThreadsDb,
     project_filter: Option<&str>,
@@ -226,8 +229,9 @@ pub(crate) fn build_ambient_gazetteer(
     let mut known: HashSet<String> = HashSet::new();
     for c in &concepts {
         let aliases = threads.list_aliases(c.id).unwrap_or_default();
-        // Capture handle + alias forms of EVERY concept (incl. terminal) into
-        // `known` BEFORE the terminal skip, so the node-mint oracle sees them.
+        // Capture handle + alias forms of EVERY concept (incl. Candidate and
+        // terminal) into `known` BEFORE the match-target gate, so the node-mint
+        // oracle never re-materializes an existing name regardless of status.
         if let Some(norm) = gaz_form(&c.handle) {
             known.insert(norm);
         }
@@ -236,7 +240,14 @@ pub(crate) fn build_ambient_gazetteer(
                 known.insert(norm);
             }
         }
-        if c.status.is_terminal() {
+        // Match targets are TRUST-gated: only `Active`/`Proposed` concepts shape
+        // topology. A `Candidate` is "known enough to avoid duplicate minting,
+        // not trusted enough to earn `co_occurs` edges" — otherwise recurring
+        // operational lexis (`file`, `signal`, `serve`) would re-touch low-trust
+        // candidate noise into durable structure. (Terminal is excluded too.)
+        // Future calibration: a repeatedly-salient Candidate could be *upgraded*
+        // to Proposed rather than ignored — deliberately out of scope here.
+        if !matches!(c.status, ConceptStatus::Active | ConceptStatus::Proposed) {
             continue;
         }
         handles.insert(c.id, c.handle.clone());
@@ -414,5 +425,29 @@ mod tests {
         // ...but its normalized form IS in the known oracle (so node-minting
         // never re-materializes it).
         assert!(gaz.known.contains("rejected name"));
+    }
+
+    #[test]
+    fn gazetteer_trust_gates_match_targets_to_active_and_proposed() {
+        let (_t, db) = db();
+        db.ensure_concept(G, "active-one", ConceptStatus::Active)
+            .unwrap();
+        db.ensure_concept(G, "proposed-two", ConceptStatus::Proposed)
+            .unwrap();
+        db.ensure_concept(G, "candidate-three", ConceptStatus::Candidate)
+            .unwrap();
+        let gaz = build_ambient_gazetteer(&db, None);
+
+        // Active + Proposed are match targets; Candidate is not (too low-trust
+        // to shape topology).
+        let ids = gaz.matches(&normalize(
+            "saw active-one and proposed-two next to candidate-three",
+        ));
+        assert_eq!(ids.len(), 2, "only Active + Proposed match");
+
+        // The Candidate still populates the known oracle, so node-minting won't
+        // re-materialize it.
+        assert!(gaz.known.contains("candidate three"));
+        assert!(gaz.known.contains("active one"));
     }
 }
