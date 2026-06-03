@@ -29,6 +29,11 @@ tracing = { workspace = true }
 # turn's text. A hand-rolled scanner would re-encode the regex grammar
 # without measurable gain; workspace already depends on `regex 1.11`.
 regex = { workspace = true }
+# aho-corasick: the Phase-2 ambient concept-growth gazetteer matches the
+# turn text against every known concept handle+alias in one pass
+# (LeftmostLongest), mirroring the scanner-side gazetteer in
+# `cli::seed`. Workspace already depends on `aho-corasick 1.1`.
+aho-corasick = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -19,7 +19,7 @@
 //! - `abi-as-sovereign-boundary` — synthetic chunks still carry
 //!   structured attribution in `extra`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -29,12 +29,19 @@ use ostk_recall_core::{Chunk, Links, Source};
 use ostk_recall_pipeline::{Pipeline, PipelineError, SyntheticSourceMeta};
 use ostk_recall_store::corpus::{CorpusStore, StoreError};
 use ostk_recall_store::{
-    ChainEvent, ChainSink, ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb,
+    ChainEvent, ChainSink, ConceptActivationReader, ConceptStatus, EdgeSource, GLOBAL_PROJECT,
+    OBSERVED_MENTION_CONFIDENCE, ProposedThreadRecord, TensionState, ThreadRecord, ThreadsDb,
+    slugify,
 };
 use regex::Regex;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+use crate::concept_growth::{
+    self, AMBIENT_EDGE_BY, CO_MENTION_RELATION, ConceptGrowthCache, ConceptGrowthConfig,
+    TermRecurrence,
+};
 
 // --- public types -----------------------------------------------------
 
@@ -62,6 +69,14 @@ pub struct ObservationResult {
     /// handle). Zero when `originating_chunk_id` is `None` — proposals
     /// require an anchor chunk for the audit trail.
     pub proposed_persisted: usize,
+    /// Phase 2: newly-created `co_occurs` concept edges minted from the
+    /// turn's resonance-gated co-mentions. Zero unless [`TurnObserver::with_corpus`]
+    /// AND [`TurnObserver::with_attention`] are wired (the concept-growth phase
+    /// is gated on both). Idempotent re-touch of an existing edge does not count.
+    pub concept_edges_minted: usize,
+    /// Phase 2: new `Proposed` concept nodes minted from salient recurring
+    /// unknown terms. Same gating as `concept_edges_minted`.
+    pub concept_nodes_minted: usize,
 }
 
 /// A candidate thread the observer wants the operator to consider.
@@ -150,6 +165,27 @@ pub struct TurnObserver {
     /// Independent from the `ThreadsDb` sink so the observer can
     /// participate in chain emission without owning ledger writes.
     chain_sink: Option<Arc<dyn ChainSink>>,
+    /// Phase 2: corpus handle for concept-anchor embeddings. `None` disables
+    /// the concept-growth phase entirely (legacy/library callers, ledger-only
+    /// tests) — the phase is gated on `corpus.is_some() && attention.is_some()`.
+    corpus: Option<Arc<CorpusStore>>,
+    /// Phase 2 tuning (resonance floor + per-turn / per-session caps), resolved
+    /// from the `[ambient_growth]` config block by `serve`.
+    concept_growth: ConceptGrowthConfig,
+    /// Phase 2: the concept-growth read cache (anchor codebook + gazetteer),
+    /// rebuilt every `concept_growth.codebook_rebuild_turns` observed turns.
+    growth_cache: Arc<RwLock<ConceptGrowthCache>>,
+    /// Observed turns since the last `growth_cache` rebuild. Atomic so the
+    /// per-turn bump never needs the cache write lock; reset to 0 on rebuild.
+    turns_since_build: Arc<AtomicU64>,
+    /// Streaming recurrence accumulator for the node-minting half: unknown term
+    /// → its mentions/resonance split + co-resonant context. Lives on the
+    /// long-lived observer (one instance == one ambient session).
+    term_recurrence: Arc<RwLock<HashMap<String, TermRecurrence>>>,
+    /// Count of nodes minted by this observer instance, compared against
+    /// [`ConceptGrowthConfig::node_mint_cap_per_session`]. Atomic so cloned
+    /// observers share the cap (mirrors `promotions_this_session`).
+    node_mints_this_session: Arc<AtomicUsize>,
 }
 
 impl TurnObserver {
@@ -170,6 +206,12 @@ impl TurnObserver {
             promotions_this_session: Arc::new(AtomicUsize::new(0)),
             attention: None,
             chain_sink: None,
+            corpus: None,
+            concept_growth: ConceptGrowthConfig::default(),
+            growth_cache: Arc::new(RwLock::new(ConceptGrowthCache::default())),
+            turns_since_build: Arc::new(AtomicU64::new(0)),
+            term_recurrence: Arc::new(RwLock::new(HashMap::new())),
+            node_mints_this_session: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -191,6 +233,25 @@ impl TurnObserver {
     #[must_use]
     pub fn with_chain_sink(mut self, sink: Arc<dyn ChainSink>) -> Self {
         self.chain_sink = Some(sink);
+        self
+    }
+
+    /// Attach a [`CorpusStore`] so the concept-growth phase (Phase 2) can build
+    /// its anchor codebook (`cosine(concept_anchor, turn_rolling_vec)` is the
+    /// resonance gate). Without this — or without [`Self::with_attention`] —
+    /// the phase is inert and `observe` grows no concept edges/nodes.
+    /// Production wiring in `cli::commands::spawn_ambient_daemons` sets this.
+    #[must_use]
+    pub fn with_corpus(mut self, corpus: Arc<CorpusStore>) -> Self {
+        self.corpus = Some(corpus);
+        self
+    }
+
+    /// Override the concept-growth tuning (resonance floor + caps). `serve`
+    /// resolves this from the optional `[ambient_growth]` config block.
+    #[must_use]
+    pub fn with_concept_growth(mut self, cfg: ConceptGrowthConfig) -> Self {
+        self.concept_growth = cfg;
         self
     }
 
@@ -512,6 +573,25 @@ impl TurnObserver {
             }
         }
 
+        // (d) concept growth — grow the *concept* graph from this turn's
+        // resonance-gated co-mentions (edges) and salient recurring unknown
+        // terms (nodes). Gated on both a corpus (anchor codebook) and an
+        // attention store (rolling vector); best-effort, never aborts the turn.
+        let (concept_edges_minted, concept_nodes_minted) = match (&self.corpus, &self.attention) {
+            (Some(corpus), Some(attn)) => match attn.scope_vector(scope).await {
+                Ok(Some(rolling_vec)) if !rolling_vec.is_empty() => {
+                    self.grow_concepts(scope, turn_text, turn_seq, &rolling_vec, corpus)
+                        .await
+                }
+                Ok(_) => (0, 0),
+                Err(err) => {
+                    tracing::warn!(error = %err, "concept-growth: scope_vector failed");
+                    (0, 0)
+                }
+            },
+            _ => (0, 0),
+        };
+
         // Stable order: highest confidence first, then alphabetical.
         proposed_stubs.sort_by(|a, b| {
             b.confidence
@@ -529,6 +609,8 @@ impl TurnObserver {
             proposed_stubs,
             promoted_handles,
             proposed_persisted,
+            concept_edges_minted,
+            concept_nodes_minted,
         })
     }
 
@@ -649,6 +731,307 @@ impl TurnObserver {
             }
         }
     }
+}
+
+// --- Phase 2: ambient concept growth ---------------------------------
+
+impl TurnObserver {
+    /// Grow the concept graph from one turn. Returns `(edges_minted,
+    /// nodes_minted)` — newly-created edges/nodes only (idempotent re-touch
+    /// does not count). Best-effort throughout: a store or codebook error is
+    /// logged and skipped, never propagated, so the durable observation that
+    /// already happened is preserved. Two halves, both gated on the SAME
+    /// per-turn resonance decision (the occurrence≠salience law):
+    ///
+    /// - **edges** — existing concepts literally named in the turn (gazetteer)
+    ///   whose anchor resonates with the turn get pairwise `co_occurs` edges;
+    /// - **nodes** — unknown terms recurring across resonant turns mint a
+    ///   `Proposed` node connected to its co-resonant context.
+    async fn grow_concepts(
+        &self,
+        scope: &AttentionScope,
+        turn_text: &str,
+        turn_seq: u64,
+        rolling_vec: &[f32],
+        corpus: &Arc<CorpusStore>,
+    ) -> (usize, usize) {
+        let cfg = self.concept_growth;
+
+        // Maybe-rebuild the anchor codebook + gazetteer. Build the new maps
+        // OUTSIDE the cache write lock (the embedding fetch is async) and swap
+        // them in under the lock — never hold the guard across `.await`.
+        let prev_turns = self.turns_since_build.fetch_add(1, Ordering::Relaxed);
+        let need_build = {
+            let g = self.growth_cache.read().await;
+            !g.built || prev_turns >= cfg.codebook_rebuild_turns
+        };
+        if need_build {
+            let anchors = Self::build_anchor_map(&self.store, corpus).await;
+            let gazetteer =
+                concept_growth::build_ambient_gazetteer(&self.store, scope.project.as_deref());
+            {
+                let mut g = self.growth_cache.write().await;
+                g.anchors = anchors;
+                g.gazetteer = gazetteer;
+                g.built = true;
+            }
+            self.turns_since_build.store(0, Ordering::Relaxed);
+        }
+
+        // Read-side work under the guard, captured into owned data so the store
+        // writes below run without holding the lock.
+        let body_norm = concept_growth::normalize(turn_text);
+        let known_threads: HashSet<ThreadHandle> = self.known_handles.read().await.clone();
+        let raw_candidates = raw_unknown_kebab(turn_text, &known_threads);
+        let (survivors, fresh_candidates): (Vec<(i64, f32, String)>, Vec<String>) = {
+            let g = self.growth_cache.read().await;
+            let matched = g.gazetteer.matches(&body_norm);
+            let survivors = concept_growth::select_survivors(
+                &matched,
+                &g.anchors,
+                rolling_vec,
+                cfg.resonance_floor,
+                cfg.edge_top_k,
+            )
+            .into_iter()
+            .filter_map(|(id, res)| g.gazetteer.handles.get(&id).map(|h| (id, res, h.clone())))
+            .collect();
+            // Exclude any raw candidate that is already a known concept form
+            // (the gazetteer `known` oracle) so existing concepts never
+            // re-materialize as fresh nodes.
+            let fresh = raw_candidates
+                .into_iter()
+                .filter(|p| !g.gazetteer.known.contains(&concept_growth::normalize(p)))
+                .collect();
+            (survivors, fresh)
+        };
+
+        // A turn is "resonant" iff it produced enough co-resonant existing
+        // concepts — the same decision the edge half uses, reused verbatim by
+        // the node-recurrence accumulator (one compute, no divergence).
+        let resonant_turn = survivors.len() >= cfg.min_survivors;
+
+        // --- edge half: pairwise co_occurs among the survivors -----------
+        let mut edges_minted = 0usize;
+        if resonant_turn {
+            for (i, a) in survivors.iter().enumerate() {
+                for b in survivors.iter().skip(i + 1) {
+                    // Deterministic min→max id order so A,B and B,A collapse
+                    // under the directional UNIQUE(from,relation,to) constraint.
+                    let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                    let evidence = serde_json::json!({
+                        "via": "ambient-observe",
+                        "resonance_from": lo.1,
+                        "resonance_to": hi.1,
+                        "turn_seq": turn_seq,
+                    })
+                    .to_string();
+                    if self.mint_co_occurs(lo.0, &lo.2, hi.0, &hi.2, &evidence) {
+                        edges_minted += 1;
+                    }
+                }
+            }
+        }
+
+        // --- node half: salient recurring unknown terms ------------------
+        let mut nodes_minted = 0usize;
+        if !fresh_candidates.is_empty() {
+            let mut ready: Vec<String> = Vec::new();
+            {
+                let mut rec = self.term_recurrence.write().await;
+                for cand in fresh_candidates {
+                    let entry = rec.entry(cand.clone()).or_default();
+                    // `mentions` advances every turn the term appears; salience
+                    // counter `resonance` advances ONLY on resonant turns.
+                    entry.mentions = entry.mentions.saturating_add(1);
+                    if resonant_turn {
+                        entry.resonance = entry.resonance.saturating_add(1);
+                        for (id, _res, handle) in &survivors {
+                            entry.co_resonant.insert(*id, handle.clone());
+                        }
+                    }
+                    if entry.resonance >= cfg.node_mint_min_resonant_turns {
+                        ready.push(cand);
+                    }
+                }
+            }
+            for cand in ready {
+                if self.node_mints_this_session.load(Ordering::Relaxed)
+                    >= cfg.node_mint_cap_per_session
+                {
+                    break; // session mint cap reached
+                }
+                let co = {
+                    let rec = self.term_recurrence.read().await;
+                    rec.get(&cand)
+                        .map(|e| e.co_resonant.clone())
+                        .unwrap_or_default()
+                };
+                if self.mint_node(&cand, &co) {
+                    nodes_minted += 1;
+                    self.node_mints_this_session.fetch_add(1, Ordering::Relaxed);
+                    self.term_recurrence.write().await.remove(&cand);
+                }
+            }
+        }
+
+        (edges_minted, nodes_minted)
+    }
+
+    /// Mint (or re-touch) a single `co_occurs` edge between two concept ids in
+    /// canonical `lo→hi` order. Returns `true` iff the edge was newly created
+    /// (so the caller's count reflects mints, not re-touches). The
+    /// creation-gated `ConceptConnected` audit uses the SAME from/to order as
+    /// the inserted row — audit-only for cross-scope edges (the by-id row is
+    /// authoritative; the event's single `project` is cosmetic across scopes).
+    fn mint_co_occurs(&self, lo: i64, lo_h: &str, hi: i64, hi_h: &str, evidence: &str) -> bool {
+        match self.store.add_concept_edge_by_id(
+            lo,
+            CO_MENTION_RELATION,
+            hi,
+            OBSERVED_MENTION_CONFIDENCE,
+            EdgeSource::Observed,
+            Some(AMBIENT_EDGE_BY),
+            Some(evidence),
+        ) {
+            Ok((_, created)) => {
+                if created {
+                    if let Err(err) = self.store.record_concept_connected(
+                        GLOBAL_PROJECT,
+                        lo_h,
+                        CO_MENTION_RELATION,
+                        hi_h,
+                        EdgeSource::Observed,
+                        Some(AMBIENT_EDGE_BY),
+                    ) {
+                        tracing::warn!(error = %err, "concept-growth: ConceptConnected emit failed");
+                    }
+                }
+                created
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "concept-growth: add_concept_edge_by_id failed");
+                false
+            }
+        }
+    }
+
+    /// Mint a new `Proposed` global concept node from a salient recurring term
+    /// and connect it to its co-resonant context via `co_occurs` edges. Returns
+    /// `true` iff a new node was created. Mirrors slice-5 prose promotion:
+    /// race-guard, born `Candidate` → promoted `Proposed` in-pass, creation-
+    /// gated audit. `kind = None` — ambient turns carry no `entity_type`.
+    fn mint_node(&self, candidate: &str, co_resonant: &BTreeMap<i64, String>) -> bool {
+        let Some(slug) = slugify(candidate) else {
+            return false;
+        };
+        // Race guard: if the term resolved to a concept since it was staged,
+        // skip (no duplicate, no status downgrade).
+        if matches!(
+            self.store.resolve_concept(GLOBAL_PROJECT, &slug),
+            Ok(Some(_))
+        ) {
+            return false;
+        }
+        let (rec, created) = match self.store.ensure_typed_concept(
+            GLOBAL_PROJECT,
+            &slug,
+            ConceptStatus::Candidate,
+            None,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(error = %err, "concept-growth: ensure_typed_concept failed");
+                return false;
+            }
+        };
+        if !created {
+            return false; // lost a race; leave the existing concept alone
+        }
+        // Promote in-pass so it joins the diffusible graph this session.
+        if let Err(err) =
+            self.store
+                .set_concept_status(GLOBAL_PROJECT, &slug, ConceptStatus::Proposed, Some(0.4))
+        {
+            tracing::warn!(error = %err, "concept-growth: set_concept_status failed");
+        }
+        if let Err(err) = self
+            .store
+            .record_concept_promoted(GLOBAL_PROJECT, &slug, "proposed")
+        {
+            tracing::warn!(error = %err, "concept-growth: ConceptPromoted emit failed");
+        }
+        // Connect to the co-resonant context that birthed it.
+        for (nbr_id, nbr_h) in co_resonant {
+            if *nbr_id == rec.id {
+                continue;
+            }
+            let ((lo, lo_h), (hi, hi_h)) = if rec.id <= *nbr_id {
+                ((rec.id, slug.as_str()), (*nbr_id, nbr_h.as_str()))
+            } else {
+                ((*nbr_id, nbr_h.as_str()), (rec.id, slug.as_str()))
+            };
+            let evidence =
+                serde_json::json!({ "via": "ambient-observe-node", "term": slug }).to_string();
+            self.mint_co_occurs(lo, lo_h, hi, hi_h, &evidence);
+        }
+        true
+    }
+
+    /// Build the concept anchor codebook map (`concept_id` → anchor embedding)
+    /// from the ledger's `concept_anchors` + the corpus embeddings of their
+    /// anchor chunks. Mirrors `query::ConceptCodebook::build` but uses only
+    /// store + corpus primitives (no `query` dependency). Best-effort: any
+    /// error yields an empty map (concept growth degrades to a no-op).
+    async fn build_anchor_map(store: &ThreadsDb, corpus: &CorpusStore) -> HashMap<i64, Vec<f32>> {
+        let anchors = match store.concept_anchors() {
+            Ok(a) => a,
+            Err(err) => {
+                tracing::warn!(error = %err, "concept-growth: concept_anchors failed");
+                return HashMap::new();
+            }
+        };
+        if anchors.is_empty() {
+            return HashMap::new();
+        }
+        let ids: Vec<String> = anchors.iter().map(|a| a.chunk_id.clone()).collect();
+        let embs = match corpus.fetch_embeddings(&ids).await {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(error = %err, "concept-growth: fetch_embeddings failed");
+                return HashMap::new();
+            }
+        };
+        let mut by_id = HashMap::with_capacity(anchors.len());
+        for a in anchors {
+            if let Some(sem) = embs.get(&a.chunk_id).cloned() {
+                by_id.insert(a.concept_id, sem);
+            }
+        }
+        by_id
+    }
+}
+
+/// Distinct unknown kebab-case candidate terms PRESENT in the turn — counted
+/// once per turn, NOT the intra-turn `>= STUB_MIN_OCCURRENCES` gate the thread
+/// path uses. A term appearing even once must register the turn, else "recurs
+/// across N resonant turns" could never mint. Excludes known thread handles;
+/// the caller additionally excludes known concept forms via the gazetteer oracle.
+fn raw_unknown_kebab(turn_text: &str, known_threads: &HashSet<ThreadHandle>) -> Vec<String> {
+    let lowered = turn_text.to_lowercase();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for caps in kebab_phrase_regex().captures_iter(&lowered) {
+        let Some(m) = caps.get(1) else { continue };
+        let phrase = m.as_str().to_string();
+        if ThreadHandle::new(phrase.clone()).is_err() {
+            continue;
+        }
+        if known_threads.iter().any(|h| h.as_str() == phrase) {
+            continue;
+        }
+        seen.insert(phrase);
+    }
+    seen.into_iter().collect()
 }
 
 /// Build a default `AttentionScope` for ambient observation.
@@ -1046,6 +1429,29 @@ mod tests {
 
     fn handle(s: &str) -> ThreadHandle {
         ThreadHandle::new(s).unwrap()
+    }
+
+    // ---- (0) Phase-2 node candidate presence ----
+
+    #[test]
+    fn raw_unknown_kebab_counts_presence_and_excludes_known_threads() {
+        let known: HashSet<ThreadHandle> = [handle("known-thread")].into_iter().collect();
+        // A known thread handle is excluded; an unknown kebab term survives.
+        let got = raw_unknown_kebab(
+            "we touched known-thread and a new-bridge-idea today",
+            &known,
+        );
+        assert_eq!(got, vec!["new-bridge-idea".to_string()]);
+    }
+
+    #[test]
+    fn raw_unknown_kebab_registers_single_occurrence() {
+        // Presence, not the intra-turn >=2 gate: one mention must register so
+        // "once across N resonant turns" can mint.
+        let got = raw_unknown_kebab("just one mention of fresh-term here", &HashSet::new());
+        assert_eq!(got, vec!["fresh-term".to_string()]);
+        // Non-kebab words (no hyphen) are not candidates.
+        assert!(raw_unknown_kebab("alpha and beta plain words", &HashSet::new()).is_empty());
     }
 
     // ---- (1) recognition regex positive cases ----

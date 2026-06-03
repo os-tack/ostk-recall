@@ -69,6 +69,7 @@ fn build_config(fixtures_dir: &Path, blocks: Vec<SourceConfig>) -> Config {
         runtime: None,
         ranking: None,
         relational: None,
+        ambient_growth: None,
         lens: None,
         record_rules: None,
         weaver: None,

@@ -59,6 +59,12 @@ pub struct Config {
     /// `memory_reflect` map this onto the latent-promotion floor + top-K.
     #[serde(default)]
     pub relational: Option<RelationalConfig>,
+    /// Optional ambient concept-growth tuning (Phase 2). Omit the
+    /// `[ambient_growth]` block to accept the calibrated defaults; `serve`
+    /// maps this onto the `TurnObserver`'s resonance floor + per-turn /
+    /// per-session caps for the salience-gated concept-edge/node loop.
+    #[serde(default)]
+    pub ambient_growth: Option<AmbientGrowthConfig>,
 }
 
 /// Runtime resource caps. Each field is the upper bound on the
@@ -175,6 +181,84 @@ impl Default for RelationalConfig {
         Self {
             latent_sim_floor: default_latent_sim_floor(),
             promote_top_k: default_promote_top_k(),
+        }
+    }
+}
+
+/// Ambient concept-growth tuning (Phase 2), surfaced as the optional
+/// `[ambient_growth]` block. Mirrors the `TurnObserver`'s runtime
+/// `ConceptGrowthConfig` (in `ostk-recall-attention`) field-for-field; `core`
+/// can't depend on `attention`, so `serve` maps this onto its own type at
+/// startup and a guard test in the CLI crate keeps the defaults in lock-step.
+/// Every field has a serde default, so an `[ambient_growth]` block may set
+/// only the knobs it cares about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmbientGrowthConfig {
+    /// Cosine a named concept's anchor must clear against the turn's rolling
+    /// vector to be a salient (not merely mentioned) co-occurrence survivor.
+    /// Calibration: real attention tops ~0.5, so 0.30–0.45 is the live range.
+    #[serde(default = "default_ambient_resonance_floor")]
+    pub resonance_floor: f32,
+    /// Max co-resonant survivors kept per turn (the per-turn hairball guard):
+    /// edges minted ≤ C(edge_top_k, 2).
+    #[serde(default = "default_ambient_edge_top_k")]
+    pub edge_top_k: usize,
+    /// Minimum survivors a turn must produce to mint any edge (a co-mention
+    /// needs a pair) — also the threshold that makes a turn "resonant" for the
+    /// node-recurrence accumulator.
+    #[serde(default = "default_ambient_min_survivors")]
+    pub min_survivors: usize,
+    /// Resonant turns an unknown term must recur across before it mints a
+    /// `Proposed` node (raw mentions never suffice — the occurrence≠salience law).
+    #[serde(default = "default_ambient_node_mint_min_resonant_turns")]
+    pub node_mint_min_resonant_turns: u32,
+    /// Rebuild the concept anchor codebook + gazetteer every N observed turns
+    /// (staleness vs. rebuild-cost knob).
+    #[serde(default = "default_ambient_codebook_rebuild_turns")]
+    pub codebook_rebuild_turns: u64,
+    /// Per-session cap on minted nodes (the runaway-spam guard).
+    #[serde(default = "default_ambient_node_mint_cap_per_session")]
+    pub node_mint_cap_per_session: usize,
+}
+
+fn default_ambient_resonance_floor() -> f32 {
+    0.35
+}
+
+const fn default_ambient_edge_top_k() -> usize {
+    4
+}
+
+const fn default_ambient_min_survivors() -> usize {
+    2
+}
+
+const fn default_ambient_node_mint_min_resonant_turns() -> u32 {
+    3
+}
+
+const fn default_ambient_codebook_rebuild_turns() -> u64 {
+    32
+}
+
+const fn default_ambient_node_mint_cap_per_session() -> usize {
+    8
+}
+
+/// Upper bound on `[ambient_growth] edge_top_k` — keeps the per-turn hairball
+/// guard meaningful no matter what the operator configures.
+pub const AMBIENT_GROWTH_EDGE_TOP_K_MAX: usize = 64;
+
+impl Default for AmbientGrowthConfig {
+    fn default() -> Self {
+        Self {
+            resonance_floor: default_ambient_resonance_floor(),
+            edge_top_k: default_ambient_edge_top_k(),
+            min_survivors: default_ambient_min_survivors(),
+            node_mint_min_resonant_turns: default_ambient_node_mint_min_resonant_turns(),
+            codebook_rebuild_turns: default_ambient_codebook_rebuild_turns(),
+            node_mint_cap_per_session: default_ambient_node_mint_cap_per_session(),
         }
     }
 }
@@ -804,6 +888,41 @@ impl Config {
                 )));
             }
         }
+        if let Some(a) = &self.ambient_growth {
+            if !a.resonance_floor.is_finite() || !(0.0..=1.0).contains(&a.resonance_floor) {
+                return Err(Error::Config(format!(
+                    "[ambient_growth] resonance_floor must be a finite cosine in [0.0, 1.0], got {}",
+                    a.resonance_floor
+                )));
+            }
+            if a.edge_top_k == 0 || a.edge_top_k > AMBIENT_GROWTH_EDGE_TOP_K_MAX {
+                return Err(Error::Config(format!(
+                    "[ambient_growth] edge_top_k must be in 1..={AMBIENT_GROWTH_EDGE_TOP_K_MAX}, got {}",
+                    a.edge_top_k
+                )));
+            }
+            if a.min_survivors < 2 || a.min_survivors > a.edge_top_k {
+                return Err(Error::Config(format!(
+                    "[ambient_growth] min_survivors must be in 2..=edge_top_k ({}), got {}",
+                    a.edge_top_k, a.min_survivors
+                )));
+            }
+            if a.node_mint_min_resonant_turns == 0 {
+                return Err(Error::Config(
+                    "[ambient_growth] node_mint_min_resonant_turns must be > 0".into(),
+                ));
+            }
+            if a.codebook_rebuild_turns == 0 {
+                return Err(Error::Config(
+                    "[ambient_growth] codebook_rebuild_turns must be > 0".into(),
+                ));
+            }
+            if a.node_mint_cap_per_session == 0 {
+                return Err(Error::Config(
+                    "[ambient_growth] node_mint_cap_per_session must be > 0".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1076,6 +1195,116 @@ paths = []
                 .to_string()
                 .contains("duplicate")
         );
+    }
+
+    /// Build a config carrying an `[ambient_growth]` block from `extra` (the
+    /// block body). A valid corpus/embedder/source precedes it so only the
+    /// ambient-growth validation is under test.
+    fn cfg_with_ambient(extra: &str) -> Config {
+        let body = format!(
+            "[corpus]\nroot = \"/tmp\"\n\n[embedder]\nmodel = \"x\"\n\n\
+             [[sources]]\nkind = \"markdown\"\npaths = [\"~/m\"]\n\n\
+             [ambient_growth]\n{extra}\n"
+        );
+        toml::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn ambient_growth_defaults_when_absent() {
+        let mut cfg = cfg_with_source("");
+        cfg.validate_and_seal().expect("no block is valid");
+        assert!(cfg.ambient_growth.is_none());
+        let d = AmbientGrowthConfig::default();
+        assert!((d.resonance_floor - 0.35).abs() < f32::EPSILON);
+        assert_eq!(d.edge_top_k, 4);
+        assert_eq!(d.min_survivors, 2);
+        assert_eq!(d.node_mint_min_resonant_turns, 3);
+        assert_eq!(d.codebook_rebuild_turns, 32);
+        assert_eq!(d.node_mint_cap_per_session, 8);
+    }
+
+    #[test]
+    fn ambient_growth_partial_block_keeps_other_defaults() {
+        let mut cfg = cfg_with_ambient("resonance_floor = 0.2");
+        cfg.validate_and_seal().expect("partial block is valid");
+        let a = cfg.ambient_growth.unwrap();
+        assert!((a.resonance_floor - 0.2).abs() < f32::EPSILON);
+        assert_eq!(a.edge_top_k, 4, "unset knobs keep their serde default");
+    }
+
+    #[test]
+    fn ambient_growth_rejects_out_of_range_floor() {
+        for bad in ["resonance_floor = 1.5", "resonance_floor = -0.1"] {
+            let mut cfg = cfg_with_ambient(bad);
+            let err = cfg.validate_and_seal().unwrap_err();
+            assert!(err.to_string().contains("resonance_floor"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn ambient_growth_rejects_bad_edge_top_k() {
+        let mut zero = cfg_with_ambient("edge_top_k = 0");
+        assert!(
+            zero.validate_and_seal()
+                .unwrap_err()
+                .to_string()
+                .contains("edge_top_k")
+        );
+        let mut over = cfg_with_ambient(&format!(
+            "edge_top_k = {}",
+            AMBIENT_GROWTH_EDGE_TOP_K_MAX + 1
+        ));
+        assert!(
+            over.validate_and_seal()
+                .unwrap_err()
+                .to_string()
+                .contains("edge_top_k")
+        );
+    }
+
+    #[test]
+    fn ambient_growth_rejects_bad_min_survivors() {
+        // Below the floor of 2 (a co-mention needs a pair).
+        let mut low = cfg_with_ambient("min_survivors = 1");
+        assert!(
+            low.validate_and_seal()
+                .unwrap_err()
+                .to_string()
+                .contains("min_survivors")
+        );
+        // Above edge_top_k.
+        let mut over = cfg_with_ambient("edge_top_k = 3\nmin_survivors = 4");
+        assert!(
+            over.validate_and_seal()
+                .unwrap_err()
+                .to_string()
+                .contains("min_survivors")
+        );
+    }
+
+    #[test]
+    fn ambient_growth_rejects_zero_counters() {
+        for (field, body) in [
+            (
+                "node_mint_min_resonant_turns",
+                "node_mint_min_resonant_turns = 0",
+            ),
+            ("codebook_rebuild_turns", "codebook_rebuild_turns = 0"),
+            ("node_mint_cap_per_session", "node_mint_cap_per_session = 0"),
+        ] {
+            let mut cfg = cfg_with_ambient(body);
+            let err = cfg.validate_and_seal().unwrap_err();
+            assert!(err.to_string().contains(field), "expected {field} in {err}");
+        }
+    }
+
+    #[test]
+    fn ambient_growth_unknown_field_rejected() {
+        // deny_unknown_fields guards typos like `resonance_flor`.
+        let body = "[corpus]\nroot = \"/tmp\"\n\n[embedder]\nmodel = \"x\"\n\n\
+                    [[sources]]\nkind = \"markdown\"\npaths = [\"~/m\"]\n\n\
+                    [ambient_growth]\nresonance_flor = 0.3\n";
+        assert!(toml::from_str::<Config>(body).is_err());
     }
 
     #[test]

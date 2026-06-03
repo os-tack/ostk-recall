@@ -1,0 +1,352 @@
+//! Phase 2 — ambient salience-gated concept-growth, daemon-path integration
+//! against a real Lance corpus + a real `ThreadsDb` + `InMemoryAttention`.
+//!
+//! The thesis: a turn grows the **concept** graph, but only along the
+//! resonance gate. Two concept anchors (`alpha`, `beta`) sit on the same axis;
+//! a turn whose rolling vector aligns to that axis AND that names both → a
+//! `co_occurs` edge. A turn that names a concept but does NOT resonate mints
+//! nothing (occurrence≠salience). An unknown kebab term recurring across
+//! resonant turns mints a `Proposed` node connected to its co-resonant context;
+//! the same term across non-resonant turns never mints.
+//!
+//! Determinism: concept anchor embeddings are set directly via `corpus.upsert`
+//! (one-hot `axis()` vectors); the turn rolling vector is produced by an
+//! [`AxisEmbedder`] wired into `InMemoryAttention` that maps a marker token in
+//! the turn text to a chosen axis — so `cosine(anchor, rolling)` is controlled.
+
+use std::sync::{Arc, Mutex as StdMutex};
+
+use chrono::Utc;
+use tempfile::TempDir;
+
+use ostk_recall_attention::{
+    AttentionForwardStore, ConceptGrowthConfig, InMemoryAttention, TurnObserver,
+};
+use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
+use ostk_recall_core::{Chunk, FacetSet, Links, Source};
+use ostk_recall_pipeline::{ChunkEmbedder, Pipeline};
+use ostk_recall_store::{
+    ChainEvent, ChainSink, ConceptStatus, CorpusStore, EdgeDirection, EvidenceAttach,
+    GLOBAL_PROJECT, IngestDb, StoreError, ThreadsDb,
+};
+
+/// In-memory chain sink so tests can assert on the audit events (`ConceptConnected`,
+/// `ConceptPromoted`) the observer emits — there is no general chain-event reader
+/// on `ThreadsDb` (its `ChainLogReader` only covers chunk-access events).
+#[derive(Default)]
+struct RecordingSink {
+    events: StdMutex<Vec<ChainEvent>>,
+}
+
+impl RecordingSink {
+    fn snapshot(&self) -> Vec<ChainEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl ChainSink for RecordingSink {
+    fn append(&self, event: &ChainEvent) -> Result<(), StoreError> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+const DIM: usize = 8;
+const G: &str = GLOBAL_PROJECT;
+/// The axis concept anchors `alpha`/`beta` live on; a resonant turn's rolling
+/// vector lands here too.
+const RESONANT_AXIS: usize = 1;
+/// An orthogonal axis a non-resonant turn's rolling vector lands on.
+const QUIET_AXIS: usize = 7;
+
+/// A one-hot unit vector on `a`.
+fn axis(a: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; DIM];
+    v[a] = 1.0;
+    v
+}
+
+/// Embedder for the attention rolling vector: a turn containing the marker
+/// `RESONATE` lands on [`RESONANT_AXIS`] (aligned with the seeded anchors),
+/// otherwise on the orthogonal [`QUIET_AXIS`]. Lets each turn's resonance be
+/// chosen by its text, independent of the gazetteer's lexical match.
+struct AxisEmbedder;
+
+impl ChunkEmbedder for AxisEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        texts
+            .iter()
+            .map(|t| {
+                if t.contains("RESONATE") {
+                    axis(RESONANT_AXIS)
+                } else {
+                    axis(QUIET_AXIS)
+                }
+            })
+            .collect()
+    }
+}
+
+fn anchor_chunk(id: &str) -> Chunk {
+    Chunk {
+        chunk_id: id.into(),
+        source: Source::Markdown,
+        project: Some("memories".into()),
+        source_id: format!("{id}.md"),
+        source_config_id: "test:cfg".into(),
+        chunk_index: 0,
+        ts: Some(Utc::now()),
+        role: None,
+        text: format!("text {id}"),
+        sha256: format!("sha-{id}"),
+        links: Links::default(),
+        facets: FacetSet::default(),
+        embedding_input_sha256: format!("emb-{id}"),
+        extra: serde_json::Value::Null,
+    }
+}
+
+fn attach_anchor(db: &ThreadsDb, handle: &str, chunk_id: &str) {
+    let id = db.get_concept(G, handle).unwrap().unwrap().id;
+    db.attach_concept_evidence(&EvidenceAttach {
+        concept_id: id,
+        project: G,
+        source: "markdown",
+        source_id: &format!("{chunk_id}.md"),
+        chunk_id: Some(chunk_id),
+        content_sha256: None,
+        anchor_vec: None,
+        score: Some(0.5),
+        reason: Some("test"),
+    })
+    .unwrap();
+}
+
+fn scope() -> AttentionScope {
+    AttentionScope {
+        project: None, // None → gazetteer lists all projects (incl. globals)
+        session_id: Some("ambient".into()),
+        agent: Some("substrate".into()),
+        privacy_tier: PrivacyTier::T1Project,
+    }
+}
+
+fn test_cfg() -> ConceptGrowthConfig {
+    ConceptGrowthConfig {
+        resonance_floor: 0.5, // admits cosine 1.0, rejects orthogonal 0.0
+        edge_top_k: 4,
+        min_survivors: 2,
+        node_mint_min_resonant_turns: 3,
+        codebook_rebuild_turns: 32,
+        node_mint_cap_per_session: 8,
+    }
+}
+
+/// Full harness: a corpus carrying `alpha`/`beta` anchor chunks on
+/// [`RESONANT_AXIS`], the ledger with both as `Active` global concepts anchored
+/// to those chunks, and an observer wired with corpus + attention + the chain
+/// sink. Returns everything the assertions need.
+async fn harness(
+    with_corpus: bool,
+) -> (
+    TempDir,
+    Arc<CorpusStore>,
+    Arc<ThreadsDb>,
+    Arc<RecordingSink>,
+    TurnObserver,
+) {
+    let tmp = TempDir::new().unwrap();
+    let corpus = Arc::new(CorpusStore::open_or_create(tmp.path(), DIM).await.unwrap());
+    corpus
+        .upsert(
+            &[anchor_chunk("alpha-anchor"), anchor_chunk("beta-anchor")],
+            &[axis(RESONANT_AXIS), axis(RESONANT_AXIS)],
+        )
+        .await
+        .unwrap();
+
+    let recorder: Arc<RecordingSink> = Arc::new(RecordingSink::default());
+    let sink: Arc<dyn ChainSink> = recorder.clone();
+    let db = Arc::new(ThreadsDb::open_with_sink(tmp.path(), sink).unwrap());
+    db.ensure_concept(G, "alpha", ConceptStatus::Active)
+        .unwrap();
+    db.ensure_concept(G, "beta", ConceptStatus::Active).unwrap();
+    attach_anchor(&db, "alpha", "alpha-anchor");
+    attach_anchor(&db, "beta", "beta-anchor");
+
+    let ingest = Arc::new(IngestDb::open(tmp.path()).unwrap());
+    let emb: Arc<dyn ChunkEmbedder> = Arc::new(AxisEmbedder);
+    let pipeline = Arc::new(Pipeline::new(Arc::clone(&corpus), ingest, emb));
+
+    let attn: Arc<dyn AttentionForwardStore> =
+        Arc::new(InMemoryAttention::with_embedder(Arc::new(AxisEmbedder)));
+    let mut observer = TurnObserver::new(pipeline, Arc::clone(&db))
+        .with_attention(attn)
+        .with_chain_sink(db.chain_sink())
+        .with_concept_growth(test_cfg());
+    if with_corpus {
+        observer = observer.with_corpus(Arc::clone(&corpus));
+    }
+    (tmp, corpus, db, recorder, observer)
+}
+
+/// Count distinct `co_occurs` edges incident on a concept handle (either
+/// direction — edges are stored in canonical `min→max` id order).
+fn co_occurs_count(db: &ThreadsDb, handle: &str) -> usize {
+    let mut ids = std::collections::BTreeSet::new();
+    for dir in [EdgeDirection::From, EdgeDirection::To] {
+        for e in db.list_concept_edges(G, handle, dir).unwrap() {
+            if e.relation == "co_occurs" {
+                ids.insert(e.id);
+            }
+        }
+    }
+    ids.len()
+}
+
+fn connected_audit_count(recorder: &RecordingSink) -> usize {
+    recorder
+        .snapshot()
+        .into_iter()
+        .filter(|e| matches!(e, ChainEvent::ConceptConnected { .. }))
+        .count()
+}
+
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resonant_co_mention_mints_a_co_occurs_edge() {
+    let (_t, _c, db, rec, observer) = harness(true).await;
+    let res = observer
+        .observe(
+            &scope(),
+            "today alpha and beta line up RESONATE",
+            0,
+            "s",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.concept_edges_minted, 1, "one co_occurs edge minted");
+    assert_eq!(co_occurs_count(&db, "alpha"), 1);
+    assert_eq!(co_occurs_count(&db, "beta"), 1);
+    assert_eq!(
+        connected_audit_count(&rec),
+        1,
+        "exactly one ConceptConnected audit row (creation-gated)"
+    );
+}
+
+#[tokio::test]
+async fn non_resonant_co_mention_mints_nothing() {
+    let (_t, _c, db, _rec, observer) = harness(true).await;
+    // Names both concepts, but no RESONATE marker → rolling lands on the quiet
+    // axis, cosine 0 < floor → no survivors → no edge.
+    let res = observer
+        .observe(
+            &scope(),
+            "alpha and beta mentioned in passing",
+            0,
+            "s",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.concept_edges_minted, 0);
+    assert_eq!(co_occurs_count(&db, "alpha"), 0);
+}
+
+#[tokio::test]
+async fn idempotent_re_touch_does_not_duplicate_edge_or_audit() {
+    let (_t, _c, db, rec, observer) = harness(true).await;
+    let turn = "alpha beta together RESONATE";
+    let first = observer
+        .observe(&scope(), turn, 0, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(first.concept_edges_minted, 1);
+    // Re-observe the identical resonant turn.
+    let second = observer
+        .observe(&scope(), turn, 1, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(second.concept_edges_minted, 0, "re-touch is not a new mint");
+    assert_eq!(co_occurs_count(&db, "alpha"), 1, "still one edge");
+    assert_eq!(
+        connected_audit_count(&rec),
+        1,
+        "no second ConceptConnected row (creation-gated, not touch-gated)"
+    );
+}
+
+#[tokio::test]
+async fn resonant_recurrence_mints_a_proposed_node() {
+    let (_t, _c, db, rec, observer) = harness(true).await;
+    // The unknown kebab term appears ONCE per turn across 3 resonant turns
+    // (each turn names alpha+beta and resonates) → resonance reaches the gate.
+    for seq in 0..3 {
+        let res = observer
+            .observe(
+                &scope(),
+                "alpha beta with new-bridge-idea RESONATE",
+                seq,
+                "s",
+                None,
+            )
+            .await
+            .unwrap();
+        if seq < 2 {
+            assert_eq!(res.concept_nodes_minted, 0, "below the recurrence gate");
+        } else {
+            assert_eq!(res.concept_nodes_minted, 1, "third resonant turn mints");
+        }
+    }
+    let node = db
+        .resolve_concept(G, "new-bridge-idea")
+        .unwrap()
+        .expect("minted node exists");
+    assert_eq!(node.status, ConceptStatus::Proposed);
+    assert_eq!(node.kind, None, "ambient node is untyped");
+    // Connected to its co-resonant context.
+    assert!(co_occurs_count(&db, "new-bridge-idea") >= 2);
+    assert!(
+        rec.snapshot().iter().any(
+            |e| matches!(e, ChainEvent::ConceptPromoted { handle, to_status, .. }
+                if handle == "new-bridge-idea" && to_status == "proposed")
+        ),
+        "ConceptPromoted audit row present"
+    );
+}
+
+#[tokio::test]
+async fn high_frequency_low_resonance_term_never_mints() {
+    let (_t, _c, db, _rec, observer) = harness(true).await;
+    // The term recurs across MANY turns, but none resonate (no RESONATE marker,
+    // so no survivors) → mentions climb, resonance stays 0 → never mints.
+    for seq in 0..6 {
+        let res = observer
+            .observe(&scope(), "noise-term-here appears again", seq, "s", None)
+            .await
+            .unwrap();
+        assert_eq!(res.concept_nodes_minted, 0);
+    }
+    assert!(
+        db.resolve_concept(G, "noise-term-here").unwrap().is_none(),
+        "occurrence is not salience — no node minted"
+    );
+}
+
+#[tokio::test]
+async fn observer_without_corpus_grows_nothing() {
+    let (_t, _c, db, _rec, observer) = harness(false).await;
+    let res = observer
+        .observe(&scope(), "alpha beta together RESONATE", 0, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(res.concept_edges_minted, 0, "phase is gated on with_corpus");
+    assert_eq!(res.concept_nodes_minted, 0);
+    assert_eq!(co_occurs_count(&db, "alpha"), 0);
+}

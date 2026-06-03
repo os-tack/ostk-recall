@@ -11,14 +11,14 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ostk_recall_attention::{
-    AttentionForwardStore, AutoWeaver, CuratorConfig, IdleCurator, InMemoryAttention, ReplayEvent,
-    TurnObserver, WeaverThresholds, ambient_scope_default,
+    AttentionForwardStore, AutoWeaver, ConceptGrowthConfig, CuratorConfig, IdleCurator,
+    InMemoryAttention, ReplayEvent, TurnObserver, WeaverThresholds, ambient_scope_default,
 };
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
-    CompiledRecordRules, Config, LensSettings, RelationalConfig, RerankerConfig, Scanner,
-    SourceConfig, SourceKind, WatchMode, WeaverSettings,
+    AmbientGrowthConfig, CompiledRecordRules, Config, LensSettings, RelationalConfig,
+    RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode, WeaverSettings,
 };
 use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
@@ -332,6 +332,7 @@ fn spawn_ambient_daemons(
     threads: &Arc<ThreadsDb>,
     attention: Option<Arc<dyn AttentionForwardStore>>,
     weaver_exclude_facets: Vec<String>,
+    concept_growth: ConceptGrowthConfig,
 ) -> AmbientHandles {
     let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads));
     if let Some(attn) = attention {
@@ -344,6 +345,12 @@ fn spawn_ambient_daemons(
     // lives only in memory and a restart erases it. The sink is
     // already `Arc`-shared, so this is a clone of a pointer.
     observer = observer.with_chain_sink(threads.chain_sink());
+    // Phase 2 — the concept-growth phase needs the corpus (anchor codebook)
+    // and the resolved `[ambient_growth]` tuning. Gated on `with_corpus` +
+    // `with_attention`; both are present on the live `serve` path.
+    observer = observer
+        .with_corpus(Arc::clone(corpus))
+        .with_concept_growth(concept_growth);
     let observer = Arc::new(observer);
     let weaver = Arc::new(
         AutoWeaver::new(
@@ -445,6 +452,7 @@ pub async fn scan_with_context(
             threads,
             attention_dyn.clone(),
             WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+            resolve_concept_growth(cfg.ambient_growth.as_ref()),
         )
     });
 
@@ -732,6 +740,7 @@ pub async fn scan_paths_with_context(
             threads,
             attention_dyn.clone(),
             WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+            resolve_concept_growth(cfg.ambient_growth.as_ref()),
         )
     });
 
@@ -1089,6 +1098,22 @@ fn resolve_lens_config(
         cfg.latent_sim_floor = r.latent_sim_floor;
     }
     cfg
+}
+
+/// Map the optional `[ambient_growth]` config block onto the observer's runtime
+/// [`ConceptGrowthConfig`]. `None` (no block) yields the calibrated defaults.
+/// Free function so the mapping is unit-testable; a guard test pins the
+/// `AmbientGrowthConfig` ↔ `ConceptGrowthConfig` defaults in lock-step (`core`
+/// cannot depend on `attention`).
+fn resolve_concept_growth(settings: Option<&AmbientGrowthConfig>) -> ConceptGrowthConfig {
+    settings.map_or_else(ConceptGrowthConfig::default, |a| ConceptGrowthConfig {
+        resonance_floor: a.resonance_floor,
+        edge_top_k: a.edge_top_k,
+        min_survivors: a.min_survivors,
+        node_mint_min_resonant_turns: a.node_mint_min_resonant_turns,
+        codebook_rebuild_turns: a.codebook_rebuild_turns,
+        node_mint_cap_per_session: a.node_mint_cap_per_session,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2939,6 +2964,64 @@ mod lens_config_tests {
         };
         let mapped = resolve_lens_config(None, Some(&rel));
         assert!((mapped.latent_sim_floor - 0.2).abs() < f32::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod ambient_growth_config_tests {
+    use ostk_recall_core::AmbientGrowthConfig;
+
+    use super::resolve_concept_growth;
+
+    /// The `[ambient_growth]` defaults are duplicated in `core` (serde can't
+    /// reach across to `attention`). This guard fails loudly if the two ever
+    /// drift, which would silently change ambient concept-growth behavior for
+    /// users who omit the block.
+    #[test]
+    fn ambient_growth_default_matches_attention_default() {
+        let mapped = resolve_concept_growth(Some(&AmbientGrowthConfig::default()));
+        let dflt = ostk_recall_attention::ConceptGrowthConfig::default();
+        assert!((mapped.resonance_floor - dflt.resonance_floor).abs() < f32::EPSILON);
+        assert_eq!(mapped.edge_top_k, dflt.edge_top_k);
+        assert_eq!(mapped.min_survivors, dflt.min_survivors);
+        assert_eq!(
+            mapped.node_mint_min_resonant_turns,
+            dflt.node_mint_min_resonant_turns
+        );
+        assert_eq!(mapped.codebook_rebuild_turns, dflt.codebook_rebuild_turns);
+        assert_eq!(
+            mapped.node_mint_cap_per_session,
+            dflt.node_mint_cap_per_session
+        );
+    }
+
+    /// Absent `[ambient_growth]` block resolves to the runtime default verbatim.
+    #[test]
+    fn resolve_concept_growth_none_is_default() {
+        let mapped = resolve_concept_growth(None);
+        let dflt = ostk_recall_attention::ConceptGrowthConfig::default();
+        assert!((mapped.resonance_floor - dflt.resonance_floor).abs() < f32::EPSILON);
+        assert_eq!(mapped.edge_top_k, dflt.edge_top_k);
+    }
+
+    /// Explicit overrides flow through the mapping.
+    #[test]
+    fn resolve_concept_growth_applies_overrides() {
+        let settings = AmbientGrowthConfig {
+            resonance_floor: 0.42,
+            edge_top_k: 6,
+            min_survivors: 3,
+            node_mint_min_resonant_turns: 5,
+            codebook_rebuild_turns: 16,
+            node_mint_cap_per_session: 2,
+        };
+        let mapped = resolve_concept_growth(Some(&settings));
+        assert!((mapped.resonance_floor - 0.42).abs() < f32::EPSILON);
+        assert_eq!(mapped.edge_top_k, 6);
+        assert_eq!(mapped.min_survivors, 3);
+        assert_eq!(mapped.node_mint_min_resonant_turns, 5);
+        assert_eq!(mapped.codebook_rebuild_turns, 16);
+        assert_eq!(mapped.node_mint_cap_per_session, 2);
     }
 }
 

@@ -173,6 +173,32 @@ latent_sim_floor = 0.35
 promote_top_k = 4
 
 # ============================================================================
+# AMBIENT_GROWTH  —  salience-gated concept-growth loop (relational-substrate Phase 2)
+# ============================================================================
+# Omit this block to accept the calibrated defaults. The ambient TurnObserver
+# grows the concept graph from the live conversation stream: concepts literally
+# named in a turn whose anchor RESONATES with the turn get pairwise `co_occurs`
+# edges, and unknown terms recurring across resonant turns mint `proposed` nodes.
+# Resonance — not raw mention count — gates every write, so dev-chatter never
+# floods the graph (the occurrence≠salience law).
+[ambient_growth]
+# Cosine a named concept's anchor must clear against the turn's rolling vector to
+# count as a salient co-occurrence (not a mere mention). Real attention tops ~0.5,
+# so 0.30–0.45 is the live range; lower on a cold/sparse graph.
+resonance_floor = 0.35
+# Max co-resonant survivors kept per turn — edges minted ≤ C(edge_top_k, 2).
+edge_top_k = 4
+# Minimum survivors a turn must produce to mint any edge (a co-mention needs a
+# pair); also the bar that makes a turn "resonant" for node recurrence.
+min_survivors = 2
+# Resonant turns an unknown term must recur across before it mints a node.
+node_mint_min_resonant_turns = 3
+# Rebuild the concept anchor codebook + gazetteer every N observed turns.
+codebook_rebuild_turns = 32
+# Per-session cap on minted nodes (runaway-spam guard).
+node_mint_cap_per_session = 8
+
+# ============================================================================
 # SOURCES  —  one [[sources]] table per logical corpus slice
 # ============================================================================
 # Every block needs `kind` + `paths`. `project` is a free-text tag — namespace

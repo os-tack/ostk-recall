@@ -17,6 +17,7 @@
 
 pub mod activity;
 pub mod cluster;
+pub mod concept_growth;
 pub mod curator;
 pub mod emergent;
 pub mod novelty;
@@ -25,6 +26,7 @@ pub mod query;
 pub mod weaver;
 
 pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
+pub use concept_growth::ConceptGrowthConfig;
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
 pub use observer::{
     ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default,
