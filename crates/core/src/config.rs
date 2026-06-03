@@ -217,7 +217,11 @@ pub struct AmbientGrowthConfig {
     /// (staleness vs. rebuild-cost knob).
     #[serde(default = "default_ambient_codebook_rebuild_turns")]
     pub codebook_rebuild_turns: u64,
-    /// Per-session cap on minted nodes (the runaway-spam guard).
+    /// Cap on minted nodes per **serve session** (the daemon's lifetime; a
+    /// restart resets it) — the runaway-spam backstop. The recurrence gate
+    /// (`node_mint_min_resonant_turns`) is the primary rate limit; this is the
+    /// absolute ceiling. Raise it for a long-lived daemon that should keep
+    /// growing nodes as work evolves.
     #[serde(default = "default_ambient_node_mint_cap_per_session")]
     pub node_mint_cap_per_session: usize,
 }

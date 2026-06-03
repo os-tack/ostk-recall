@@ -195,7 +195,9 @@ min_survivors = 2
 node_mint_min_resonant_turns = 3
 # Rebuild the concept anchor codebook + gazetteer every N observed turns.
 codebook_rebuild_turns = 32
-# Per-session cap on minted nodes (runaway-spam guard).
+# Cap on minted nodes per serve session (daemon lifetime; a restart resets it) —
+# the runaway-spam backstop. node_mint_min_resonant_turns is the primary rate
+# limit; this is the absolute ceiling. Raise it for a long-lived daemon.
 node_mint_cap_per_session = 8
 
 # ============================================================================

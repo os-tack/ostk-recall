@@ -182,9 +182,11 @@ pub struct TurnObserver {
     /// → its mentions/resonance split + co-resonant context. Lives on the
     /// long-lived observer (one instance == one ambient session).
     term_recurrence: Arc<RwLock<HashMap<String, TermRecurrence>>>,
-    /// Count of nodes minted by this observer instance, compared against
-    /// [`ConceptGrowthConfig::node_mint_cap_per_session`]. Atomic so cloned
-    /// observers share the cap (mirrors `promotions_this_session`).
+    /// Count of nodes minted, compared against
+    /// [`ConceptGrowthConfig::node_mint_cap_per_session`]. Fresh per observer by
+    /// default, but [`Self::with_concept_growth_runtime`] replaces it with the
+    /// shared `ConceptGrowthRuntime` counter so the cap is genuinely per serve
+    /// session (not per scan trigger, which spawns a fresh observer).
     node_mints_this_session: Arc<AtomicUsize>,
 }
 
@@ -258,16 +260,17 @@ impl TurnObserver {
     /// Share the cross-turn concept-growth state (anchor/gazetteer cache,
     /// rebuild cadence, node-recurrence accumulator) with a long-lived
     /// [`ConceptGrowthRuntime`]. `serve` holds one in `ServeContext` and passes
-    /// it to every per-trigger observer, so node-recurrence persists across the
-    /// fresh observers each watch trigger spawns (without this, the node-minting
-    /// half is inert in production — a term never recurs within one short scan).
-    /// The per-session node-mint cap stays per-observer (a per-trigger burst
-    /// guard). One-shot scans skip this and keep fresh state.
+    /// it to every per-trigger observer, so node-recurrence — and the
+    /// `node_mint_cap_per_session` counter — persist across the fresh observers
+    /// each watch trigger spawns (without this, the node-minting half is inert in
+    /// production AND the cap resets to "per scan trigger" rather than per serve
+    /// session). One-shot scans skip this and keep fresh state.
     #[must_use]
     pub fn with_concept_growth_runtime(mut self, runtime: ConceptGrowthRuntime) -> Self {
         self.growth_cache = runtime.growth_cache;
         self.turns_since_build = runtime.turns_since_build;
         self.term_recurrence = runtime.term_recurrence;
+        self.node_mints_this_session = runtime.node_mints_this_session;
         self
     }
 
@@ -896,7 +899,14 @@ impl TurnObserver {
                 if self.node_mints_this_session.load(Ordering::Relaxed)
                     >= cfg.node_mint_cap_per_session
                 {
-                    break; // session mint cap reached
+                    // No silent caps: the per-serve-session mint backstop is hit.
+                    // Remaining ready terms stay staged (the recurrence gate is
+                    // the primary rate limit; a restart resets the counter).
+                    tracing::debug!(
+                        cap = cfg.node_mint_cap_per_session,
+                        "concept-growth: node-mint session cap reached; deferring further mints"
+                    );
+                    break;
                 }
                 let co = {
                     let rec = self.term_recurrence.read().await;

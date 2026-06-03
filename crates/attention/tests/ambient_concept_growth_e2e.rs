@@ -574,6 +574,17 @@ fn observer_sharing(
     attn: &Arc<dyn AttentionForwardStore>,
     runtime: ConceptGrowthRuntime,
 ) -> TurnObserver {
+    observer_sharing_cfg(tmp, corpus, db, attn, runtime, test_cfg())
+}
+
+fn observer_sharing_cfg(
+    tmp: &TempDir,
+    corpus: &Arc<CorpusStore>,
+    db: &Arc<ThreadsDb>,
+    attn: &Arc<dyn AttentionForwardStore>,
+    runtime: ConceptGrowthRuntime,
+    cfg: ConceptGrowthConfig,
+) -> TurnObserver {
     let ingest = Arc::new(IngestDb::open(tmp.path()).unwrap());
     let pipeline = Arc::new(Pipeline::new(
         Arc::clone(corpus),
@@ -583,7 +594,7 @@ fn observer_sharing(
     TurnObserver::new(pipeline, Arc::clone(db))
         .with_attention(Arc::clone(attn))
         .with_chain_sink(db.chain_sink())
-        .with_concept_growth(test_cfg())
+        .with_concept_growth(cfg)
         .with_corpus(Arc::clone(corpus))
         .with_concept_growth_runtime(runtime)
 }
@@ -657,5 +668,46 @@ async fn node_recurrence_resets_without_shared_runtime() {
     assert!(
         db.resolve_concept(G, "cross-scan-term").unwrap().is_none(),
         "no node minted without shared recurrence"
+    );
+}
+
+/// The `node_mint_cap_per_session` backstop is genuinely per serve session: a
+/// second observer sharing the runtime sees the cap already reached by the
+/// first and mints nothing. (Regression for the cap resetting per scan trigger.)
+#[tokio::test]
+async fn node_mint_cap_is_shared_per_session_across_observers() {
+    let (tmp, corpus, db, attn) = growth_fixture().await;
+    // Mint on the first resonant turn, but allow only ONE node per session.
+    let cfg = ConceptGrowthConfig {
+        node_mint_min_resonant_turns: 1,
+        node_mint_cap_per_session: 1,
+        ..test_cfg()
+    };
+    let runtime = ConceptGrowthRuntime::default();
+
+    // Observer A (scan 1) mints the first term → counter at the cap.
+    let obs_a = observer_sharing_cfg(&tmp, &corpus, &db, &attn, runtime.clone(), cfg);
+    let ra = obs_a
+        .observe(&scope(), "alpha beta with term-one RESONATE", 0, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(ra.concept_nodes_minted, 1);
+    drop(obs_a);
+
+    // Observer B (scan 2) shares the runtime → the per-session cap is already
+    // spent → it mints nothing, even for a brand-new mintable term.
+    let obs_b = observer_sharing_cfg(&tmp, &corpus, &db, &attn, runtime.clone(), cfg);
+    let rb = obs_b
+        .observe(&scope(), "alpha beta with term-two RESONATE", 1, "s", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rb.concept_nodes_minted, 0,
+        "shared per-session cap blocks the second observer (not reset per trigger)"
+    );
+    assert!(db.resolve_concept(G, "term-one").unwrap().is_some());
+    assert!(
+        db.resolve_concept(G, "term-two").unwrap().is_none(),
+        "second term blocked by the shared session cap"
     );
 }

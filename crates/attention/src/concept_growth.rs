@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use ostk_recall_store::{ConceptStatus, ThreadsDb};
@@ -121,14 +121,15 @@ pub(crate) struct TermRecurrence {
 /// *separate* live turns would never reach the recurrence gate (the node-minting
 /// half would be inert). Hoisting it into `ServeContext` and sharing it across
 /// triggers via [`crate::TurnObserver::with_concept_growth_runtime`] makes
-/// recurrence (and the codebook cache) persist for the daemon's life. The
-/// per-session node-mint cap stays on the observer (a per-trigger burst guard),
-/// not here. Cheap to clone — all `Arc`.
+/// recurrence, the codebook cache, AND the per-session node-mint cap persist for
+/// the daemon's life — so `node_mint_cap_per_session` is genuinely per serve
+/// session, not per scan trigger. Cheap to clone — all `Arc`.
 #[derive(Clone, Default)]
 pub struct ConceptGrowthRuntime {
     pub(crate) growth_cache: Arc<RwLock<ConceptGrowthCache>>,
     pub(crate) turns_since_build: Arc<AtomicU64>,
     pub(crate) term_recurrence: Arc<RwLock<HashMap<String, TermRecurrence>>>,
+    pub(crate) node_mints_this_session: Arc<AtomicUsize>,
 }
 
 // --- gazetteer (mirrors cli::seed, minus the self-node exclusion) -----
