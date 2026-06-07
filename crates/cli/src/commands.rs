@@ -2580,6 +2580,51 @@ impl KickGate {
     }
 }
 
+/// Minimum gap between →1966 rescan recovery kicks. Recovery is a full
+/// scan (heavy), and rescan hints recur for as long as the storm that
+/// caused them lasts, so the gate bounds recovery to one full scan per
+/// window instead of one per hint. Worst-case staleness during a storm
+/// is this window; before →1966 it was unbounded (freeze until bounce).
+const RESCAN_KICK_RATE_LIMIT: Duration = Duration::from_secs(300);
+
+/// →1966 rescan recovery gate. A `Flag::Rescan` event is the watch
+/// backend saying "I dropped events" (FSEvents kernel/user queue
+/// overflow under e.g. worktree-build `target/` storms). The dropped
+/// window is unrecoverable from the event stream — the only correct
+/// response is a full-scan kick. `pending` survives rate-limit
+/// suppression, so the *last* hint of a storm always produces a final
+/// recovery kick.
+#[derive(Default)]
+struct RescanGate {
+    last_kick: Option<Instant>,
+    pending: bool,
+}
+
+impl RescanGate {
+    /// Record a rescan hint; the next allowed [`Self::try_emit`] fires.
+    fn note(&mut self) {
+        self.pending = true;
+    }
+
+    /// True exactly when a recovery kick should fire now. Clears
+    /// `pending` and stamps the rate-limit window; callers re-[`Self::note`]
+    /// on dispatch failure so the kick is retried.
+    fn try_emit(&mut self, now: Instant) -> bool {
+        if !self.pending {
+            return false;
+        }
+        let allowed = self
+            .last_kick
+            .is_none_or(|t| now.duration_since(t) >= RESCAN_KICK_RATE_LIMIT);
+        if !allowed {
+            return false;
+        }
+        self.pending = false;
+        self.last_kick = Some(now);
+        true
+    }
+}
+
 /// →1957 watcher observability: every drop in the event loop was
 /// previously an unobservable non-event (→1947's 4-day freeze was three
 /// stacked silent drops). The watcher maintains these counters and
@@ -2592,6 +2637,16 @@ struct WatchStatus {
     /// Events that passed the noise filter but matched no watched
     /// root + extension pair — the →1947 starvation class.
     unmatched: u64,
+    /// Rescan hints from the watch backend — each one is a window of
+    /// dropped events (→1966: FSEvents queue overflow under churn).
+    rescans: u64,
+    /// Watch backend errors (previously warn-logged only — invisible
+    /// to `recall_stats`).
+    backend_errors: u64,
+    /// RFC 3339 stamp of the last successful full-scan recovery kick
+    /// (→1966). Absent until the first rescan hint is recovered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_rescan_kick: Option<String>,
     /// Per-source-label timestamp (RFC 3339) of the last successful
     /// scan-trigger kick.
     kicks: std::collections::BTreeMap<String, String>,
@@ -2805,6 +2860,9 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
 
     let mode = watch_cfg.mode;
     let mut kick_gates: HashMap<String, KickGate> = HashMap::new();
+    // →1966: pending-rescan state — set by Rescan-flagged events,
+    // drained by rate-limited full-scan recovery kicks.
+    let mut rescan_gate = RescanGate::default();
     // →1957: observable drop counters + last-kick stamps, persisted to
     // the corpus root for the stats surface.
     let status_path = corpus_root.join("watch_status.json");
@@ -2838,6 +2896,28 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                         // rewalk completed) still get dropped here.
                         let mut by_source: HashMap<String, Vec<PathBuf>> = HashMap::new();
                         for ev in &events {
+                            // →1966: a Rescan-flagged event is the backend
+                            // saying "I dropped events" (FSEvents kernel/
+                            // user queue overflow under e.g. worktree-build
+                            // target/ storms). Its path is the affected
+                            // *directory*, so the filters below ate the
+                            // hint (target/ → noise_filtered; bare dir →
+                            // unmatched) and the dropped window was never
+                            // recovered — haystack kicks froze 04:12Z while
+                            // other roots kept flowing. Route it to the
+                            // rescan gate: a rate-limited full-scan kick is
+                            // the only correct recovery.
+                            if ev.event.need_rescan() {
+                                status.rescans += 1;
+                                status_dirty = true;
+                                rescan_gate.note();
+                                tracing::warn!(
+                                    paths = ?ev.event.paths,
+                                    info = ev.event.info().unwrap_or("none"),
+                                    "watch backend dropped events; full-scan recovery kick scheduled"
+                                );
+                                continue;
+                            }
                             for p in &ev.event.paths {
                                 if path_has_noise_segment(p) {
                                     status.noise_filtered += 1;
@@ -2912,9 +2992,33 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                                 }
                             }
                         }
+
+                        // →1966 recovery: emit the pending full-scan kick
+                        // once the rescan gate allows. Empty frame = full
+                        // scan in both watch modes.
+                        if rescan_gate.try_emit(now) {
+                            if let Err(e) =
+                                dispatch_scan_trigger(&sink, &socket_path, config_path, &[]).await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    "rescan recovery kick failed; will retry"
+                                );
+                                rescan_gate.note();
+                            } else {
+                                tracing::info!("rescan recovery: full-scan kick dispatched");
+                                status.last_rescan_kick =
+                                    Some(chrono::Utc::now().to_rfc3339());
+                                status.persist(&status_path);
+                                status_dirty = false;
+                                status_last_write = Instant::now();
+                            }
+                        }
                     }
                     Err(errors) => {
                         for e in errors {
+                            status.backend_errors += 1;
+                            status_dirty = true;
                             tracing::warn!(error = %e, "watch backend error");
                         }
                     }
@@ -2925,6 +3029,26 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                 // during a rate-limited gap when no new events arrived to
                 // re-drive the loop.
                 let now = Instant::now();
+                // →1966: a rescan hint suppressed by the rate limit must
+                // still recover after the storm goes quiet — the tick is
+                // what guarantees the final full-scan kick.
+                if rescan_gate.try_emit(now) {
+                    if let Err(e) =
+                        dispatch_scan_trigger(&sink, &socket_path, config_path, &[]).await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "rescan recovery kick failed; will retry"
+                        );
+                        rescan_gate.note();
+                    } else {
+                        tracing::info!("rescan recovery: full-scan kick dispatched (flush)");
+                        status.last_rescan_kick = Some(chrono::Utc::now().to_rfc3339());
+                        status.persist(&status_path);
+                        status_dirty = false;
+                        status_last_write = Instant::now();
+                    }
+                }
                 for (label, gate) in &mut kick_gates {
                     let Some(to_send) = gate.try_emit(now) else { continue };
                     let frame: &[PathBuf] = match mode {
@@ -3386,6 +3510,56 @@ mod watch_mode_tests {
     fn watch_mode_default_is_legacy() {
         let w = WatchConfig::default();
         assert_eq!(w.mode, WatchMode::Legacy);
+    }
+}
+
+#[cfg(test)]
+mod rescan_gate_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{RESCAN_KICK_RATE_LIMIT, RescanGate};
+
+    #[test]
+    fn idle_gate_never_emits() {
+        let mut g = RescanGate::default();
+        assert!(!g.try_emit(Instant::now()));
+    }
+
+    #[test]
+    fn first_hint_emits_immediately() {
+        let mut g = RescanGate::default();
+        g.note();
+        assert!(g.try_emit(Instant::now()));
+        // Drained: no double-emit for the same hint.
+        assert!(!g.try_emit(Instant::now()));
+    }
+
+    #[test]
+    fn hint_inside_window_is_suppressed_then_recovers() {
+        let mut g = RescanGate::default();
+        let t0 = Instant::now();
+        g.note();
+        assert!(g.try_emit(t0));
+        // Storm continues: a second hint lands inside the window.
+        g.note();
+        assert!(!g.try_emit(t0 + Duration::from_secs(1)));
+        // →1966 guarantee: pending survives suppression, so once the
+        // window passes the final recovery kick still fires — bounded
+        // staleness, not an indefinite freeze.
+        assert!(g.try_emit(t0 + RESCAN_KICK_RATE_LIMIT));
+    }
+
+    #[test]
+    fn failed_dispatch_renote_retries_after_window() {
+        let mut g = RescanGate::default();
+        let t0 = Instant::now();
+        g.note();
+        assert!(g.try_emit(t0));
+        // Caller's dispatch failed and re-noted; the retry obeys the
+        // rate limit rather than hot-looping.
+        g.note();
+        assert!(!g.try_emit(t0 + Duration::from_secs(1)));
+        assert!(g.try_emit(t0 + RESCAN_KICK_RATE_LIMIT));
     }
 }
 
