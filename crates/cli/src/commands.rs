@@ -1042,7 +1042,8 @@ async fn build_query_engine_inner(
         IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?
     });
     let events = events_db_if_wanted(&cfg, &root, read_only)?;
-    let mut engine = QueryEngine::new(store, ingest, events, embedder, cfg.embedder.model.clone());
+    let mut engine = QueryEngine::new(store, ingest, events, embedder, cfg.embedder.model.clone())
+        .with_corpus_root(root.clone());
     if attach_reranker && !skip_reranker_for_tests() {
         let reranker_cfg = RerankerConfig::resolve(cfg.reranker.as_ref());
         if reranker_cfg.enabled {
@@ -1323,6 +1324,57 @@ pub async fn serve(
     // external socket poke never run concurrently on the single-writer
     // corpus.
     let scan_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+
+    // →1957/→1958 seam: liveness + freshness sidecar for `ostk ps` —
+    // a zero-IPC attestation surface at `<corpus_root>/stats.json`.
+    // Contract v1 (p48651): `written_at` + `scan_cadence_secs` are
+    // REQUIRED — without them a wedged serve would freeze the sidecar
+    // at last-good values and read healthy forever (→1947 one level
+    // up). Cadence here is the attestation-WRITE cadence (60s timer,
+    // not per-scan): a wedged daemon stops the timer, written_at ages
+    // past 2× cadence, and ps renders the seat wedged.
+    {
+        let ingest = Arc::clone(engine.ingest());
+        let events = engine.events().cloned();
+        let sidecar_root = root.clone();
+        let started_at = chrono::Utc::now().to_rfc3339();
+        const SIDECAR_CADENCE_SECS: u64 = 60;
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(SIDECAR_CADENCE_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let last_scan_at = ingest.latest_upserted_at().ok().flatten();
+                let audit_newest_ts: Vec<serde_json::Value> = events
+                    .as_ref()
+                    .and_then(|db| db.newest_ts_by_project().ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(project, newest_ts)| {
+                        serde_json::json!({ "project": project, "newest_ts": newest_ts })
+                    })
+                    .collect();
+                let body = serde_json::json!({
+                    "v": 1,
+                    "pid": std::process::id(),
+                    "started_at": started_at,
+                    "host_build": env!("CARGO_PKG_VERSION"),
+                    "last_scan_at": last_scan_at,
+                    "written_at": chrono::Utc::now().to_rfc3339(),
+                    "scan_cadence_secs": SIDECAR_CADENCE_SECS,
+                    "audit_newest_ts": audit_newest_ts,
+                });
+                let path = sidecar_root.join("stats.json");
+                let tmp = sidecar_root.join("stats.json.tmp");
+                let write = std::fs::write(&tmp, body.to_string())
+                    .and_then(|()| std::fs::rename(&tmp, &path));
+                if let Err(e) = write {
+                    tracing::warn!(path = %path.display(), error = %e, "stats sidecar write failed");
+                }
+            }
+        });
+    }
 
     // Spawn background scan trigger listener
     let config_path_for_bg = config_path.to_path_buf();
@@ -2035,16 +2087,7 @@ pub async fn connect(config_path: &Path) -> Result<()> {
 
     #[cfg(unix)]
     {
-        use tokio::net::UnixStream;
-        let stream = UnixStream::connect(&endpoint).await.map_err(|e| {
-            anyhow!(
-                "connecting to ostk-recall MCP daemon at {}: {e}\n\
-                 is a daemon running? start one with `ostk-recall serve --watch`",
-                endpoint.display()
-            )
-        })?;
-        let (mut sock_r, mut sock_w) = stream.into_split();
-        bridge_stdio(&mut sock_r, &mut sock_w).await
+        connect_with_heal(&endpoint).await
     }
 
     #[cfg(windows)]
@@ -2062,7 +2105,271 @@ pub async fn connect(config_path: &Path) -> Result<()> {
     }
 }
 
-/// Bidirectional splice for [`connect`]: copy stdin → socket and
+/// →1957 legs 1+2: line-oriented bridge with daemon heal (port of
+/// haystack's →1935.1 `reconnect_with_backoff` + →1943 receipt). The
+/// old byte-splice died with the daemon — the operator's restart of
+/// serve killed every connected client's toolset mid-request. This
+/// loop caches the client's `initialize`/`notifications/initialized`
+/// handshake, reconnects with backoff when the daemon goes away, and
+/// REPLAYS the handshake against the new daemon so the client never
+/// has to re-`initialize`. Requests arriving while the daemon is down
+/// queue in the OS pipe buffer and deliver on heal.
+#[cfg(unix)]
+struct DaemonConn {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+#[cfg(unix)]
+async fn connect_daemon(endpoint: &Path) -> std::io::Result<DaemonConn> {
+    let stream = tokio::net::UnixStream::connect(endpoint).await?;
+    let (r, w) = stream.into_split();
+    Ok(DaemonConn {
+        reader: tokio::io::BufReader::new(r),
+        writer: w,
+    })
+}
+
+/// Cache the client's handshake lines so they can be replayed against
+/// any daemon we reconnect to. Notifications and non-handshake methods
+/// pass through untouched.
+#[cfg(unix)]
+fn cache_handshake(
+    line: &str,
+    cached_initialize: &mut Option<String>,
+    cached_initialized: &mut Option<String>,
+) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    match v.get("method").and_then(serde_json::Value::as_str) {
+        Some("initialize") => *cached_initialize = Some(line.to_string()),
+        Some("initialized" | "notifications/initialized") => {
+            *cached_initialized = Some(line.to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Reconnect budget. Default 300s rides out a `make install` + daemon
+/// restart; override via `OSTK_RECALL_RECONNECT_BUDGET_S`.
+#[cfg(unix)]
+fn reconnect_budget() -> Duration {
+    const FALLBACK_SECS: u64 = 300;
+    let secs = std::env::var("OSTK_RECALL_RECONNECT_BUDGET_S")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(FALLBACK_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Reconnect with exponential backoff (250ms → 5s cap) until the
+/// budget is exhausted, replaying the cached handshake on the fresh
+/// socket. On success, sends a `notifications/bridge_reconnected`
+/// receipt THROUGH the healed daemon (→1943 sibling): the receipt is
+/// self-attesting — it can only land if the new socket works — and
+/// turns "silently healed" into an attested event. Best-effort: the
+/// heal never fails because the receipt couldn't be written.
+#[cfg(unix)]
+async fn reconnect_with_backoff(
+    endpoint: &Path,
+    cached_initialize: Option<&str>,
+    cached_initialized: Option<&str>,
+) -> Result<DaemonConn> {
+    use tokio::io::AsyncWriteExt;
+
+    let budget = reconnect_budget();
+    let deadline = tokio::time::Instant::now() + budget;
+    let started = std::time::Instant::now();
+    let mut delay = Duration::from_millis(250);
+    let mut attempts: u32 = 0;
+    let mut conn = loop {
+        attempts += 1;
+        match connect_and_replay(endpoint, cached_initialize, cached_initialized).await {
+            Ok(c) => {
+                if attempts > 1 {
+                    eprintln!("[recall-bridge] daemon reconnect recovered after {attempts} attempts");
+                }
+                break c;
+            }
+            Err(e) => {
+                if attempts == 1 || attempts % 8 == 0 {
+                    eprintln!("[recall-bridge] daemon reconnect attempt {attempts} failed: {e}");
+                }
+                if tokio::time::Instant::now() + delay > deadline {
+                    bail!(
+                        "daemon reconnect budget ({budget:?}) exhausted after {attempts} attempts: {e}"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    };
+
+    let frame = format!(
+        "{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/bridge_reconnected",
+            "params": {
+                "attempts": attempts,
+                "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "bridge_pid": std::process::id(),
+            }
+        })
+    );
+    if let Err(e) = async {
+        conn.writer.write_all(frame.as_bytes()).await?;
+        conn.writer.flush().await
+    }
+    .await
+    {
+        eprintln!("[recall-bridge] bridge_reconnected receipt failed (heal itself OK): {e}");
+    }
+    Ok(conn)
+}
+
+/// Connect and replay the cached handshake. The replayed `initialize`
+/// RESPONSE is consumed here so it doesn't reach stdout as a duplicate
+/// answer to the client's original request; the `initialized`
+/// notification gets no response.
+#[cfg(unix)]
+async fn connect_and_replay(
+    endpoint: &Path,
+    cached_initialize: Option<&str>,
+    cached_initialized: Option<&str>,
+) -> Result<DaemonConn> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut conn = connect_daemon(endpoint)
+        .await
+        .with_context(|| format!("connecting {}", endpoint.display()))?;
+    if let Some(init) = cached_initialize {
+        conn.writer
+            .write_all(init.as_bytes())
+            .await
+            .context("replay initialize")?;
+        conn.writer.flush().await.context("flush initialize")?;
+        let mut discard = String::new();
+        let n = conn
+            .reader
+            .read_line(&mut discard)
+            .await
+            .context("read replayed initialize response")?;
+        if n == 0 {
+            bail!("daemon EOF during initialize replay");
+        }
+    }
+    if let Some(initialized) = cached_initialized {
+        conn.writer
+            .write_all(initialized.as_bytes())
+            .await
+            .context("replay initialized")?;
+        conn.writer.flush().await.context("flush initialized")?;
+    }
+    Ok(conn)
+}
+
+/// The healing bridge loop. First connect fails fast with the
+/// daemon-hint message (a missing daemon at startup is operator error,
+/// not an outage to ride out); after that, every daemon-side failure
+/// heals via [`reconnect_with_backoff`]. stdin EOF / stdout close are
+/// the client leaving — clean exit, never healed.
+#[cfg(unix)]
+async fn connect_with_heal(endpoint: &Path) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut conn = connect_daemon(endpoint).await.map_err(|e| {
+        anyhow!(
+            "connecting to ostk-recall MCP daemon at {}: {e}\n\
+             is a daemon running? start one with `ostk-recall serve --watch`",
+            endpoint.display()
+        )
+    })?;
+
+    let mut cached_initialize: Option<String> = None;
+    let mut cached_initialized: Option<String> = None;
+    let mut stdin_reader = BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::stdout();
+    let mut stdin_line = String::new();
+    let mut daemon_line = String::new();
+
+    loop {
+        tokio::select! {
+            r = stdin_reader.read_line(&mut stdin_line) => {
+                match r {
+                    Ok(0) => {
+                        // Client closed stdin — half-close so the daemon
+                        // sees the disconnect, then exit clean.
+                        let _ = conn.writer.shutdown().await;
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        cache_handshake(&stdin_line, &mut cached_initialize, &mut cached_initialized);
+                        if conn.writer.write_all(stdin_line.as_bytes()).await.is_err()
+                            || conn.writer.flush().await.is_err()
+                        {
+                            eprintln!("[recall-bridge] daemon write failed — reconnecting");
+                            conn = reconnect_with_backoff(
+                                endpoint,
+                                cached_initialize.as_deref(),
+                                cached_initialized.as_deref(),
+                            ).await?;
+                            // Retry the original write once on the fresh
+                            // connection; a second failure drops the
+                            // message (the client's own timeout covers it).
+                            if conn.writer.write_all(stdin_line.as_bytes()).await.is_err()
+                                || conn.writer.flush().await.is_err()
+                            {
+                                eprintln!("[recall-bridge] write still failing after reconnect — dropping message");
+                            }
+                        }
+                        stdin_line.clear();
+                    }
+                    Err(_) => return Ok(()),
+                }
+            }
+            r = conn.reader.read_line(&mut daemon_line) => {
+                match r {
+                    Ok(0) => {
+                        // Daemon EOF. In-flight responses are lost;
+                        // reconnect + replay so the next request still
+                        // passes the daemon's initialized gate.
+                        eprintln!("[recall-bridge] daemon disconnected — reconnecting");
+                        conn = reconnect_with_backoff(
+                            endpoint,
+                            cached_initialize.as_deref(),
+                            cached_initialized.as_deref(),
+                        ).await?;
+                        daemon_line.clear();
+                    }
+                    Ok(_) => {
+                        if stdout.write_all(daemon_line.as_bytes()).await.is_err()
+                            || stdout.flush().await.is_err()
+                        {
+                            return Ok(()); // stdout closed — client gone
+                        }
+                        daemon_line.clear();
+                    }
+                    Err(_) => {
+                        eprintln!("[recall-bridge] daemon read error — reconnecting");
+                        conn = reconnect_with_backoff(
+                            endpoint,
+                            cached_initialize.as_deref(),
+                            cached_initialized.as_deref(),
+                        ).await?;
+                        daemon_line.clear();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Bidirectional splice for the **Windows** [`connect`] path (the unix
+/// path heals via [`connect_with_heal`]): copy stdin → socket and
 /// socket → stdout concurrently, each running to completion. When
 /// stdin hits EOF the socket write half is shut down so the daemon
 /// sees the client disconnect (and closes its side, ending the
@@ -2070,6 +2377,7 @@ pub async fn connect(config_path: &Path) -> Result<()> {
 /// ends and the stdin copy unblocks once the client closes stdin.
 /// Neither direction is cut off early, so trailing JSON-RPC frames are
 /// not dropped.
+#[cfg(windows)]
 async fn bridge_stdio<R, W>(sock_r: &mut R, sock_w: &mut W) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2091,6 +2399,7 @@ where
 /// its side. Neither direction is cut off early, so trailing JSON-RPC
 /// frames survive. Split out from the stdin/stdout wiring so it can be
 /// driven over in-memory pipes in tests.
+#[cfg(any(windows, test))]
 async fn splice_bidirectional<R, W, In, Out>(
     sock_r: &mut R,
     sock_w: &mut W,
@@ -2271,6 +2580,40 @@ impl KickGate {
     }
 }
 
+/// →1957 watcher observability: every drop in the event loop was
+/// previously an unobservable non-event (→1947's 4-day freeze was three
+/// stacked silent drops). The watcher maintains these counters and
+/// persists them to `<corpus_root>/watch_status.json` so `recall_stats`
+/// can surface them out-of-process.
+#[derive(Default, serde::Serialize)]
+struct WatchStatus {
+    /// Events dropped by the `NOISE_PATH_SEGMENTS` filter.
+    noise_filtered: u64,
+    /// Events that passed the noise filter but matched no watched
+    /// root + extension pair — the →1947 starvation class.
+    unmatched: u64,
+    /// Per-source-label timestamp (RFC 3339) of the last successful
+    /// scan-trigger kick.
+    kicks: std::collections::BTreeMap<String, String>,
+    /// When this snapshot was written (RFC 3339).
+    updated: String,
+}
+
+impl WatchStatus {
+    /// Atomic snapshot write (tmp + rename). Failures are warned, not
+    /// fatal — observability must never take the watcher down.
+    fn persist(&mut self, path: &Path) {
+        self.updated = chrono::Utc::now().to_rfc3339();
+        let Ok(json) = serde_json::to_vec_pretty(self) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &json).and_then(|()| std::fs::rename(&tmp, path)) {
+            tracing::warn!(path = %path.display(), error = %e, "watch_status persist failed");
+        }
+    }
+}
+
 /// Source label used as the `KickGate` key. Falls back to the source
 /// kind when the source has no explicit `project`.
 fn source_label(source: &SourceConfig) -> String {
@@ -2398,6 +2741,21 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
             "no watchable source paths after applying [watch].projects filter — refine the filter or add sources"
         );
     }
+    // →1957 (from →1947 forensics): an `ostk_project` source that is
+    // declared but excluded by the [watch].projects allowlist is almost
+    // certainly a mistake — its `.ostk` journal will never live-ingest
+    // and the staleness is silent (haystack froze 4 days this way).
+    for source in &cfg.sources {
+        if matches!(source.kind, SourceKind::OstkProject)
+            && !watch_cfg.watches_project(source.project.as_deref())
+        {
+            tracing::warn!(
+                project = source.project.as_deref().unwrap_or("<unnamed>"),
+                "ostk_project source declared but absent from [watch].projects — \
+                 its audit/decisions/needles will NOT live-ingest (→1947)"
+            );
+        }
+    }
 
     // Tokio mpsc as the bridge: the debouncer's std-style closure can call
     // UnboundedSender::send (non-blocking, no async needed), and the main
@@ -2447,6 +2805,13 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
 
     let mode = watch_cfg.mode;
     let mut kick_gates: HashMap<String, KickGate> = HashMap::new();
+    // →1957: observable drop counters + last-kick stamps, persisted to
+    // the corpus root for the stats surface.
+    let status_path = corpus_root.join("watch_status.json");
+    let mut status = WatchStatus::default();
+    let mut status_dirty = false;
+    let mut status_last_write = Instant::now();
+    const STATUS_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
     // 1 Hz wake-up so kick gates with pending paths flush even when no
     // new events arrive within the rate-limit window.
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -2475,8 +2840,11 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                         for ev in &events {
                             for p in &ev.event.paths {
                                 if path_has_noise_segment(p) {
+                                    status.noise_filtered += 1;
+                                    status_dirty = true;
                                     continue;
                                 }
+                                let mut matched = false;
                                 for (root, source) in &watched_roots {
                                     if !p.starts_with(root) {
                                         continue;
@@ -2492,8 +2860,16 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                                             .entry(source_label(source))
                                             .or_default()
                                             .push(p.clone());
+                                        matched = true;
                                         break;
                                     }
+                                }
+                                if !matched {
+                                    // →1947 starvation class: the event
+                                    // arrived but no root+ext pair claimed
+                                    // it — count it so the silence shows.
+                                    status.unmatched += 1;
+                                    status_dirty = true;
                                 }
                             }
                         }
@@ -2527,6 +2903,12 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                                         paths = frame.len(),
                                         "scan-trigger kicked"
                                     );
+                                    status
+                                        .kicks
+                                        .insert(label.clone(), chrono::Utc::now().to_rfc3339());
+                                    status.persist(&status_path);
+                                    status_dirty = false;
+                                    status_last_write = Instant::now();
                                 }
                             }
                         }
@@ -2564,7 +2946,19 @@ async fn run_watcher(config_path: &Path, sink: ScanTriggerSink) -> Result<()> {
                             paths = frame.len(),
                             "scan-trigger kicked (flush)"
                         );
+                        status
+                            .kicks
+                            .insert(label.clone(), chrono::Utc::now().to_rfc3339());
+                        status_dirty = true;
                     }
+                }
+                // Periodic flush so drop counters surface even when no
+                // kick fires (a starved watcher is exactly the case the
+                // counters exist for).
+                if status_dirty && status_last_write.elapsed() >= STATUS_FLUSH_INTERVAL {
+                    status.persist(&status_path);
+                    status_dirty = false;
+                    status_last_write = Instant::now();
                 }
             }
         }
@@ -3213,6 +3607,83 @@ mod daemon_transport_tests {
         let mut got = Vec::new();
         stdout_r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"pong\n", "daemon reply reached client stdout");
+    }
+
+    /// →1957 legs 1+2: a heal must (1) reconnect, (2) REPLAY the cached
+    /// `initialize` (consuming its response so it never duplicates onto
+    /// client stdout), (3) replay `notifications/initialized`, and
+    /// (4) send the self-attesting `bridge_reconnected` receipt — in
+    /// that order, all over the fresh socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_replays_handshake_then_sends_receipt() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock = tmp.path().join("recall-mcp.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+
+            let init = lines.next_line().await.unwrap().unwrap();
+            // Respond to the replayed initialize so the bridge can
+            // consume (and discard) it.
+            w.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                .await
+                .unwrap();
+            let initialized = lines.next_line().await.unwrap().unwrap();
+            let receipt = lines.next_line().await.unwrap().unwrap();
+            (init, initialized, receipt)
+        });
+
+        let init_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
+        let initialized_line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        let conn =
+            super::reconnect_with_backoff(&sock, Some(init_line), Some(initialized_line))
+                .await
+                .expect("heal against live socket");
+        drop(conn);
+
+        let (init, initialized, receipt) = daemon.await.unwrap();
+        assert!(init.contains("\"method\":\"initialize\""), "{init}");
+        assert!(
+            initialized.contains("notifications/initialized"),
+            "{initialized}"
+        );
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["method"], "notifications/bridge_reconnected");
+        assert_eq!(receipt["params"]["attempts"], 1);
+        assert!(receipt["params"]["bridge_pid"].as_u64().is_some());
+    }
+
+    /// `cache_handshake` must capture exactly the two handshake frames
+    /// and ignore everything else.
+    #[cfg(unix)]
+    #[test]
+    fn cache_handshake_captures_only_handshake_frames() {
+        let mut init = None;
+        let mut initialized = None;
+        super::cache_handshake(
+            "{\"method\":\"initialize\",\"id\":1}\n",
+            &mut init,
+            &mut initialized,
+        );
+        super::cache_handshake(
+            "{\"method\":\"notifications/initialized\"}\n",
+            &mut init,
+            &mut initialized,
+        );
+        super::cache_handshake(
+            "{\"method\":\"tools/call\",\"id\":2}\n",
+            &mut init,
+            &mut initialized,
+        );
+        super::cache_handshake("not json\n", &mut init, &mut initialized);
+        assert!(init.unwrap().contains("initialize"));
+        assert!(initialized.unwrap().contains("notifications/initialized"));
     }
 }
 

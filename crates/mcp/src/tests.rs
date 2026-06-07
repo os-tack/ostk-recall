@@ -305,3 +305,132 @@ async fn attention_tools_unavailable_without_dispatch() {
     assert!(resp.error.is_some(), "expected method-not-found");
     assert_eq!(resp.error.unwrap().code, -32601);
 }
+
+/// →1957 leg 3 helpers: build a server whose config declares one watched
+/// `ostk_project` source rooted at `proj_root`, with one ingested audit
+/// row at `row_ts`. Each call builds a fresh server (the stale probe
+/// caches for 30s, so cases must not share one).
+async fn build_server_with_watch(
+    proj_root: &std::path::Path,
+    row_ts: &str,
+) -> (TempDir, Server) {
+    let (tmp, server) = build_server().await;
+    // Drop the plain server; rebuild with config + a seeded events row.
+    drop(server);
+    let dim = 8;
+    let store = Arc::new(CorpusStore::open_or_create(tmp.path(), dim).await.unwrap());
+    let ingest = Arc::new(IngestDb::open(tmp.path()).unwrap());
+    let events = Arc::new(EventsDb::open(tmp.path()).unwrap());
+    events
+        .ingest_batch(&[ostk_recall_store::AuditEventRow {
+            row_key: format!("p1:{row_ts}"),
+            project: Some("p1".into()),
+            ts: Some(
+                chrono::DateTime::parse_from_rfc3339(row_ts)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            event: Some("tool.bash".into()),
+            tool: None,
+            agent: None,
+            success: Some(true),
+            exit_code: None,
+            duration_ms: None,
+            raw: "{}".into(),
+        }])
+        .unwrap();
+    let emb: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder { dim });
+    let engine = QueryEngine::new(store, ingest, Some(events), emb, "test");
+    let cfg: ostk_recall_core::Config = serde_json::from_value(json!({
+        "corpus": { "root": tmp.path().to_str().unwrap() },
+        "embedder": { "model": "test" },
+        "sources": [{
+            "kind": "ostk_project",
+            "project": "p1",
+            "paths": [proj_root.to_str().unwrap()],
+        }],
+        "watch": { "enabled": true, "freshness_threshold_secs": 60 },
+    }))
+    .unwrap();
+    let server = Server::new(engine).with_config(Arc::new(cfg));
+    (tmp, server)
+}
+
+async fn stats_response_body(server: &Server) -> Value {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 200,
+        "method": "tools/call",
+        "params": { "name": "recall_stats", "arguments": {} }
+    });
+    let resp = server.handle_request(req).await.unwrap();
+    let r = resp.result.unwrap();
+    serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// →1957: fresh journal + old ingested row = divergence → the envelope
+/// carries `stale_ingest` naming the project.
+#[tokio::test]
+async fn stale_ingest_flags_journal_vs_ingest_divergence() {
+    let proj = TempDir::new().unwrap();
+    std::fs::create_dir_all(proj.path().join(".ostk")).unwrap();
+    // Journal written NOW; newest ingested row months old.
+    std::fs::write(proj.path().join(".ostk/journal.jsonl"), "{}\n").unwrap();
+    let (_tmp, server) = build_server_with_watch(proj.path(), "2026-01-01T00:00:00+00:00").await;
+
+    let body = stats_response_body(&server).await;
+    let stale = body
+        .get("stale_ingest")
+        .expect("divergent project must flag stale_ingest");
+    assert_eq!(stale["projects"][0]["project"], "p1");
+    assert_eq!(stale["threshold_secs"], 60);
+}
+
+/// →1957 leg 2: the bridge's heal receipt must be accepted as a
+/// notification (None response), logged, and appended durably to
+/// `<corpus_root>/bridge_events.jsonl`.
+#[tokio::test]
+async fn bridge_reconnected_receipt_appends_durable_row() {
+    let proj = TempDir::new().unwrap();
+    std::fs::create_dir_all(proj.path().join(".ostk")).unwrap();
+    std::fs::write(proj.path().join(".ostk/journal.jsonl"), "{}\n").unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let (tmp, server) = build_server_with_watch(proj.path(), &now).await;
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/bridge_reconnected",
+        "params": { "attempts": 3, "elapsed_ms": 1200, "bridge_pid": 42 }
+    });
+    let resp = server.handle_request(req).await;
+    assert!(resp.is_none(), "notification must get no response");
+
+    let raw = std::fs::read_to_string(tmp.path().join("bridge_events.jsonl"))
+        .expect("durable receipt row written");
+    let row: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    assert_eq!(row["event"], "bridge.reconnected");
+    assert_eq!(row["params"]["attempts"], 3);
+    assert_eq!(row["params"]["bridge_pid"], 42);
+    assert!(row["ts"].as_str().is_some());
+}
+
+/// →1957: ingest keeping pace with the journal (row ts ≈ mtime ≈ now)
+/// stays silent — the conditional push only fires on failure. (The pull
+/// side, `audit_newest_ts` in stats, stays unconditional — that pairing
+/// is the invariant.)
+#[tokio::test]
+async fn stale_ingest_silent_when_ingest_keeps_pace() {
+    let proj = TempDir::new().unwrap();
+    std::fs::create_dir_all(proj.path().join(".ostk")).unwrap();
+    std::fs::write(proj.path().join(".ostk/journal.jsonl"), "{}\n").unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let (_tmp, server) = build_server_with_watch(proj.path(), &now).await;
+
+    let body = stats_response_body(&server).await;
+    assert!(
+        body.get("stale_ingest").is_none(),
+        "healthy ingest must not flag: {body}"
+    );
+    // Pull path stays unconditionally truthful.
+    assert!(body.get("audit_newest_ts").is_some());
+}

@@ -84,7 +84,48 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts
     ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_project_agent
     ON audit_events(project, agent);
+
+CREATE TABLE IF NOT EXISTS seal_segments (
+    path TEXT PRIMARY KEY,
+    size_bytes INTEGER NOT NULL,
+    mtime_micros INTEGER NOT NULL
+);
 ",
+        )?;
+        Ok(())
+    }
+
+    /// →1957: seal-segment high-water marks — `(size_bytes, mtime_micros)`
+    /// per ingested sealed journal segment. Sealed epochs are immutable
+    /// once rotated, so an unchanged pair means the segment is already
+    /// fully ingested and `scan_audit`'s recovery pass can skip the
+    /// re-parse (pre-HWM it re-read the whole seal corpus every kick).
+    pub fn seal_hwms(&self) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT path, size_bytes, mtime_micros FROM seal_segments")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
+                ))
+            })?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record (or refresh) a seal segment's high-water mark. Call only
+    /// after every row of the segment flushed successfully — a mark on a
+    /// partial ingest would skip the remainder forever.
+    pub fn set_seal_hwm(&self, path: &str, size_bytes: i64, mtime_micros: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO seal_segments (path, size_bytes, mtime_micros)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET
+                 size_bytes = excluded.size_bytes,
+                 mtime_micros = excluded.mtime_micros",
+            params![path, size_bytes, mtime_micros],
         )?;
         Ok(())
     }

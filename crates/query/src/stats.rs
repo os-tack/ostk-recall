@@ -14,6 +14,7 @@ pub async fn recall_stats(
     events: Option<&EventsDb>,
     model: &str,
     reranker: Option<&dyn RerankerLike>,
+    corpus_root: Option<&std::path::Path>,
 ) -> Result<RecallStats> {
     let total = store.row_count().await?;
     let by_source_raw = ingest.count_by_source()?;
@@ -37,6 +38,13 @@ pub async fn recall_stats(
                 .collect()
         })
     });
+    // →1957 watcher observability: pass the watcher's snapshot through
+    // verbatim (drop counters + last-kick stamps). Best-effort — absent
+    // or unparsable file degrades to omission.
+    let watch: Option<serde_json::Value> = corpus_root
+        .map(|root| root.join("watch_status.json"))
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     Ok(RecallStats {
         total,
         by_source,
@@ -45,5 +53,6 @@ pub async fn recall_stats(
         last_scan_at,
         reranker: reranker_stats,
         audit_newest_ts,
+        watch,
     })
 }

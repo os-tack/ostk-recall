@@ -70,6 +70,10 @@ pub struct QueryEngine {
     embedder: Arc<dyn ChunkEmbedder>,
     model: String,
     reranker: Option<Arc<dyn RerankerLike>>,
+    /// →1957: corpus root, so stats can surface the watcher's
+    /// `watch_status.json` snapshot. Optional — tests and embedded
+    /// callers without a watcher skip it.
+    corpus_root: Option<std::path::PathBuf>,
 }
 
 impl QueryEngine {
@@ -87,7 +91,16 @@ impl QueryEngine {
             embedder,
             model: model.into(),
             reranker: None,
+            corpus_root: None,
         }
+    }
+
+    /// Builder: record the corpus root so `recall_stats` can read the
+    /// watcher's `watch_status.json` snapshot (→1957).
+    #[must_use]
+    pub fn with_corpus_root(mut self, root: std::path::PathBuf) -> Self {
+        self.corpus_root = Some(root);
+        self
     }
 
     /// Builder: attach a cross-encoder reranker. When set, hybrid recall
@@ -152,6 +165,7 @@ impl QueryEngine {
             self.events.as_deref(),
             &self.model,
             self.reranker.as_deref(),
+            self.corpus_root.as_deref(),
         )
         .await
     }

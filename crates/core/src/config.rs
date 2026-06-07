@@ -593,6 +593,20 @@ pub struct WatchConfig {
     /// UTF-8; the server scans only those paths via `Pipeline::scan_paths`.
     #[serde(default)]
     pub mode: WatchMode,
+    /// →1957: ingest-lag threshold (seconds) for the in-band staleness
+    /// warning. A watched `ostk_project` source whose journal file mtime
+    /// runs ahead of its newest ingested `audit_events` row by more than
+    /// this flags `stale_ingest` on serve responses. Mtime-vs-ingest
+    /// divergence — not data age — so dormant projects never cry wolf.
+    #[serde(default = "default_freshness_threshold_secs")]
+    pub freshness_threshold_secs: u64,
+}
+
+/// One hour: long enough to absorb scan scheduling + debounce + seal
+/// rotation, short enough that a →1947-style freeze surfaces the same
+/// working session it starts in.
+const fn default_freshness_threshold_secs() -> u64 {
+    3600
 }
 
 /// Wire-format selector for the watcher → serve scan-trigger socket.
@@ -652,6 +666,7 @@ impl Default for WatchConfig {
             socket: None,
             projects: Vec::new(),
             mode: WatchMode::default(),
+            freshness_threshold_secs: default_freshness_threshold_secs(),
         }
     }
 }

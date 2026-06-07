@@ -46,6 +46,10 @@ pub struct Server {
     /// the `--stdio`/test paths, where crystallize returns an error rather than
     /// panicking.
     config: Option<Arc<Config>>,
+    /// →1957: cached `stale_ingest` probe result (30s TTL) so the
+    /// per-response staleness check costs a clock read, not a sqlite
+    /// MAX + journal stats.
+    stale_cache: std::sync::Mutex<Option<(std::time::Instant, Option<Value>)>>,
 }
 
 impl Server {
@@ -56,6 +60,7 @@ impl Server {
             attention: None,
             resources: Arc::new(ResourceRegistry::new()),
             config: None,
+            stale_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -66,6 +71,7 @@ impl Server {
             attention: None,
             resources: Arc::new(ResourceRegistry::new()),
             config: None,
+            stale_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -293,6 +299,48 @@ impl Server {
         match req.method.as_str() {
             "initialize" => Some(JsonRpcResponse::ok(id, Self::handle_initialize())),
             "initialized" | "notifications/initialized" | "notifications/cancelled" => None,
+            // →1957 leg 2: the connect bridge's heal receipt (→1943
+            // sibling). Self-attesting — the frame can only arrive over
+            // a working fresh socket, so logging it here IS the heal
+            // evidence. Also appended durably to
+            // `<corpus_root>/bridge_events.jsonl` (best-effort) so the
+            // attestation survives daemon log rotation.
+            "notifications/bridge_reconnected" => {
+                let p = &req.params;
+                let attempts = p.get("attempts").and_then(serde_json::Value::as_u64);
+                let elapsed_ms = p.get("elapsed_ms").and_then(serde_json::Value::as_u64);
+                let bridge_pid = p.get("bridge_pid").and_then(serde_json::Value::as_u64);
+                info!(
+                    attempts = attempts.unwrap_or(0),
+                    elapsed_ms = elapsed_ms.unwrap_or(0),
+                    bridge_pid = bridge_pid.unwrap_or(0),
+                    "bridge.reconnected — connect bridge healed"
+                );
+                if let Some(root) = self
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.expanded_root().ok())
+                {
+                    let row = json!({
+                        "event": "bridge.reconnected",
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "params": p,
+                    });
+                    let path = root.join("bridge_events.jsonl");
+                    if let Err(e) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "{row}")
+                        })
+                    {
+                        warn!(path = %path.display(), error = %e, "bridge_events append failed");
+                    }
+                }
+                None
+            }
             "ping" => Some(JsonRpcResponse::ok(id, json!({}))),
             "tools/list" => Some(JsonRpcResponse::ok(id, self.handle_tools_list())),
             "tools/call" => match self.handle_tools_call(req.params).await {
@@ -668,6 +716,20 @@ impl Server {
             }
         };
 
+        // →1957 leg 3: in-band staleness. The block appears ONLY when a
+        // watched ostk project's ingest is lagging its journal — healthy
+        // responses stay clean. INVARIANT: this conditional push path is
+        // safe only because `recall_stats` carries `audit_newest_ts`
+        // UNCONDITIONALLY — pull always-truthful, push loud-on-failure.
+        // Do not "optimize" stats to conditional too; that recreates
+        // →1947's silent-stale with extra steps.
+        let mut result_json = result_json;
+        if let Some(stale) = self.stale_ingest() {
+            if let Value::Object(map) = &mut result_json {
+                map.insert("stale_ingest".to_string(), stale);
+            }
+        }
+
         // Wrap in MCP content block.
         let text = serde_json::to_string(&result_json)
             .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
@@ -677,6 +739,105 @@ impl Server {
             ],
             "isError": false
         }))
+    }
+
+    /// →1957: probe for watched-but-frozen audit ingest. Staleness is
+    /// journal-mtime vs newest-ingested-row DIVERGENCE, not data age —
+    /// a dormant project (old journal, old rows) never flags; a frozen
+    /// ingest (fresh journal, old rows) flags within one threshold.
+    /// Result is cached for 30s; absent config / events DB / `[watch]`
+    /// block disables the probe (no watcher ⇒ no liveness expectation).
+    fn stale_ingest(&self) -> Option<Value> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let now = std::time::Instant::now();
+        let mut cache = self
+            .stale_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, cached)) = cache.as_ref() {
+            if now.duration_since(*at) < TTL {
+                return cached.clone();
+            }
+        }
+        let computed = self.compute_stale_ingest();
+        *cache = Some((now, computed.clone()));
+        computed
+    }
+
+    fn compute_stale_ingest(&self) -> Option<Value> {
+        let cfg = self.config.as_ref()?;
+        let watch = cfg.watch.as_ref().filter(|w| w.is_active())?;
+        // PAIRING (review finding, →1957): this probe only covers sources
+        // IN the [watch].projects allowlist — a configured-but-unallowlisted
+        // project (→1947's actual failure) can never flag here. The
+        // complement is the watcher's boot-time WARN (cli run_watcher),
+        // which fires for exactly that case: OstkProject source declared
+        // but absent from [watch].projects. The probe is honest only with
+        // that guard in place — change one, change both.
+        // SCOPE: staleness is sniffed from the journal file alone
+        // (journal.jsonl, legacy audit.jsonl) — the high-frequency signal.
+        // Decisions/needles activity with a quiet journal won't flag.
+        let threshold = i64::try_from(watch.freshness_threshold_secs).ok()?;
+        let events = self.engine.events()?;
+        let newest: std::collections::HashMap<String, String> =
+            events.newest_ts_by_project().ok()?.into_iter().collect();
+
+        let mut stale = Vec::new();
+        for source in &cfg.sources {
+            if !matches!(source.kind, ostk_recall_core::SourceKind::OstkProject)
+                || !watch.watches_project(source.project.as_deref())
+            {
+                continue;
+            }
+            let Some(project) = source.project.as_deref() else {
+                continue;
+            };
+            let Some(root) = source
+                .expanded_paths()
+                .ok()
+                .and_then(|roots| roots.into_iter().next())
+            else {
+                continue;
+            };
+            // Same canonical-then-legacy order as the scanner (→1458).
+            let journal = [".ostk/journal.jsonl", ".ostk/audit.jsonl"]
+                .iter()
+                .map(|rel| root.join(rel))
+                .find(|p| p.is_file());
+            let Some(journal) = journal else { continue };
+            let Some(mtime) = std::fs::metadata(&journal)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(chrono::DateTime::<chrono::Utc>::from)
+            else {
+                continue;
+            };
+            // Missing newest_ts with a present journal = never ingested —
+            // maximal lag, flag it.
+            let newest_ts = newest.get(project).and_then(|ts| {
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            let lag_secs = newest_ts.map_or(i64::MAX, |ts| (mtime - ts).num_seconds());
+            if lag_secs > threshold {
+                stale.push(json!({
+                    "project": project,
+                    "journal_mtime": mtime.to_rfc3339(),
+                    "newest_ingested_ts": newest.get(project),
+                    "lag_secs": if lag_secs == i64::MAX { Value::Null } else { json!(lag_secs) },
+                }));
+            }
+        }
+        if stale.is_empty() {
+            None
+        } else {
+            Some(json!({
+                "projects": stale,
+                "threshold_secs": watch.freshness_threshold_secs,
+                "hint": "audit ingest is lagging its journal — check `recall_stats` audit_newest_ts / watch fields (→1947/→1957)",
+            }))
+        }
     }
 }
 

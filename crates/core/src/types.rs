@@ -280,6 +280,12 @@ pub struct RecallStats {
     /// is attached (non-ostk deployments) so old clients keep parsing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_newest_ts: Option<Vec<AuditFreshness>>,
+    /// →1957 watcher observability: the watcher's `watch_status.json`
+    /// snapshot (drop counters + per-source last-kick stamps), passed
+    /// through verbatim. Omitted when no watcher has ever run against
+    /// this corpus root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch: Option<serde_json::Value>,
 }
 
 /// Per-project newest audit_events timestamp (→1947 freshness guard).

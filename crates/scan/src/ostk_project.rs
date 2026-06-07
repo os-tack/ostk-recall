@@ -675,7 +675,7 @@ fn scan_audit(
     // journal lifetime, so the per-line rolling hash (fresh per file, same
     // as a live read of that epoch) reproduces the same row_keys and
     // `INSERT OR IGNORE` dedups re-ingests.
-    if events.is_some() {
+    if let Some(db) = events {
         let seals = root.join(".ostk/journal-seals");
         if let Ok(rd) = std::fs::read_dir(&seals) {
             let mut segs: Vec<std::path::PathBuf> = rd
@@ -688,8 +688,35 @@ fn scan_audit(
                 })
                 .collect();
             segs.sort();
+            // →1957: per-segment HWM — sealed segments are immutable once
+            // rotated, so an unchanged (size, mtime) means already-ingested
+            // and the re-parse is skipped. Without this every routed audit
+            // kick re-read the whole seal corpus (~1,300 segments / ~100MB
+            // on haystack) at the kick rate limit. The mark is recorded
+            // only after a fully-successful ingest so a failed flush
+            // retries on the next kick instead of being skipped forever.
+            let hwms = db.seal_hwms().unwrap_or_default();
             for seg in segs {
-                ingest_events_only(&seg, project, events);
+                let Ok(meta) = std::fs::metadata(&seg) else {
+                    continue;
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let size = meta.len() as i64;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_micros() as i64);
+                let key = seg.to_string_lossy();
+                if hwms.get(key.as_ref()) == Some(&(size, mtime)) {
+                    continue;
+                }
+                if ingest_events_only(&seg, project, events) {
+                    if let Err(e) = db.set_seal_hwm(&key, size, mtime) {
+                        tracing::warn!(seg = %seg.display(), error = %e, "seal HWM record failed");
+                    }
+                }
             }
         }
     }
@@ -700,15 +727,20 @@ fn scan_audit(
 /// →1947: parse one sealed journal segment and flush its rows to the
 /// events DB. No chunk emission — corpus significance is the live
 /// journal's concern; this path exists so sealed rows aren't lost to
-/// `recall_audit` analyses.
-fn ingest_events_only(file: &Path, project: Option<&str>, events: Option<&EventsDb>) {
+/// `recall_audit` analyses. Returns `true` only if the file opened and
+/// every batch flushed cleanly — the →1957 HWM caller must not record
+/// a mark over a partial ingest.
+fn ingest_events_only(file: &Path, project: Option<&str>, events: Option<&EventsDb>) -> bool {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let Ok(f) = File::open(file) else { return };
+    let Ok(f) = File::open(file) else {
+        return false;
+    };
     let reader = BufReader::new(f);
     let mut pending: Vec<AuditEventRow> = Vec::with_capacity(AUDIT_BATCH);
     let mut prev_hash: u64 = 0;
+    let mut ok = true;
     for line in reader.lines() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
@@ -720,20 +752,25 @@ fn ingest_events_only(file: &Path, project: Option<&str>, events: Option<&Events
         prev_hash = hash_update(prev_hash, &line);
         pending.push(build_audit_row(&value, project, prev_hash));
         if pending.len() >= AUDIT_BATCH {
-            flush_audit(events, &pending);
+            ok &= flush_audit(events, &pending);
             pending.clear();
         }
     }
     if !pending.is_empty() {
-        flush_audit(events, &pending);
+        ok &= flush_audit(events, &pending);
     }
+    ok
 }
 
-fn flush_audit(events: Option<&EventsDb>, rows: &[AuditEventRow]) {
-    let Some(db) = events else { return };
+/// Returns `false` only on a failed ingest — a missing sink is a no-op,
+/// not a failure (unit tests run chunk-only without the duckdb side).
+fn flush_audit(events: Option<&EventsDb>, rows: &[AuditEventRow]) -> bool {
+    let Some(db) = events else { return true };
     if let Err(e) = db.ingest_batch(rows) {
         tracing::warn!(error = %e, "audit: events ingest failed");
+        return false;
     }
+    true
 }
 
 fn build_audit_row(
@@ -1582,6 +1619,65 @@ mod tests {
         assert!(chunks[1].text.contains("KERNEL_SHIPPED"));
         assert!(chunks[1].text.contains("status: A"));
         assert!(chunks[1].text.contains("phases 1-5 done"));
+    }
+
+    #[test]
+    fn seal_recovery_records_hwm_and_reingest_only_on_change() {
+        let proj = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        std::fs::create_dir_all(proj.path().join(".ostk/journal-seals")).unwrap();
+        write_jsonl(
+            &proj.path().join(".ostk/journal.jsonl"),
+            &[r#"{"ts":"2026-06-01T00:00:00Z","event":"tool.bash","tool":"bash","agent":"a1","success":true}"#],
+        );
+        let seg = proj.path().join(".ostk/journal-seals/epoch-0000.jsonl");
+        write_jsonl(
+            &seg,
+            &[
+                r#"{"ts":"2026-06-02T00:00:00Z","event":"tool.read","tool":"read","agent":"a1","success":true}"#,
+                r#"{"ts":"2026-06-03T00:00:00Z","event":"tool.bash","tool":"bash","agent":"a1","success":true}"#,
+            ],
+        );
+        let events = EventsDb::open(store.path()).unwrap();
+
+        // First scan: segment ingested, HWM recorded at its (size, mtime).
+        scan_audit(proj.path(), Some("p"), "cfg", Some(&events)).unwrap();
+        let hwms = events.seal_hwms().unwrap();
+        let key = seg.to_string_lossy().into_owned();
+        let mark = hwms.get(&key).copied().expect("HWM recorded for segment");
+        let meta = std::fs::metadata(&seg).unwrap();
+        assert_eq!(mark.0, i64::try_from(meta.len()).unwrap(), "size matches");
+        assert_eq!(
+            events.newest_ts_by_project().unwrap(),
+            vec![("p".into(), "2026-06-03T00:00:00+00:00".into())],
+            "sealed rows reached the events DB"
+        );
+
+        // Second scan with the segment unchanged: HWM stays identical.
+        scan_audit(proj.path(), Some("p"), "cfg", Some(&events)).unwrap();
+        assert_eq!(
+            events.seal_hwms().unwrap().get(&key).copied(),
+            Some(mark),
+            "unchanged segment keeps its mark"
+        );
+
+        // Segment grows (size change): re-ingested, mark refreshed, new
+        // row visible.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        writeln!(
+            f,
+            r#"{{"ts":"2026-06-04T00:00:00Z","event":"tool.bash","tool":"bash","agent":"a1","success":false}}"#
+        )
+        .unwrap();
+        drop(f);
+        scan_audit(proj.path(), Some("p"), "cfg", Some(&events)).unwrap();
+        let refreshed = events.seal_hwms().unwrap().get(&key).copied().unwrap();
+        assert!(refreshed.0 > mark.0, "mark refreshed after growth");
+        assert_eq!(
+            events.newest_ts_by_project().unwrap(),
+            vec![("p".into(), "2026-06-04T00:00:00+00:00".into())],
+            "grown segment re-ingested"
+        );
     }
 
     fn write_fixture(root: &Path) {
