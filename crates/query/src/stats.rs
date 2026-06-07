@@ -2,15 +2,16 @@
 
 use std::sync::Arc;
 
-use ostk_recall_store::{CorpusStore, IngestDb};
+use ostk_recall_store::{CorpusStore, EventsDb, IngestDb};
 
 use crate::error::Result;
 use crate::rerank::RerankerLike;
-use crate::types::{RecallStats, RerankerStats, SourceCount};
+use crate::types::{AuditFreshness, RecallStats, RerankerStats, SourceCount};
 
 pub async fn recall_stats(
     store: &Arc<CorpusStore>,
     ingest: &IngestDb,
+    events: Option<&EventsDb>,
     model: &str,
     reranker: Option<&dyn RerankerLike>,
 ) -> Result<RecallStats> {
@@ -25,6 +26,17 @@ pub async fn recall_stats(
         model: r.model_id().to_string(),
         enabled: true,
     });
+    // →1947 freshness guard: surface newest audit row per project so a
+    // frozen events ingest is visible here instead of silently serving
+    // stale recall_audit analyses. Best-effort: a read error degrades to
+    // omission, never fails stats.
+    let audit_newest_ts: Option<Vec<AuditFreshness>> = events.and_then(|db| {
+        db.newest_ts_by_project().ok().map(|rows| {
+            rows.into_iter()
+                .map(|(project, newest_ts)| AuditFreshness { project, newest_ts })
+                .collect()
+        })
+    });
     Ok(RecallStats {
         total,
         by_source,
@@ -32,5 +44,6 @@ pub async fn recall_stats(
         dim: store.dim(),
         last_scan_at,
         reranker: reranker_stats,
+        audit_newest_ts,
     })
 }

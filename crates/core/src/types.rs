@@ -274,6 +274,19 @@ pub struct RecallStats {
     /// from the JSON when `None` so old MCP clients keep parsing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reranker: Option<RerankerStats>,
+    /// →1947 freshness guard: newest audit_events row per project, so a
+    /// frozen ingest is visible at the stats surface instead of silently
+    /// serving stale `recall_audit` analyses. Omitted when no events DB
+    /// is attached (non-ostk deployments) so old clients keep parsing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_newest_ts: Option<Vec<AuditFreshness>>,
+}
+
+/// Per-project newest audit_events timestamp (→1947 freshness guard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFreshness {
+    pub project: String,
+    pub newest_ts: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

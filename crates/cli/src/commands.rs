@@ -2594,13 +2594,50 @@ const NOISE_PATH_SEGMENTS: &[&str] = &[
     "build",
 ];
 
+/// Basenames under `.ostk/` that carry sub-area SIGNAL and must pass the
+/// noise filter despite the `.ostk` segment. These are exactly the files
+/// `path_sub_area` routes (journal/audit → Audit, decisions → Decisions,
+/// issues → Needles): →1947 found the blanket `.ostk` noise entry starved
+/// the audit_events ingest for 4 days — incremental mode never delivered
+/// `journal.jsonl`, so audit/decisions/needles only refreshed on explicit
+/// full `scan` runs. The rest of `.ostk/` (proc/ inboxes, locks/, gen
+/// tables, journal-seals/ churn) stays filtered — that flood is the
+/// reason the noise entry exists.
+const OSTK_SIGNAL_BASENAMES: &[&str] = &[
+    "journal.jsonl",
+    "audit.jsonl",
+    "decisions.jsonl",
+    "issues.jsonl",
+];
+
 /// True if any component of `path` matches a noise segment exactly.
+/// `.ostk`-resident sub-area files (see [`OSTK_SIGNAL_BASENAMES`]) are
+/// exempt — they are the signal the ostk_project scanner exists to read.
 fn path_has_noise_segment(path: &Path) -> bool {
-    path.components().any(|c| {
+    let noisy = path.components().any(|c| {
         c.as_os_str()
             .to_str()
             .is_some_and(|s| NOISE_PATH_SEGMENTS.contains(&s))
-    })
+    });
+    if !noisy {
+        return false;
+    }
+    // Exemption only applies when `.ostk` is the sole noise segment —
+    // a journal.jsonl under target/ or .worktrees/ is still noise.
+    let only_ostk_noise = path.components().all(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_none_or(|s| s == ".ostk" || !NOISE_PATH_SEGMENTS.contains(&s))
+    });
+    if only_ostk_noise
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| OSTK_SIGNAL_BASENAMES.contains(&n))
+    {
+        return false;
+    }
+    noisy
 }
 
 /// Connect to the scan-trigger surface, write `paths` line-delimited

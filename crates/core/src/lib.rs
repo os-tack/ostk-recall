@@ -41,7 +41,7 @@ pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};
 pub use types::{
     AttentionBiasParams, AuditResult, MatchFeature, RankingOverrides, RecallHit, RecallLinkResult,
-    RecallParams, RecallStats, RerankerStats, SourceCount, SynthesizedPage,
+    AuditFreshness, RecallParams, RecallStats, RerankerStats, SourceCount, SynthesizedPage,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

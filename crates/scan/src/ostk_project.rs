@@ -666,7 +666,67 @@ fn scan_audit(
         flush_audit(events, &pending);
     }
 
+    // →1947: seal segments. 7.x rotation moves finished epochs out of the
+    // live journal into `.ostk/journal-seals/epoch-*.jsonl`; rows that were
+    // written and sealed between scans would otherwise never reach the
+    // events DB (the live-file read above only sees the current epoch).
+    // Events-only recovery — significant CHUNKS stay live-journal-scoped so
+    // the corpus side is unchanged. Idempotent: each segment is exactly one
+    // journal lifetime, so the per-line rolling hash (fresh per file, same
+    // as a live read of that epoch) reproduces the same row_keys and
+    // `INSERT OR IGNORE` dedups re-ingests.
+    if events.is_some() {
+        let seals = root.join(".ostk/journal-seals");
+        if let Ok(rd) = std::fs::read_dir(&seals) {
+            let mut segs: Vec<std::path::PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("epoch-") && n.ends_with(".jsonl"))
+                })
+                .collect();
+            segs.sort();
+            for seg in segs {
+                ingest_events_only(&seg, project, events);
+            }
+        }
+    }
+
     Ok(chunks)
+}
+
+/// →1947: parse one sealed journal segment and flush its rows to the
+/// events DB. No chunk emission — corpus significance is the live
+/// journal's concern; this path exists so sealed rows aren't lost to
+/// `recall_audit` analyses.
+fn ingest_events_only(file: &Path, project: Option<&str>, events: Option<&EventsDb>) {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let Ok(f) = File::open(file) else { return };
+    let reader = BufReader::new(f);
+    let mut pending: Vec<AuditEventRow> = Vec::with_capacity(AUDIT_BATCH);
+    let mut prev_hash: u64 = 0;
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        prev_hash = hash_update(prev_hash, &line);
+        pending.push(build_audit_row(&value, project, prev_hash));
+        if pending.len() >= AUDIT_BATCH {
+            flush_audit(events, &pending);
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        flush_audit(events, &pending);
+    }
 }
 
 fn flush_audit(events: Option<&EventsDb>, rows: &[AuditEventRow]) {

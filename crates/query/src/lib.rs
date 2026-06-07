@@ -149,6 +149,7 @@ impl QueryEngine {
         stats::recall_stats(
             &self.store,
             &self.ingest,
+            self.events.as_deref(),
             &self.model,
             self.reranker.as_deref(),
         )

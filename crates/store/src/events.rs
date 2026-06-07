@@ -91,6 +91,22 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_agent
 
     // `conn` is held intentionally: `tx` borrows it for the whole batch.
     #[allow(clippy::significant_drop_tightening)]
+    /// →1947 freshness guard: newest row timestamp per project. Cheap
+    /// (index-assisted max over ts) and read-only — safe for the stats
+    /// surface on the read-only connection.
+    pub fn newest_ts_by_project(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT project, MAX(ts) FROM audit_events
+             WHERE project IS NOT NULL AND ts IS NOT NULL
+             GROUP BY project ORDER BY project",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn ingest_batch(&self, rows: &[AuditEventRow]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
