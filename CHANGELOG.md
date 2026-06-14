@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-14
+### Added
+- **`recover-orphans` command** — rebuild the corpus's irreplaceable rows after
+  a backup → wipe → rescan. Diffs `chunk_id`s against a backup corpus
+  (`--from`) and appends the backup-only rows — chunks whose source files were
+  rotated away (e.g. expired Claude transcripts) for which the backup is the
+  only surviving copy — copying their stored vectors (no re-embed, no merge
+  scan), so recovery is O(rows). Reads facets in either the new or legacy form;
+  `--dry-run` reports the diff without writing.
+### Fixed
+- **`optimize` (`OptimizeAction::All`) failed on large corpora, so the corpus
+  never compacted** and grew without bound (observed: 17 GB / 18k versions /
+  11k fragments / 350+ un-merged index deltas). Two columns defeated lance's
+  miniblock structural encoder: oversized `text` chunks (multi-hundred-KiB tool
+  outputs) tripped the 32 KiB chunk assertion, and the sparse `facets` list
+  overflowed the u16 rep/def buffer-length field. Fixed by pinning `text` to
+  the `fullzip` encoding and storing `facets` as a flat `Utf8` JSON column.
+- **`.ostk` substrate stopped ingesting incrementally** (→2040). The watcher
+  noise filter blanket-vetoed `.ostk`, starving the `journal`/`decisions`/
+  `issues` signal files; now only `.ostk/vfs` (the loopback NFS mount) is
+  vetoed, and `walk_filtered` no longer crosses that mount
+  (`same_file_system`).
+### Changed
+- **Corpus on-disk format**: `facets` is now a flat `Utf8` JSON array instead of
+  `List<Utf8>`. Reads stay backward-compatible (legacy `List` corpora and
+  backups still decode), but a corpus written by 0.8.0 is **not** readable by
+  0.7.x, and existing corpora need a rescan to benefit from the `optimize` fix.
+- **Dependencies**: `lancedb` 0.29 → 0.30 (lance 7.0).
+
 ## [0.7.2] - 2026-06-03
 ### Added
 - **Relational substrate — ambient salience-gated concept-growth (Phase 1 + 2).**

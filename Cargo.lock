@@ -4545,7 +4545,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-attention"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -4606,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-attention-mcp"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4624,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-core"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -4641,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-embed"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "fastembed",
  "model2vec-rs",
@@ -4653,7 +4653,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-mcp"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "ostk-recall-attention",
@@ -4672,7 +4672,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-pipeline"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "arrow-array",
  "chrono",
@@ -4692,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-query"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4716,7 +4716,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-scan"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "globset",
@@ -4742,7 +4742,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-recall-store"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "arrow-array",
