@@ -15,7 +15,10 @@ use lancedb::table::OptimizeAction;
 use ostk_recall_core::{Chunk, SourceKind};
 use thiserror::Error;
 
-use crate::schema::{CORPUS_TABLE, corpus_schema};
+use crate::schema::{
+    CORPUS_TABLE, FULLZIP_FIELDS, LANCE_STRUCTURAL_ENCODING_FULLZIP, LANCE_STRUCTURAL_ENCODING_KEY,
+    corpus_schema, fullzip_metadata,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -96,6 +99,11 @@ impl CorpusStore {
                 schema.clone(),
             );
             let reader: Box<dyn RecordBatchReader + Send> = Box::new(empty);
+            // Default Lance file format (stable 2.1). The columns that the 2.1
+            // miniblock encoder can't handle are pinned to fullzip in
+            // `corpus_schema` (`text`'s large values; `facets` is now a flat
+            // Utf8, not a list), so no oversized/sparse miniblock chunk arises
+            // and the newer 2.2 format isn't needed.
             conn.create_table(CORPUS_TABLE, reader).execute().await?;
         }
 
@@ -228,6 +236,29 @@ impl CorpusStore {
         Ok(chunks.len())
     }
 
+    /// Append a batch of chunks + embeddings WITHOUT a merge — a plain
+    /// `table.add`. Unlike [`Self::upsert`], this does no `chunk_id` match
+    /// scan, so it stays O(rows) regardless of corpus size. Only safe when the
+    /// caller guarantees the rows are absent (a duplicate `chunk_id` would
+    /// create a second physical row). `recover-orphans` uses this: orphans are
+    /// by definition the backup `chunk_id`s NOT present in the live corpus.
+    pub async fn append(&self, chunks: &[Chunk], embeddings: &[Vec<f32>]) -> Result<usize> {
+        debug_assert_eq!(chunks.len(), embeddings.len());
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        let schema = corpus_schema(self.dim);
+        let batch = build_record_batch(&schema, chunks, embeddings, self.dim)?;
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let reader = RecordBatchIterator::new(
+            std::iter::once(Ok::<_, arrow::error::ArrowError>(batch)),
+            schema,
+        );
+        let boxed_reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+        table.add(boxed_reader).execute().await?;
+        Ok(chunks.len())
+    }
+
     /// Return all `chunk_id`s in the corpus whose `project` column equals
     /// `project`. Used by the `--reingest` path to collect ids for
     /// cross-store cleanup before the `LanceDB` delete fires.
@@ -237,6 +268,38 @@ impl CorpusStore {
         let stream = table
             .query()
             .only_if(filter)
+            .select(Select::Columns(vec!["chunk_id".into()]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("chunk_id").ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::SchemaError(
+                    "chunk_id column missing in projection".into(),
+                ))
+            })?;
+            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                StoreError::Arrow(arrow::error::ArrowError::CastError(
+                    "chunk_id expected to be Utf8".into(),
+                ))
+            })?;
+            let rows = batch.num_rows();
+            ids.reserve(rows);
+            for i in 0..rows {
+                ids.push(arr.value(i).to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Every `chunk_id` in the corpus. Used to diff one corpus against another
+    /// (e.g. `recover-orphans`: rows present in a backup but absent from the
+    /// live corpus). Streams the projection so only the id column is read.
+    pub async fn all_chunk_ids(&self) -> Result<Vec<String>> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let stream = table
+            .query()
             .select(Select::Columns(vec!["chunk_id".into()]))
             .execute()
             .await?;
@@ -799,7 +862,12 @@ impl CorpusStore {
             let sha256 = downcast_str(batch, "sha256")?;
             let links_json = downcast_str(batch, "links_json")?;
             let extra_json = downcast_str(batch, "extra_json")?;
-            let facets = batch
+            // facets: new corpora store a JSON array string (Utf8); a legacy
+            // (or backup) corpus may store List<Utf8>. Read whichever is
+            // present so cross-format reads (e.g. recover-orphans from an old
+            // backup) preserve facets.
+            let facets_str = downcast_str_opt(batch, "facets");
+            let facets_list = batch
                 .column_by_name("facets")
                 .and_then(|c| c.as_any().downcast_ref::<ListArray>());
             let emb = batch
@@ -831,27 +899,26 @@ impl CorpusStore {
                     serde_json::from_str(extra_json.value(i)).unwrap_or(serde_json::Value::Null)
                 };
 
-                let facet_list: Vec<String> = if let Some(arr) = facets {
+                // Prefer the Utf8 JSON form (current); fall back to a legacy
+                // List<Utf8> column when reading an older corpus/backup.
+                let facet_list: Vec<String> = if let Some(arr) = facets_str {
+                    if arr.is_null(i) {
+                        Vec::new()
+                    } else {
+                        serde_json::from_str(arr.value(i)).unwrap_or_default()
+                    }
+                } else if let Some(arr) = facets_list {
                     if arr.is_null(i) {
                         Vec::new()
                     } else {
                         let inner = arr.value(i);
-                        let inner_str =
-                            inner
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .ok_or_else(|| {
-                                    StoreError::Arrow(arrow::error::ArrowError::CastError(
-                                        "facets inner expected Utf8".into(),
-                                    ))
-                                })?;
-                        let mut v = Vec::with_capacity(inner_str.len());
-                        for j in 0..inner_str.len() {
-                            if !inner_str.is_null(j) {
-                                v.push(inner_str.value(j).to_string());
-                            }
+                        match inner.as_any().downcast_ref::<StringArray>() {
+                            Some(s) => (0..s.len())
+                                .filter(|&j| !s.is_null(j))
+                                .map(|j| s.value(j).to_string())
+                                .collect(),
+                            None => Vec::new(),
                         }
-                        v
                     }
                 } else {
                     Vec::new()
@@ -1228,6 +1295,53 @@ impl CorpusStore {
         Ok(n)
     }
 
+    /// Idempotently pin the [`FULLZIP_FIELDS`] to the `fullzip` structural
+    /// encoding in the stored schema, healing corpora created before a column
+    /// was pinned. Returns `true` if a write happened.
+    ///
+    /// New tables already bake this in via [`corpus_schema`], but a corpus
+    /// written earlier has those columns on Lance's default `miniblock`
+    /// encoding — and compaction then panics in the encoder
+    /// (`assert!(chunk_bytes <= max_chunk_size)` for an oversized `text`
+    /// value, or the u16 def-buffer overflow for sparse `facets`). Stamping
+    /// the field metadata makes the *next* compaction re-encode those columns
+    /// as fullzip, so this runs at the head of every optimize pass.
+    ///
+    /// `field.metadata` (and field ids) live on `NativeTable`, not the `Table`
+    /// trait; `as_native()` is `None` only for the remote-LanceDB client, and
+    /// we always use the embedded path.
+    pub async fn ensure_structural_encodings(&self) -> Result<bool> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let Some(native) = table.as_native() else {
+            return Ok(false);
+        };
+        let manifest = native.manifest().await?;
+        let mut updates: Vec<(u32, std::collections::HashMap<String, String>)> = Vec::new();
+        for name in FULLZIP_FIELDS {
+            let Some(field) = manifest.schema.field(name) else {
+                continue;
+            };
+            if field.metadata.get(LANCE_STRUCTURAL_ENCODING_KEY).map(String::as_str)
+                == Some(LANCE_STRUCTURAL_ENCODING_FULLZIP)
+            {
+                continue; // already pinned
+            }
+            // Preserve any existing field metadata; add the fullzip hint.
+            let mut md = field.metadata.clone();
+            md.extend(fullzip_metadata());
+            updates.push((u32::try_from(field.id).unwrap_or(0), md));
+        }
+        if updates.is_empty() {
+            return Ok(false);
+        }
+        tracing::info!(
+            fields = updates.len(),
+            "stamping fullzip structural-encoding onto corpus schema"
+        );
+        native.replace_field_metadata(updates).await?;
+        Ok(true)
+    }
+
     /// Run Lance's full optimize pass on the corpus table — merges small
     /// fragments, reindexes new data into existing indices, and prunes
     /// versions older than the lance default retention window (so files
@@ -1236,6 +1350,9 @@ impl CorpusStore {
     /// actually collapses the per-batch fragments and lets serve return
     /// to idle.
     pub async fn optimize_all(&self) -> Result<()> {
+        // Heal legacy miniblock columns first, or compaction panics in the
+        // encoder on this corpus's oversized text / sparse facets.
+        self.ensure_structural_encodings().await?;
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         table.optimize(OptimizeAction::All).await?;
         Ok(())
@@ -1254,6 +1371,8 @@ impl CorpusStore {
     /// guarantee exclusivity (the `optimize --aggressive` CLI path makes
     /// the operator responsible).
     pub async fn optimize_compact_and_prune(&self) -> Result<u64> {
+        // Heal legacy miniblock columns first (see `optimize_all`).
+        self.ensure_structural_encodings().await?;
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         // 1. Compact small fragments + fold new data into indices.
         table.optimize(OptimizeAction::All).await?;
@@ -1774,23 +1893,17 @@ fn build_record_batch(
             }
         })
         .collect();
-    // P1: facets serialized as `key:value` strings via to_list (sorted
-    // for stable round-trip). Column is List<Utf8>.
-    let facets_lists: Vec<Vec<String>> = chunks
+    // P1: facets serialized as a JSON array of sorted `key:value` strings
+    // (via to_list) into a flat Utf8 column — see `schema::corpus_schema` for
+    // why this is not a List<Utf8>. Empty facet sets serialize to "[]".
+    let facets_json: Vec<String> = chunks
         .iter()
-        .map(|c| ostk_recall_core::to_list(&c.facets))
+        .map(|c| {
+            serde_json::to_string(&ostk_recall_core::to_list(&c.facets))
+                .unwrap_or_else(|_| "[]".to_string())
+        })
         .collect();
-    let facets_col = {
-        use arrow_array::builder::{ListBuilder, StringBuilder};
-        let mut b = ListBuilder::new(StringBuilder::new());
-        for list in &facets_lists {
-            for v in list {
-                b.values().append_value(v);
-            }
-            b.append(true);
-        }
-        b.finish()
-    };
+    let facets_col = StringArray::from_iter_values(facets_json.iter().map(String::as_str));
     // P1: embedding_input_sha256 — nullable; empty string maps to NULL
     // for migration symmetry.
     let embedding_input_sha256: StringArray = chunks
@@ -2049,6 +2162,40 @@ mod tests {
         );
         // Prune drops history, never live rows.
         assert_eq!(store.row_count().await.unwrap(), 8);
+    }
+
+    /// End-to-end guard that `OptimizeAction::All` compaction completes over a
+    /// corpus of sparse-`facets` rows. On the real corpus this path failed
+    /// every run — Lance's miniblock encoder overflowed the u16 per-chunk
+    /// definition-level buffer because nearly every row has an empty facet
+    /// list ("Definition buffer size (684480 bytes) too large"). The
+    /// `fullzip` encoding hint on the `facets` field (see `schema.rs`) is what
+    /// keeps compaction healthy; this exercises that path through several
+    /// fragments. (The byte overflow only manifests at ~500k rows, so this
+    /// test asserts the happy path rather than reproducing the original size.)
+    #[tokio::test]
+    async fn optimize_all_compacts_sparse_facets_corpus() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        // Several batches → several fragments for compaction to merge. Every
+        // chunk carries the default (empty) facet set, the exact shape that
+        // tripped the miniblock def-buffer limit.
+        for batch in 0..8 {
+            let chunks: Vec<Chunk> = (0..250)
+                .map(|i| sample_chunk(&format!("c{batch}-{i}"), "text"))
+                .collect();
+            let embs = vec![vec![0.1, 0.2, 0.3, 0.4]; chunks.len()];
+            store.upsert(&chunks, &embs).await.unwrap();
+        }
+        assert_eq!(store.row_count().await.unwrap(), 2000);
+
+        // The previously-failing call. Must succeed and preserve every row.
+        store
+            .optimize_all()
+            .await
+            .expect("OptimizeAction::All must succeed with fullzip facets");
+        assert_eq!(store.row_count().await.unwrap(), 2000);
     }
 
     #[tokio::test]
