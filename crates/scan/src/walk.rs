@@ -46,7 +46,12 @@ pub fn walk_filtered(
         .git_global(true)
         .git_exclude(true)
         .add_custom_ignore_filename(".ostk-recall-ignore")
-        .follow_links(false);
+        .follow_links(false)
+        // Never cross a filesystem boundary mid-walk (→2040): a mountpoint
+        // inside a source root is foreign territory — haystack's .ostk/vfs
+        // is a loopback NFS mount served by the ostk daemon, and walking it
+        // turned every getattr into daemon work (2026-06-11 incident).
+        .same_file_system(true);
 
     if !extra_ignore_patterns.is_empty() {
         let mut overrides = OverrideBuilder::new(root);

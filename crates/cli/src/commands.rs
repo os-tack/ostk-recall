@@ -18,7 +18,7 @@ use ostk_recall_attention::{
 use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
-    AmbientGrowthConfig, CompiledRecordRules, Config, LensSettings, RelationalConfig,
+    AmbientGrowthConfig, Chunk, CompiledRecordRules, Config, LensSettings, RelationalConfig,
     RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode, WeaverSettings,
 };
 use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
@@ -38,7 +38,8 @@ use ostk_recall_scan::ostk_project::OstkProjectScanner;
 use ostk_recall_scan::threads::ThreadScanner;
 use ostk_recall_scan::zip_export::ZipExportScanner;
 use ostk_recall_store::{
-    ChainLogReader, ChainSink, CorpusStore, EventsDb, IngestDb, SqliteChainSink, ThreadsDb,
+    ChainLogReader, ChainSink, CorpusStore, EventsDb, IngestChunkRow, IngestDb, SqliteChainSink,
+    ThreadsDb,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -978,6 +979,167 @@ pub async fn optimize(
     Ok(OptimizeOutcome {
         elapsed: started.elapsed(),
         versions_pruned,
+    })
+}
+
+/// Outcome of a [`recover_orphans`] pass.
+pub struct RecoverOrphansOutcome {
+    /// Total rows in the backup corpus.
+    pub backup_rows: usize,
+    /// Total rows in the live corpus (before recovery).
+    pub live_rows: usize,
+    /// `chunk_id`s present in the backup but absent from the live corpus.
+    pub orphans: usize,
+    /// Rows actually re-ingested into the live corpus (0 on a dry run).
+    pub recovered: usize,
+    /// Whether this was a dry run (diff only, no writes).
+    pub dry_run: bool,
+    /// Wall-clock duration of the pass.
+    pub elapsed: std::time::Duration,
+}
+
+/// Recover backup-only corpus rows into the live corpus.
+///
+/// Targets chunks whose source files were rotated away (e.g. expired Claude
+/// transcripts), for which the backup is the only surviving copy — the
+/// "reindex missing data from the original" half of a backup → wipe → rescan
+/// → recover rebuild.
+///
+/// It diffs `chunk_id`s, reads the backup-only rows' full content (including
+/// their stored embeddings), and `append`s them to the live corpus —
+/// preserving each chunk's original `chunk_id` / `source_config_id` and its
+/// vector. Because the orphans are provably absent from the live corpus and the
+/// backup was embedded by the same model, this copies vectors and appends (no
+/// re-embed, no merge scan), staying O(rows) instead of O(rows²). Idempotent:
+/// re-running re-diffs, so already-recovered rows are no longer orphans.
+///
+/// `from` is the **recall data root** of the backup (the directory that
+/// contains `corpus.lance/`), not the `.lance` directory itself. Run with
+/// `serve`/`watch` stopped — this mutates the live corpus.
+pub async fn recover_orphans(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    from: &Path,
+    batch: usize,
+    dry_run: bool,
+) -> Result<RecoverOrphansOutcome> {
+    let started = Instant::now();
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let root = cfg.expanded_root()?;
+    if from == root {
+        bail!(
+            "--from ({}) must differ from the live corpus root ({})",
+            from.display(),
+            root.display()
+        );
+    }
+    if !from.join("corpus.lance").exists() {
+        bail!(
+            "no corpus.lance under --from {} (point it at the backup's recall data root)",
+            from.display()
+        );
+    }
+
+    let live = CorpusStore::open_or_create(&root, embedder.dim())
+        .await
+        .map_err(|e| anyhow!("open live corpus: {e}"))?;
+    let backup = CorpusStore::open_or_create(from, embedder.dim())
+        .await
+        .map_err(|e| anyhow!("open backup corpus {}: {e}", from.display()))?;
+
+    // Diff chunk_ids: orphans = backup-only.
+    let backup_ids = backup
+        .all_chunk_ids()
+        .await
+        .map_err(|e| anyhow!("read backup chunk ids: {e}"))?;
+    let live_ids: HashSet<String> = live
+        .all_chunk_ids()
+        .await
+        .map_err(|e| anyhow!("read live chunk ids: {e}"))?
+        .into_iter()
+        .collect();
+    let backup_rows = backup_ids.len();
+    let live_rows = live_ids.len();
+    let orphan_ids: Vec<String> = backup_ids
+        .into_iter()
+        .filter(|id| !live_ids.contains(id))
+        .collect();
+    let orphans = orphan_ids.len();
+
+    if dry_run || orphans == 0 {
+        return Ok(RecoverOrphansOutcome {
+            backup_rows,
+            live_rows,
+            orphans,
+            recovered: 0,
+            dry_run,
+            elapsed: started.elapsed(),
+        });
+    }
+
+    let ingest = IngestDb::open(&root).map_err(|e| anyhow!("open ingest db: {e}"))?;
+    let dim = embedder.dim();
+
+    let mut recovered = 0usize;
+    let mut skipped = 0usize;
+    for id_batch in orphan_ids.chunks(batch) {
+        let fetched = backup
+            .fetch_chunks_by_ids(id_batch)
+            .await
+            .map_err(|e| anyhow!("fetch orphan chunks from backup: {e}"))?;
+        // Copy the backup's stored vector and `append` (no merge scan):
+        // orphans are provably absent from the live corpus, so this is a plain
+        // O(rows) insert. The backup was embedded by the same model, so the
+        // vector is valid as-is — no re-embed needed. Rows whose backup vector
+        // is missing or the wrong dim are skipped (a model change calls for a
+        // full re-scan, not orphan recovery).
+        let mut chunks: Vec<Chunk> = Vec::with_capacity(fetched.len());
+        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(fetched.len());
+        for (chunk, embedding) in fetched.into_values() {
+            match embedding {
+                Some(e) if e.len() == dim => {
+                    chunks.push(chunk);
+                    embs.push(e);
+                }
+                _ => skipped += 1,
+            }
+        }
+        if chunks.is_empty() {
+            continue;
+        }
+        live.append(&chunks, &embs)
+            .await
+            .map_err(|e| anyhow!("append recovered rows: {e}"))?;
+        // Mirror the rows into the ingest ledger so `verify` reconciles and a
+        // later scan dedupes against them.
+        for chunk in &chunks {
+            let row = IngestChunkRow {
+                chunk_id: chunk.chunk_id.clone(),
+                source: chunk.source.as_str().to_string(),
+                source_id: chunk.source_id.clone(),
+                source_config_id: chunk.source_config_id.clone(),
+                chunk_index: chunk.chunk_index,
+                content_sha256: chunk.sha256.clone(),
+                embedding_input_sha256: chunk.embedding_input_sha256.clone(),
+            };
+            ingest
+                .record_chunk(&row, Some("recover-orphans"))
+                .map_err(|e| anyhow!("record ingest row: {e}"))?;
+        }
+        recovered += chunks.len();
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "orphans skipped (backup vector missing or wrong dim)");
+    }
+
+    Ok(RecoverOrphansOutcome {
+        backup_rows,
+        live_rows,
+        orphans,
+        recovered,
+        dry_run,
+        elapsed: started.elapsed(),
     })
 }
 
@@ -3131,7 +3293,15 @@ const OSTK_SIGNAL_BASENAMES: &[&str] = &[
 /// True if any component of `path` matches a noise segment exactly.
 /// `.ostk`-resident sub-area files (see [`OSTK_SIGNAL_BASENAMES`]) are
 /// exempt — they are the signal the ostk_project scanner exists to read.
+/// Paths through `.ostk/vfs/` are unconditionally noise (→2040): vfs is a
+/// loopback NFS mount served by the ostk daemon, so even a single
+/// `is_file()` stat downstream becomes daemon work — and vfs mirrors
+/// signal basenames like `issues.jsonl` that would otherwise ride the
+/// exemption straight into `discover_paths`.
 fn path_has_noise_segment(path: &Path) -> bool {
+    if path_enters_ostk_vfs(path) {
+        return true;
+    }
     let noisy = path.components().any(|c| {
         c.as_os_str()
             .to_str()
@@ -3156,6 +3326,21 @@ fn path_has_noise_segment(path: &Path) -> bool {
         return false;
     }
     noisy
+}
+
+/// True if `path` contains the adjacent segments `.ostk/vfs` — the
+/// daemon-served loopback mountpoint (→2040). Segment-exact, so a
+/// project directory merely *named* `vfs` outside `.ostk` is unaffected.
+fn path_enters_ostk_vfs(path: &Path) -> bool {
+    let mut prev_was_ostk = false;
+    for c in path.components() {
+        let seg = c.as_os_str().to_str();
+        if prev_was_ostk && seg == Some("vfs") {
+            return true;
+        }
+        prev_was_ostk = seg == Some(".ostk");
+    }
+    false
 }
 
 /// Connect to the scan-trigger surface, write `paths` line-delimited
@@ -3510,6 +3695,44 @@ mod watch_mode_tests {
     fn watch_mode_default_is_legacy() {
         let w = WatchConfig::default();
         assert_eq!(w.mode, WatchMode::Legacy);
+    }
+}
+
+#[cfg(test)]
+mod noise_filter_tests {
+    use std::path::Path;
+
+    use super::path_has_noise_segment;
+
+    #[test]
+    fn ostk_signal_basenames_pass() {
+        assert!(!path_has_noise_segment(Path::new(
+            "/p/haystack/.ostk/journal.jsonl"
+        )));
+        assert!(!path_has_noise_segment(Path::new(
+            "/p/haystack/.ostk/needles/issues.jsonl"
+        )));
+    }
+
+    #[test]
+    fn ostk_vfs_is_unconditional_noise() {
+        // →2040: vfs mirrors signal basenames; the exemption must not
+        // let them through — a downstream stat hits the NFS mount.
+        assert!(path_has_noise_segment(Path::new(
+            "/p/haystack/.ostk/vfs/needles/issues.jsonl"
+        )));
+        assert!(path_has_noise_segment(Path::new(
+            "/p/haystack/.ostk/vfs/journal.jsonl"
+        )));
+        assert!(path_has_noise_segment(Path::new("/p/haystack/.ostk/vfs")));
+    }
+
+    #[test]
+    fn vfs_segment_outside_ostk_is_not_noise() {
+        assert!(!path_has_noise_segment(Path::new("/p/proj/vfs/notes.md")));
+        assert!(!path_has_noise_segment(Path::new(
+            "/p/proj/src/vfs/namespace.rs"
+        )));
     }
 }
 

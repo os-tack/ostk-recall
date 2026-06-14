@@ -170,6 +170,25 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Recover rows that exist only in a backup corpus (e.g. rotated Claude
+    /// transcripts whose source files are gone) into the live corpus — the
+    /// "reindex missing data from the original" half of a backup → wipe →
+    /// rescan rebuild. Diffs `chunk_id`s, then re-embeds and upserts the
+    /// backup-only rows with the current model (originals' ids preserved).
+    /// Idempotent. Run with `serve`/`watch` stopped.
+    RecoverOrphans {
+        /// Recall data root of the backup — the directory that CONTAINS
+        /// `corpus.lance/` (e.g. `~/.local/share/ostk-recall-backups/<ts>`),
+        /// not the `.lance` directory itself.
+        #[arg(long)]
+        from: PathBuf,
+        /// Diff and report only — no embedding, no writes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Orphan `chunk_id`s fetched + re-embedded per batch.
+        #[arg(long, default_value_t = 2000)]
+        batch: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -610,6 +629,35 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
                     out.elapsed.as_secs_f64()
                 ),
                 None => println!("done in {:.1}s", out.elapsed.as_secs_f64()),
+            }
+        }
+        Command::RecoverOrphans {
+            from,
+            dry_run,
+            batch,
+        } => {
+            let embedder = resolve_embedder(cli.config.as_ref())?;
+            if dry_run {
+                println!("recover-orphans (dry run): diffing backup vs live corpus…");
+            } else {
+                println!("recover-orphans: diffing + re-embedding backup-only rows…");
+            }
+            let out = commands::recover_orphans(&config_path, embedder, &from, batch, dry_run).await?;
+            println!(
+                "backup_rows={} live_rows={} orphans={}",
+                out.backup_rows, out.live_rows, out.orphans
+            );
+            if out.dry_run {
+                println!(
+                    "dry run — no rows written ({:.1}s). Re-run without --dry-run to recover.",
+                    out.elapsed.as_secs_f64()
+                );
+            } else {
+                println!(
+                    "recovered {} rows in {:.1}s",
+                    out.recovered,
+                    out.elapsed.as_secs_f64()
+                );
             }
         }
         Command::Weave {
