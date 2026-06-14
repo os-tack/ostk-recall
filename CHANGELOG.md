@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-14
+### Fixed
+- **Fresh corpora had no FTS index, so hybrid recall failed on every query**
+  (`Cannot perform full text search unless an INVERTED index has been
+  created`). `ensure_corpus_indexes` runs on every scan and (per its own doc
+  comment) is meant to backfill the scalar **and** FTS indexes, but it only
+  ever ensured the scalar ones — the `text` inverted index was built solely by
+  `init`, which runs against a still-empty table, so the index covered zero
+  rows and nothing rebuilt it once data landed. Existing corpora only had a
+  working FTS index because they had been re-`init`'d over populated data at
+  some point. A corpus created by `init` → `scan` (the normal path, and the
+  v0.8.0 rebuild) was left with no inverted index. Scan now calls
+  `ensure_fts_index` too, so the first populated scan builds it; the call is
+  idempotent (no-op once a `text` index exists).
+
 ## [0.8.0] - 2026-06-14
 ### Added
 - **`recover-orphans` command** — rebuild the corpus's irreplaceable rows after

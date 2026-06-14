@@ -276,6 +276,18 @@ pub struct ServeContext {
 /// `cleanup_old_versions` (an O(versions) walk) every 20th commit, even
 /// when nothing is old enough to delete.
 async fn ensure_corpus_indexes(store: &CorpusStore) -> Result<()> {
+    // FTS (inverted) index on `text` — hybrid recall's BM25 leg cannot run
+    // without it. `init` builds it once at create time, but a freshly-created
+    // corpus is empty then, so the index covers zero rows; the first populated
+    // scan must (re)build it. Omitting this call here is exactly what stranded
+    // the v0.8.0 rebuilt corpus with no inverted index — every recall errored
+    // "Cannot perform full text search unless an INVERTED index has been
+    // created". `ensure_fts_index` is idempotent (no-op once a `text` index
+    // exists), so running it every scan is cheap.
+    store
+        .ensure_fts_index()
+        .await
+        .map_err(|e| anyhow!("ensure fts index: {e}"))?;
     store
         .ensure_auto_cleanup_disabled()
         .await
