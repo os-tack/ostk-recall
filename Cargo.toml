@@ -57,7 +57,7 @@ ostk-recall-cli = { path = "crates/cli" }
 
 # external
 model2vec-rs = "0.1.4"
-lancedb = "0.29.0"
+lancedb = "0.30.0"
 arrow = "58"
 arrow-array = "58"
 arrow-schema = "58"
