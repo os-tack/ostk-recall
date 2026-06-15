@@ -54,5 +54,11 @@ pub async fn recall_stats(
         reranker: reranker_stats,
         audit_newest_ts,
         watch,
+        // The salience-health pull leg (axis 4) is injected at the MCP server
+        // layer, where the attention surface + threads ledger live — the
+        // `QueryEngine` does not hold those handles (same split as
+        // `stale_ingest`, which is server-injected rather than computed here).
+        // Left `None` for embedded/non-attention callers.
+        salience_health: None,
     })
 }

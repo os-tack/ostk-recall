@@ -194,8 +194,13 @@ pub fn act_r_base(ages_hours: &[f32], d: f32) -> f32 {
 }
 
 /// Squash an unbounded non-negative raw activation into `[0, 1)`.
+///
+/// Public so the attention crate's value axis (I3 `value_use`) reuses the
+/// **same** squash as the concept-activation `decayed_access` term rather than
+/// re-deriving it — the THESIS "reuse `activation.rs` curves verbatim, no new
+/// curve" directive.
 #[must_use]
-fn squash(raw: f32) -> f32 {
+pub fn squash(raw: f32) -> f32 {
     raw / (1.0 + raw)
 }
 
@@ -460,7 +465,12 @@ impl ThreadsDb {
 
 /// ACT-R age in hours, floored so a just-touched concept can't blow the
 /// `age^{-d}` term up and a future ts (clock skew) can't go negative.
-fn age_hours_floored(now: DateTime<Utc>, ts: DateTime<Utc>, floor_hours: f32) -> f32 {
+///
+/// Public so the attention crate's value axis (I3 `value_use`) ages its
+/// access timestamps with the **same** floor the concept tier uses — no
+/// duplicated age math (THESIS "reuse the curves").
+#[must_use]
+pub fn age_hours_floored(now: DateTime<Utc>, ts: DateTime<Utc>, floor_hours: f32) -> f32 {
     #[allow(clippy::cast_precision_loss)]
     let hours = (now - ts).num_seconds() as f32 / 3600.0;
     hours.max(floor_hours)

@@ -1129,6 +1129,50 @@ impl AccessWeights {
     }
 }
 
+/// Per-handle surfaced-vs-used roll-up from the access ledger — the shared
+/// join behind the value axis (R2/I3 scores it) and the self-audit never-used
+/// metric (R4/I4 measures it). One helper, two readers, so "surfaced then
+/// used" is reconstructed exactly once (the THESIS "write the join helper
+/// once" directive).
+///
+/// Built by [`ThreadsDb::surfaced_vs_used`] from a handle's evidence/anchor
+/// chunks joined to `chain_log` access events. The distinct-`query_hash` gate
+/// (the `salience-vs-familiarity` discipline, mirrors
+/// `activation.rs::scan_concept_signals`) is applied to `used_weighted` and
+/// `distinct_used_queries` so a chatty recall loop sharing one `query_hash`
+/// can't inflate "used."
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct UseLedger {
+    /// Count of `LensIncluded` accesses (ambient surfacing) on this handle's
+    /// chunks. The "surfaced" side of the click-through; v1's value loop does
+    /// not damp on it (no wasted signal until the deferred `ThreadSurfaced`
+    /// event — design §4.4), but R4 metric 3 reads it.
+    pub surfaced: u32,
+    /// Weighted "used" mass: Σ over **distinct** `(query_hash, kind)` of
+    /// `AccessWeights.weight_of(kind)` for the used kinds
+    /// (`ExplicitRecall`/`OperatorSelected`/`RecallFault`). Already
+    /// distinct-query-gated; `value_use` decays this by access age.
+    pub used_weighted: f32,
+    /// Distinct `query_hash` count across the used accesses — the salience
+    /// signal (NOT raw access count).
+    pub distinct_used_queries: u32,
+    /// True when the handle has **no** evidence links and no anchor chunk, so
+    /// there is nothing to join the ledger against. R4 §5: flag separately,
+    /// don't miscount as "never used."
+    pub unattributable: bool,
+}
+
+/// One used-access observation kept for `value_use`'s age-decay: the
+/// representative timestamp of a distinct `(query_hash, kind)` bucket and the
+/// `AccessKind` that produced it (so the caller weights by `AccessWeights`).
+/// Returned alongside [`UseLedger`] so the value scorer can apply the ACT-R
+/// age curve without re-scanning the ledger.
+#[derive(Debug, Clone, Copy)]
+pub struct UsedAccess {
+    pub kind: AccessKind,
+    pub ts: DateTime<Utc>,
+}
+
 /// Read-only access to the chunk-access ledger backing ACT-R freshness.
 ///
 /// Synchronous (the backing query is a single indexed SQLite scan under a
@@ -1200,6 +1244,162 @@ impl ChainLogReader for ThreadsDb {
             out.entry(chunk_id.to_string())
                 .or_default()
                 .push((access, ts.with_timezone(&Utc)));
+        }
+        Ok(out)
+    }
+}
+
+impl ThreadsDb {
+    /// Roll up surfaced-vs-used access per handle — the SHARED ledger join
+    /// (design §3.4) consumed by the value axis (I3) and the self-audit
+    /// never-used metric (I4).
+    ///
+    /// `handle_chunks` maps each handle to the chunk-ids that attest it
+    /// (`{anchor_chunk_id} ∪ {Active evidence last_resolved_chunk_id}` — the
+    /// caller, which already loaded the evidence graph in the boot pass, owns
+    /// the membership so the store does not re-read it). A handle present with
+    /// an **empty** chunk set is marked `unattributable` (no evidence to join);
+    /// a handle absent from the map gets no entry.
+    ///
+    /// One batched `chain_log` scan over the union of all chunk-ids (bounded
+    /// like `thread_query`'s cross-axis backfill — one fetch, not per-handle),
+    /// classified by [`AccessKind`]: `LensIncluded` → surfaced;
+    /// `ExplicitRecall`/`OperatorSelected`/`RecallFault` → used. The used side
+    /// is **distinct-`query_hash`-gated** (the `salience-vs-familiarity`
+    /// discipline — mirrors `activation.rs::scan_concept_signals`): accesses
+    /// sharing a `(query_hash, kind)` collapse to one bucket, keeping the most
+    /// recent ts. Returns, per handle, the [`UseLedger`] roll-up plus the
+    /// per-bucket [`UsedAccess`] list so the value scorer can age-decay
+    /// `used_weighted` without re-scanning.
+    ///
+    /// Reads the row `ts` column directly (NOT via `ChainEvent::from_row`,
+    /// which synthesizes `Utc::now()` and would collapse every age — the same
+    /// trap `access_history`/`scan_concept_signals` document).
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    pub fn surfaced_vs_used(
+        &self,
+        handle_chunks: &std::collections::HashMap<String, Vec<String>>,
+        since: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<String, (UseLedger, Vec<UsedAccess>)>> {
+        use std::collections::{HashMap, HashSet};
+
+        // The distinct-(query_hash, kind) bucket key — items-before-statements.
+        type UsedKey = (String, AccessKind);
+
+        let mut out: HashMap<String, (UseLedger, Vec<UsedAccess>)> = HashMap::new();
+        if handle_chunks.is_empty() {
+            return Ok(out);
+        }
+
+        // chunk_id -> handles attesting it (a chunk can back several threads).
+        let mut chunk_to_handles: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (handle, chunks) in handle_chunks {
+            // Seed the entry so an evidence-less handle is `unattributable`
+            // rather than silently absent.
+            out.entry(handle.clone()).or_insert_with(|| {
+                (
+                    UseLedger {
+                        unattributable: chunks.is_empty(),
+                        ..UseLedger::default()
+                    },
+                    Vec::new(),
+                )
+            });
+            for cid in chunks {
+                chunk_to_handles.entry(cid.as_str()).or_default().push(handle);
+            }
+        }
+        if chunk_to_handles.is_empty() {
+            return Ok(out); // every handle was evidence-less → all unattributable
+        }
+
+        // One batched scan over the access kinds; extract chunk_id + query_hash
+        // from the JSON payload and fan out to every handle the chunk attests.
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT ts, kind, payload FROM chain_log \
+             WHERE ts >= ?1 AND kind IN \
+             ('explicit_recall', 'lens_included', 'recall_fault', 'operator_selected') \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt
+            .query_map([since.to_rfc3339()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+
+        // Per handle: the distinct-(query_hash, kind) used buckets (keep most
+        // recent ts) and the raw surfaced (LensIncluded) count.
+        let mut used_buckets: HashMap<&str, HashMap<UsedKey, DateTime<Utc>>> = HashMap::new();
+        let mut surfaced: HashMap<&str, u32> = HashMap::new();
+
+        for (ts_s, kind, payload) in &rows {
+            let Some(access) = AccessKind::from_kind_str(kind) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            let Some(chunk_id) = v.get("chunk_id").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(handles) = chunk_to_handles.get(chunk_id) else {
+                continue;
+            };
+            let Ok(ts) = DateTime::parse_from_rfc3339(ts_s) else {
+                continue;
+            };
+            let ts = ts.with_timezone(&Utc);
+            // `LensIncluded` has no query_hash; the used kinds carry one.
+            let query_hash = v
+                .get("query_hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            for h in handles {
+                if matches!(access, AccessKind::LensIncluded) {
+                    *surfaced.entry(*h).or_insert(0) += 1;
+                } else {
+                    // Distinct-(query_hash, kind) gate: keep the most recent ts.
+                    used_buckets
+                        .entry(*h)
+                        .or_default()
+                        .entry((query_hash.clone(), access))
+                        .and_modify(|prev| {
+                            if ts > *prev {
+                                *prev = ts;
+                            }
+                        })
+                        .or_insert(ts);
+                }
+            }
+        }
+
+        // Collapse buckets into the UseLedger roll-up + UsedAccess list. Apply
+        // AccessWeights to each distinct bucket; distinct queries counts the
+        // distinct query_hash across the used buckets.
+        let weights = AccessWeights::default();
+        for (handle, slot) in &mut out {
+            let h = handle.as_str();
+            slot.0.surfaced = surfaced.get(h).copied().unwrap_or(0);
+            if let Some(buckets) = used_buckets.get(h) {
+                let mut used_weighted = 0.0_f32;
+                let mut distinct_q: HashSet<&str> = HashSet::new();
+                let mut accesses = Vec::with_capacity(buckets.len());
+                for ((qh, kind), ts) in buckets {
+                    used_weighted += weights.weight_of(*kind);
+                    distinct_q.insert(qh.as_str());
+                    accesses.push(UsedAccess { kind: *kind, ts: *ts });
+                }
+                slot.0.used_weighted = used_weighted;
+                slot.0.distinct_used_queries =
+                    u32::try_from(distinct_q.len()).unwrap_or(u32::MAX);
+                slot.1 = accesses;
+            }
         }
         Ok(out)
     }
@@ -1967,6 +2167,29 @@ PRAGMA foreign_keys=ON;
         Ok(out)
     }
 
+    /// Anchor vectors of every **dormant** thread that carries a cached
+    /// `anchor_vec` — the STRONG negative-transfer label source (R3 §1A; the
+    /// demoted handles: `per-trigger`, `post-hoc`, `compile-check`,
+    /// `anthropic-*`, …). Mirrors [`Self::reanchor_inputs`] filtered to
+    /// `tension='dormant'`, decoding via [`bytes_to_f32_vec`]. Returns the raw
+    /// (un-centered) embeddings; the caller mean-centers them before use
+    /// (centering is MANDATORY — R3 §TL;DR).
+    pub fn dormant_anchor_vecs(&self) -> Result<Vec<Vec<f32>>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT anchor_vec FROM threads \
+             WHERE tension = 'dormant' AND anchor_vec IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for bytes in rows {
+            out.push(bytes_to_f32_vec(&bytes)?);
+        }
+        Ok(out)
+    }
+
     /// Return every thread handle that anchors on the given `chunk_id`
     /// or has an evidence link whose `last_resolved_chunk_id` matches.
     /// Used by attention-biased recall to lift hits whose chunk is
@@ -2406,6 +2629,36 @@ PRAGMA foreign_keys=ON;
             .query_map(params![handle.as_str()], row_to_evidence)?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
         Ok(rows)
+    }
+
+    /// All evidence rows for every thread, grouped by `thread_handle`. One
+    /// table scan instead of N `list_evidence` calls — the boot-time salience
+    /// precompute pass reads the whole evidence graph once to build each
+    /// handle's co-occurrence histogram (the specificity input). Ordering
+    /// within a handle matches `list_evidence` (`created_at ASC, id ASC`).
+    pub fn list_evidence_all(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<EvidenceLink>>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, thread_handle, original_path, current_path, content_hash,
+                    last_resolved_chunk_id, relation_state, association_type,
+                    category, similarity, created_at, updated_at,
+                    touch_count, last_touched_at
+             FROM evidence_links
+             ORDER BY thread_handle ASC, created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_evidence)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let mut out: std::collections::HashMap<String, Vec<EvidenceLink>> =
+            std::collections::HashMap::new();
+        for link in rows {
+            out.entry(link.thread_handle.as_str().to_string())
+                .or_default()
+                .push(link);
+        }
+        Ok(out)
     }
 
     /// Transition an evidence row to `broken_reference` (chain-emitting).
@@ -4086,5 +4339,114 @@ CREATE TABLE concept_edges (
             }
             _ => unreachable!(),
         }
+    }
+
+    // --- surfaced_vs_used (the SHARED ledger join; I3/I4) ----------------
+
+    /// Build a ThreadsDb whose chain sink writes to the same threads.sqlite,
+    /// so emitted access events are visible to `surfaced_vs_used`'s scan.
+    fn db_with_sink() -> (TempDir, ThreadsDb, Arc<dyn ChainSink>) {
+        let tmp = TempDir::new().unwrap();
+        let sink: Arc<dyn ChainSink> = Arc::new(SqliteChainSink::open(tmp.path()).unwrap());
+        let db = ThreadsDb::open_with_sink(tmp.path(), Arc::clone(&sink)).unwrap();
+        (tmp, db, sink)
+    }
+
+    fn explicit_recall(sink: &Arc<dyn ChainSink>, chunk_id: &str, query_hash: &str) {
+        sink.append(&ChainEvent::ExplicitRecall {
+            chunk_id: chunk_id.into(),
+            query_hash: query_hash.into(),
+            ts: Utc::now(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn surfaced_vs_used_distinct_query_gate_and_classification() {
+        let (_t, db, sink) = db_with_sink();
+        let mut hc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        // `chatty`: 5 ExplicitRecall, ALL one query_hash → 1 distinct used query.
+        hc.insert("chatty".into(), vec!["c-chatty".into()]);
+        for _ in 0..5 {
+            explicit_recall(&sink, "c-chatty", "qh-same");
+        }
+        // `varied`: 2 ExplicitRecall, two distinct query_hashes → 2 distinct.
+        hc.insert("varied".into(), vec!["c-varied".into()]);
+        explicit_recall(&sink, "c-varied", "qh-a");
+        explicit_recall(&sink, "c-varied", "qh-b");
+        // `lit`: only a LensIncluded (surfaced, not used).
+        hc.insert("lit".into(), vec!["c-lit".into()]);
+        sink.append(&ChainEvent::LensIncluded {
+            chunk_id: "c-lit".into(),
+            slot: "ambient".into(),
+            ts: Utc::now(),
+        })
+        .unwrap();
+        // `bare`: present but no chunks → unattributable.
+        hc.insert("bare".into(), Vec::new());
+
+        let since = Utc::now() - chrono::Duration::days(30);
+        let out = db.surfaced_vs_used(&hc, since).unwrap();
+
+        let chatty = out.get("chatty").unwrap();
+        assert_eq!(
+            chatty.0.distinct_used_queries, 1,
+            "5 same-query recalls gate to 1 distinct used query"
+        );
+        let varied = out.get("varied").unwrap();
+        assert_eq!(varied.0.distinct_used_queries, 2);
+        // The salience gate: distinct information beats raw recurrence.
+        assert!(
+            varied.0.used_weighted > chatty.0.used_weighted,
+            "varied (2 distinct) outweighs chatty (5 raw, 1 distinct): {} vs {}",
+            varied.0.used_weighted,
+            chatty.0.used_weighted
+        );
+        // ExplicitRecall weight is 1.0 per distinct bucket.
+        assert!((chatty.0.used_weighted - 1.0).abs() < 1e-6);
+        assert!((varied.0.used_weighted - 2.0).abs() < 1e-6);
+
+        let lit = out.get("lit").unwrap();
+        assert_eq!(lit.0.surfaced, 1, "LensIncluded counts as surfaced");
+        assert_eq!(lit.0.used_weighted, 0.0, "LensIncluded is not used");
+        assert!(!lit.0.unattributable, "lit has an evidence chunk");
+
+        let bare = out.get("bare").unwrap();
+        assert!(
+            bare.0.unattributable,
+            "a handle with no chunks is unattributable, not never-used"
+        );
+        assert_eq!(bare.0.used_weighted, 0.0);
+    }
+
+    #[test]
+    fn surfaced_vs_used_fans_one_chunk_to_many_handles() {
+        // A chunk that backs two threads credits both (a chunk can resonate
+        // with several anchors — weaver.rs writes an edge per anchor).
+        let (_t, db, sink) = db_with_sink();
+        let mut hc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        hc.insert("a".into(), vec!["shared".into()]);
+        hc.insert("b".into(), vec!["shared".into()]);
+        explicit_recall(&sink, "shared", "qh-1");
+
+        let since = Utc::now() - chrono::Duration::days(30);
+        let out = db.surfaced_vs_used(&hc, since).unwrap();
+        assert_eq!(out.get("a").unwrap().0.distinct_used_queries, 1);
+        assert_eq!(out.get("b").unwrap().0.distinct_used_queries, 1);
+    }
+
+    #[test]
+    fn surfaced_vs_used_respects_since_cutoff() {
+        // Events strictly before `since` are not joined.
+        let (_t, db, sink) = db_with_sink();
+        let mut hc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        hc.insert("h".into(), vec!["c".into()]);
+        explicit_recall(&sink, "c", "qh-1");
+        // A `since` in the future excludes the just-written event.
+        let since = Utc::now() + chrono::Duration::days(1);
+        let out = db.surfaced_vs_used(&hc, since).unwrap();
+        let h = out.get("h").unwrap();
+        assert_eq!(h.0.used_weighted, 0.0, "event before since is excluded");
+        assert!(!h.0.unattributable, "still has a chunk, just no recent use");
     }
 }

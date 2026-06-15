@@ -712,6 +712,11 @@ async fn mcp_surface_payload_carries_full_score_attribution() {
         "mentions",
         "resonance_count",
         "time_since_touch_secs",
+        // Autonomous-salience axes (THESIS): always serialized so `why`
+        // decomposes the full scorer, even with the flag off (neutral values).
+        "specificity",
+        "value",
+        "neg_penalty",
     ] {
         assert!(
             why.get(*field).is_some(),

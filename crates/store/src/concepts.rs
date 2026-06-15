@@ -1252,6 +1252,57 @@ impl ThreadsDb {
         Ok(rows)
     }
 
+    /// Per-concept anchor vectors for every **rejected** concept that carries
+    /// embedded evidence — the WEAKER negative-transfer label source (R3 §1B;
+    /// 47 handles: `cache`, `boot`, `daemon`, `page`, `handler`, …). One vector
+    /// per concept: the *mean* of its non-orphaned evidence `anchor_vec`s, so a
+    /// concept with many evidence rows does not over-weight the exemplar set.
+    ///
+    /// Bare session-rejected handles (`follow-up`, `pre-existing`, `re-touch`,
+    /// …) carry NO evidence anchor and are correctly excluded here — R3 §1 is
+    /// emphatic that the bare handle string must NOT be embedded (the
+    /// dormant-thread anchors already cover that vocab; specificity catches the
+    /// rest). Returns raw (un-centered) means; the caller centers them.
+    // The lock guard is intentionally held only for the query block, then
+    // dropped before the lock-free decode/average loop — clippy's
+    // significant-drop lint still fires on the guard inside the block (same as
+    // the sibling `evidence_to_reconcile`), so suppress it for this fn.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn rejected_concept_anchors(&self) -> Result<Vec<Vec<f32>>> {
+        // Hold the connection lock only for the query; the per-concept decode +
+        // averaging runs lock-free below.
+        let rows: Vec<(i64, Vec<u8>)> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT ce.concept_id, ce.anchor_vec \
+                 FROM concept_evidence ce \
+                 JOIN concepts c ON c.id = ce.concept_id \
+                 WHERE c.status = 'rejected' \
+                   AND ce.relation_state != 'orphaned' \
+                   AND ce.anchor_vec IS NOT NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?
+        };
+        // Group evidence vectors per concept, then average within each concept
+        // so a concept with many evidence rows contributes ONE exemplar.
+        let mut by_concept: std::collections::HashMap<i64, Vec<Vec<f32>>> =
+            std::collections::HashMap::new();
+        for (concept_id, bytes) in rows {
+            by_concept
+                .entry(concept_id)
+                .or_default()
+                .push(bytes_to_f32_vec(&bytes)?);
+        }
+        let mut out = Vec::with_capacity(by_concept.len());
+        for vecs in by_concept.into_values() {
+            if let Some(mean) = mean_vec(&vecs) {
+                out.push(mean);
+            }
+        }
+        Ok(out)
+    }
+
     /// Re-point an evidence row to a freshly resolved chunk. Coordinates +
     /// pointer + content hash are overwritten; `anchor_vec` is written only
     /// when supplied (so re-resolution preserves the original semantic
@@ -1436,6 +1487,34 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (na.sqrt() * nb.sqrt())
     }
+}
+
+/// Element-wise mean of equal-length vectors. Returns `None` for an empty
+/// input or when the vectors disagree on dimension (the safe choice — a
+/// dimension mismatch should never silently produce a malformed centroid).
+/// Used by [`ThreadsDb::rejected_concept_anchors`] to collapse a concept's
+/// multiple evidence anchors into one exemplar; intentionally does NOT
+/// normalize (the negative-transfer caller centers, then normalizes).
+// `vecs.len()` is a per-concept evidence-row count (tiny), well within f32
+// mantissa range — the divisor cast is exact in practice.
+#[allow(clippy::cast_precision_loss)]
+fn mean_vec(vecs: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let first = vecs.first()?;
+    let dim = first.len();
+    if dim == 0 || vecs.iter().any(|v| v.len() != dim) {
+        return None;
+    }
+    let mut acc = vec![0.0f32; dim];
+    for v in vecs {
+        for (a, x) in acc.iter_mut().zip(v.iter()) {
+            *a += *x;
+        }
+    }
+    let n = vecs.len() as f32;
+    for a in &mut acc {
+        *a /= n;
+    }
+    Some(acc)
 }
 
 // ---------------------------------------------------------------------

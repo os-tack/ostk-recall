@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Autonomous-salience scorer, axis 1 (specificity) — behind a flag.** New
+  `[salience]` config block with a master `scorer_v2` flag (default **OFF**, so
+  `compute_score_parts` stays bit-identical to v1 until opted in). The
+  specificity axis computes each thread handle's co-occurrence entropy across
+  the distinct source documents its evidence links resonate with
+  (`specificity = 1 − H/H_max`) and multiplies it into the idle floor — the
+  principled, continuous replacement for the binary `is_stop_handle` cliff. A
+  handle that resonates with *everything* (diffuse, high-entropy — `re-read`,
+  `top-level`) self-demotes toward the unresonant baseline with **no hand-list**;
+  a concentrated concept (`cognitive-memory`, `dereference-or-void`) is
+  preserved. Factors are precomputed once at boot (one evidence-graph scan +
+  corpus join) and carried scope-independently on the attention runtime; the
+  scorer reads them by value with zero added score-time cost. Value (axis 3) and
+  negative-transfer (axis 2) fields ship as the neutral identity for now.
+  `ScoreAttribution` gains `specificity`/`value`/`neg_penalty` (serde-default
+  neutral, so older clients still parse). The curated `[weaver] stop_handles`
+  set stays wired as a safety net and A/B control.
+- **Autonomous-salience axis 4 (self-audit) — salience-health metrics on
+  `recall_stats`.** The surfacer can now see its own drift. A new
+  `recall_stats.salience_health` block (pull leg, always present when an
+  attention surface is wired; omitted otherwise so old MCP clients keep
+  parsing) reports four decomposed metrics over the active surface: (1)
+  normalized score-share **entropy** + a cheap score-spread companion (the
+  collapse / flat-ribbon alarm); (2) the **curated:autonomous ratio** + the
+  hand-list handles still doing load-bearing work (the receipt that the
+  stop-set is becoming redundant); (3) **surfaced-but-never-used** handles
+  (`LensIncluded` ≥ N with zero distinct used queries), via the shared
+  `surfaced_vs_used` ledger join, with `unattributable` handles flagged
+  separately rather than miscounted; (4) **active-vs-decided drift** (Jaccard
+  distance between the active surface and the recently-judged-salient concept
+  set) plus the `J \ A` *forgotten* tail — handles the operator judged salient
+  that the surfacer dropped (the dangling-anchor failure mode). When a
+  threshold breaches, a compact loud-on-failure verdict is also pushed into
+  tool responses (the `stale_ingest` pull+push pattern). The compute path is
+  **pure observation, NOT flag-gated** — it watches both the v1 and `scorer_v2`
+  scorers, so its metrics double as the A/B scoreboard. Thresholds live in a
+  `[salience.health]` config block (live-tunable); the result is cached on a
+  30s TTL. Every metric is decomposable (carries its `why`).
 
 ## [0.8.3] - 2026-06-15
 ### Changed

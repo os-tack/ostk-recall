@@ -46,6 +46,12 @@ pub struct Config {
     /// `record_kind:harness_orchestration` from weaving).
     #[serde(default)]
     pub weaver: Option<WeaverSettings>,
+    /// Optional autonomous-salience scorer tuning (`[salience]`). Omit to
+    /// accept defaults — the master `scorer_v2` flag defaults OFF, so an
+    /// absent block leaves `compute_score_parts` bit-identical to the v1
+    /// scorer. See [`SalienceSettings`].
+    #[serde(default)]
+    pub salience: Option<SalienceSettings>,
     /// Optional rank-engine feature weights (P5), keyed by retrieval
     /// profile. Omit the `[ranking]` block to accept the compiled-in
     /// defaults (explicit recall: `rrf = 1.0`; ambient/lens:
@@ -474,6 +480,237 @@ impl WeaverSettings {
     #[must_use]
     pub fn resolve(slot: Option<&Self>) -> Self {
         slot.cloned().unwrap_or_default()
+    }
+}
+
+// --- autonomous salience (`[salience]`) -------------------------------------
+// The unified-scorer evolution (THESIS `salience = specificity × value ×
+// recency − negative_penalty`). Every knob ships behind the master
+// `scorer_v2` flag, default OFF, so an absent block is bit-identical to the
+// v1 scorer. Mirrors `WeaverSettings` exactly: `deny_unknown_fields`, a
+// per-field `#[serde(default = "…")]`, a `Default` impl, and `resolve`.
+
+/// Tuning for the autonomous-salience scorer (`[salience]` block).
+///
+/// `scorer_v2` is the master A/B flag: `false` (default) ⇒ today's scorer,
+/// every factor is the neutral identity and `compute_score_parts` is
+/// bit-identical to v1. The three `*_enabled` toggles let each axis be
+/// validated independently on the live thread set.
+// The master flag + three per-axis toggles are intentionally distinct bools,
+// each mapping 1:1 to a `[salience]` config key the operator sets.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SalienceSettings {
+    /// Master flag. `false` ⇒ factors are identity, scorer unchanged.
+    #[serde(default = "default_salience_scorer_v2")]
+    pub scorer_v2: bool,
+    /// Axis 1 (specificity / co-occurrence entropy). The core; ships first.
+    #[serde(default = "default_true")]
+    pub specificity_enabled: bool,
+    /// Axis 3 (value / use + judgment). v1 is a `value_neutral = 1.0`
+    /// pass-through (attribution-only) — see [`Self::value_neutral`].
+    #[serde(default = "default_true")]
+    pub value_enabled: bool,
+    /// Axis 2 (negative-transfer proximity to rejected/dormant exemplars).
+    #[serde(default = "default_true")]
+    pub negative_enabled: bool,
+
+    // --- specificity (R1) ---
+    /// Neutral (`specificity = 1.0`) below this many resonating chunks — not
+    /// enough evidence to call a handle diffuse. Mirrors `STOPWORD_MENTION_MIN`.
+    #[serde(default = "default_specificity_min_evidence")]
+    pub specificity_min_evidence: u32,
+    /// Deny off-diagonal lift to a handle whose specificity is below this — a
+    /// "surprise" from a resonate-with-everything term is not a surprise.
+    #[serde(default = "default_specificity_lift_cutoff")]
+    pub specificity_lift_cutoff: f32,
+
+    // --- value (R2) ---
+    /// `value = value_neutral + (1 − value_neutral)·positive`. v1 ships
+    /// `1.0` ⇒ value is a constant pass-through (no cold-start damp; the
+    /// monotonicity invariant holds trivially). The ceiling-raiser regime
+    /// (`< 1.0`, e.g. `0.7`) unlocks with the deferred `ThreadSurfaced` event.
+    #[serde(default = "default_value_neutral")]
+    pub value_neutral: f32,
+    /// Weight on `value_use` within `positive`.
+    #[serde(default = "default_value_half")]
+    pub value_w_use: f32,
+    /// Weight on `value_judgment` within `positive`.
+    #[serde(default = "default_value_half")]
+    pub value_w_judg: f32,
+
+    // --- negative-transfer (R3) ---
+    /// Max damp `= 1 − γ`; `γ = 0.8` ⇒ a perfect negative twin keeps ≥ 20% of
+    /// its resonance-driven score (the ostk-cache recoverability guarantee).
+    #[serde(default = "default_neg_gamma")]
+    pub neg_gamma: f32,
+    /// kNN `k` in centered exemplar space. `k = 1` is brittle (the ostk-cache
+    /// cosine-1.0 collision); `k = 3` averages the neighborhood.
+    #[serde(default = "default_negative_knn_k")]
+    pub negative_knn_k: usize,
+    /// Proximity floor below which `neg_penalty = 0`.
+    #[serde(default = "default_negative_tau")]
+    pub negative_tau: f32,
+    /// Treat `neg_penalty` above this like `is_stop` for off-diagonal lift.
+    #[serde(default = "default_negative_lift_cutoff")]
+    pub negative_lift_cutoff: f32,
+
+    // --- shared guards ---
+    /// ε clamp on each `[0,1]` damper (`spec`, `val`, `damp`) so no single
+    /// axis can zero the score outright — demotion is to the unresonant
+    /// baseline, not to nothing ("gate, don't delete").
+    #[serde(default = "default_damper_floor")]
+    pub damper_floor: f32,
+
+    // --- self-audit thresholds (R4) — NOT flag-gated; pure observation ---
+    #[serde(default)]
+    pub health: SalienceHealthSettings,
+}
+
+/// Self-audit (axis #4) thresholds (`[salience.health]`). The health compute
+/// path is NOT flag-gated — it watches both the old and new scorer — so only
+/// its thresholds are config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SalienceHealthSettings {
+    #[serde(default = "default_min_surface_entropy")]
+    pub min_surface_entropy: f32,
+    #[serde(default = "default_max_active_decided_drift")]
+    pub max_active_decided_drift: f32,
+    #[serde(default = "default_never_used_min_surfaced")]
+    pub never_used_min_surfaced: u32,
+    #[serde(default = "default_health_window_days")]
+    pub health_window_days: i64,
+    #[serde(default = "default_health_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+const fn default_salience_scorer_v2() -> bool {
+    false
+}
+const fn default_true() -> bool {
+    true
+}
+const fn default_specificity_min_evidence() -> u32 {
+    5
+}
+const fn default_specificity_lift_cutoff() -> f32 {
+    0.2
+}
+const fn default_value_neutral() -> f32 {
+    1.0
+}
+const fn default_value_half() -> f32 {
+    0.5
+}
+const fn default_neg_gamma() -> f32 {
+    0.8
+}
+const fn default_negative_knn_k() -> usize {
+    3
+}
+const fn default_negative_tau() -> f32 {
+    0.45
+}
+const fn default_negative_lift_cutoff() -> f32 {
+    0.5
+}
+const fn default_damper_floor() -> f32 {
+    0.02
+}
+const fn default_min_surface_entropy() -> f32 {
+    0.6
+}
+const fn default_max_active_decided_drift() -> f32 {
+    0.7
+}
+const fn default_never_used_min_surfaced() -> u32 {
+    10
+}
+const fn default_health_window_days() -> i64 {
+    14
+}
+const fn default_health_ttl_secs() -> u64 {
+    30
+}
+
+impl Default for SalienceSettings {
+    fn default() -> Self {
+        Self {
+            scorer_v2: default_salience_scorer_v2(),
+            specificity_enabled: default_true(),
+            value_enabled: default_true(),
+            negative_enabled: default_true(),
+            specificity_min_evidence: default_specificity_min_evidence(),
+            specificity_lift_cutoff: default_specificity_lift_cutoff(),
+            value_neutral: default_value_neutral(),
+            value_w_use: default_value_half(),
+            value_w_judg: default_value_half(),
+            neg_gamma: default_neg_gamma(),
+            negative_knn_k: default_negative_knn_k(),
+            negative_tau: default_negative_tau(),
+            negative_lift_cutoff: default_negative_lift_cutoff(),
+            damper_floor: default_damper_floor(),
+            health: SalienceHealthSettings::default(),
+        }
+    }
+}
+
+impl Default for SalienceHealthSettings {
+    fn default() -> Self {
+        Self {
+            min_surface_entropy: default_min_surface_entropy(),
+            max_active_decided_drift: default_max_active_decided_drift(),
+            never_used_min_surfaced: default_never_used_min_surfaced(),
+            health_window_days: default_health_window_days(),
+            ttl_secs: default_health_ttl_secs(),
+        }
+    }
+}
+
+/// Clamp a config `f32` into `[lo, hi]`, replacing NaN with `default`. Used by
+/// `SalienceSettings::resolve` so a malformed `[salience]` block can never feed
+/// an out-of-range or NaN knob into the scorer / boot pass — most critically
+/// `damper_floor`, which becomes the `min` of an `f32::clamp(min, 1.0)` that
+/// **panics** when `min > max` or NaN (review Finding 1). This is the
+/// config-layer half of the defense; `SalienceScorer::from` re-sanitizes the
+/// hot-path snapshot as belt-and-suspenders.
+fn sanitize_f32(v: f32, lo: f32, hi: f32, default: f32) -> f32 {
+    if v.is_nan() { default } else { v.clamp(lo, hi) }
+}
+
+impl SalienceSettings {
+    /// Resolve from an optional `[salience]` block, falling back to defaults,
+    /// then **sanitize every knob into its documented range** (review Finding
+    /// 1). A misconfigured block (e.g. `damper_floor = 2.0` or `NaN`) resolves
+    /// to safe values rather than panicking the scorer or distorting the boot
+    /// pass — the toggles and `health` thresholds are untouched.
+    #[must_use]
+    pub fn resolve(slot: Option<&Self>) -> Self {
+        let mut s = slot.cloned().unwrap_or_default();
+        // `damper_floor` is the floor of a `[damper_floor, 1.0]` clamp — hold it
+        // strictly < 1.0 so the clamp range is always valid.
+        s.damper_floor =
+            sanitize_f32(s.damper_floor, 0.0, 1.0 - f32::EPSILON, default_damper_floor());
+        s.neg_gamma = sanitize_f32(s.neg_gamma, 0.0, 1.0, default_neg_gamma());
+        // τ feeds `(prox − τ)/(1 − τ)`; keep it strictly < 1.0 to avoid a
+        // zero/negative denominator (the fn also guards with `.max(EPSILON)`).
+        s.negative_tau =
+            sanitize_f32(s.negative_tau, 0.0, 1.0 - f32::EPSILON, default_negative_tau());
+        s.negative_lift_cutoff =
+            sanitize_f32(s.negative_lift_cutoff, 0.0, 1.0, default_negative_lift_cutoff());
+        s.specificity_lift_cutoff =
+            sanitize_f32(s.specificity_lift_cutoff, 0.0, 1.0, default_specificity_lift_cutoff());
+        s.value_neutral = sanitize_f32(s.value_neutral, 0.0, 1.0, default_value_neutral());
+        // Weights only need to be non-negative finite (the `positive` sum is
+        // clamped to [0,1] downstream); cap at 1.0 so neither dominates.
+        s.value_w_use = sanitize_f32(s.value_w_use, 0.0, 1.0, default_value_half());
+        s.value_w_judg = sanitize_f32(s.value_w_judg, 0.0, 1.0, default_value_half());
+        // kNN k must be >= 1 (it indexes `sims[..k]`; the fn also clamps to
+        // `sims.len()`, but a 0 here would be a silent no-op).
+        s.negative_knn_k = s.negative_knn_k.max(1);
+        s
     }
 }
 
@@ -1159,6 +1396,83 @@ paths = ["~/notes"]
         );
         // Absent `[weaver]` block resolves to the seeded defaults.
         assert_eq!(WeaverSettings::resolve(None).stop_handles, d.stop_handles);
+    }
+
+    #[test]
+    fn salience_default_block_is_scorer_v2_off_and_value_neutral_one() {
+        // An absent `[salience]` block must resolve to defaults with the
+        // master flag OFF and value pinned to the v1 pass-through — so the
+        // scorer is bit-identical to v1 until a config explicitly opts in.
+        let d = SalienceSettings::default();
+        assert!(!d.scorer_v2, "scorer_v2 must default OFF");
+        assert!((d.value_neutral - 1.0).abs() < f32::EPSILON);
+        assert_eq!(d.specificity_min_evidence, 5);
+        assert_eq!(d.negative_knn_k, 3);
+        assert_eq!(SalienceSettings::resolve(None).scorer_v2, d.scorer_v2);
+        // A partial block fills the rest from serde defaults.
+        let s: SalienceSettings = toml::from_str("scorer_v2 = true").unwrap();
+        assert!(s.scorer_v2);
+        assert!(s.specificity_enabled, "omitted toggle ⇒ serde default true");
+        assert!((s.value_neutral - 1.0).abs() < f32::EPSILON);
+        assert_eq!(s.health.never_used_min_surfaced, 10);
+    }
+
+    #[test]
+    fn salience_resolve_sanitizes_out_of_range_and_nan_knobs() {
+        // review Finding 1: a malformed `[salience]` block must resolve to safe
+        // values, never out-of-range / NaN — most critically `damper_floor`,
+        // which is the `min` of an `f32::clamp(min, 1.0)` that panics on
+        // `min > max` / NaN. Test the two named cases (2.0 and NaN) plus a
+        // negative, across the f32 knobs.
+        for bad in [2.0_f32, f32::NAN, f32::INFINITY, -1.0] {
+            let mut raw = SalienceSettings::default();
+            raw.damper_floor = bad;
+            raw.neg_gamma = bad;
+            raw.negative_tau = bad;
+            raw.negative_lift_cutoff = bad;
+            raw.specificity_lift_cutoff = bad;
+            raw.value_neutral = bad;
+            raw.value_w_use = bad;
+            raw.value_w_judg = bad;
+            raw.negative_knn_k = 0;
+            let r = SalienceSettings::resolve(Some(&raw));
+            assert!(
+                (0.0..1.0).contains(&r.damper_floor),
+                "damper_floor must resolve into [0,1), got {} from {bad}",
+                r.damper_floor
+            );
+            for v in [
+                r.neg_gamma,
+                r.negative_tau,
+                r.negative_lift_cutoff,
+                r.specificity_lift_cutoff,
+                r.value_neutral,
+                r.value_w_use,
+                r.value_w_judg,
+            ] {
+                assert!(v.is_finite() && (0.0..=1.0).contains(&v), "knob {v} not finite in [0,1]");
+            }
+            assert!(r.negative_knn_k >= 1, "kNN k must resolve to >= 1");
+            // The clamp the scorer runs is now always valid (no panic).
+            let _ = (1.0f32 - r.neg_gamma).clamp(r.damper_floor, 1.0);
+        }
+    }
+
+    #[test]
+    fn salience_resolve_preserves_in_range_knobs() {
+        // Sanitization is a no-op for valid config — no silent retuning.
+        let mut raw = SalienceSettings::default();
+        raw.damper_floor = 0.05;
+        raw.neg_gamma = 0.75;
+        raw.negative_tau = 0.5;
+        raw.value_w_use = 0.3;
+        raw.negative_knn_k = 5;
+        let r = SalienceSettings::resolve(Some(&raw));
+        assert!((r.damper_floor - 0.05).abs() < 1e-7);
+        assert!((r.neg_gamma - 0.75).abs() < 1e-7);
+        assert!((r.negative_tau - 0.5).abs() < 1e-7);
+        assert!((r.value_w_use - 0.3).abs() < 1e-7);
+        assert_eq!(r.negative_knn_k, 5);
     }
 
     #[test]

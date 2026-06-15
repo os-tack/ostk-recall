@@ -12,9 +12,10 @@ pub mod schema;
 pub mod threads;
 
 pub use activation::{
-    ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy, EDGE_TAU_HOURS,
-    PROMOTED_EDGE_CONFIDENCE, REL_HOP_DECAY, REL_LATENT_K, REL_PROMOTED_RELATION,
-    RelationalSupport, SeedAnchor, default_since, default_since_now, edge_conductance,
+    ACT_R_DECAY_D, ConceptActivation, ConceptActivationReader, ConceptSupport, ConceptWhy,
+    EDGE_TAU_HOURS, PROMOTED_EDGE_CONFIDENCE, REL_HOP_DECAY, REL_LATENT_K, REL_PROMOTED_RELATION,
+    RelationalSupport, SeedAnchor, act_r_base, age_hours_floored, default_since, default_since_now,
+    edge_conductance, squash,
 };
 pub use concepts::{
     AUTHORED_EDGE_CONFIDENCE, AliasSource, ConceptAlias, ConceptAnchor, ConceptEdge,
@@ -31,5 +32,5 @@ pub use schema::{CORPUS_TABLE, corpus_schema};
 pub use threads::{
     AccessKind, AccessWeights, AssociationType, ChainEvent, ChainLogReader, ChainSink,
     EvidenceLink, NoopChainSink, ProposedThreadRecord, RelationState, SqliteChainSink,
-    TensionState, ThreadRecord, ThreadThreadLink, ThreadsDb,
+    TensionState, ThreadRecord, ThreadThreadLink, ThreadsDb, UseLedger, UsedAccess,
 };

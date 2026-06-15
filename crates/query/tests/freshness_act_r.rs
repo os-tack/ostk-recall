@@ -12,7 +12,7 @@ use ostk_recall_core::{Chunk, FacetSet, Links, Source};
 use ostk_recall_query::{
     AttentionContext, Candidate, FreshnessFactory, QueryContext, RankFeatureFactory,
 };
-use ostk_recall_store::{AccessKind, AccessWeights, ChainLogReader};
+use ostk_recall_store::{AccessKind, ChainLogReader};
 
 /// A `ChainLogReader` that returns a fixed, pre-baked history regardless
 /// of `since` (the test controls ages directly via the event timestamps).

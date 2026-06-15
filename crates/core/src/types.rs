@@ -286,6 +286,98 @@ pub struct RecallStats {
     /// this corpus root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watch: Option<serde_json::Value>,
+    /// Autonomous-salience axis 4 (self-audit): a decomposed health read of
+    /// the surfacer's own active surface — entropy, curated:autonomous ratio,
+    /// surfaced-but-never-used handles, and active-vs-decided drift. Computed
+    /// by `salience_health` (`ostk-recall-attention::health`) and surfaced
+    /// here as the always-on pull leg, modeled on `audit_newest_ts` /
+    /// `stale_ingest`. Omitted (`None`) when no attention surface is wired
+    /// (non-attention deployments / `--stdio`) so old MCP clients keep
+    /// parsing. NOT gated on `scorer_v2` — it watches both scorers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salience_health: Option<SalienceHealth>,
+}
+
+/// Self-audit (autonomous-salience axis 4) — a decomposed health read of the
+/// surfacer's active surface. Every metric carries its `why` (the component
+/// handles/counts that produced it), never a bare scalar, per
+/// `abi-as-sovereign-boundary`: argue with the math, not the vibe.
+///
+/// Computed over the *active surface* (the pages `attention_surface` returns
+/// above `ARCHIVE_THRESHOLD`) plus the access ledger and the judged-handle
+/// set. Surfaced on `recall_stats` (pull) and pushed into responses when a
+/// threshold breaches (loud-on-failure), the same dual-leg pattern as
+/// `stale_ingest`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SalienceHealth {
+    /// Metric 1: normalized Shannon entropy `H/ln(N)` of the surface's
+    /// score-share distribution, in `[0,1]`. `→1` = score spread evenly
+    /// across many handles (healthy, diverse); `→0` = a few handles dominate
+    /// the surface mass (collapse / a coherent-noise handle eating the
+    /// surface). `None` when the surface has < 2 pages (entropy undefined).
+    pub surface_entropy: Option<f32>,
+    /// Metric 1 companion (cheap, embedding-free): `max_score − min_score`
+    /// over the surface. A tight ribbon (the live ~0.25-wide baseline) means
+    /// the floor dominates and handles bunch regardless of discrimination.
+    pub surface_score_spread: f32,
+    /// Metric 2: fraction of the surface held up by the curated set
+    /// (`forced_stop` / hand-authored anchors) in `[0,1]`. Health = trending
+    /// *down* without surface quality dropping — the THESIS goal that the
+    /// curated stop-set becomes redundant.
+    pub curated_ratio: f32,
+    /// Metric 2 `why`: the specific curated handles still on the surface — the
+    /// hand-list entries still doing load-bearing work.
+    pub curated_load_bearing: Vec<String>,
+    /// Metric 3: handles surfaced `≥ never_used_min_surfaced` times
+    /// (`LensIncluded`) but never used (`ExplicitRecall`/`OperatorSelected`/
+    /// `RecallFault`). Pure surface cost — context budget spent, nothing
+    /// returned. `unattributable` handles (no evidence to join against) are
+    /// excluded here and reported separately.
+    pub never_used: Vec<NeverUsed>,
+    /// Metric 3 caveat: surface handles with no evidence links / anchor chunk,
+    /// so the access ledger cannot attribute use to them. Flagged separately
+    /// (R4 §5) rather than miscounted as "never used."
+    pub unattributable: Vec<String>,
+    /// Metric 4: Jaccard distance `1 − |A∩J| / |A∪J|` between the active
+    /// surface `A` and the recently-judged-salient set `J` (handles in active
+    /// concepts / recent decisions). `→0` = the active set tracks operator
+    /// judgment (healthy); `→1` = divergence. `None` when both sets are empty.
+    pub active_decided_drift: Option<f32>,
+    /// Metric 4 top alarm: `J \ A` — handles the operator recently judged
+    /// salient that are NOT on the active surface ("judged salient but the
+    /// surfacer forgot"). This is the dangling-anchor / dropped-thread failure
+    /// mode `projection-truth` is meant to catch.
+    pub drift_forgotten: Vec<String>,
+    /// The thresholds this read was judged against (`[salience.health]`),
+    /// echoed so the block is self-interpreting — the window especially, since
+    /// never-used and drift are windowed.
+    pub thresholds: SalienceHealthThresholds,
+    /// True when ANY threshold breached (entropy below floor, drift above
+    /// ceiling, or a non-empty `never_used`). The push leg fires on this.
+    pub unhealthy: bool,
+}
+
+/// One surfaced-but-never-used handle (self-audit metric 3). Carries the raw
+/// counts so the flag is decomposable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NeverUsed {
+    pub handle: String,
+    /// `LensIncluded` count over the health window.
+    pub surfaced: u32,
+    /// Distinct `query_hash` count of *used* accesses (0 by definition of the
+    /// flag, but carried for symmetry / future windows where it relaxes).
+    pub used: u32,
+}
+
+/// The `[salience.health]` thresholds echoed onto a [`SalienceHealth`] block
+/// so the read interprets itself (R4 §5: report the window — never-used and
+/// drift are windowed and the number is meaningless without it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SalienceHealthThresholds {
+    pub min_surface_entropy: f32,
+    pub max_active_decided_drift: f32,
+    pub never_used_min_surfaced: u32,
+    pub window_days: i64,
 }
 
 /// Per-project newest audit_events timestamp (→1947 freshness guard).

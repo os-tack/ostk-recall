@@ -129,6 +129,29 @@ pub struct ScoreAttribution {
     pub off_diagonal_lift: f32,
     /// Seconds since the thread was last touched.
     pub time_since_touch_secs: u64,
+    /// Autonomous-salience axis 1: co-occurrence specificity multiplier in
+    /// `[0,1]` as applied this score (`1.0` = neutral / scorer_v2 off). A
+    /// diffuse handle (`→0`) has had its idle floor damped toward the
+    /// unresonant baseline. `#[serde(default)]` so pre-axis MCP clients still
+    /// parse pages written by an older serve.
+    #[serde(default = "default_neutral_multiplier")]
+    pub specificity: f32,
+    /// Autonomous-salience axis 3: value multiplier in `[value_neutral, 1.0]`
+    /// (`1.0` = neutral / v1 pass-through).
+    #[serde(default = "default_neutral_multiplier")]
+    pub value: f32,
+    /// Autonomous-salience axis 2: negative-transfer proximity penalty in
+    /// `[0,1]` (`0.0` = neutral / no proximity to a rejected exemplar).
+    #[serde(default)]
+    pub neg_penalty: f32,
+}
+
+/// Serde default for the salience multiplier axes: neutral identity `1.0`, so
+/// an `AttentionPage` serialized before these axes existed deserializes as
+/// "no salience adjustment" rather than zero (which would read as fully
+/// damped).
+fn default_neutral_multiplier() -> f32 {
+    1.0
 }
 
 /// One row returned by `surface()`.
@@ -373,6 +396,9 @@ mod tests {
             resonance_count: 9,
             off_diagonal_lift: 0.03,
             time_since_touch_secs: 11 * 86_400,
+            specificity: 0.6,
+            value: 1.0,
+            neg_penalty: 0.25,
         };
         let v: ScoreAttribution = round_trip(&s);
         assert!(f32_eq(v.tension, s.tension));
@@ -381,6 +407,25 @@ mod tests {
         assert_eq!(v.resonance_count, s.resonance_count);
         assert!(f32_eq(v.off_diagonal_lift, s.off_diagonal_lift));
         assert_eq!(v.time_since_touch_secs, s.time_since_touch_secs);
+        assert!(f32_eq(v.specificity, s.specificity));
+        assert!(f32_eq(v.value, s.value));
+        assert!(f32_eq(v.neg_penalty, s.neg_penalty));
+    }
+
+    #[test]
+    fn score_attribution_defaults_neutral_for_old_payload() {
+        // A payload written before the salience axes existed (no specificity/
+        // value/neg_penalty keys) must deserialize to the neutral identity:
+        // multipliers 1.0, penalty 0.0 — i.e. "no salience adjustment", not 0.
+        let json = r#"{
+            "tension": 0.1, "resonance": 0.2, "mentions": 3,
+            "resonance_count": 2, "off_diagonal_lift": 0.0,
+            "time_since_touch_secs": 100
+        }"#;
+        let v: ScoreAttribution = serde_json::from_str(json).unwrap();
+        assert!(f32_eq(v.specificity, 1.0));
+        assert!(f32_eq(v.value, 1.0));
+        assert!(f32_eq(v.neg_penalty, 0.0));
     }
 
     #[test]
@@ -396,6 +441,9 @@ mod tests {
                 resonance_count: 9,
                 off_diagonal_lift: 0.03,
                 time_since_touch_secs: 950_400,
+                specificity: 1.0,
+                value: 1.0,
+                neg_penalty: 0.0,
             },
         };
         let v: AttentionPage = round_trip(&p);

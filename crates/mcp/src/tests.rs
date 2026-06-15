@@ -434,3 +434,54 @@ async fn stale_ingest_silent_when_ingest_keeps_pace() {
     // Pull path stays unconditionally truthful.
     assert!(body.get("audit_newest_ts").is_some());
 }
+
+// Autonomous-salience axis 4 (self-audit): the salience-health PULL leg on
+// `recall_stats` is present (and decomposed) when an attention surface is
+// wired, and absent — degrade-to-omission — when it is not. Mirrors the
+// `audit_newest_ts` pull-leg contract.
+#[tokio::test]
+async fn salience_health_pull_leg_present_with_attention() {
+    let (_tmp, server) = build_server_with_attention().await;
+    let body = stats_response_body(&server).await;
+    let health = body
+        .get("salience_health")
+        .expect("pull leg present when attention is wired");
+    // Decomposed block — every metric field is carried (R4
+    // `abi-as-sovereign-boundary`), even on an empty fresh surface.
+    for field in [
+        "surface_score_spread",
+        "curated_ratio",
+        "curated_load_bearing",
+        "never_used",
+        "unattributable",
+        "drift_forgotten",
+        "thresholds",
+        "unhealthy",
+    ] {
+        assert!(
+            health.get(field).is_some(),
+            "salience_health missing `{field}`: {health}"
+        );
+    }
+    // A fresh, empty surface has no drift / collapse / never-used ⇒ healthy,
+    // so the conditional PUSH leg must NOT fire on this same response.
+    assert_eq!(health["unhealthy"], serde_json::json!(false));
+    assert_eq!(
+        health["thresholds"]["window_days"],
+        serde_json::json!(14),
+        "shipped [salience.health] default window"
+    );
+}
+
+#[tokio::test]
+async fn salience_health_absent_without_attention() {
+    // No attention dispatch wired (the `--stdio` / embedded path) ⇒ the pull
+    // field is omitted entirely so old MCP clients keep parsing, the same
+    // degrade contract `audit_newest_ts` uses with no events DB.
+    let (_tmp, server) = build_server().await;
+    let body = stats_response_body(&server).await;
+    assert!(
+        body.get("salience_health").is_none(),
+        "no attention surface ⇒ no salience_health pull field: {body}"
+    );
+}

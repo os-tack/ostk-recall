@@ -25,8 +25,9 @@ pub use chunk::{Chunk, Links};
 pub use config::{
     AMBIENT_GROWTH_EDGE_TOP_K_MAX, AmbientGrowthConfig, Config, CorpusConfig, EmbedderConfig,
     LensSettings, ProfileWeights, RankProfile, RankingConfig, RelationalConfig, RerankerConfig,
-    RuntimeConfig, SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SourceConfig, WatchConfig, WatchMode,
-    WeaverSettings, compute_source_config_id, default_profile_weights, default_worker_threads,
+    RuntimeConfig, SYNTHETIC_SOURCE_CONFIG_ID_PREFIX, SalienceHealthSettings, SalienceSettings,
+    SourceConfig, WatchConfig, WatchMode, WeaverSettings, compute_source_config_id,
+    default_profile_weights, default_worker_threads,
 };
 pub use error::{Error, Result};
 pub use facets::{
@@ -40,8 +41,9 @@ pub use record_rules::{
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};
 pub use types::{
-    AttentionBiasParams, AuditResult, MatchFeature, RankingOverrides, RecallHit, RecallLinkResult,
-    AuditFreshness, RecallParams, RecallStats, RerankerStats, SourceCount, SynthesizedPage,
+    AttentionBiasParams, AuditResult, MatchFeature, NeverUsed, RankingOverrides, RecallHit,
+    RecallLinkResult, AuditFreshness, RecallParams, RecallStats, RerankerStats, SalienceHealth,
+    SalienceHealthThresholds, SourceCount, SynthesizedPage,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

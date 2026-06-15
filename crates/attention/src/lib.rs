@@ -20,9 +20,11 @@ pub mod cluster;
 pub mod concept_growth;
 pub mod curator;
 pub mod emergent;
+pub mod health;
 pub mod novelty;
 pub mod observer;
 pub mod query;
+pub mod salience;
 pub mod weaver;
 
 pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
@@ -34,6 +36,11 @@ pub use observer::{
 pub use query::{
     Axis, AxisAttribution, CompositeWeights, RankBy, ThreadQueryAttribution, ThreadQueryError,
     ThreadQueryParams, ThreadQueryReport, run_query,
+};
+pub use health::salience_health;
+pub use salience::{
+    SalienceFactors, SalienceScorer, SourceMeta, center, negative_penalty, shannon_entropy,
+    value_from, value_judgment, value_use,
 };
 pub use weaver::{
     AutoWeaver, ConsolidateOutcome, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome,
@@ -382,6 +389,16 @@ pub trait AttentionForwardStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<AttentionPage>, AttentionError>;
 
+    /// The curated handle set (`[weaver] stop_handles` / hand-authored
+    /// anchors wired via `with_stop_handles`) — the `forced_stop` set the
+    /// scorer treats as a hard demote. Exposed so the self-audit health
+    /// metric (axis 4) can compute the curated:autonomous ratio of the
+    /// surface without reaching into the store internals. Default empty for
+    /// stores that carry no curated set.
+    fn curated_handles(&self) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     /// Set fold-depth state for a thread handle within the scope.
     async fn fold(
         &self,
@@ -697,6 +714,27 @@ fn ema_blend_normalized(prev: &[f32], next: &[f32], lambda: f32) -> Vec<f32> {
 #[derive(Debug, Default)]
 struct Inner {
     scopes: HashMap<ScopeKey, ScopeState>,
+    /// Precomputed per-handle autonomous-salience factors (THESIS axes 1-3),
+    /// keyed by handle string and scope-independent (one factor per handle,
+    /// like `stop_handles`). Default empty ⇒ every lookup is the neutral
+    /// identity, so the scorer is bit-identical to v1. Filled once at boot by
+    /// `re_anchor_threads_from_corpus`'s precompute pass via
+    /// [`InMemoryAttention::set_salience_factors`]. Lives on `Inner` (behind
+    /// the existing `RwLock`) rather than a new `ArcSwap`/`ThreadState` field:
+    /// the scorer's callers (`surface`/`score_thread`) already hold the read
+    /// guard, so they read it directly — no extra lock, no per-thread clone.
+    salience_factors: HashMap<String, salience::SalienceFactors>,
+    /// Negative-transfer exemplar set (THESIS axis 2): centered, normalized
+    /// anchor vectors of rejected/dormant handles. Default empty = neutral (no
+    /// proximity penalty). Filled by I2's boot pass via
+    /// [`InMemoryAttention::set_negative_exemplars`]; carried here, behind the
+    /// same `RwLock`, so the boot pass computes each handle's `neg_penalty`
+    /// once and the scorer never embeds at score time.
+    negative_exemplars: Vec<Vec<f32>>,
+    /// Global anchor mean (THESIS axis 2): the centroid the negative-transfer
+    /// centering subtracts before the kNN. Default empty = neutral. Set
+    /// alongside `negative_exemplars`.
+    global_anchor_mean: Vec<f32>,
 }
 
 /// In-memory attention runtime. Cloning is cheap (Arc-shared).
@@ -707,6 +745,12 @@ struct ScoreParts {
     resonance: f32,
     lift_term: f32,
     dt_secs: u64,
+    /// Per-axis salience factors as applied (post-gating) this score, carried
+    /// onto `ScoreAttribution` so `why` decomposes (`abi-as-sovereign-boundary`
+    /// discipline). With the flag off these are the neutral identity.
+    specificity: f32,
+    value: f32,
+    neg_penalty: f32,
 }
 
 #[allow(
@@ -719,10 +763,42 @@ fn compute_score_parts(
     attention_vec: &[f32],
     now: DateTime<Utc>,
     forced_stop: bool,
+    factors: SalienceFactors,
+    cfg: &SalienceScorer,
 ) -> ScoreParts {
     let resonance = cosine_similarity(&state.anchor, attention_vec);
     let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
     let dt_days = dt_secs as f32 / 86_400.0;
+
+    // --- autonomous-salience axis gating (THESIS) ----------------------
+    // Each axis is individually toggleable and is the neutral identity when
+    // its gate is off, so with `scorer_v2 = false` (every `*_enabled` forced
+    // off in `SalienceScorer::from`) `spec = val = 1.0`, `neg = 0.0`,
+    // `damp = 1.0`, and this function is bit-identical to the v1 scorer.
+    // The ε `damper_floor` clamp keeps any single damper from zeroing the
+    // score outright — demotion is to the unresonant baseline, not to
+    // nothing ("gate, don't delete").
+    let eps = cfg.damper_floor;
+    let spec = if cfg.specificity_enabled {
+        factors.specificity.clamp(eps, 1.0)
+    } else {
+        1.0
+    };
+    let val = if cfg.value_enabled {
+        factors.value.clamp(eps, 1.0)
+    } else {
+        1.0
+    };
+    let neg = if cfg.negative_enabled {
+        factors.neg_penalty
+    } else {
+        0.0
+    };
+    // Bounded multiplicative negative damp `∈ [1 − γ, 1]` (γ < 1) so even a
+    // perfect negative twin keeps ≥ (1 − γ) of its resonance-driven score —
+    // the ostk-cache recoverability guarantee. ε-floored like the others.
+    let damp = (1.0 - cfg.neg_gamma * neg).clamp(eps, 1.0);
+
     // Floor is driven by the resonance *counter* (salience), not raw
     // mentions: a thread surfaces at idle only to the extent it has
     // genuinely resonated. Decay *rate* still tracks mentions (the
@@ -746,23 +822,45 @@ fn compute_score_parts(
     // frequency-derived one: clamp the floor to the unresonant baseline and
     // deny off-diagonal lift, so it can light up while actively discussed but
     // never buys idle dominance. See `[weaver] stop_handles`.
+    //
+    // The `spec × val` product is the principled, continuous generalization
+    // of the binary `is_stop` cliff: a diffuse handle (`spec → 0`) collapses
+    // its earned idle floor toward the unresonant baseline WITHOUT a
+    // hand-list. `is_stop` still wins outright when it fires (the curated set
+    // and the frequency cliff stay wired as a safety net and A/B control), so
+    // a forced-stop handle's floor is `familiarity_floor(0)` and the
+    // `spec·val` damper is a no-op for it — they do not double-count.
     let is_stop = forced_stop || is_stop_handle(state.mentions, state.resonance);
+    let earned_floor = familiarity_floor(state.resonance) * spec * val;
     let resonance_floor = if is_stop {
         familiarity_floor(0)
     } else {
-        familiarity_floor(state.resonance)
+        earned_floor
     };
+    // Negative-transfer damps the floor AND the live resonance term, so a
+    // *novel* harness term near the rejected/dormant centroid is pre-damped
+    // even while actively discussed (not just at idle).
+    let resonance_floor = resonance_floor * damp;
     let floor = resonance_floor * state.fade_multiplier;
     let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
-    let resonance_term = ALPHA * resonance;
+    let resonance_term = ALPHA * resonance * damp;
+    // A "surprise" from a diffuse or negatively-twinned handle is not a
+    // surprise — treat low specificity / high neg like `is_stop` for lift,
+    // which zeroes the off-diagonal bonus.
+    let lift_is_stop = is_stop
+        || (cfg.specificity_enabled && spec < cfg.specificity_lift_cutoff)
+        || (cfg.negative_enabled && neg > cfg.negative_lift_cutoff);
     let lift_term = BETA
-        * off_diagonal_lift(state.tension, resonance, state.resonance, is_stop);
+        * off_diagonal_lift(state.tension, resonance, state.resonance, lift_is_stop);
     let score = decay_term + resonance_term + lift_term;
     ScoreParts {
         score,
         resonance,
         lift_term,
         dt_secs,
+        specificity: spec,
+        value: val,
+        neg_penalty: neg,
     }
 }
 
@@ -869,6 +967,13 @@ pub struct InMemoryAttention {
     /// idle dominance — the lever for "coherent noise" harness vocab that the
     /// derived `is_stop_handle` gate misses. `Arc` so `Clone` stays cheap.
     stop_handles: Arc<std::collections::HashSet<String>>,
+    /// Hot-path snapshot of the `[salience]` scorer knobs + per-axis toggles
+    /// (THESIS autonomous-salience). A plain `Copy` field set at construction
+    /// (the config is known then, unlike the boot-computed factors map which
+    /// lives on `Inner`). Defaults to the neutral identity (`scorer_v2 =
+    /// false`), so unconfigured constructors keep `compute_score_parts`
+    /// bit-identical to v1.
+    salience_scorer: SalienceScorer,
 }
 
 impl Default for InMemoryAttention {
@@ -878,6 +983,7 @@ impl Default for InMemoryAttention {
             embedder: None,
             lambda: DEFAULT_ATTENTION_LAMBDA,
             stop_handles: Arc::new(std::collections::HashSet::new()),
+            salience_scorer: SalienceScorer::default(),
         }
     }
 }
@@ -902,7 +1008,50 @@ impl InMemoryAttention {
             embedder: Some(embedder),
             lambda: DEFAULT_ATTENTION_LAMBDA,
             stop_handles: Arc::new(std::collections::HashSet::new()),
+            salience_scorer: SalienceScorer::default(),
         }
+    }
+
+    /// Install the resolved `[salience]` scorer knobs (THESIS autonomous
+    /// salience). Builder-style so production wiring stays a single chained
+    /// expression alongside `with_stop_handles`. The per-handle factors map is
+    /// set separately, after the boot precompute pass, via
+    /// [`Self::set_salience_factors`] — the knobs are known at construction,
+    /// the factors are not. With the default `SalienceSettings` (`scorer_v2 =
+    /// false`) this is a no-op and the scorer stays v1.
+    #[must_use]
+    pub fn with_salience_settings(mut self, cfg: &ostk_recall_core::SalienceSettings) -> Self {
+        self.salience_scorer = SalienceScorer::from(cfg);
+        self
+    }
+
+    /// Install/replace the precomputed per-handle salience factors. Called
+    /// once at boot after `re_anchor_threads_from_corpus` computes them (and,
+    /// later, on each consolidate cycle). Takes a brief write guard; readers
+    /// (`surface`/`score_thread`) see the new map on their next call. Handles
+    /// absent from the map score with the neutral identity.
+    pub async fn set_salience_factors(&self, factors: HashMap<String, SalienceFactors>) {
+        let mut inner = self.inner.write().await;
+        inner.salience_factors = factors;
+    }
+
+    /// Install/replace the negative-transfer exemplar set + global anchor mean
+    /// (THESIS axis 2). Called once at boot by I2's pass. Like
+    /// [`Self::set_salience_factors`], takes a brief write guard; the boot pass
+    /// must NOT hold any guard on `inner` across this call (tokio `RwLock` is
+    /// not reentrant — compute into locals under a scoped read guard, drop it,
+    /// then call the setter). Default-empty until I2 lands ⇒ neutral.
+    pub async fn set_negative_exemplars(&self, mean: Vec<f32>, exemplars: Vec<Vec<f32>>) {
+        let mut inner = self.inner.write().await;
+        inner.global_anchor_mean = mean;
+        inner.negative_exemplars = exemplars;
+    }
+
+    /// Snapshot the resolved scorer knobs (so the boot pass can read
+    /// `scorer_v2` + the specificity knobs without re-resolving config).
+    #[must_use]
+    pub fn salience_scorer(&self) -> SalienceScorer {
+        self.salience_scorer
     }
 
     /// Install the curated handle stop-set (`[weaver] stop_handles`).
@@ -1427,6 +1576,13 @@ impl AttentionForwardStore for InMemoryAttention {
         Ok(())
     }
 
+    fn curated_handles(&self) -> std::collections::HashSet<String> {
+        // The curated set is the `Arc<HashSet<String>>` wired by
+        // `with_stop_handles`; clone the contents (small hand-list) so the
+        // health metric owns a plain set without holding the Arc.
+        self.stop_handles.as_ref().clone()
+    }
+
     async fn surface(
         &self,
         scope: &AttentionScope,
@@ -1473,7 +1629,21 @@ impl AttentionForwardStore for InMemoryAttention {
                         continue;
                     }
                     let forced_stop = self.stop_handles.contains(handle.as_str());
-                    let parts = compute_score_parts(state, query_vec, now, forced_stop);
+                    // Precomputed salience factors live on `Inner`, behind the
+                    // read guard we already hold — read by value, no extra lock.
+                    let factors = inner
+                        .salience_factors
+                        .get(handle.as_str())
+                        .copied()
+                        .unwrap_or_default();
+                    let parts = compute_score_parts(
+                        state,
+                        query_vec,
+                        now,
+                        forced_stop,
+                        factors,
+                        &self.salience_scorer,
+                    );
                     if parts.score < ARCHIVE_THRESHOLD {
                         continue;
                     }
@@ -1490,6 +1660,9 @@ impl AttentionForwardStore for InMemoryAttention {
                             // axes sum (within float tolerance) to `score`.
                             off_diagonal_lift: parts.lift_term,
                             time_since_touch_secs: parts.dt_secs,
+                            specificity: parts.specificity,
+                            value: parts.value,
+                            neg_penalty: parts.neg_penalty,
                         },
                     };
                     best.entry(handle.to_string())
@@ -1674,13 +1847,25 @@ impl AttentionForwardStore for InMemoryAttention {
         let inner = self.inner.read().await;
         let now = Utc::now();
         let mut best: Option<f32> = None;
+        let factors = inner
+            .salience_factors
+            .get(handle.as_str())
+            .copied()
+            .unwrap_or_default();
         for scope_state in inner.scopes.values() {
             let Some(state) = scope_state.threads.get(handle) else {
                 continue;
             };
             let forced_stop = self.stop_handles.contains(handle.as_str());
-            let score =
-                compute_score_parts(state, scope_state.effective_vec(), now, forced_stop).score;
+            let score = compute_score_parts(
+                state,
+                scope_state.effective_vec(),
+                now,
+                forced_stop,
+                factors,
+                &self.salience_scorer,
+            )
+            .score;
             best = Some(best.map_or(score, |b| b.max(score)));
         }
         Ok(best.unwrap_or(0.0))
@@ -2484,6 +2669,422 @@ mod tests {
             // possible demotion; the curated gate worked.
             None => {}
         }
+    }
+
+    // --- I1: specificity multiplier --------------------------------------
+
+    /// Build a `SalienceSettings` with the master flag ON and only the
+    /// specificity axis enabled (value/negative off) — the I1-isolation
+    /// config the A/B harness's P2 (specificity-alone) run uses.
+    fn salience_specificity_only() -> ostk_recall_core::SalienceSettings {
+        let mut s = ostk_recall_core::SalienceSettings::default();
+        s.scorer_v2 = true;
+        s.specificity_enabled = true;
+        s.value_enabled = false;
+        s.negative_enabled = false;
+        s
+    }
+
+    /// Build a `SalienceSettings` with the master flag ON and only the
+    /// negative-transfer axis enabled (specificity/value off) — the I2
+    /// isolation config, so a surface test exercises the `damp` term alone.
+    fn salience_negative_only() -> ostk_recall_core::SalienceSettings {
+        let mut s = ostk_recall_core::SalienceSettings::default();
+        s.scorer_v2 = true;
+        s.specificity_enabled = false;
+        s.value_enabled = false;
+        s.negative_enabled = true;
+        s
+    }
+
+    /// Build a `SalienceSettings` with the master flag ON and only the value
+    /// axis enabled (specificity/negative off) — the I3 isolation config. The
+    /// `value_neutral` arg lets a test pick v1's pass-through (`1.0`) or the
+    /// deferred ceiling-raiser regime (`< 1.0`) where the multiplier is active.
+    fn salience_value_only(value_neutral: f32) -> ostk_recall_core::SalienceSettings {
+        let mut s = ostk_recall_core::SalienceSettings::default();
+        s.scorer_v2 = true;
+        s.specificity_enabled = false;
+        s.value_enabled = true;
+        s.negative_enabled = false;
+        s.value_neutral = value_neutral;
+        s
+    }
+
+    #[tokio::test]
+    async fn specificity_demotes_diffuse_handle_with_no_hand_list() {
+        // The direct cliff-replacement proof. Two threads with IDENTICAL
+        // counters (300/290, rate 0.97 — NOT a derived stopword) and
+        // identically-aligned anchors, so their live resonance term is equal
+        // and neither is `is_stop`. They differ ONLY in precomputed
+        // specificity: `diffuse` (0.05, the `re-read`/`top-level` case —
+        // resonates everywhere) vs `concentrated` (0.95, the
+        // `cognitive-memory`/`dereference-or-void` case). With NO
+        // `with_stop_handles`, the specificity multiplier alone must rank the
+        // concentrated handle above the diffuse one — reproducing the stop-set
+        // effect unsupervised.
+        assert!(
+            !is_stop_handle(300, 290),
+            "guard: 300/290 is not a derived stopword — specificity must do the work",
+        );
+        let store = InMemoryAttention::new()
+            .with_salience_settings(&salience_specificity_only());
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        for h in ["diffuse", "concentrated"] {
+            store.seed_anchor(&scope, handle(h), v.clone()).await.unwrap();
+            store.seed_counters(&scope, &handle(h), 300, 290).await.unwrap();
+        }
+        let mut factors = HashMap::new();
+        factors.insert(
+            "diffuse".to_string(),
+            SalienceFactors { specificity: 0.05, ..Default::default() },
+        );
+        factors.insert(
+            "concentrated".to_string(),
+            SalienceFactors { specificity: 0.95, ..Default::default() },
+        );
+        store.set_salience_factors(factors).await;
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let conc = pages.iter().find(|p| p.handle == "concentrated").unwrap();
+        let diff = pages.iter().find(|p| p.handle == "diffuse").unwrap();
+        assert!(
+            conc.score > diff.score,
+            "specificity alone (no hand-list) must rank concentrated (0.95) \
+             above diffuse (0.05): conc {} vs diff {}",
+            conc.score,
+            diff.score
+        );
+        // And the attribution decomposes: the diffuse handle reports its damp.
+        assert!(approx_eq(diff.why.specificity, 0.05, 1e-6));
+        assert!(approx_eq(conc.why.specificity, 0.95, 1e-6));
+    }
+
+    #[tokio::test]
+    async fn specificity_one_reproduces_current_scorer() {
+        // The A/B no-regression guard: flag OFF (default settings) ⇒ the
+        // factors map is irrelevant and the score equals the v1 scorer's. We
+        // assert that a store with the flag ON but every handle at the neutral
+        // identity (specificity 1.0) produces the SAME surface scores as a
+        // flag-off store with identical seeds.
+        let scope = scope_for("haystack");
+        let v = stub_embed("ctx");
+
+        let build = |on: bool| {
+            let cfg = {
+                let mut c = ostk_recall_core::SalienceSettings::default();
+                c.scorer_v2 = on;
+                c
+            };
+            InMemoryAttention::new().with_salience_settings(&cfg)
+        };
+
+        let mut scores = Vec::new();
+        for on in [false, true] {
+            let store = build(on);
+            store.attend(&scope, "ctx").await.unwrap();
+            store.seed_anchor(&scope, handle("idea"), v.clone()).await.unwrap();
+            store.seed_counters(&scope, &handle("idea"), 22, 11).await.unwrap();
+            if on {
+                // Explicitly neutral factor — must be a no-op.
+                let mut f = HashMap::new();
+                f.insert("idea".to_string(), SalienceFactors::default());
+                store.set_salience_factors(f).await;
+            }
+            let pages = store.surface(&scope, 10).await.unwrap();
+            scores.push(pages.iter().find(|p| p.handle == "idea").unwrap().score);
+        }
+        assert!(
+            approx_eq(scores[0], scores[1], 1e-6),
+            "neutral specificity must be bit-identical to flag-off: off {} vs on {}",
+            scores[0],
+            scores[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn specificity_does_not_block_active_discussion() {
+        // "Light up while discussed, never idle-dominate." A diffuse handle
+        // (specificity 0.05) whose anchor is ALIGNED with the live attention
+        // vector still surfaces: the floor is clamped, but the live
+        // `ALPHA·resonance` term is untouched by specificity, so an actively
+        // resonating diffuse handle clears ARCHIVE_THRESHOLD.
+        let store = InMemoryAttention::new()
+            .with_salience_settings(&salience_specificity_only());
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx"); // aligned with the scope's attention vec
+
+        store.seed_anchor(&scope, handle("diffuse-live"), v.clone()).await.unwrap();
+        store.seed_counters(&scope, &handle("diffuse-live"), 300, 290).await.unwrap();
+        let mut f = HashMap::new();
+        f.insert(
+            "diffuse-live".to_string(),
+            SalienceFactors { specificity: 0.05, ..Default::default() },
+        );
+        store.set_salience_factors(f).await;
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let p = pages.iter().find(|p| p.handle == "diffuse-live");
+        assert!(
+            p.is_some(),
+            "a diffuse handle actively resonating with the live vector must \
+             still surface (live resonance term is not specificity-gated)"
+        );
+        // The live resonance is the load-bearing term here, not the floor.
+        assert!(pages[0].why.resonance > OFF_DIAGONAL_RESONANCE_FLOOR * 0.5);
+    }
+
+    #[tokio::test]
+    async fn negative_penalty_damps_harness_twin() {
+        // I2 surface-level proof: two threads with IDENTICAL counters and
+        // anchors (so equal live resonance, neither `is_stop`), differing ONLY
+        // in precomputed `neg_penalty`. The high-penalty handle (a near-twin of
+        // the rejected/dormant centroid) must rank BELOW the clean one — the
+        // `1 − γ·neg` damp on the idle floor, with no hand-list.
+        let store =
+            InMemoryAttention::new().with_salience_settings(&salience_negative_only());
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        for h in ["clean", "harness-twin"] {
+            store.seed_anchor(&scope, handle(h), v.clone()).await.unwrap();
+            store.seed_counters(&scope, &handle(h), 300, 290).await.unwrap();
+        }
+        let mut factors = HashMap::new();
+        factors.insert(
+            "clean".to_string(),
+            SalienceFactors { neg_penalty: 0.0, ..Default::default() },
+        );
+        factors.insert(
+            "harness-twin".to_string(),
+            SalienceFactors { neg_penalty: 1.0, ..Default::default() },
+        );
+        store.set_salience_factors(factors).await;
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let clean = pages.iter().find(|p| p.handle == "clean").unwrap();
+        let twin = pages.iter().find(|p| p.handle == "harness-twin").unwrap();
+        assert!(
+            clean.score > twin.score,
+            "a negative-twin (neg 1.0) must rank below a clean handle (neg 0.0) \
+             with no hand-list: clean {} vs twin {}",
+            clean.score,
+            twin.score
+        );
+        // Attribution decomposes the penalty.
+        assert!(approx_eq(twin.why.neg_penalty, 1.0, 1e-6));
+        assert!(approx_eq(clean.why.neg_penalty, 0.0, 1e-6));
+    }
+
+    #[tokio::test]
+    async fn negative_penalty_keeps_recoverable_concept() {
+        // The ostk-cache case (R3 named A/B hard case): a real concept that
+        // reuses rejected sub-vocab gets a HIGH neg_penalty but, because the
+        // damp is bounded (`γ = 0.8` ⇒ floor keeps ≥ 20%) AND the live
+        // resonance term carries the same bounded damp, it stays surfaceable
+        // above a true-noise handle. Here both `ostk-cache` and a pure-noise
+        // handle carry neg_penalty 1.0, but `ostk-cache` also has a strong live
+        // resonance (anchor aligned with the attention vector) while noise does
+        // not — so the bounded form preserves the genuine signal.
+        let store =
+            InMemoryAttention::new().with_salience_settings(&salience_negative_only());
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let aligned = stub_embed("ctx"); // resonates with the live vector
+        let orthogonal = stub_embed("totally-unrelated-context-zzz");
+
+        store.seed_anchor(&scope, handle("ostk-cache"), aligned).await.unwrap();
+        store.seed_counters(&scope, &handle("ostk-cache"), 22, 11).await.unwrap();
+        store.seed_anchor(&scope, handle("pure-noise"), orthogonal).await.unwrap();
+        store.seed_counters(&scope, &handle("pure-noise"), 300, 290).await.unwrap();
+
+        let mut factors = HashMap::new();
+        // Both look like rejected twins by embedding proximity.
+        factors.insert(
+            "ostk-cache".to_string(),
+            SalienceFactors { neg_penalty: 1.0, ..Default::default() },
+        );
+        factors.insert(
+            "pure-noise".to_string(),
+            SalienceFactors { neg_penalty: 1.0, ..Default::default() },
+        );
+        store.set_salience_factors(factors).await;
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let cache = pages
+            .iter()
+            .find(|p| p.handle == "ostk-cache")
+            .expect("ostk-cache must survive the bounded negative damp and stay on the surface");
+        // It clears the archive threshold (bounded damp never zeroes it)...
+        assert!(
+            cache.score >= ARCHIVE_THRESHOLD,
+            "bounded damp must keep ostk-cache above ARCHIVE_THRESHOLD: {}",
+            cache.score
+        );
+        // ...and outranks the equally-penalized but non-resonant noise handle.
+        if let Some(noise) = pages.iter().find(|p| p.handle == "pure-noise") {
+            assert!(
+                cache.score > noise.score,
+                "the recoverable concept (live resonance) must outrank pure noise \
+                 even at equal neg_penalty: cache {} vs noise {}",
+                cache.score,
+                noise.score
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn value_v1_pass_through_is_bit_identical_to_flag_off() {
+        // I3 exit criterion: with the shipped `value_neutral = 1.0`, the value
+        // axis is a pass-through — a proven handle (value factor 1.0, the only
+        // value v1 ever assigns) scores EXACTLY the same as the flag-off
+        // scorer. No value-driven regression in the A/B.
+        let scope = scope_for("haystack");
+        let v = stub_embed("ctx");
+
+        let mut scores = Vec::new();
+        for on in [false, true] {
+            let cfg = if on {
+                salience_value_only(1.0)
+            } else {
+                ostk_recall_core::SalienceSettings::default()
+            };
+            let store = InMemoryAttention::new().with_salience_settings(&cfg);
+            store.attend(&scope, "ctx").await.unwrap();
+            store.seed_anchor(&scope, handle("idea"), v.clone()).await.unwrap();
+            store.seed_counters(&scope, &handle("idea"), 22, 11).await.unwrap();
+            if on {
+                // v1 only ever assigns value = 1.0; assert that is a no-op.
+                let mut f = HashMap::new();
+                f.insert(
+                    "idea".to_string(),
+                    SalienceFactors { value: 1.0, ..Default::default() },
+                );
+                store.set_salience_factors(f).await;
+            }
+            let pages = store.surface(&scope, 10).await.unwrap();
+            scores.push(pages.iter().find(|p| p.handle == "idea").unwrap().score);
+        }
+        assert!(
+            approx_eq(scores[0], scores[1], 1e-6),
+            "v1 value (neutral 1.0) must be bit-identical to flag-off: off {} vs on {}",
+            scores[0],
+            scores[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn value_monotone_raises_proven_handle_in_surface() {
+        // The §4.5 invariant, END-TO-END at the surface: in the unlocked
+        // ceiling-raiser regime (`value_neutral = 0.7`), two threads with
+        // IDENTICAL counters/anchors differ ONLY in value — `proven` (value
+        // 1.0, raised by use/judgment) vs `unproven` (value 0.7, the neutral
+        // floor). The proven handle must score ≥ the unproven one. Value is a
+        // floor multiplier, so the lift shows at idle (counters give a floor;
+        // anchors are orthogonal to the live vector so the resonance term is
+        // ~0 and the floor dominates).
+        let store = InMemoryAttention::new().with_salience_settings(&salience_value_only(0.7));
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        // Orthogonal anchors so the live ALPHA·resonance term is ~0 and the
+        // value-multiplied idle floor is what separates the two.
+        let off = stub_embed("an-unrelated-idle-context-qqq");
+
+        for h in ["proven", "unproven"] {
+            store.seed_anchor(&scope, handle(h), off.clone()).await.unwrap();
+            store.seed_counters(&scope, &handle(h), 22, 11).await.unwrap();
+        }
+        let mut factors = HashMap::new();
+        factors.insert(
+            "proven".to_string(),
+            SalienceFactors { value: 1.0, ..Default::default() },
+        );
+        factors.insert(
+            "unproven".to_string(),
+            SalienceFactors { value: 0.7, ..Default::default() },
+        );
+        store.set_salience_factors(factors).await;
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let proven = pages.iter().find(|p| p.handle == "proven").unwrap();
+        let unproven = pages.iter().find(|p| p.handle == "unproven").unwrap();
+        assert!(
+            proven.score >= unproven.score,
+            "positive evidence may only RAISE value (§4.5): proven {} vs unproven {}",
+            proven.score,
+            unproven.score
+        );
+        assert!(
+            proven.score > unproven.score,
+            "with orthogonal anchors the value-multiplied floor must separate them"
+        );
+        // Attribution decomposes the value axis.
+        assert!(approx_eq(proven.why.value, 1.0, 1e-6));
+        assert!(approx_eq(unproven.why.value, 0.7, 1e-6));
+    }
+
+    #[test]
+    fn compute_score_parts_flag_off_is_bit_exact_v1() {
+        // review Finding 4: a strict `==` bit-identical guard at the
+        // `compute_score_parts` unit level (no surface sort/float-aggregation in
+        // between, so exact equality is well-defined). Two assertions:
+        //  (1) flag-OFF (scorer_v2=false ⇒ every gate forced off) produces the
+        //      SAME raw score as flag-ON with the neutral-identity factor —
+        //      proving the new factor/cfg params are a true no-op when neutral.
+        //  (2) that score equals a hand-computed v1 value
+        //      `floor·decay + ALPHA·resonance + BETA·lift`, anchoring it to the
+        //      pre-branch formula rather than only to itself.
+        let now = Utc::now();
+        let anchor = stub_embed("a real idea worth surfacing");
+        let attn = anchor.clone(); // perfectly aligned ⇒ resonance = 1.0
+        let state = ThreadState {
+            tension: 0.0,
+            mentions: 7,
+            resonance: 11,
+            last_touched_at: now - Duration::days(3),
+            depth: FoldDepth::Folded,
+            fade_multiplier: 1.0,
+            anchor,
+            origin: ScopeKey { project: None, session_id: None, agent: None },
+            origin_was_private: false,
+        };
+
+        let off = SalienceScorer::default(); // scorer_v2 = false
+        let on_neutral = SalienceScorer::from(&{
+            let mut s = ostk_recall_core::SalienceSettings::default();
+            s.scorer_v2 = true; // gates on, but factors are the neutral identity
+            s
+        });
+
+        let s_off =
+            compute_score_parts(&state, &attn, now, false, SalienceFactors::default(), &off).score;
+        let s_on =
+            compute_score_parts(&state, &attn, now, false, SalienceFactors::default(), &on_neutral)
+                .score;
+        assert_eq!(
+            s_off.to_bits(),
+            s_on.to_bits(),
+            "neutral factors must be BIT-EXACT to flag-off at the scorer unit level",
+        );
+
+        // (2) Anchor to the hand-computed v1 formula.
+        let resonance = cosine_similarity(&state.anchor, &attn); // ~1.0
+        let dt_days = (now - state.last_touched_at).num_seconds().max(0) as f32 / 86_400.0;
+        let floor = familiarity_floor(state.resonance) * state.fade_multiplier;
+        let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
+        let expected = decay_term
+            + ALPHA * resonance
+            + BETA * off_diagonal_lift(state.tension, resonance, state.resonance, false);
+        assert_eq!(
+            s_off.to_bits(),
+            expected.to_bits(),
+            "flag-off must be bit-exact to the v1 formula: got {s_off}, expected {expected}",
+        );
     }
 
     #[tokio::test]

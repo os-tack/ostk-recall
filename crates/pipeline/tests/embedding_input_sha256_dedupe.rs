@@ -92,6 +92,7 @@ fn make_cfg(fixtures_dir: &Path, facets_override: &[(&str, &[&str])]) -> SourceC
         lens: None,
         record_rules: None,
         weaver: None,
+        salience: None,
     };
     cfg.validate_and_seal().expect("seal");
     cfg.sources.remove(0)

@@ -50,6 +50,11 @@ pub struct Server {
     /// per-response staleness check costs a clock read, not a sqlite
     /// MAX + journal stats.
     stale_cache: std::sync::Mutex<Option<(std::time::Instant, Option<Value>)>>,
+    /// Autonomous-salience axis 4: cached `salience_health` probe result.
+    /// TTL is `[salience.health].ttl_secs` (default 30s) — the surface scan +
+    /// ledger join is heavier than the staleness probe, so a per-response
+    /// recompute would be wasteful. Same cache shape as `stale_cache`.
+    salience_cache: std::sync::Mutex<Option<(std::time::Instant, Option<Value>)>>,
 }
 
 impl Server {
@@ -61,6 +66,7 @@ impl Server {
             resources: Arc::new(ResourceRegistry::new()),
             config: None,
             stale_cache: std::sync::Mutex::new(None),
+            salience_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -72,6 +78,7 @@ impl Server {
             resources: Arc::new(ResourceRegistry::new()),
             config: None,
             stale_cache: std::sync::Mutex::new(None),
+            salience_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -473,8 +480,22 @@ impl Server {
                     .recall_stats()
                     .await
                     .map_err(query_error_to_rpc)?;
-                serde_json::to_value(out)
-                    .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?
+                let mut value = serde_json::to_value(out)
+                    .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
+                // Salience-health PULL leg (axis 4): the always-on, truthful
+                // field. The `QueryEngine` left `salience_health = null`
+                // (it has no attention handle); fill it here, where the
+                // surface + ledger live. INVARIANT (mirrors `stale_ingest`
+                // L719): `recall_stats` carries this block UNCONDITIONALLY —
+                // pull always-truthful, push (below) loud-on-failure. Do not
+                // make this conditional; that recreates the silent-stale
+                // failure mode with extra steps.
+                if let Some(block) = self.salience_health().await {
+                    if let Value::Object(map) = &mut value {
+                        map.insert("salience_health".to_string(), block);
+                    }
+                }
+                value
             }
             "recall_audit" => {
                 let sql = args
@@ -730,6 +751,20 @@ impl Server {
             }
         }
 
+        // Salience-health PUSH leg (axis 4): a compact verdict appears ONLY
+        // when the surfacer is drifting (entropy collapse, drift over
+        // ceiling, or a surfaced-never-used handle) — healthy responses stay
+        // clean. Same invariant as `stale_ingest`: safe to push conditionally
+        // because `recall_stats` carries the FULL block unconditionally (pull
+        // always-truthful, push loud-on-failure). The push carries only the
+        // verdict + a hint pointing at the full pull block, not the whole
+        // surface scan.
+        if let Some(push) = self.salience_health_push().await {
+            if let Value::Object(map) = &mut result_json {
+                map.insert("salience_health".to_string(), push);
+            }
+        }
+
         // Wrap in MCP content block.
         let text = serde_json::to_string(&result_json)
             .map_err(|e| JsonRpcError::internal(format!("serialize: {e}")))?;
@@ -838,6 +873,154 @@ impl Server {
                 "hint": "audit ingest is lagging its journal — check `recall_stats` audit_newest_ts / watch fields (→1947/→1957)",
             }))
         }
+    }
+
+    /// Autonomous-salience axis 4 (self-audit) — the cached full health block,
+    /// the PULL leg's payload. Cached for `[salience.health].ttl_secs`
+    /// (default 30s) so the surface scan + ledger join is not repaid on every
+    /// `recall_stats`. Returns `None` when no attention dispatch is wired
+    /// (`--stdio`/non-attention deployments) — the same degrade-to-omission
+    /// contract `audit_newest_ts` uses when no events DB is attached.
+    async fn salience_health(&self) -> Option<Value> {
+        let ttl = std::time::Duration::from_secs(self.salience_ttl_secs());
+        let now = std::time::Instant::now();
+        {
+            let cache = self
+                .salience_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((at, cached)) = cache.as_ref() {
+                if now.duration_since(*at) < ttl {
+                    return cached.clone();
+                }
+            }
+        }
+        // Compute outside the lock (it awaits an async surface() — never hold
+        // a std Mutex across an await). A concurrent racer may recompute once;
+        // the result is identical and the window is one TTL at boot.
+        let computed = self.compute_salience_health().await;
+        let mut cache = self
+            .salience_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cache = Some((now, computed.clone()));
+        computed
+    }
+
+    /// The PUSH leg: a compact loud-on-failure verdict, present only when the
+    /// cached block exists AND reports `unhealthy`. Healthy (or absent)
+    /// responses stay clean. Carries the verdict + a hint pointing at the full
+    /// pull block, not the whole surface scan — the direct analogue of
+    /// `compute_stale_ingest`'s conditional return.
+    async fn salience_health_push(&self) -> Option<Value> {
+        let block = self.salience_health().await?;
+        if block.get("unhealthy").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        // Project the alarming fields only; the full decomposition lives on
+        // `recall_stats.salience_health`.
+        Some(json!({
+            "unhealthy": true,
+            "surface_entropy": block.get("surface_entropy"),
+            "active_decided_drift": block.get("active_decided_drift"),
+            "never_used": block.get("never_used"),
+            "drift_forgotten": block.get("drift_forgotten"),
+            "hint": "salience surface is drifting — entropy collapse, \
+                     active-vs-decided drift, or surfaced-never-used handles. \
+                     See recall_stats.salience_health for the full decomposition.",
+        }))
+    }
+
+    /// The `[salience.health].ttl_secs`, defaulting to 30 when no config /
+    /// `[salience]` block is present.
+    fn salience_ttl_secs(&self) -> u64 {
+        self.config
+            .as_ref()
+            .and_then(|c| c.salience.as_ref())
+            .map_or(30, |s| s.health.ttl_secs)
+    }
+
+    /// Gather the inputs (surface, curated set, use-ledger, judged set) and
+    /// run the pure `salience_health` metric. Pure observation — NOT gated on
+    /// `scorer_v2` (design §7.2): it watches whatever the live scorer
+    /// surfaced. Returns `None` only when no attention dispatch is wired.
+    async fn compute_salience_health(&self) -> Option<Value> {
+        use ostk_recall_attention::health::salience_health;
+        use ostk_recall_core::AttentionScope;
+        use ostk_recall_core::config::SalienceHealthSettings;
+        use ostk_recall_store::ConceptActivationReader;
+
+        let dispatch = self.attention.as_ref()?;
+        let cfg: SalienceHealthSettings = self
+            .config
+            .as_ref()
+            .and_then(|c| c.salience.as_ref())
+            .map(|s| s.health.clone())
+            .unwrap_or_default();
+
+        // (1) The active surface. Use the default scope (project=None,
+        // T1Project) — the cross-scope surfacer ranks every visible thread
+        // against it (lib.rs surface()). A wide limit so the entropy/ratio see
+        // the whole active set, not just the top slice.
+        let surface = dispatch
+            .attention
+            .surface(&AttentionScope::default(), 200)
+            .await
+            .ok()?;
+
+        // (2) Curated set (forced_stop / hand-list) for the curated:autonomous
+        // ratio.
+        let curated = dispatch.attention.curated_handles();
+
+        // (3) The surfaced-vs-used ledger over the health window. Build the
+        // handle→chunks map from each handle's Active evidence links
+        // (`last_resolved_chunk_id`) — the SAME shape `surfaced_vs_used`
+        // consumes for the value axis (the shared join, written once). A
+        // handle with no evidence chunks lands as `unattributable`.
+        let since = chrono::Utc::now() - chrono::Duration::days(cfg.health_window_days.max(0));
+        let ledger = match dispatch.threads.list_evidence_all() {
+            Ok(all) => {
+                let mut handle_chunks: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for page in &surface {
+                    let chunks = all.get(&page.handle).map_or_else(Vec::new, |links| {
+                        links
+                            .iter()
+                            .filter(|l| {
+                                l.relation_state == ostk_recall_store::RelationState::Active
+                            })
+                            .filter_map(|l| l.last_resolved_chunk_id.clone())
+                            .collect()
+                    });
+                    handle_chunks.insert(page.handle.clone(), chunks);
+                }
+                dispatch
+                    .threads
+                    .surfaced_vs_used(&handle_chunks, since)
+                    .map(|m| {
+                        m.into_iter()
+                            .map(|(h, (ledger, _accesses))| (h, ledger))
+                            .collect::<std::collections::HashMap<_, _>>()
+                    })
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                warn!(error = %e, "salience_health: list_evidence_all failed; never-used metric degrades to empty");
+                std::collections::HashMap::new()
+            }
+        };
+
+        // (4) The judged-salient set J — handles of currently-active concepts
+        // (durable operator judgment) within the window. The drift metric
+        // compares this against the active surface A.
+        let judged: std::collections::HashSet<String> = dispatch
+            .threads
+            .concept_activations(None, since)
+            .map(|acts| acts.into_iter().map(|a| a.handle).collect())
+            .unwrap_or_default();
+
+        let health = salience_health(&surface, &curated, &ledger, &judged, &cfg);
+        serde_json::to_value(health).ok()
     }
 }
 

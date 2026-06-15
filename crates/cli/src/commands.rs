@@ -19,7 +19,7 @@ use ostk_recall_attention_mcp::AttentionDispatch;
 use ostk_recall_core::attention::{AttentionScope, PrivacyTier};
 use ostk_recall_core::{
     AmbientGrowthConfig, Chunk, CompiledRecordRules, Config, LensSettings, RelationalConfig,
-    RerankerConfig, Scanner, SourceConfig, SourceKind, WatchMode, WeaverSettings,
+    RerankerConfig, SalienceSettings, Scanner, SourceConfig, SourceKind, WatchMode, WeaverSettings,
 };
 use ostk_recall_mcp::{ClientId, ResourceRegistry, Server};
 use ostk_recall_pipeline::{ChunkEmbedder, Pipeline, PipelineStats, VerifyReport};
@@ -1425,9 +1425,11 @@ pub async fn serve(
             // `attend()`-produced scope vectors are cosine-comparable
             // with corpus chunk embeddings — the prerequisite for
             // embedding-mediated attention bias (focus-feature Phase B).
+            let salience_settings = SalienceSettings::resolve(cfg.salience.as_ref());
             let attention_arc: Arc<InMemoryAttention> = Arc::new(
                 InMemoryAttention::with_embedder(Arc::clone(&embedder))
-                    .with_stop_handles(WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles),
+                    .with_stop_handles(WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles)
+                    .with_salience_settings(&salience_settings),
             );
 
             if let Err(err) =
@@ -1452,6 +1454,7 @@ pub async fn serve(
                 &threads_arc,
                 engine.store(),
                 attention_arc.as_ref(),
+                &salience_settings,
             )
             .await
             {
@@ -1968,6 +1971,7 @@ async fn re_anchor_threads_from_corpus(
     threads: &Arc<ThreadsDb>,
     corpus: &Arc<CorpusStore>,
     attention: &InMemoryAttention,
+    salience: &SalienceSettings,
 ) -> Result<usize> {
     let inputs = threads
         .reanchor_inputs()
@@ -2039,7 +2043,294 @@ async fn re_anchor_threads_from_corpus(
              re-anchor with `thread create --anchor <chunk_id>`"
         );
     }
+
+    // --- autonomous-salience precompute (THESIS axis 1) ----------------
+    // Skip all the work when the master flag is off (factors stay empty ⇒ the
+    // scorer is bit-identical to v1). Later axes (value, negative-transfer)
+    // hang their precompute off this same single walk (design §2.2: ONE pass);
+    // I1 fills only the specificity field.
+    if salience.scorer_v2 {
+        if let Err(err) =
+            precompute_salience_factors(threads, corpus, attention, salience).await
+        {
+            // Never block boot on the precompute — a failure just leaves the
+            // factors neutral (the scorer falls back to v1 behavior).
+            tracing::warn!(error = %err, "salience precompute failed; factors left neutral");
+        }
+    }
+
     Ok(seeded)
+}
+
+/// Boot-time per-handle salience precompute (THESIS axes 1-3) — ONE pass that
+/// fills all three fields of the factor map (design §2.2 "design the boot
+/// wiring as ONE pass").
+///
+/// Reads the whole evidence graph once (`list_evidence_all`), resolves the
+/// union of resonating + anchor chunk-ids to their `(project, source, source_id)`
+/// metadata via the corpus, then per handle computes:
+/// - **specificity** (axis 1): co-occurrence entropy `1 − H/H_max`;
+/// - **value** (axis 3): the surfaced/used ledger join (`surfaced_vs_used`) +
+///   curated-confidence propagation (decision/needle evidence +
+///   `concept_support_by_coord`), monotone in positive evidence (v1
+///   `value_neutral = 1.0` ⇒ a pass-through);
+/// - **`neg_penalty`** (axis 2): centered-kNN proximity to the dormant/rejected
+///   exemplar set (built store-level in passes A/B above).
+///
+/// Each axis is skipped entirely when its toggle is off (no DB reads for it),
+/// and its field stays the neutral identity. Cost is bounded: one evidence
+/// scan + one corpus fetch + one ledger scan + one concept-support read, paid
+/// once at boot.
+#[allow(clippy::too_many_lines)]
+async fn precompute_salience_factors(
+    threads: &Arc<ThreadsDb>,
+    corpus: &Arc<CorpusStore>,
+    attention: &InMemoryAttention,
+    salience: &SalienceSettings,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    use ostk_recall_attention::{
+        SalienceFactors, SourceMeta, center, negative_penalty,
+        salience::{specificity_from_evidence, value_from},
+    };
+    use ostk_recall_store::{ConceptActivationReader, RelationState, default_since_now};
+
+    // Per-handle anchors: the negative-transfer query side, plus the global-
+    // mean input. `reanchor_inputs` already carries each anchored thread's
+    // cached `anchor_vec` AND its `anchor_chunk_id`; read once and split into
+    // the per-handle anchor-vector map (negative-transfer query side + global
+    // mean) and the per-handle anchor-chunk map (value's surfaced/used join
+    // unions the anchor chunk with the evidence chunks).
+    let reanchor = threads
+        .reanchor_inputs()
+        .map_err(|e| anyhow!("reanchor_inputs for salience: {e}"))?;
+    let anchors: HashMap<String, Vec<f32>> = reanchor
+        .iter()
+        .filter_map(|i| {
+            i.anchor_vec
+                .clone()
+                .map(|v| (i.handle.as_str().to_string(), v))
+        })
+        .collect();
+    let anchor_chunk: HashMap<String, String> = reanchor
+        .iter()
+        .filter_map(|i| {
+            i.anchor_chunk_id
+                .clone()
+                .map(|c| (i.handle.as_str().to_string(), c))
+        })
+        .collect();
+
+    // ---- negative-transfer passes (A: global mean, B: exemplar set) ----
+    // R3: built ONCE here, store-level. Skipped entirely when the axis is off
+    // (no DB reads, no centering); the neg factor then stays at the neutral
+    // 0.0 and the scorer's `damp` term is the v1 identity.
+    let mut global_mean: Vec<f32> = Vec::new();
+    let mut neg_exemplars: Vec<Vec<f32>> = Vec::new();
+    if salience.negative_enabled {
+        // (A) global anchor mean — the anisotropy correction `center()` needs
+        //     (R3 §TL;DR; design §2.2 A). Mean of every normalized thread anchor.
+        global_mean = mean_normalized(anchors.values());
+        // (B) exemplar set: dormant-thread anchors (STRONG, R3 §1A) + rejected-
+        //     concept evidence anchors (WEAKER, R3 §1B), each centered.
+        let mut neg_raw = threads
+            .dormant_anchor_vecs()
+            .map_err(|e| anyhow!("dormant_anchor_vecs: {e}"))?;
+        neg_raw.extend(
+            threads
+                .rejected_concept_anchors()
+                .map_err(|e| anyhow!("rejected_concept_anchors: {e}"))?,
+        );
+        neg_exemplars = neg_raw.iter().map(|v| center(v, &global_mean)).collect();
+        attention
+            .set_negative_exemplars(global_mean.clone(), neg_exemplars.clone())
+            .await;
+        tracing::info!(
+            exemplars = neg_exemplars.len(),
+            "negative-transfer exemplar set installed"
+        );
+    }
+
+    let ev_by_handle = threads
+        .list_evidence_all()
+        .map_err(|e| anyhow!("list_evidence_all: {e}"))?;
+    // The negative penalty keys on a handle's anchor, not its evidence graph,
+    // and value can key on an anchor chunk's use even with no evidence links —
+    // so a thread with an anchor but no evidence still earns those axes. Only
+    // bail when there is nothing to compute on ANY axis.
+    let have_anchored_work =
+        !anchors.is_empty() && (salience.negative_enabled || salience.value_enabled);
+    if ev_by_handle.is_empty() && neg_exemplars.is_empty() && !have_anchored_work {
+        return Ok(());
+    }
+
+    // Union of every resonating chunk-id across all handles, resolved once.
+    // Anchor chunks join too (value's surfaced/used ledger and judgment lookup
+    // key on the anchor as well as the evidence links).
+    let mut chunk_ids: HashSet<String> = HashSet::new();
+    for links in ev_by_handle.values() {
+        for link in links {
+            if let Some(id) = link
+                .last_resolved_chunk_id
+                .clone()
+                .or_else(|| link.original_path.to_str().map(str::to_string))
+            {
+                chunk_ids.insert(id);
+            }
+        }
+    }
+    for id in anchor_chunk.values() {
+        chunk_ids.insert(id.clone());
+    }
+    let chunk_ids: Vec<String> = chunk_ids.into_iter().collect();
+    let fetched = corpus
+        .fetch_chunks_by_ids(&chunk_ids)
+        .await
+        .map_err(|e| anyhow!("fetch_chunks_by_ids for salience: {e}"))?;
+    let chunk_meta: HashMap<String, SourceMeta> = fetched
+        .into_iter()
+        .map(|(id, (chunk, _emb))| {
+            (
+                id,
+                SourceMeta {
+                    project: chunk.project,
+                    source: chunk.source.as_str().to_string(),
+                    source_id: chunk.source_id,
+                },
+            )
+        })
+        .collect();
+
+    // ---- value pass inputs (I3) — the SHARED surfaced/used ledger join +
+    // the curated-confidence sources. Built once here, skipped entirely when
+    // the value axis is off (no ledger scan, no concept-support read). ----
+    let now = chrono::Utc::now();
+    let since = default_since_now();
+    let (use_ledger, active_coords) = if salience.value_enabled {
+        // Each handle's attesting chunks: {anchor} ∪ {Active evidence chunks}.
+        let mut handle_chunks: HashMap<String, Vec<String>> = HashMap::new();
+        let handle_union: HashSet<&String> = ev_by_handle.keys().chain(anchors.keys()).collect();
+        for handle in handle_union {
+            let mut chunks: Vec<String> = Vec::new();
+            if let Some(cid) = anchor_chunk.get(handle) {
+                chunks.push(cid.clone());
+            }
+            if let Some(links) = ev_by_handle.get(handle) {
+                for link in links {
+                    if link.relation_state != RelationState::Active {
+                        continue;
+                    }
+                    if let Some(id) = link
+                        .last_resolved_chunk_id
+                        .clone()
+                        .or_else(|| link.original_path.to_str().map(str::to_string))
+                    {
+                        chunks.push(id);
+                    }
+                }
+            }
+            handle_chunks.insert(handle.clone(), chunks);
+        }
+        let ledger = threads
+            .surfaced_vs_used(&handle_chunks, since)
+            .map_err(|e| anyhow!("surfaced_vs_used for value: {e}"))?;
+        // Active-concept support per coordinate — judgment propagation source
+        // (active concepts carry confidence 1.0). One ledger-backed read.
+        let coords = threads
+            .concept_support_by_coord(since)
+            .map(|m| {
+                m.into_iter()
+                    .map(|(coord, sup)| (coord, sup.activation))
+                    .collect::<HashMap<(String, String), f32>>()
+            })
+            .unwrap_or_default();
+        (ledger, coords)
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
+
+    // ---- pass C: per-handle factors (one map, all three axes) ----
+    // Specificity keys on the evidence graph; negative-transfer keys on the
+    // anchor; value keys on the surfaced/used ledger + judgment evidence.
+    // Iterate the UNION so a handle qualifying for any one axis gets it; the
+    // others stay their neutral identity (`specificity = 1.0`, `value = 1.0`,
+    // `neg_penalty = 0.0`).
+    let mut factors: HashMap<String, SalienceFactors> = HashMap::new();
+    let handle_union: HashSet<&String> = ev_by_handle.keys().chain(anchors.keys()).collect();
+    let empty_ev: Vec<ostk_recall_store::EvidenceLink> = Vec::new();
+    for handle in handle_union {
+        let evidence = ev_by_handle.get(handle).unwrap_or(&empty_ev);
+        let specificity = if evidence.is_empty() {
+            1.0
+        } else {
+            specificity_from_evidence(evidence, &chunk_meta, salience)
+        };
+        let neg_penalty = if salience.negative_enabled {
+            anchors.get(handle).map_or(0.0, |anchor| {
+                negative_penalty(anchor, &global_mean, &neg_exemplars, salience)
+            })
+        } else {
+            0.0
+        };
+        // value = value_neutral + (1 − value_neutral)·positive (monotone in
+        // positive evidence; v1 value_neutral = 1.0 ⇒ a constant pass-through).
+        let value = if salience.value_enabled {
+            let used = use_ledger
+                .get(handle)
+                .map(|(_, accesses)| accesses.as_slice())
+                .unwrap_or(&[]);
+            value_from(used, evidence, &chunk_meta, &active_coords, now, salience)
+        } else {
+            1.0
+        };
+        factors.insert(
+            handle.clone(),
+            SalienceFactors {
+                specificity,
+                value,
+                neg_penalty,
+            },
+        );
+    }
+    let n = factors.len();
+    attention.set_salience_factors(factors).await;
+    tracing::info!(
+        handles = n,
+        "salience factors computed (specificity + value + negative-transfer)"
+    );
+    Ok(())
+}
+
+/// Element-wise mean of L2-normalized vectors — the global anchor mean the
+/// negative-transfer `center()` subtracts (R3 anisotropy correction). Empty /
+/// dimension-mismatched input yields an empty mean (a no-op for `center`).
+fn mean_normalized<'a>(vecs: impl Iterator<Item = &'a Vec<f32>>) -> Vec<f32> {
+    let mut acc: Vec<f32> = Vec::new();
+    let mut n = 0usize;
+    for v in vecs {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm <= 0.0 {
+            continue;
+        }
+        if acc.is_empty() {
+            acc = vec![0.0; v.len()];
+        } else if acc.len() != v.len() {
+            continue; // dimension drift — skip, never corrupt the mean
+        }
+        for (a, x) in acc.iter_mut().zip(v.iter()) {
+            *a += x / norm;
+        }
+        n += 1;
+    }
+    if n > 0 {
+        #[allow(clippy::cast_precision_loss)] // n is a thread count, well within range
+        let nf = n as f32;
+        for a in &mut acc {
+            *a /= nf;
+        }
+    }
+    acc
 }
 
 /// Listen for scan-trigger pokes from a local single-operator surface and
