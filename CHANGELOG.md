@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-06-15
+### Added
+- **`[weaver] stop_handles` — curated thread-handle stop-set.** Handles listed
+  here are forced to `is_stop` in the attention scorer (floor clamped to the
+  unresonant baseline, off-diagonal lift zeroed) so the `IdleCurator` decays
+  them to dormant and keeps them there, and the weaver/observer never mint or
+  re-promote them. This complements the *derived* frequency stopword classifier
+  (`is_stop_handle`), which only catches high-frequency / **low**-resonance
+  generic vocab — harness mechanism vocabulary (`turn-digest`, `squad-lead`,
+  `re-run`, `post-restart`, …) is "coherent noise" (high-frequency **and**
+  high-resonance) that evades it and dominates the active surface, and a manual
+  tension demote is recomputed straight back to Active by the curator. Seeded
+  with the common harness / coordination / test-plumbing handles; override via
+  the `[weaver]` block. Gate, don't delete: stopped handles stay reachable via
+  `recall`/`thread_list`. Takes effect on `serve` restart.
+
 ## [0.8.1] - 2026-06-14
 ### Fixed
 - **Fresh corpora had no FTS index, so hybrid recall failed on every query**
