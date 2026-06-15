@@ -453,6 +453,7 @@ fn default_weaver_stop_handles() -> Vec<String> {
         "teammate-message",
         "auto-compact",
         "whoami-probe",
+        "non-blocking",
     ]
     .iter()
     .map(|s| (*s).to_string())

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- `[weaver] stop_handles` default: added `non-blocking` — a generic adjective
+  that surfaces a grab-bag of unrelated incidental uses (status checks, review
+  nits, logging writers, TUI channels) with no unifying concept. Coherent noise
+  the derived frequency gate misses (rate ~0.19, above the threshold).
 
 ## [0.8.2] - 2026-06-15
 ### Added
