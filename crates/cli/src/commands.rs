@@ -2302,6 +2302,345 @@ async fn precompute_salience_factors(
     Ok(())
 }
 
+// --- salience A/B diagnostic (read-only) ------------------------------------
+
+/// Confirmed coherent-NOISE handles (THESIS / review). Tagged NOISE in the A/B
+/// table; the real-data P1 verdict checks these rank below every CONCEPT.
+const AB_NOISE: &[&str] = &[
+    "turn-digest",
+    "squad-lead",
+    "re-run",
+    "non-blocking",
+    "re-read",
+    "pre-existing",
+    "follow-up",
+    "top-level",
+    "system-reminder",
+    "exec-replace",
+    "watch-notify",
+    "post-restart",
+    "no-op",
+    "read-only",
+    "team-lead",
+    "teammate-message",
+];
+
+/// Confirmed REAL concepts. Tagged CONCEPT; the P1 verdict checks every NOISE
+/// handle ranks below the worst of these.
+const AB_CONCEPT: &[&str] = &[
+    "cognitive-memory",
+    "ostk-cache",
+    "dereference-or-void",
+    "relational-substrate-docgraph",
+    "ostk-recall",
+    "slipstream",
+    "mish",
+    "attention-is-sovereign",
+    "abi-as-sovereign-boundary",
+];
+
+/// One row of the merged off-vs-on ranking.
+#[derive(Debug, serde::Serialize)]
+struct AbRow {
+    handle: String,
+    tag: &'static str, // NOISE | CONCEPT | (other)
+    off_score: Option<f32>,
+    off_rank: Option<usize>,
+    on_score: Option<f32>,
+    on_rank: Option<usize>,
+    /// `off_rank - on_rank` (positive = moved UP under the new scorer). `None`
+    /// if the handle is missing from either surface.
+    rank_delta: Option<i64>,
+}
+
+/// READ-ONLY salience A/B: run the real boot-pass scoring over the live ledger
+/// with `scorer_v2` off and on, and report the ranking delta + the THESIS P1
+/// ordering verdict + the salience-health scoreboard for each.
+///
+/// Opens the corpus + threads **read-only** (`ThreadsDb::open_read_only`,
+/// `build_query_engine_read_only`) and never scans/ingests; the in-memory
+/// scoring (replay + a write-free re-anchor + the factor precompute) is exactly
+/// what `serve` runs at boot, so the surface this prints is the IDLE,
+/// floor-driven surface where coherent-noise dominates today. No mutation.
+pub async fn salience_ab(
+    config_path: &Path,
+    embedder: Arc<dyn ChunkEmbedder>,
+    top: usize,
+    json: bool,
+) -> Result<()> {
+    use ostk_recall_core::SalienceHealth;
+
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
+    // Read-only engine (no scan/ingest), shared embedder for cosine-comparable
+    // vectors — same prerequisite serve asserts.
+    let engine = build_query_engine_read_only(config_path, Arc::clone(&embedder)).await?;
+    let root = engine.store().root().to_path_buf();
+    if engine.store().dim() != embedder.dim() {
+        return Err(anyhow!(
+            "embedder/corpus dimension mismatch ({} vs {}) — point the original \
+             embedder model at this corpus",
+            embedder.dim(),
+            engine.store().dim()
+        ));
+    }
+    let weaver_stop = WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles;
+
+    // Run the boot-pass scoring for one value of `scorer_v2`, returning the
+    // ranked surface (handle → score, descending) of the substrate scope plus
+    // the health block. READ-ONLY: opens its own read-only ThreadsDb handle.
+    async fn run_one(
+        scorer_v2: bool,
+        cfg: &Config,
+        root: &Path,
+        engine: &QueryEngine,
+        embedder: &Arc<dyn ChunkEmbedder>,
+        weaver_stop: &[String],
+    ) -> Result<(Vec<ostk_recall_core::AttentionPage>, ostk_recall_core::SalienceHealth)> {
+        use ostk_recall_attention::salience_health;
+        // Read-only threads handle: SQLITE_OPEN_READ_ONLY + NoopChainSink, so
+        // even a stray chain-emitting/anchor-backfill call cannot write.
+        let threads = Arc::new(
+            ThreadsDb::open_read_only(root)
+                .map_err(|e| anyhow!("open threads db (read-only): {e}"))?,
+        );
+        let mut salience = SalienceSettings::resolve(cfg.salience.as_ref());
+        salience.scorer_v2 = scorer_v2; // the A/B knob
+
+        let attention = InMemoryAttention::with_embedder(Arc::clone(embedder))
+            .with_stop_handles(weaver_stop.to_vec())
+            .with_salience_settings(&salience);
+
+        // Replay the chain into attention (restores counters/folds/anchors),
+        // exactly as serve does — read-only (replay emits no new chain rows).
+        if let Err(e) = replay_chain_into_attention(&threads, &attention).await {
+            tracing::warn!(error = %e, "salience-ab: chain replay failed; attention starts empty");
+        }
+        // Write-free re-anchor: seed every thread's anchor into attention from
+        // its cached anchor_vec (the common path) or the corpus chunk — WITHOUT
+        // the `set_anchor_vec` persistence serve does (that is the only DB write
+        // in the boot re-anchor; skipping it keeps this read-only while the
+        // in-memory anchors — hence the scoring — stay identical to serve).
+        reanchor_into_attention_read_only(&threads, engine.store(), &attention).await?;
+        // The factor precompute (specificity/value/negative) — runs only when
+        // scorer_v2 is on; reads threads/corpus, writes only in-memory attention.
+        if salience.scorer_v2 {
+            if let Err(e) =
+                precompute_salience_factors(&threads, engine.store(), &attention, &salience).await
+            {
+                tracing::warn!(error = %e, "salience-ab: precompute failed; factors neutral");
+            }
+        }
+
+        // Surface the substrate scope (project=None) — where the boot pass lands
+        // every durable thread; a wide limit so the whole active set is ranked.
+        let scope = AttentionScope {
+            project: None,
+            session_id: Some("replay".into()),
+            agent: Some("substrate".into()),
+            privacy_tier: PrivacyTier::T1Project,
+        };
+        let surface = attention.surface(&scope, 1000).await?;
+
+        // Health scoreboard over this surface (no ledger join needed for the
+        // entropy/ratio/spread the A/B reads; never-used/drift left empty).
+        let curated = attention.curated_handles();
+        let health = salience_health(
+            &surface,
+            &curated,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &salience.health,
+        );
+        Ok((surface, health))
+    }
+
+    let (off_surface, off_health) =
+        run_one(false, &cfg, &root, &engine, &embedder, &weaver_stop).await?;
+    let (on_surface, on_health) =
+        run_one(true, &cfg, &root, &engine, &embedder, &weaver_stop).await?;
+
+    // Merge into per-handle rows.
+    let rank_map = |surface: &[ostk_recall_core::AttentionPage]| {
+        surface
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.handle.clone(), (p.score, i + 1)))
+            .collect::<std::collections::HashMap<String, (f32, usize)>>()
+    };
+    let off = rank_map(&off_surface);
+    let on = rank_map(&on_surface);
+    let tag_of = |h: &str| -> &'static str {
+        if AB_NOISE.contains(&h) {
+            "NOISE"
+        } else if AB_CONCEPT.contains(&h) {
+            "CONCEPT"
+        } else {
+            "-"
+        }
+    };
+    let mut handles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    handles.extend(off.keys().cloned());
+    handles.extend(on.keys().cloned());
+    let mut rows: Vec<AbRow> = handles
+        .into_iter()
+        .map(|h| {
+            let o = off.get(&h).copied();
+            let n = on.get(&h).copied();
+            let rank_delta = match (o, n) {
+                (Some((_, orank)), Some((_, nrank))) => {
+                    Some(orank as i64 - nrank as i64) // + = moved up under v2
+                }
+                _ => None,
+            };
+            AbRow {
+                tag: tag_of(&h),
+                handle: h,
+                off_score: o.map(|x| x.0),
+                off_rank: o.map(|x| x.1),
+                on_score: n.map(|x| x.0),
+                on_rank: n.map(|x| x.1),
+                rank_delta,
+            }
+        })
+        .collect();
+    // Sort by the new scorer's rank (handles absent from the on-surface last).
+    rows.sort_by(|a, b| match (a.on_rank, b.on_rank) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.handle.cmp(&b.handle),
+    });
+
+    // Real-data P1 verdict: every NOISE handle on the on-surface ranks below
+    // every CONCEPT handle on the on-surface.
+    let worst_concept_on_rank = rows
+        .iter()
+        .filter(|r| r.tag == "CONCEPT")
+        .filter_map(|r| r.on_rank)
+        .max();
+    let best_noise_on_rank = rows
+        .iter()
+        .filter(|r| r.tag == "NOISE")
+        .filter_map(|r| r.on_rank)
+        .min();
+    let p1_holds = match (worst_concept_on_rank, best_noise_on_rank) {
+        (Some(worst_concept), Some(best_noise)) => best_noise > worst_concept,
+        // No noise (or no concept) present on the surface ⇒ vacuously holds.
+        _ => true,
+    };
+
+    // Biggest rank drops (noise pushed down = positive-then-negative delta) and
+    // rises, for the summary.
+    let mut by_delta: Vec<&AbRow> = rows.iter().filter(|r| r.rank_delta.is_some()).collect();
+    by_delta.sort_by_key(|r| r.rank_delta.unwrap());
+    let drops: Vec<&AbRow> = by_delta.iter().take(5).copied().collect(); // most negative = dropped
+    let rises: Vec<&AbRow> = by_delta.iter().rev().take(5).copied().collect();
+
+    if json {
+        let out = serde_json::json!({
+            "rows": rows.iter().take(top).collect::<Vec<_>>(),
+            "p1_noise_below_concept": p1_holds,
+            "health_off": off_health,
+            "health_on": on_health,
+            "top_drops": drops.iter().map(|r| (&r.handle, r.tag, r.rank_delta)).collect::<Vec<_>>(),
+            "top_rises": rises.iter().map(|r| (&r.handle, r.tag, r.rank_delta)).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("salience A/B — scorer_v2 OFF vs ON (read-only, idle surface)\n");
+    println!(
+        "{:<34} {:>7} {:>5} {:>7} {:>5} {:>6}  {}",
+        "handle", "off", "o#", "on", "n#", "Δrank", "tag"
+    );
+    for r in rows.iter().take(top) {
+        let fmt_s = |s: Option<f32>| s.map_or("-".to_string(), |v| format!("{v:.3}"));
+        let fmt_r = |r: Option<usize>| r.map_or("-".to_string(), |v| v.to_string());
+        let fmt_d = |d: Option<i64>| d.map_or("-".to_string(), |v| format!("{v:+}"));
+        println!(
+            "{:<34} {:>7} {:>5} {:>7} {:>5} {:>6}  {}",
+            r.handle,
+            fmt_s(r.off_score),
+            fmt_r(r.off_rank),
+            fmt_s(r.on_score),
+            fmt_r(r.on_rank),
+            fmt_d(r.rank_delta),
+            r.tag,
+        );
+    }
+    println!("\n── summary ──");
+    println!(
+        "P1 (every NOISE ranks below every CONCEPT under v2): {}",
+        if p1_holds { "PASS" } else { "FAIL" }
+    );
+    let board = |label: &str, h: &SalienceHealth| {
+        println!(
+            "  {label:<4} entropy={:?} spread={:.3} curated_ratio={:.3}",
+            h.surface_entropy, h.surface_score_spread, h.curated_ratio
+        );
+    };
+    println!("salience-health scoreboard:");
+    board("off", &off_health);
+    board("on", &on_health);
+    println!("top rank drops (NOISE should dominate):");
+    for r in &drops {
+        println!("  {:<34} Δ{:+} {}", r.handle, r.rank_delta.unwrap_or(0), r.tag);
+    }
+    println!("top rank rises (CONCEPT should dominate):");
+    for r in &rises {
+        println!("  {:<34} Δ{:+} {}", r.handle, r.rank_delta.unwrap_or(0), r.tag);
+    }
+    Ok(())
+}
+
+/// Write-free variant of the boot re-anchor: seeds each thread's anchor into
+/// `attention` from its cached `anchor_vec`, or the corpus chunk embedding,
+/// but does NOT persist the `set_anchor_vec` backfill (the only DB write in
+/// `re_anchor_threads_from_corpus`). Keeps the salience A/B diagnostic
+/// read-only while the in-memory anchors — and therefore the scoring — stay
+/// identical to what `serve` produces at boot.
+async fn reanchor_into_attention_read_only(
+    threads: &Arc<ThreadsDb>,
+    corpus: &Arc<CorpusStore>,
+    attention: &InMemoryAttention,
+) -> Result<()> {
+    let inputs = threads
+        .reanchor_inputs()
+        .map_err(|e| anyhow!("reanchor_inputs: {e}"))?;
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let need_fetch: Vec<String> = inputs
+        .iter()
+        .filter(|i| i.anchor_vec.is_none())
+        .filter_map(|i| i.anchor_chunk_id.clone())
+        .collect();
+    let fetched = corpus
+        .fetch_embeddings(&need_fetch)
+        .await
+        .map_err(|e| anyhow!("fetch_embeddings for re-anchor: {e}"))?;
+    for input in inputs {
+        let scope = AttentionScope {
+            project: None,
+            session_id: Some("replay".into()),
+            agent: Some("substrate".into()),
+            privacy_tier: input.privacy_tier,
+        };
+        let vec = input
+            .anchor_vec
+            .or_else(|| input.anchor_chunk_id.as_ref().and_then(|id| fetched.get(id).cloned()));
+        if let Some(vec) = vec {
+            attention
+                .seed_anchor(&scope, input.handle, vec)
+                .await
+                .map_err(|e| anyhow!("seed_anchor: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Element-wise mean of L2-normalized vectors — the global anchor mean the
 /// negative-transfer `center()` subtracts (R3 anisotropy correction). Empty /
 /// dimension-mismatched input yields an empty mean (a no-op for `center`).

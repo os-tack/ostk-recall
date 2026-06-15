@@ -189,6 +189,22 @@ enum Command {
         #[arg(long, default_value_t = 2000)]
         batch: usize,
     },
+    /// READ-ONLY salience A/B diagnostic (hidden). Runs the real boot-pass
+    /// scoring over the live ledger BOTH ways (scorer_v2 off vs on) and prints
+    /// the merged ranking + a NOISE-vs-CONCEPT ordering verdict and the
+    /// salience-health scoreboard. Opens the corpus + threads read-only; never
+    /// scans, ingests, or writes the ledger. The standalone `attention surface`
+    /// does not run the salience boot-pass — only `serve` does — so this is the
+    /// repeatable offline A/B the plan's P-4 anticipated.
+    #[command(hide = true)]
+    SalienceAb {
+        /// Top-N rows of the merged ranking to print.
+        #[arg(long, default_value_t = 30)]
+        top: usize,
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -748,6 +764,10 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
         }
         Command::Crystallize { handle, project } => {
             run_crystallize(&config_path, &handle, project.as_deref().unwrap_or(""))?;
+        }
+        Command::SalienceAb { top, json } => {
+            let embedder = resolve_embedder(cli.config.as_ref())?;
+            commands::salience_ab(&config_path, embedder, top, json).await?;
         }
     }
 
