@@ -352,10 +352,12 @@ fn spawn_ambient_daemons(
     threads: &Arc<ThreadsDb>,
     attention: Option<Arc<dyn AttentionForwardStore>>,
     weaver_exclude_facets: Vec<String>,
+    weaver_stop_handles: Vec<String>,
     concept_growth: ConceptGrowthConfig,
     growth_runtime: Option<ConceptGrowthRuntime>,
 ) -> AmbientHandles {
-    let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads));
+    let mut observer = TurnObserver::new(Arc::clone(pipeline), Arc::clone(threads))
+        .with_stop_handles(weaver_stop_handles.clone());
     if let Some(attn) = attention {
         observer = observer.with_attention(attn);
     }
@@ -385,7 +387,8 @@ fn spawn_ambient_daemons(
             Arc::clone(corpus),
             WeaverThresholds::default(),
         )
-        .with_exclude_facets(weaver_exclude_facets),
+        .with_exclude_facets(weaver_exclude_facets)
+        .with_stop_handles(weaver_stop_handles),
     );
     let cancel = CancellationToken::new();
 
@@ -479,6 +482,7 @@ pub async fn scan_with_context(
             threads,
             attention_dyn.clone(),
             WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+            WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles,
             resolve_concept_growth(cfg.ambient_growth.as_ref()),
             ctx.map(|c| c.concept_growth.clone()),
         )
@@ -669,7 +673,8 @@ pub async fn weave(
     );
     let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
     let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default())
-        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets);
+        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets)
+        .with_stop_handles(WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles);
     let since = since
         .map(chrono::Duration::from_std)
         .transpose()
@@ -700,7 +705,8 @@ pub async fn consolidate(
     );
     let threads = Arc::new(ThreadsDb::open(&root).map_err(|e| anyhow!("open threads db: {e}"))?);
     let weaver = AutoWeaver::new(threads, store, WeaverThresholds::default())
-        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets);
+        .with_exclude_facets(WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets)
+        .with_stop_handles(WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles);
     let since = since
         .map(chrono::Duration::from_std)
         .transpose()
@@ -770,6 +776,7 @@ pub async fn scan_paths_with_context(
             threads,
             attention_dyn.clone(),
             WeaverSettings::resolve(cfg.weaver.as_ref()).exclude_facets,
+            WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles,
             resolve_concept_growth(cfg.ambient_growth.as_ref()),
             ctx.map(|c| c.concept_growth.clone()),
         )
@@ -1418,8 +1425,10 @@ pub async fn serve(
             // `attend()`-produced scope vectors are cosine-comparable
             // with corpus chunk embeddings — the prerequisite for
             // embedding-mediated attention bias (focus-feature Phase B).
-            let attention_arc: Arc<InMemoryAttention> =
-                Arc::new(InMemoryAttention::with_embedder(Arc::clone(&embedder)));
+            let attention_arc: Arc<InMemoryAttention> = Arc::new(
+                InMemoryAttention::with_embedder(Arc::clone(&embedder))
+                    .with_stop_handles(WeaverSettings::resolve(cfg.weaver.as_ref()).stop_handles),
+            );
 
             if let Err(err) =
                 replay_chain_into_attention(&threads_arc, attention_arc.as_ref()).await

@@ -248,6 +248,11 @@ pub struct AutoWeaver {
     /// to [`default_weaver_exclude_facets`]; production wires `[weaver]
     /// exclude_facets` via [`AutoWeaver::with_exclude_facets`].
     exclude_facets: Vec<String>,
+    /// Curated handle stop-set (`[weaver] stop_handles`): handles here are
+    /// never re-promoted to Active, mirroring the derived `is_stop_handle`
+    /// gate but for "coherent noise" harness vocab the frequency classifier
+    /// misses. Wired via [`AutoWeaver::with_stop_handles`].
+    stop_handles: std::collections::HashSet<String>,
 }
 
 impl AutoWeaver {
@@ -262,6 +267,7 @@ impl AutoWeaver {
             corpus,
             thresholds,
             exclude_facets: default_weaver_exclude_facets(),
+            stop_handles: std::collections::HashSet::new(),
         }
     }
 
@@ -270,6 +276,15 @@ impl AutoWeaver {
     #[must_use]
     pub fn with_exclude_facets(mut self, exclude_facets: Vec<String>) -> Self {
         self.exclude_facets = exclude_facets;
+        self
+    }
+
+    /// Install the curated handle stop-set (`[weaver] stop_handles`).
+    /// Production passes `WeaverSettings::resolve(...).stop_handles`. Handles
+    /// here are never re-promoted to Active by `promote_recurring_proposals`.
+    #[must_use]
+    pub fn with_stop_handles(mut self, stop_handles: Vec<String>) -> Self {
+        self.stop_handles = stop_handles.into_iter().collect();
         self
     }
 
@@ -485,6 +500,13 @@ impl AutoWeaver {
             let Ok(handle) = ThreadHandle::new(&p.proposed_handle) else {
                 continue;
             };
+            // Curated stop-handle gate: never re-promote a hand-listed
+            // harness handle (`[weaver] stop_handles`), regardless of its
+            // resonance — these resonate strongly, so the derived gate below
+            // would let them through.
+            if self.stop_handles.contains(handle.as_str()) {
+                continue;
+            }
             // Derived stop-handle gate: if a thread already exists under
             // this handle and reads as a frequency-derived stopword
             // (ubiquitous but unresonant), don't re-promote it to Active.

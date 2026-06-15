@@ -188,6 +188,11 @@ pub struct TurnObserver {
     /// shared `ConceptGrowthRuntime` counter so the cap is genuinely per serve
     /// session (not per scan trigger, which spawns a fresh observer).
     node_mints_this_session: Arc<AtomicUsize>,
+    /// Curated handle stop-set (`[weaver] stop_handles`): tokens here are
+    /// never auto-promoted to an Active thread, even before any stats exist —
+    /// the hand-list complement to the derived `is_stop_handle` gate, for
+    /// "coherent noise" harness vocab the frequency classifier misses.
+    stop_handles: HashSet<String>,
 }
 
 impl TurnObserver {
@@ -214,7 +219,17 @@ impl TurnObserver {
             turns_since_build: Arc::new(AtomicU64::new(0)),
             term_recurrence: Arc::new(RwLock::new(HashMap::new())),
             node_mints_this_session: Arc::new(AtomicUsize::new(0)),
+            stop_handles: HashSet::new(),
         }
+    }
+
+    /// Install the curated handle stop-set (`[weaver] stop_handles`).
+    /// Production passes `WeaverSettings::resolve(...).stop_handles`. Tokens
+    /// here are never auto-promoted to an Active thread.
+    #[must_use]
+    pub fn with_stop_handles(mut self, stop_handles: Vec<String>) -> Self {
+        self.stop_handles = stop_handles.into_iter().collect();
+        self
     }
 
     /// Attach an in-memory attention store. Used by production wiring
@@ -519,6 +534,13 @@ impl TurnObserver {
                 && self.promotions_this_session.load(Ordering::Relaxed) < PROMOTION_CAP_PER_SESSION;
             let promoted_to_handle = if qualifies_for_promotion {
                 ThreadHandle::new(phrase.clone()).ok().filter(|h| {
+                    // Curated stop-handle gate (primary defense): a hand-listed
+                    // harness handle (`[weaver] stop_handles`) is never
+                    // auto-promoted, even before any stats exist — these
+                    // resonate strongly, so the derived gate below misses them.
+                    if self.stop_handles.contains(h.as_str()) {
+                        return false;
+                    }
                     // Derived stop-handle gate (secondary defense): never
                     // re-promote a token an existing thread already shows
                     // is ubiquitous-but-unresonant (high mentions, near-zero

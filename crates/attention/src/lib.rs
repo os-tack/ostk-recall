@@ -718,6 +718,7 @@ fn compute_score_parts(
     state: &ThreadState,
     attention_vec: &[f32],
     now: DateTime<Utc>,
+    forced_stop: bool,
 ) -> ScoreParts {
     let resonance = cosine_similarity(&state.anchor, attention_vec);
     let dt_secs = (now - state.last_touched_at).num_seconds().max(0) as u64;
@@ -741,7 +742,12 @@ fn compute_score_parts(
     // Gate, don't delete: the durable row and `recall` / `thread_list`
     // reachability are untouched; only the proactive surfacer floor is
     // clamped, so diluted resonance never buys idle dominance.
-    let resonance_floor = if is_stop_handle(state.mentions, state.resonance) {
+    // A curated stop handle (`forced_stop`) is treated exactly like a
+    // frequency-derived one: clamp the floor to the unresonant baseline and
+    // deny off-diagonal lift, so it can light up while actively discussed but
+    // never buys idle dominance. See `[weaver] stop_handles`.
+    let is_stop = forced_stop || is_stop_handle(state.mentions, state.resonance);
+    let resonance_floor = if is_stop {
         familiarity_floor(0)
     } else {
         familiarity_floor(state.resonance)
@@ -750,12 +756,7 @@ fn compute_score_parts(
     let decay_term = floor * (-decay_rate(state.mentions) * dt_days).exp();
     let resonance_term = ALPHA * resonance;
     let lift_term = BETA
-        * off_diagonal_lift(
-            state.tension,
-            resonance,
-            state.resonance,
-            is_stop_handle(state.mentions, state.resonance),
-        );
+        * off_diagonal_lift(state.tension, resonance, state.resonance, is_stop);
     let score = decay_term + resonance_term + lift_term;
     ScoreParts {
         score,
@@ -862,6 +863,12 @@ pub struct InMemoryAttention {
     /// EMA update rate for the per-scope rolling vector. See
     /// [`DEFAULT_ATTENTION_LAMBDA`].
     lambda: f32,
+    /// Curated handle stop-set (`[weaver] stop_handles`). A handle in this set
+    /// is forced to `is_stop` in `compute_score_parts` regardless of its
+    /// resonance rate, so the curator decays it to dormant and it can't buy
+    /// idle dominance — the lever for "coherent noise" harness vocab that the
+    /// derived `is_stop_handle` gate misses. `Arc` so `Clone` stays cheap.
+    stop_handles: Arc<std::collections::HashSet<String>>,
 }
 
 impl Default for InMemoryAttention {
@@ -870,6 +877,7 @@ impl Default for InMemoryAttention {
             inner: Arc::default(),
             embedder: None,
             lambda: DEFAULT_ATTENTION_LAMBDA,
+            stop_handles: Arc::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -893,7 +901,20 @@ impl InMemoryAttention {
             inner: Arc::new(RwLock::new(Inner::default())),
             embedder: Some(embedder),
             lambda: DEFAULT_ATTENTION_LAMBDA,
+            stop_handles: Arc::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Install the curated handle stop-set (`[weaver] stop_handles`).
+    /// Builder-style so production wiring stays a single chained expression.
+    /// Handles in this set are forced to `is_stop` in the thread scorer
+    /// (`compute_score_parts`), so the `IdleCurator` demotes them to dormant
+    /// and the proactive surfacer denies them a floor — without deleting them
+    /// (still reachable via `recall`/`thread_list`).
+    #[must_use]
+    pub fn with_stop_handles(mut self, stop_handles: Vec<String>) -> Self {
+        self.stop_handles = Arc::new(stop_handles.into_iter().collect());
+        self
     }
 
     /// Override the EMA update rate λ. Builder-style so production
@@ -1451,7 +1472,8 @@ impl AttentionForwardStore for InMemoryAttention {
                     if !should_surface_thread(state, &key) {
                         continue;
                     }
-                    let parts = compute_score_parts(state, query_vec, now);
+                    let forced_stop = self.stop_handles.contains(handle.as_str());
+                    let parts = compute_score_parts(state, query_vec, now, forced_stop);
                     if parts.score < ARCHIVE_THRESHOLD {
                         continue;
                     }
@@ -1656,7 +1678,9 @@ impl AttentionForwardStore for InMemoryAttention {
             let Some(state) = scope_state.threads.get(handle) else {
                 continue;
             };
-            let score = compute_score_parts(state, scope_state.effective_vec(), now).score;
+            let forced_stop = self.stop_handles.contains(handle.as_str());
+            let score =
+                compute_score_parts(state, scope_state.effective_vec(), now, forced_stop).score;
             best = Some(best.map_or(score, |b| b.max(score)));
         }
         Ok(best.unwrap_or(0.0))
@@ -2401,6 +2425,65 @@ mod tests {
             idea.score,
             topword.score
         );
+    }
+
+    #[tokio::test]
+    async fn curated_stop_set_clamps_high_resonance_harness_handle() {
+        // The hand-list (`[weaver] stop_handles` → `with_stop_handles`) is the
+        // lever for "coherent noise" the *derived* classifier cannot catch:
+        // harness vocab that is mentioned a lot AND resonates a lot (rate ≫
+        // STOPWORD_RATE_MAX), so `is_stop_handle` returns false. Two threads
+        // with identical counters (300/290) and identically-aligned anchors —
+        // so the live resonance *term* is equal — differ only in stop-set
+        // membership. The listed handle must be clamped to the unresonant
+        // baseline floor and rank below the unlisted twin (or be archived out
+        // entirely, an even stronger demotion).
+        assert!(
+            !is_stop_handle(300, 290),
+            "guard: 300/290 (rate 0.97) is NOT a derived stopword — only the \
+             curated list can demote it",
+        );
+        let store =
+            InMemoryAttention::new().with_stop_handles(vec!["turn-digest".to_string()]);
+        let scope = scope_for("haystack");
+        store.attend(&scope, "ctx").await.unwrap();
+        let v = stub_embed("ctx");
+
+        store
+            .seed_anchor(&scope, handle("turn-digest"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("turn-digest"), 300, 290)
+            .await
+            .unwrap();
+
+        store
+            .seed_anchor(&scope, handle("real-idea"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("real-idea"), 300, 290)
+            .await
+            .unwrap();
+
+        let pages = store.surface(&scope, 10).await.unwrap();
+        let kept = pages
+            .iter()
+            .find(|p| p.handle == "real-idea")
+            .expect("unlisted twin must still surface");
+        match pages.iter().find(|p| p.handle == "turn-digest") {
+            Some(stopped) => assert!(
+                kept.score > stopped.score,
+                "curated stop handle must rank below its identical non-stop \
+                 twin: kept {} vs stopped {}",
+                kept.score,
+                stopped.score
+            ),
+            // Clamped below ARCHIVE_THRESHOLD and filtered out — strongest
+            // possible demotion; the curated gate worked.
+            None => {}
+        }
     }
 
     #[tokio::test]

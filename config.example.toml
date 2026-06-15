@@ -108,6 +108,20 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id; als
 # [weaver]
 # exclude_facets = ["record_kind:harness_orchestration"]
 #
+# `stop_handles` is a curated thread-handle denylist. Handles listed here are
+# forced to "stop" in the attention scorer — clamped to the unresonant floor
+# and denied off-diagonal lift, so the idle curator demotes them to dormant —
+# and are never minted/promoted by the weaver. This is the complement to the
+# *derived* frequency stopword gate (`is_stop_handle`), which only catches
+# high-frequency / LOW-resonance generic vocab. Harness mechanism vocabulary
+# (`turn-digest`, `squad-lead`, `re-run`, `post-restart`, …) is "coherent
+# noise" — high-frequency AND high-resonance — so the derived gate misses it;
+# this hand-list is the lever for that case. Gate, don't delete: stopped
+# handles stay reachable via `recall`/`thread_list`, they just can't dominate
+# the active surface. Omit for the seeded default (a set of common harness /
+# coordination / test-plumbing handles); set explicitly to override.
+# stop_handles = ["turn-digest", "squad-lead", "re-run", "no-op", "read-only"]
+#
 # Independent of this denylist, the weaver ALWAYS treats two classes of
 # structural apparatus as un-weavable (kept in corpus + recall, never anchor or
 # seed threads): Claude Code tool-call envelopes (block_kind tool_use /

@@ -397,16 +397,73 @@ impl Default for LensSettings {
 pub struct WeaverSettings {
     #[serde(default = "default_weaver_exclude_facets")]
     pub exclude_facets: Vec<String>,
+    /// Curated thread-handle stop-set. Handles listed here are forced to
+    /// `is_stop` in the attention scorer — clamped to the unresonant floor and
+    /// denied off-diagonal lift — regardless of their resonance rate, and are
+    /// never minted/promoted by the weaver. This complements the *derived*
+    /// frequency stopword classifier (`is_stop_handle`), which only catches
+    /// high-frequency / low-resonance generic vocab. Harness mechanism
+    /// vocabulary (`turn-digest`, `squad-lead`, `re-run`, …) is "coherent
+    /// noise" — high-frequency *and* high-resonance — so the derived gate
+    /// misses it; this hand-list is the operator's lever for that case. Gate,
+    /// don't delete: stopped handles stay reachable via `recall`/`thread_list`;
+    /// they just can't buy idle dominance of the active surface.
+    #[serde(default = "default_weaver_stop_handles")]
+    pub stop_handles: Vec<String>,
 }
 
 fn default_weaver_exclude_facets() -> Vec<String> {
     vec!["record_kind:harness_orchestration".to_string()]
 }
 
+/// Default curated harness-mechanism stop-set. These are coordination /
+/// lifecycle / test plumbing handles that resonate strongly (so the derived
+/// `is_stop_handle` gate never catches them) but carry no domain cognition.
+fn default_weaver_stop_handles() -> Vec<String> {
+    [
+        "squad-lead",
+        "turn-digest",
+        "re-run",
+        "post-restart",
+        "no-op",
+        "read-only",
+        "exec-replace",
+        "resolve-or-reject",
+        "watch-notify",
+        "re-arm",
+        "re-armed",
+        "cron-wake",
+        "in-flight",
+        "byte-stable",
+        "per-turn",
+        "per-seat",
+        "per-session",
+        "per-connection",
+        "single-bounce",
+        "pre-bounce",
+        "post-bounce",
+        "warm-standby",
+        "fleet-wide",
+        "re-render",
+        "self-test",
+        "cargo-test-lib",
+        "depends-on",
+        "team-lead",
+        "in-process",
+        "teammate-message",
+        "auto-compact",
+        "whoami-probe",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 impl Default for WeaverSettings {
     fn default() -> Self {
         Self {
             exclude_facets: default_weaver_exclude_facets(),
+            stop_handles: default_weaver_stop_handles(),
         }
     }
 }
@@ -1089,6 +1146,32 @@ paths = ["~/notes"]
         let cfg = Config::load(f.path()).unwrap();
         assert_eq!(cfg.sources.len(), 1);
         assert_eq!(cfg.embedder.model, "potion-retrieval-32M");
+    }
+
+    #[test]
+    fn weaver_default_stop_handles_seeded() {
+        let d = WeaverSettings::default();
+        assert!(!d.stop_handles.is_empty(), "default stop-set must be seeded");
+        assert!(
+            d.stop_handles.iter().any(|h| h == "turn-digest"),
+            "seed set must include known harness handles",
+        );
+        // Absent `[weaver]` block resolves to the seeded defaults.
+        assert_eq!(WeaverSettings::resolve(None).stop_handles, d.stop_handles);
+    }
+
+    #[test]
+    fn weaver_block_without_stop_handles_uses_serde_default() {
+        // A `[weaver]` block that sets only `exclude_facets` must still get
+        // the seeded `stop_handles` via the field's serde default — not an
+        // empty list (which would silently disable the gate).
+        let w: WeaverSettings =
+            toml::from_str(r#"exclude_facets = ["status:archived"]"#).unwrap();
+        assert_eq!(w.exclude_facets, vec!["status:archived".to_string()]);
+        assert!(
+            !w.stop_handles.is_empty(),
+            "omitted stop_handles must fall back to the seeded default",
+        );
     }
 
     #[test]
