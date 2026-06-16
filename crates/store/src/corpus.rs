@@ -161,6 +161,113 @@ impl CorpusStore {
         Ok(())
     }
 
+    /// Per-handle PROJECT co-occurrence for the autonomous-salience specificity
+    /// axis (recalibration approach 1). One projected `(project, text)` scan; for
+    /// each handle, count how many chunks in each PROJECT contain the handle as
+    /// an ORDERED whole-phrase substring (de-hyphenated, e.g. `"cognitive
+    /// memory"`). Returns `(n_projects_global, handle → per-project counts)` —
+    /// the caller feeds the per-project counts to `specificity_from_project_dist`
+    /// normalized by `n_projects_global`.
+    ///
+    /// **Project buckets + GLOBAL normalization, not doc-frequency.** A coined
+    /// concept concentrates in FEW projects (low project-entropy vs the global
+    /// span → SPECIFIC); generic plumbing (`in-memory`, `top-level`) spreads
+    /// across MANY projects (high entropy → GENERIC). The diagnostic measured
+    /// concepts in ≤6 projects, plumbing in 8–14, out of 23 — project-span
+    /// cleanly separates them where raw document-frequency inverted (the corpus
+    /// is mono-thematic, so the most-discussed ideas have the most DOCS).
+    ///
+    /// **Ordered-substring UNIT match, not token-AND.** The phrase
+    /// `"cognitive memory"` must appear as an ordered substring of the
+    /// lowercased text — matching the handle as a unit. Token-AND (each word
+    /// present anywhere) inverts for multi-word coined concepts whose component
+    /// words are individually common.
+    ///
+    /// One full `(project, text)` scan (proven lane-7 projection; no FTS, no
+    /// embedding column). A scan error propagates as `Err` — the boot caller
+    /// degrades it to neutral specificity (never aborts re-anchor).
+    #[allow(clippy::implicit_hasher)]
+    pub async fn project_phrase_cooccurrence(
+        &self,
+        handles: &[String],
+    ) -> Result<(usize, std::collections::HashMap<String, Vec<f32>>)> {
+        use std::collections::{HashMap, HashSet};
+
+        use arrow_array::Array;
+
+        if handles.is_empty() {
+            return Ok((0, HashMap::new()));
+        }
+        // handle → its de-hyphenated lowercased phrase (the ordered substring).
+        let needles: Vec<(String, String)> = handles
+            .iter()
+            .map(|h| (h.clone(), h.replace('-', " ").to_lowercase()))
+            .collect();
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        let stream = table
+            .query()
+            .select(Select::Columns(vec![
+                "project".into(),
+                "source".into(),
+                "links_json".into(),
+                "text".into(),
+            ]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        let mut all_projects: HashSet<String> = HashSet::new();
+        // handle → (project → match count)
+        let mut hits: HashMap<&str, HashMap<String, f32>> =
+            needles.iter().map(|(h, _)| (h.as_str(), HashMap::new())).collect();
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let project = downcast_str_opt(batch, "project");
+            let source = downcast_str_opt(batch, "source");
+            let links_json = downcast_str_opt(batch, "links_json");
+            let text = downcast_str(batch, "text")?;
+            for i in 0..batch.num_rows() {
+                // Project bucket: for claude_code transcripts the `project`
+                // column is the single shared `claude-code-history` label (~80%
+                // of the corpus would collapse into one bucket); derive the REAL
+                // per-session repo from the transcript file_path so the bulk
+                // contributes its true project structure. Fall back to the
+                // `project` column for non-transcript / unparseable rows.
+                let is_transcript =
+                    matches!(source, Some(a) if !a.is_null(i) && a.value(i) == "claude_code");
+                let derived = if is_transcript {
+                    links_json
+                        .filter(|a| !a.is_null(i))
+                        .and_then(|a| repo_from_transcript_path(a.value(i)))
+                } else {
+                    None
+                };
+                let proj = derived.unwrap_or_else(|| match project {
+                    Some(a) if !a.is_null(i) => a.value(i).to_string(),
+                    _ => "<none>".to_string(),
+                });
+                all_projects.insert(proj.clone());
+                let lc = text.value(i).to_lowercase();
+                for (handle, needle) in &needles {
+                    if lc.contains(needle.as_str()) {
+                        *hits
+                            .get_mut(handle.as_str())
+                            .expect("seeded")
+                            .entry(proj.clone())
+                            .or_insert(0.0) += 1.0;
+                    }
+                }
+            }
+        }
+        let out: HashMap<String, Vec<f32>> = needles
+            .iter()
+            .map(|(h, _)| (h.clone(), hits[h.as_str()].values().copied().collect()))
+            .collect();
+        Ok((all_projects.len(), out))
+    }
+
     /// Ensure a BTree scalar index exists on `chunk_id`. Idempotent.
     ///
     /// `Pipeline::embed_and_persist` lands every batch through
@@ -1785,6 +1892,47 @@ fn escape_sql(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Derive the real per-session REPO from a claude_code transcript's
+/// `links_json` (recalibration approach 1, project-derivation). The transcript
+/// path encodes the session's cwd, e.g.
+/// `…/.claude/projects/-Users-scottmeyer-projects-<REPO>/<session>.jsonl`
+/// (subagents nest under `…/-Users-…-<REPO>/subagents/…`). We take the
+/// directory segment right under `projects/` and return its LAST
+/// dash-delimited component — the repo name (`ostk-recall`, `haystack`,
+/// `agent-projection`→`projection`). Defensive: any shape we don't recognize →
+/// `None`, so the caller falls back to the `project` column (never panics).
+fn repo_from_transcript_path(links_json: &str) -> Option<String> {
+    // Cheap extraction of the `file_path` value without a full serde parse —
+    // links_json is a flat object; find the field literally.
+    let v: serde_json::Value = serde_json::from_str(links_json).ok()?;
+    let path = v.get("file_path")?.as_str()?;
+    // The encoded-cwd segment is the path component immediately after a
+    // `projects/` component (the `.claude/projects/<encoded-cwd>/…` layout).
+    let mut comps = path.split('/').peekable();
+    let mut encoded: Option<&str> = None;
+    while let Some(c) = comps.next() {
+        if c == "projects" {
+            if let Some(next) = comps.peek() {
+                encoded = Some(next);
+            }
+            break;
+        }
+    }
+    let encoded = encoded?;
+    // `-Users-scottmeyer-projects-<REPO>` → the REPO is everything after the
+    // last `-projects-`; if that marker is absent, fall back to the last
+    // dash-component (still a stable per-cwd label).
+    let repo = encoded
+        .rsplit_once("-projects-")
+        .map_or_else(|| encoded.rsplit('-').next().unwrap_or(encoded), |(_, r)| r);
+    let repo = repo.trim_matches('-');
+    if repo.is_empty() {
+        None
+    } else {
+        Some(repo.to_string())
+    }
+}
+
 /// Required Utf8 column — error if missing or wrong type.
 fn downcast_str<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
     let col = batch.column_by_name(name).ok_or_else(|| {
@@ -1991,6 +2139,35 @@ mod tests {
     use super::*;
     use ostk_recall_core::{Chunk, Links, Source};
     use tempfile::TempDir;
+
+    #[test]
+    fn repo_from_transcript_path_derives_repo_and_degrades() {
+        let p = |fp: &str| format!(r#"{{"file_path":"{fp}"}}"#);
+        // Top-level session under a -projects- cwd → repo is the tail.
+        assert_eq!(
+            repo_from_transcript_path(&p(
+                "/Users/scottmeyer/.claude/projects/-Users-scottmeyer-projects-ostk-recall/abc.jsonl"
+            )),
+            Some("ostk-recall".to_string())
+        );
+        // Subagent transcript, different repo.
+        assert_eq!(
+            repo_from_transcript_path(&p(
+                "/Users/me/.claude/projects/-Users-me-projects-haystack/subagents/agent-x.jsonl"
+            )),
+            Some("haystack".to_string())
+        );
+        // No `-projects-` marker → falls back to the last dash-component.
+        assert_eq!(
+            repo_from_transcript_path(&p("/Users/me/.claude/projects/-Users-me-notes/s.jsonl")),
+            Some("notes".to_string())
+        );
+        // Defensive: no file_path, malformed JSON, no `projects/` segment → None
+        // (caller falls back to the project column; never panics).
+        assert_eq!(repo_from_transcript_path(r#"{"x":1}"#), None);
+        assert_eq!(repo_from_transcript_path("not json"), None);
+        assert_eq!(repo_from_transcript_path(&p("/var/log/foo.jsonl")), None);
+    }
 
     fn sample_chunk(id: &str, text: &str) -> Chunk {
         Chunk {

@@ -593,7 +593,12 @@ const fn default_true() -> bool {
     true
 }
 const fn default_specificity_min_evidence() -> u32 {
-    5
+    // Token-hit scale (recal §2): specificity now reads corpus-token
+    // co-occurrence (dense — hundreds of hits for plumbing) rather than the
+    // sparse evidence graph, so the "enough signal to judge" floor is the
+    // number of phrase-matching corpus chunks, not curated links. 20 keeps a
+    // rarely-mentioned real concept neutral rather than judged on noise.
+    20
 }
 const fn default_specificity_lift_cutoff() -> f32 {
     0.2
@@ -1406,7 +1411,7 @@ paths = ["~/notes"]
         let d = SalienceSettings::default();
         assert!(!d.scorer_v2, "scorer_v2 must default OFF");
         assert!((d.value_neutral - 1.0).abs() < f32::EPSILON);
-        assert_eq!(d.specificity_min_evidence, 5);
+        assert_eq!(d.specificity_min_evidence, 20);
         assert_eq!(d.negative_knn_k, 3);
         assert_eq!(SalienceSettings::resolve(None).scorer_v2, d.scorer_v2);
         // A partial block fills the rest from serde defaults.

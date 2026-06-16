@@ -2092,7 +2092,7 @@ async fn precompute_salience_factors(
 
     use ostk_recall_attention::{
         SalienceFactors, SourceMeta, center, negative_penalty,
-        salience::{specificity_from_evidence, value_from},
+        salience::{specificity_from_project_dist, value_from},
     };
     use ostk_recall_store::{ConceptActivationReader, RelationState, default_since_now};
 
@@ -2250,21 +2250,67 @@ async fn precompute_salience_factors(
         (HashMap::new(), HashMap::new())
     };
 
+    // ---- specificity pass: lexical project co-occurrence (recal approach 1) ----
+    // Specificity = how CONCENTRATED a handle's whole-phrase mentions are across
+    // the corpus's PROJECTS, normalized by the GLOBAL project count. A coined
+    // concept concentrates in few projects (SPECIFIC); generic plumbing spreads
+    // across many (GENERIC). Document-frequency inverts here (mono-thematic
+    // corpus — the core concepts have the most DOCS), but project-span
+    // separates them (diagnostic: concepts ≤6 projects, plumbing 8–14, N=23).
+    // One projected (project, text) scan, run only when the axis is on; a scan
+    // error degrades every handle to neutral specificity.
+    let (n_projects_global, project_dist): (usize, HashMap<String, Vec<f32>>) =
+        if salience.specificity_enabled {
+            // Specificity is a property of the handle STRING (its text
+            // co-occurrence across projects) — independent of whether the
+            // thread has a cached anchor_vec. Source from EVERY thread handle
+            // (`reanchor`), not just the anchored subset, so anchor-poor but
+            // text-rich plumbing (in-memory, hand-off) is measured + demoted
+            // rather than escaping to neutral.
+            let handle_strings: Vec<String> = reanchor
+                .iter()
+                .map(|i| i.handle.as_str().to_string())
+                .collect::<HashSet<String>>()
+                .into_iter()
+                .collect();
+            match corpus.project_phrase_cooccurrence(&handle_strings).await {
+                Ok((n, d)) => (n, d),
+                Err(e) => {
+                    tracing::warn!(error = %e, "salience: project_phrase_cooccurrence failed; specificity stays neutral");
+                    (0, HashMap::new())
+                }
+            }
+        } else {
+            (0, HashMap::new())
+        };
+
     // ---- pass C: per-handle factors (one map, all three axes) ----
-    // Specificity keys on the evidence graph; negative-transfer keys on the
-    // anchor; value keys on the surfaced/used ledger + judgment evidence.
-    // Iterate the UNION so a handle qualifying for any one axis gets it; the
-    // others stay their neutral identity (`specificity = 1.0`, `value = 1.0`,
-    // `neg_penalty = 0.0`).
+    // Specificity = 1 − H(project_dist)/ln(N_projects_global) (concentrated in
+    // few projects = high); negative-transfer keys on the anchor; value keys on
+    // the surfaced/used ledger + judgment evidence. Iterate the UNION so a
+    // handle qualifying for any one axis gets it; the others stay their neutral
+    // identity (`specificity = 1.0`, `value = 1.0`, `neg_penalty = 0.0`).
     let mut factors: HashMap<String, SalienceFactors> = HashMap::new();
-    let handle_union: HashSet<&String> = ev_by_handle.keys().chain(anchors.keys()).collect();
+    // Union includes project_dist.keys() so an anchor-poor but text-measured
+    // handle (in-memory, hand-off) still gets a specificity factor written —
+    // otherwise it falls through to the scorer's neutral 1.0 and escapes
+    // demotion despite having a computed low specificity.
+    let handle_union: HashSet<&String> = ev_by_handle
+        .keys()
+        .chain(anchors.keys())
+        .chain(project_dist.keys())
+        .collect();
     let empty_ev: Vec<ostk_recall_store::EvidenceLink> = Vec::new();
     for handle in handle_union {
         let evidence = ev_by_handle.get(handle).unwrap_or(&empty_ev);
-        let specificity = if evidence.is_empty() {
-            1.0
-        } else {
-            specificity_from_evidence(evidence, &chunk_meta, salience)
+        // Project-distribution specificity, GLOBAL-normalized (recal approach 1).
+        // A handle with no project matches (coined-unwritten / axis off) ⇒
+        // neutral 1.0 (rests on the other axes).
+        let specificity = match project_dist.get(handle) {
+            Some(counts) if !counts.is_empty() => {
+                specificity_from_project_dist(counts, n_projects_global)
+            }
+            _ => 1.0,
         };
         let neg_penalty = if salience.negative_enabled {
             anchors.get(handle).map_or(0.0, |anchor| {
@@ -2325,14 +2371,16 @@ const AB_NOISE: &[&str] = &[
     "teammate-message",
 ];
 
-/// Confirmed REAL concepts. Tagged CONCEPT; the P1 verdict checks every NOISE
-/// handle ranks below the worst of these.
+/// Confirmed REAL concepts — coined IDEAS, not repo/tool/project NAMES. The
+/// P1 verdict checks every NOISE handle ranks below the worst of these.
+/// `ostk-recall` was removed: it's the REPO NAME (present in ~11 projects,
+/// legitimately GENERIC under project-span), so tagging it CONCEPT made P1 fail
+/// on a mislabel, not a signal error. Repo/tool names sit with the plumbing.
 const AB_CONCEPT: &[&str] = &[
     "cognitive-memory",
     "ostk-cache",
     "dereference-or-void",
     "relational-substrate-docgraph",
-    "ostk-recall",
     "slipstream",
     "mish",
     "attention-is-sovereign",
@@ -2344,6 +2392,11 @@ const AB_CONCEPT: &[&str] = &[
 struct AbRow {
     handle: String,
     tag: &'static str, // NOISE | CONCEPT | (other)
+    /// The specificity FACTOR applied on the v2 surface (`why.specificity`) —
+    /// the recalibration's key proof: < 1.0 (and low) for diffuse plumbing,
+    /// ~1.0 for concentrated concepts. `None` if the handle isn't on the v2
+    /// surface.
+    on_specificity: Option<f32>,
     off_score: Option<f32>,
     off_rank: Option<usize>,
     on_score: Option<f32>,
@@ -2376,6 +2429,7 @@ pub async fn salience_ab(
     // vectors — same prerequisite serve asserts.
     let engine = build_query_engine_read_only(config_path, Arc::clone(&embedder)).await?;
     let root = engine.store().root().to_path_buf();
+
     if engine.store().dim() != embedder.dim() {
         return Err(anyhow!(
             "embedder/corpus dimension mismatch ({} vs {}) — point the original \
@@ -2470,6 +2524,12 @@ pub async fn salience_ab(
     };
     let off = rank_map(&off_surface);
     let on = rank_map(&on_surface);
+    // The specificity factor applied on the v2 surface, per handle — the proof
+    // the recalibration actually fires (was uniformly 1.0 / inert before).
+    let on_spec: std::collections::HashMap<String, f32> = on_surface
+        .iter()
+        .map(|p| (p.handle.clone(), p.why.specificity))
+        .collect();
     let tag_of = |h: &str| -> &'static str {
         if AB_NOISE.contains(&h) {
             "NOISE"
@@ -2495,6 +2555,7 @@ pub async fn salience_ab(
             };
             AbRow {
                 tag: tag_of(&h),
+                on_specificity: on_spec.get(&h).copied(),
                 handle: h,
                 off_score: o.map(|x| x.0),
                 off_rank: o.map(|x| x.1),
@@ -2552,16 +2613,17 @@ pub async fn salience_ab(
 
     println!("salience A/B — scorer_v2 OFF vs ON (read-only, idle surface)\n");
     println!(
-        "{:<34} {:>7} {:>5} {:>7} {:>5} {:>6}  {}",
-        "handle", "off", "o#", "on", "n#", "Δrank", "tag"
+        "{:<34} {:>5} {:>7} {:>5} {:>7} {:>5} {:>6}  {}",
+        "handle", "spec", "off", "o#", "on", "n#", "Δrank", "tag"
     );
     for r in rows.iter().take(top) {
         let fmt_s = |s: Option<f32>| s.map_or("-".to_string(), |v| format!("{v:.3}"));
         let fmt_r = |r: Option<usize>| r.map_or("-".to_string(), |v| v.to_string());
         let fmt_d = |d: Option<i64>| d.map_or("-".to_string(), |v| format!("{v:+}"));
         println!(
-            "{:<34} {:>7} {:>5} {:>7} {:>5} {:>6}  {}",
+            "{:<34} {:>5} {:>7} {:>5} {:>7} {:>5} {:>6}  {}",
             r.handle,
+            fmt_s(r.on_specificity),
             fmt_s(r.off_score),
             fmt_r(r.off_rank),
             fmt_s(r.on_score),

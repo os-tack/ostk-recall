@@ -1010,13 +1010,27 @@ impl Server {
             }
         };
 
-        // (4) The judged-salient set J — handles of currently-active concepts
-        // (durable operator judgment) within the window. The drift metric
-        // compares this against the active surface A.
+        // (4) The judged-salient set J — handles the operator actually engaged
+        // recently, NOT every graph-present concept. The unfiltered set floods
+        // J with hundreds of file-seeded doc-concepts (spec-*/draft-*/man-*/
+        // patents-*) that activate purely on durable `confidence` and are never
+        // active threads, inflating `active_decided_drift` to ~0.97 and making
+        // the alarm meaningless (recal §3). Scope J to concepts with a non-zero
+        // recent DYNAMIC signal (`decayed_access + focus_lift > 0` — actually
+        // accessed/focused in the window), mirroring `relational_support`'s
+        // seed filter. A doc-concept that only carries confidence and was never
+        // touched is excluded; a genuinely-engaged concept stays. (Folding in
+        // recent ostk_decision/ostk_needle handles is the next refinement — it
+        // needs a new reader, so it's deferred per the no-new-query constraint.)
         let judged: std::collections::HashSet<String> = dispatch
             .threads
             .concept_activations(None, since)
-            .map(|acts| acts.into_iter().map(|a| a.handle).collect())
+            .map(|acts| {
+                acts.into_iter()
+                    .filter(|a| a.why.decayed_access + a.why.focus_lift > 0.0)
+                    .map(|a| a.handle)
+                    .collect()
+            })
             .unwrap_or_default();
 
         let health = salience_health(&surface, &curated, &ledger, &judged, &cfg);

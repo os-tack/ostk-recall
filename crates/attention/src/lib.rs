@@ -40,7 +40,8 @@ pub use query::{
 pub use health::salience_health;
 pub use salience::{
     SalienceFactors, SalienceScorer, SourceMeta, center, negative_penalty, shannon_entropy,
-    value_from, value_judgment, value_use,
+    specificity_from_histogram, specificity_from_project_dist, value_from, value_judgment,
+    value_use,
 };
 pub use weaver::{
     AutoWeaver, ConsolidateOutcome, ProposedWeave, WeaveWindowOutcome, WeaverError, WeaverOutcome,

@@ -169,6 +169,11 @@ fn ab_settings(specificity: bool, value: bool, negative: bool) -> SalienceSettin
     s.specificity_enabled = specificity;
     s.value_enabled = value;
     s.negative_enabled = negative;
+    // The fixture seeds 12 synthetic co-occurrence docs per handle; pin the
+    // min-evidence floor below that so the harness exercises the entropy
+    // ORDERING, not the production token-hit floor (20). The live re-run via
+    // salience-ab is what validates the real-corpus threshold.
+    s.specificity_min_evidence = 5;
     s
 }
 

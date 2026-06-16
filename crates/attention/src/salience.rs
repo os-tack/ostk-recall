@@ -190,8 +190,91 @@ pub fn shannon_entropy(weights: &[f32]) -> f32 {
 // resonated with); the `as f32` for `ln(N_eff)` is well within mantissa
 // range. `implicit_hasher`: the boot caller always passes a default-hasher
 // `HashMap`, so generalizing the signature buys nothing.
+/// Entropy CORE of the specificity axis — the source-agnostic `1 − H/ln(N_eff)`
+/// over a per-handle `(project, source_id)` co-occurrence histogram.
+///
+/// `bin_weights` is the per-document count (one entry per distinct source doc
+/// the handle co-occurs with); `total` is their sum (the total co-occurrence
+/// count). Both the corpus-token co-occurrence path (the live input, recal §2)
+/// and the legacy evidence-link path build this histogram and call here, so the
+/// entropy math + its guards live in one place:
+/// - `total < specificity_min_evidence` ⇒ `1.0` (not enough signal to judge —
+///   never punish a thin-but-real concept on noise);
+/// - `N_eff ≤ 1` (one bin) ⇒ `1.0` (one document is maximally specific);
+/// - otherwise `1 − H/ln(N_eff)` in `[0,1]`: peaked → high, flat → low.
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::implicit_hasher)]
+#[allow(clippy::cast_precision_loss)]
+pub fn specificity_from_histogram(bin_weights: &[f32], total: u32, cfg: &SalienceSettings) -> f32 {
+    if total < cfg.specificity_min_evidence {
+        return 1.0; // not enough co-occurrence to judge — neutral
+    }
+    let n_eff = bin_weights.iter().filter(|w| **w > 0.0).count();
+    if n_eff <= 1 {
+        return 1.0; // single document ⇒ maximally specific
+    }
+    let h = shannon_entropy(bin_weights);
+    let h_max = (n_eff as f32).ln();
+    if h_max <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - h / h_max).clamp(0.0, 1.0)
+}
+
+/// Specificity over a handle's PROJECT-count distribution, normalized by the
+/// GLOBAL project count (recal approach 1, with the lead's formula correction).
+///
+/// `project_counts` is the handle's per-project match count (one entry per
+/// distinct project the handle's phrase appears in); `n_projects_global` is the
+/// total number of distinct projects in the corpus. Returns
+/// `1 − H(project_dist) / ln(n_projects_global)` in `[0,1]`.
+///
+/// **Why GLOBAL normalization, not `ln(N_eff)` (load-bearing):** normalizing by
+/// the handle's OWN span discards the span signal — a concept even across 6
+/// projects and plumbing even across 14 both give `1 − ln(k)/ln(k) = 0`, so the
+/// 6-vs-14 discrimination the diagnostic proved is normalized away. Against the
+/// fixed global denominator `ln(N_global)`, span survives:
+/// concentrated-in-1 → `H=0` → `1.0` (specific); even-across-6 →
+/// `1 − ln 6/ln 23 ≈ 0.43`; even-across-14 → `1 − ln 14/ln 23 ≈ 0.16` (diffuse).
+/// Captures BOTH span and skew, globally comparable across handles.
+///
+/// No `min_evidence` guard: for an IDF-like signal the sparse end is correct on
+/// its own — a handle in 1 project → `H=0` → `1.0` (maximally specific); 0
+/// projects (empty) → `1.0` (caller's default; coined-unwritten handle → rests
+/// on the other axes).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn specificity_from_project_dist(project_counts: &[f32], n_projects_global: usize) -> f32 {
+    let n_eff = project_counts.iter().filter(|w| **w > 0.0).count();
+    if n_eff <= 1 {
+        return 1.0; // in ≤1 project ⇒ maximally specific
+    }
+    // RAW project SPAN, not entropy. The diagnostic proved distinct project
+    // COUNT separates concepts (≤6) from plumbing (8–14) — but entropy weights
+    // by match VOLUME, and every handle is bursty in its home project, so the
+    // skew re-conflates them (concepts and plumbing both land ~0.6–0.7). Span
+    // ignores volume: a handle in `s` of `N` projects scores `1 − (s−1)/(N−1)`
+    // — in 1 project → 1.0 (specific), in all → 0.0 (generic), linear between.
+    // This is the signal the diagnostic measured directly.
+    let n_global = n_projects_global.max(n_eff);
+    if n_global <= 1 {
+        return 1.0;
+    }
+    let span_frac = (n_eff as f32 - 1.0) / (n_global as f32 - 1.0);
+    (1.0 - span_frac).clamp(0.0, 1.0)
+}
+
+/// Specificity over a handle's **evidence-link** co-occurrence distribution
+/// (legacy input — kept for tests and as a fallback). Builds the `(project,
+/// source_id)` histogram from the handle's Active evidence links, then defers
+/// to [`specificity_from_histogram`].
+///
+/// NOTE: on the real ledger this input is too sparse to fire (evidence_links
+/// is a curated high-cosine weaver artifact, < `specificity_min_evidence` per
+/// handle), which is why the boot pass now feeds the entropy core from
+/// `CorpusStore::token_cooccurrence` instead (recal §2). This fn remains the
+/// reference implementation the unit tests pin.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn specificity_from_evidence(
     evidence: &[EvidenceLink],
     chunk_meta: &HashMap<String, SourceMeta>,
@@ -218,21 +301,8 @@ pub fn specificity_from_evidence(
         *hist.entry(meta).or_insert(0.0) += 1.0;
         total_chunks += 1;
     }
-
-    if total_chunks < cfg.specificity_min_evidence {
-        return 1.0; // not enough evidence to judge — neutral
-    }
-    let n_eff = hist.len();
-    if n_eff <= 1 {
-        return 1.0; // single document ⇒ maximally specific
-    }
     let weights: Vec<f32> = hist.values().copied().collect();
-    let h = shannon_entropy(&weights);
-    let h_max = (n_eff as f32).ln();
-    if h_max <= 0.0 {
-        return 1.0;
-    }
-    (1.0 - h / h_max).clamp(0.0, 1.0)
+    specificity_from_histogram(&weights, total_chunks, cfg)
 }
 
 // --- value / use-feedback + judgment propagation (THESIS axis 3 / R2) --
@@ -509,7 +579,13 @@ mod tests {
     // --- specificity_from_evidence --------------------------------------
 
     fn cfg() -> SalienceSettings {
-        SalienceSettings::default()
+        // The entropy-math tests use small synthetic histograms; pin a low
+        // `specificity_min_evidence` so they exercise the FORMULA, not the
+        // production token-hit floor (20). The `*_below_min_evidence_*` test
+        // sets its own threshold to exercise the floor itself.
+        let mut s = SalienceSettings::default();
+        s.specificity_min_evidence = 2;
+        s
     }
 
     fn link(chunk_id: &str) -> EvidenceLink {
@@ -542,6 +618,81 @@ mod tests {
             source: source.to_string(),
             source_id: source_id.to_string(),
         }
+    }
+
+    #[test]
+    fn specificity_from_project_dist_global_norm_captures_span() {
+        // recal approach 1 + the global-normalization fix. The live diagnostic
+        // measured concepts in ≤6 projects, plumbing in 8–14, out of N=23.
+        // Normalizing by the GLOBAL count (not the handle's own span) must keep
+        // the span signal: a concept spread evenly across 6 projects out-ranks
+        // plumbing spread across 14 — both would be 0 under ln(N_eff) norm.
+        let global = 23;
+        let concept = vec![1.0_f32; 6]; // cognitive-memory: 6 projects, even
+        let plumbing = vec![1.0_f32; 14]; // in-memory: 14 projects, even
+        let s_concept = specificity_from_project_dist(&concept, global);
+        let s_plumbing = specificity_from_project_dist(&plumbing, global);
+        // RAW SPAN: 1 − (span−1)/(N−1). concept 6/23 → 1−5/22 ≈ 0.773;
+        // plumbing 14/23 → 1−13/22 ≈ 0.409. Span ignores match volume, so the
+        // 6-vs-14 separation survives regardless of skew.
+        assert!((s_concept - (1.0 - 5.0 / 22.0)).abs() < 1e-5);
+        assert!((s_plumbing - (1.0 - 13.0 / 22.0)).abs() < 1e-5);
+        assert!(
+            s_concept > s_plumbing + 0.2,
+            "raw span must keep the 6-vs-14 separation: concept {s_concept} vs plumbing {s_plumbing}"
+        );
+        // Concentrated in one project ⇒ maximally specific (regardless of volume).
+        assert_eq!(specificity_from_project_dist(&[9.0], global), 1.0);
+        // A SKEWED 14-project handle still reads generic by span — the property
+        // entropy lost: volume concentration must NOT rescue a broad-span term.
+        let skewed14: Vec<f32> = {
+            let mut v = vec![1.0_f32; 13];
+            v.push(900.0); // bursty home project
+            v
+        };
+        let s_skewed = specificity_from_project_dist(&skewed14, global);
+        assert!(
+            (s_skewed - s_plumbing).abs() < 1e-5,
+            "span ignores volume: a skewed 14-project handle scores like an even \
+             14-project one ({s_skewed} vs {s_plumbing}) — the skew can't rescue it"
+        );
+        // Empty (coined-unwritten handle) ⇒ neutral 1.0 (rests on other axes).
+        assert_eq!(specificity_from_project_dist(&[], global), 1.0);
+    }
+
+    #[test]
+    fn specificity_from_histogram_discriminates_plumbing_vs_concept() {
+        // recal §2: the corpus-token co-occurrence histogram is the live input.
+        // PLUMBING (`top-level`/`in-memory`) phrase-matches across MANY docs →
+        // flat histogram → LOW specificity. A CONCEPT (`cognitive-memory`)
+        // concentrates in a few docs → peaked → HIGH. Drive the entropy core
+        // directly on the two histogram shapes.
+        let c = cfg(); // min_evidence 2
+
+        // Plumbing: 100 hits spread evenly across 50 distinct docs.
+        let plumbing: Vec<f32> = vec![2.0; 50];
+        let s_plumbing = specificity_from_histogram(&plumbing, 100, &c);
+        assert!(
+            s_plumbing < 0.05,
+            "plumbing spread across 50 docs should be ~0 specificity, got {s_plumbing}"
+        );
+
+        // Concept: 100 hits, 90 in one doc + a thin 10 across 5 others.
+        let mut concept = vec![90.0];
+        concept.extend(std::iter::repeat(2.0).take(5));
+        let s_concept = specificity_from_histogram(&concept, 100, &c);
+        assert!(
+            s_concept > 0.7 && s_concept > s_plumbing,
+            "concentrated concept should be HIGH and well above plumbing: \
+             concept {s_concept} vs plumbing {s_plumbing}"
+        );
+
+        // Single doc ⇒ maximally specific.
+        assert_eq!(specificity_from_histogram(&[100.0], 100, &c), 1.0);
+        // Below the floor ⇒ neutral regardless of spread.
+        let mut hi = cfg();
+        hi.specificity_min_evidence = 50;
+        assert_eq!(specificity_from_histogram(&[1.0, 1.0, 1.0], 3, &hi), 1.0);
     }
 
     #[test]
@@ -603,14 +754,18 @@ mod tests {
 
     #[test]
     fn specificity_below_min_evidence_is_neutral() {
-        // Only 3 resonances (< min_evidence 5), spread across 3 docs — would
-        // be diffuse, but there isn't enough evidence to judge → neutral 1.0.
+        // 3 resonances across 3 docs — would read diffuse, but with a
+        // min_evidence floor ABOVE the count there isn't enough signal to
+        // judge → neutral 1.0. (Exercises the floor itself; uses an explicit
+        // threshold of 5 rather than `cfg()`'s test-low 2.)
+        let mut c = cfg();
+        c.specificity_min_evidence = 5;
         let ev: Vec<_> = (0..3).map(|i| link(&format!("c{i}"))).collect();
         let mut cm = HashMap::new();
         for i in 0..3 {
             cm.insert(format!("c{i}"), meta("p", &format!("doc{i}.md")));
         }
-        assert_eq!(specificity_from_evidence(&ev, &cm, &cfg()), 1.0);
+        assert_eq!(specificity_from_evidence(&ev, &cm, &c), 1.0);
     }
 
     #[test]
