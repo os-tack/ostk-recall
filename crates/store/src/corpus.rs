@@ -161,6 +161,31 @@ impl CorpusStore {
         Ok(())
     }
 
+    /// Drop the `text` full-text index if present. Used **before** an
+    /// `optimize` pass to keep lance off its inverted-index *delta-merge*
+    /// path, which is broken in lance-index 7.0.0: `merge_postings`
+    /// (`scalar/inverted/builder.rs`) resizes `posting_lists` to the merged
+    /// token-set length, then indexes it with a remapped token id that can
+    /// exceed that length — an out-of-bounds panic that aborts the process
+    /// under our release `panic = "abort"`. It fires when folding the FTS
+    /// deltas that accumulate from incremental appends (observed merging a
+    /// backlog: "len is 128568 but the index is 130109"). A from-scratch
+    /// build (`ensure_fts_index`) never takes the merge path, so callers drop
+    /// here and rebuild fresh after optimizing. Idempotent — no-op if absent.
+    async fn drop_fts_index_if_present(&self) -> Result<()> {
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
+        for ix in table.list_indices().await? {
+            if ix.columns.iter().any(|c| c == "text") {
+                tracing::info!(
+                    index = %ix.name,
+                    "dropping FTS index before optimize (rebuilt from scratch after)"
+                );
+                table.drop_index(&ix.name).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Per-handle PROJECT co-occurrence for the autonomous-salience specificity
     /// axis (recalibration approach 1). One projected `(project, text)` scan; for
     /// each handle, count how many chunks in each PROJECT contain the handle as
@@ -1460,8 +1485,14 @@ impl CorpusStore {
         // Heal legacy miniblock columns first, or compaction panics in the
         // encoder on this corpus's oversized text / sparse facets.
         self.ensure_structural_encodings().await?;
+        // Then drop the FTS index so `OptimizeAction::All` folds only the
+        // vector/scalar indices — never lance-7's broken FTS delta-merge
+        // (see `drop_fts_index_if_present`); it is rebuilt from scratch below.
+        self.drop_fts_index_if_present().await?;
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         table.optimize(OptimizeAction::All).await?;
+        // Rebuild the FTS index in one pass over the compacted data.
+        self.ensure_fts_index().await?;
         Ok(())
     }
 
@@ -1480,10 +1511,17 @@ impl CorpusStore {
     pub async fn optimize_compact_and_prune(&self) -> Result<u64> {
         // Heal legacy miniblock columns first (see `optimize_all`).
         self.ensure_structural_encodings().await?;
+        // Drop FTS so the compaction below avoids lance-7's FTS delta-merge
+        // panic (see `drop_fts_index_if_present`); it is rebuilt from scratch
+        // before the prune so its intermediate versions are collapsed too.
+        self.drop_fts_index_if_present().await?;
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         // 1. Compact small fragments + fold new data into indices.
         table.optimize(OptimizeAction::All).await?;
-        // 2. Prune every version older than "now" (keep only the latest).
+        // 2. Rebuild the FTS index in one pass over the compacted data.
+        self.ensure_fts_index().await?;
+        // 3. Prune every version older than "now" (keep only the latest).
+        let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
         let stats = table
             .optimize(OptimizeAction::Prune {
                 older_than: Some(chrono::Duration::zero()),
@@ -2373,6 +2411,68 @@ mod tests {
             .await
             .expect("OptimizeAction::All must succeed with fullzip facets");
         assert_eq!(store.row_count().await.unwrap(), 2000);
+    }
+
+    /// Guards the FTS drop→rebuild contract in [`CorpusStore::optimize_all`].
+    /// lance-index 7.0.0 aborts when *merging* accumulated FTS delta indices
+    /// (`inverted/builder.rs` remaps a token id past the merged token-set
+    /// length). `optimize_all` sidesteps that by dropping the `text` index
+    /// before optimizing and rebuilding it from scratch after. The merge
+    /// overflow only manifests at corpus scale, so — like the sibling
+    /// miniblock test above — this asserts the contract (optimize succeeds and
+    /// a single fresh `text` index remains) rather than reproducing the panic.
+    #[tokio::test]
+    async fn optimize_all_rebuilds_fts_index_across_deltas() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        // Batch 1, then build the FTS index over it.
+        let b1: Vec<Chunk> = (0..50)
+            .map(|i| sample_chunk(&format!("a{i}"), &format!("alpha token{i}")))
+            .collect();
+        store
+            .upsert(&b1, &vec![vec![0.1, 0.2, 0.3, 0.4]; b1.len()])
+            .await
+            .unwrap();
+        store.ensure_fts_index().await.unwrap();
+
+        // Two more batches AFTER the index exists → FTS delta segments, the
+        // input to lance's buggy merge path.
+        for batch in 1..3 {
+            let chunks: Vec<Chunk> = (0..50)
+                .map(|i| sample_chunk(&format!("b{batch}-{i}"), &format!("beta token{batch}-{i}")))
+                .collect();
+            store
+                .upsert(&chunks, &vec![vec![0.1, 0.2, 0.3, 0.4]; chunks.len()])
+                .await
+                .unwrap();
+        }
+
+        // The previously-aborting call. Must succeed and preserve every row.
+        store
+            .optimize_all()
+            .await
+            .expect("optimize_all must survive accumulated FTS deltas");
+        assert_eq!(store.row_count().await.unwrap(), 150);
+
+        // Exactly one index remains on `text` — the freshly rebuilt one.
+        let table = store
+            .conn
+            .open_table(CORPUS_TABLE)
+            .execute()
+            .await
+            .unwrap();
+        let text_indices = table
+            .list_indices()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|ix| ix.columns.iter().any(|c| c == "text"))
+            .count();
+        assert_eq!(
+            text_indices, 1,
+            "optimize_all must leave exactly one fresh text FTS index"
+        );
     }
 
     #[tokio::test]
