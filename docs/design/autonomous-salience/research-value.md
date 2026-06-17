@@ -352,6 +352,110 @@ confirmed coherent-noise vs real-concept sets.
 
 ---
 
+## Ground-truth fixture — needle-bench / sql-injection / haystack-boot (operator-labeled, 2026-06-16)
+
+A live, operator-confirmed triple that the current (specificity + familiarity)
+scorer ranks **wrong**, and that the value axis must fix. Captured from
+`attention_surface` *after* the harness/coordination ephemera were decayed off
+the surface, so these three are genuine domain handles — not noise to gate, but
+real concepts the scorer orders incorrectly.
+
+**Operator ground truth** (the haystack `needle-bench` eval set):
+- `needle-bench` — **active** (the eval harness currently under development).
+- `sql-injection` — **active** (a test currently being run in that set).
+- `haystack-boot` — **retired** (a decommissioned test in the same set).
+
+**Observed `why` decomposition** (single surface snapshot):
+
+| handle | truth | rank | score | mentions | resonance | spec | value | recency | neg |
+|---|---|---|---|---|---|---|---|---|---|
+| `needle-bench`  | active  | #3  | 1.212 | 45 | 0.239 | 0.973 | 1.0 | 1760s | 0.0 |
+| `haystack-boot` | RETIRED | #13 | 1.127 | 21 | 0.209 | 0.919 | 1.0 | 1760s | 0.0 |
+| `sql-injection` | active  | #19 | 1.080 | 33 | 0.188 | 0.892 | 1.0 | 1760s | 0.0 |
+
+**The failure (two parts):**
+1. **Retired `haystack-boot` outranks active `sql-injection`.** It wins on
+   specificity (0.919 > 0.892) and resonance-per-mention (0.209 > 0.188) despite
+   *fewer* raw mentions (21 < 33). Retirement leaves **no trace** in any axis —
+   past discussion still buoys it.
+2. **`needle-bench` ranks top for the wrong reason** — highest resonance_count
+   (45) and specificity (0.973), i.e. lifetime discussion weight, not because the
+   system knows it is the operator's current focus.
+
+**Why lifecycle is invisible — every axis that could encode "active vs retired"
+is inert here:**
+- `value = 1.0` for all three (pass-through; **this** axis). The corrective signal.
+- `recency` is **per-handle in the math** (`dt_secs = now − state.last_touched_at`,
+  `lib.rs:771`; it decays the idle floor at `:846`) — yet it still can't separate
+  this triple, for two reasons. **(i) Flattened in practice:** `last_touched_at`
+  is bumped on every *observation* (`lib.rs:1794`), and all three share a
+  near-identical value (`time_since_touch_secs` a uniform 1760s across every
+  surfaced handle this pull, 1452s the prior pull) — consistent with a bulk
+  re-touch at the ~16:08 serve-boot scan, which flattens recency across the whole
+  active set. **(ii) Mention ≠ use (the structural reason):** `last_touched_at`
+  tracks the last time a handle was *mentioned/observed*, not *used*. A retired
+  test is still mentioned — in its own code, in discussions of the eval set, in
+  this very session — so it keeps being observed and stays "fresh." Recency
+  therefore **cannot encode retirement even when it isn't flattened**; only value
+  (use-feedback) distinguishes "still talked about" from "actually used."
+- `negative_transfer = 0.0`. A retired handle that keeps surfacing but is never
+  acted on is the textbook surfaced-never-used case and should be *accruing*
+  penalty.
+
+**Acceptance criterion `value_use` must satisfy:**
+- `sql-injection` is being **run now** → its evidence chunks (test file + result
+  chunks) accrue `ExplicitRecall`/`OperatorSelected` → `value_use` rises.
+- `haystack-boot` retired → its evidence chunks see no access since retirement →
+  `value_use → 0` → the multiplier collapses its specificity/familiarity lead.
+- ⇒ **Required post-fix ordering: `rank(sql-injection) > rank(haystack-boot)`**
+  (active beats retired), and `needle-bench`'s lead carried by `value` (use), not
+  `resonance_count`. This is the minimal regression the A/B harness should assert
+  on this triple: known labels where specificity ranks them wrong and value ranks
+  them right.
+
+**Empirical status (Phase 0, 2026-06-17) — `value_use` is currently STARVED for
+this triple and cannot flip it as-is.** Live `threads.sqlite` shows all three
+have **zero `evidence_links`**, and their anchor chunks have **zero
+`explicit_recall` hits** — so both the `evidence_links → access_history` join and
+the anchor-only fallback evaluate to 0 for every one of them. The use-signal from
+*running* the benchmark lands on the retrieved **answer** chunks, which are not
+bridged to these thread handles. Two upstream gaps must close first:
+
+1. **Evidence-link coverage.** Only 174/540 threads carry any `evidence_links`;
+   these three are in the unlinked 68%. `value_use` needs the thread→chunk bridge
+   populated for the handles it scores.
+2. **The epoch weave is manual-only — serve never auto-weaves bulk content
+   (CONFIRMED by repair).** `AutoWeaver::run` weaves only live `TurnEnd` events
+   (`weaver.rs:589`: `if !event.is_turn_end() { continue }`); bulk-ingested chunks
+   are deferred to a "periodic whole-corpus epoch pass" that **does not exist as a
+   periodic pass**. `weave_window`/`consolidate` are invoked *only* by the manual
+   `ostk-recall weave` CLI (`main.rs:679`; the CLI even prints `run 'ostk-recall
+   weave' to weave them`). So with transcript tailing stalled (few/no `TurnEnd`s)
+   and no manual weave since Jun 15, evidence linking froze. Running
+   `ostk-recall weave` repaired it: `evidence_links` grew **21470 → 22286 (+816,
+   174 → 185 threads)** and `sql-injection` gained its first link. It is **not**
+   the stop-handle commit (`113af76` gates `promote_recurring_proposals`, not the
+   write path). **Prerequisite for `value_use`:** the epoch weave must run
+   automatically (periodic, or weave-at-end-of-scan), or `evidence_links` rot
+   between manual runs and `value_use` re-starves — a recall-quality issue beyond
+   salience. **Observability gap:** the bulk weave writes links to the table but
+   does **not** emit the `evidence_add` chain event (it stayed at Jun 15 while the
+   table grew +816), so `chain_log` undercounts linking — the `evidence_links`
+   table is the source of truth. Coverage after one windowed weave is still thin:
+   `sql-injection` 1 link, `needle-bench`/`haystack-boot` 0 — a full-corpus
+   `weave` is needed for the fixture to carry signal.
+
+So this triple is an **integration target gated on the evidence-link bridge**, not
+a unit-flippable fixture today. Conceptually `value_use` is still the right axis
+(test lifecycle = use, not judgment), but it only separates active-vs-retired once
+(i) the linker writes again and (ii) running a test recalls its linked chunks.
+`value_judgment` (anchor-vs-curated-chunk proximity — needs no traffic and no
+evidence links; 488/540 threads have an `anchor_vec`) is the traffic-independent
+lift, but it does **not** by itself order this lifecycle triple, since these test
+handles are not decision-adjacent. The honest near-term sequence is therefore:
+**confirm/repair the weaver linker → then `value_use`**, with `value_judgment`
+as a parallel, independent surface-drift lift.
+
 ## Open questions / risks to hand to Design (D)
 
 1. **Cold-start sparsity.** `value_use` is ~0 for almost every handle today
