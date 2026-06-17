@@ -1,25 +1,29 @@
-//! End-to-end test for the P11 bulk/live boundary.
+//! End-to-end tests for the P11 bulk/live boundary and the →007 serve
+//! auto-weave.
 //!
-//! Drives the production `commands::scan` entry point with a markdown
-//! corpus that (a) mentions a pre-seeded thread handle and (b) contains
-//! a chunk whose `FakeEmbedder` output collides with a pre-seeded
-//! anchor's vector. A bulk scan is `IngestOrigin::Bulk`, which is NOT a
-//! TurnEnd, so the ambient daemons (`TurnObserver` + `AutoWeaver`) must
-//! leave the ledger untouched — this guards the P11a gate against
-//! regressing back to "library load == live cognition" (the bug that
-//! flooded the corpus with one membrane commit per historical chunk).
+//! Both build on an identical fixture: a markdown corpus that (a) mentions a
+//! pre-seeded thread handle and (b) contains a chunk whose `FakeEmbedder`
+//! output collides with a pre-seeded anchor's vector (cosine ≈ 1.0 → above the
+//! Markdown weaver threshold of 0.82, guaranteeing one Derived evidence link).
 //!
-//! Weaving bulk content is instead the job of the explicit
-//! `commands::weave` pass (P11b / `weave_window`), so after `weave`
-//! returns we expect the resonant chunk to have produced at least one
-//! derived evidence link. Familiarity stays 0 throughout: it advances
-//! only on live watched conversation-transcript TurnEnds (covered by the
-//! observer unit tests), never on a bulk scan or an offline weave.
+//! - `bulk_scan_is_inert_and_explicit_weave_writes_evidence` guards the P11a
+//!   gate: a one-shot `commands::scan` (ctx=None) is `IngestOrigin::Bulk`, not
+//!   a TurnEnd, so the ambient daemons leave the ledger untouched; only the
+//!   explicit `commands::weave` pass writes evidence.
+//! - `serve_scan_auto_weaves_bulk_evidence` guards →007: the long-lived serve
+//!   daemon (ctx=Some) runs an end-of-scan epoch weave, so bulk content is
+//!   bound into the thread graph WITHOUT a manual `weave`. Serve has no
+//!   operator to run one, so it must self-maintain.
+//!
+//! Familiarity (`mentions`) stays 0 throughout either path: it advances only on
+//! live watched conversation-transcript TurnEnds (observer unit tests), never
+//! on a bulk scan or a weave.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
+use ostk_recall_attention::{ConceptGrowthRuntime, InMemoryAttention};
 use ostk_recall_cli::commands;
 use ostk_recall_core::{Chunk, Links, PrivacyTier, Source, ThreadHandle};
 use ostk_recall_pipeline::ChunkEmbedder;
@@ -28,10 +32,10 @@ use tempfile::TempDir;
 
 const FAKE_DIM: usize = 16;
 
-/// Deterministic embedder. The seed is `(text.len() % 100) * 0.01`, so
-/// two texts of equal length produce identical vectors — the test uses
-/// that property to engineer a guaranteed cosine = 1.0 between the
-/// pre-seeded anchor chunk and the resonant markdown fixture.
+/// Deterministic embedder. The seed is `(text.len() % 100) * 0.01`, so two
+/// texts of equal length produce identical vectors — the tests use that to
+/// engineer a guaranteed cosine = 1.0 between the pre-seeded anchor chunk and
+/// the resonant markdown fixture.
 struct FakeEmbedder;
 
 impl ChunkEmbedder for FakeEmbedder {
@@ -71,43 +75,29 @@ paths = ['{fixture}']
     std::fs::write(path, body).unwrap();
 }
 
-#[tokio::test]
-async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
-    let corpus = TempDir::new().unwrap();
-    let fixture = TempDir::new().unwrap();
-    let config_dir = TempDir::new().unwrap();
-    let config_path = config_dir.path().join("config.toml");
-
-    // Resonant body: this exact text will appear in both the pre-seeded
-    // anchor chunk and the `resonant.md` markdown fixture. Since the
-    // `FakeEmbedder` keys off `text.len() % 100`, equal-length texts
-    // produce identical vectors → cosine ≈ 1.0 → above the Markdown
-    // weaver threshold of 0.82, guaranteeing one Derived evidence link.
+/// Shared fixture: writes `resonant.md` (vector-collides with the anchor) and
+/// `mention.md` (names the handle), the config, then pre-seeds the corpus with
+/// the anchor chunk and an Active thread anchored to it. Returns the seeded
+/// handle and the embedder.
+async fn seed_resonant_corpus(
+    corpus: &Path,
+    fixture: &Path,
+    config_path: &Path,
+) -> (ThreadHandle, Arc<dyn ChunkEmbedder>) {
     let resonant_body = "Resonant anchor text body for the e2e fixture content.";
-
-    // Mention fixture: contains the known handle as a kebab-case token,
-    // surrounded by non-handle characters so the observer's word-boundary
-    // check fires.
-    let mention_body = "We keep circling three-time-scales as the same shape under three names.\n";
-
-    std::fs::write(fixture.path().join("resonant.md"), resonant_body).unwrap();
-    std::fs::write(fixture.path().join("mention.md"), mention_body).unwrap();
-
-    write_config(&config_path, corpus.path(), fixture.path());
+    let mention_body =
+        "We keep circling three-time-scales as the same shape under three names.\n";
+    std::fs::write(fixture.join("resonant.md"), resonant_body).unwrap();
+    std::fs::write(fixture.join("mention.md"), mention_body).unwrap();
+    write_config(config_path, corpus, fixture);
 
     let handle = ThreadHandle::new("three-time-scales").unwrap();
     let anchor_source_id = "anchor-fixture.md";
     let anchor_chunk_id = Chunk::make_id(Source::Markdown, anchor_source_id, 0, "");
 
-    // --- pre-seed the corpus with the anchor chunk -------------------
-    // commands::scan does CorpusStore::open_or_create with the same dim,
-    // so opening it here first is fine — the second open_or_create is a
-    // no-op migration. We don't need IngestDb at this stage because the
-    // weaver only reads from CorpusStore.
+    // Pre-seed the corpus with the anchor chunk (weaver reads CorpusStore).
     {
-        let store = CorpusStore::open_or_create(corpus.path(), FAKE_DIM)
-            .await
-            .unwrap();
+        let store = CorpusStore::open_or_create(corpus, FAKE_DIM).await.unwrap();
         let anchor_chunk = Chunk {
             chunk_id: anchor_chunk_id.clone(),
             source: Source::Markdown,
@@ -124,14 +114,13 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
             links: Links::default(),
             extra: serde_json::Value::Null,
         };
-        let embedder = FakeEmbedder;
-        let vec = embedder.encode_batch(&[resonant_body]).remove(0);
+        let vec = FakeEmbedder.encode_batch(&[resonant_body]).remove(0);
         store.upsert(&[anchor_chunk], &[vec]).await.unwrap();
     }
 
-    // --- pre-seed the ledger ----------------------------------------
+    // Pre-seed the ledger with an Active thread anchored to that chunk.
     {
-        let db = ThreadsDb::open(corpus.path()).unwrap();
+        let db = ThreadsDb::open(corpus).unwrap();
         let now = Utc::now();
         db.upsert_thread(&ThreadRecord {
             handle: handle.clone(),
@@ -148,12 +137,22 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
         .unwrap();
     }
 
-    // --- production scan entry point: spawns ambient daemons --------
-    // The daemons are spawned, but a bulk scan emits only
-    // `IngestOrigin::Bulk` events — none of them TurnEnds — so the
-    // observer and weaver must skip every one and leave the ledger
-    // untouched.
     let embedder: Arc<dyn ChunkEmbedder> = Arc::new(FakeEmbedder);
+    (handle, embedder)
+}
+
+#[tokio::test]
+async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
+    let corpus = TempDir::new().unwrap();
+    let fixture = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("config.toml");
+    let (handle, embedder) =
+        seed_resonant_corpus(corpus.path(), fixture.path(), &config_path).await;
+
+    // Production one-shot scan entry point (ctx=None). A bulk scan emits only
+    // `IngestOrigin::Bulk` events — none TurnEnds — so observer and weaver must
+    // skip every one and leave the ledger untouched.
     let outcome = commands::scan(&config_path, Arc::clone(&embedder), None, false)
         .await
         .expect("scan");
@@ -163,11 +162,7 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
         outcome.totals
     );
 
-    // --- gate assertion: a bulk scan must NOT trigger live cognition.
-    // resonant.md resonates with the seeded anchor and mention.md names
-    // the known handle, yet because the scan is Bulk (not a watched
-    // conversation TurnEnd) neither daemon may fire. Regressing this is
-    // the version-explosion bug returning.
+    // Gate: a bulk one-shot scan must NOT trigger live cognition.
     {
         let db = ThreadsDb::open(corpus.path()).unwrap();
         let after = db
@@ -189,14 +184,10 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
         );
     }
 
-    // --- explicit weave: the bulk-content coverage path (P11b) -------
-    // `commands::weave` runs `weave_window(None)` over the whole corpus.
-    // This is how bulk-ingested content is woven into the thread graph
-    // now that the live daemon deliberately ignores it.
+    // Explicit weave: the bulk-content coverage path (P11b).
     let weave_out = commands::weave(&config_path, Arc::clone(&embedder), None, 1)
         .await
         .expect("weave");
-
     let db = ThreadsDb::open(corpus.path()).unwrap();
     let after = db
         .get_thread(&handle)
@@ -209,11 +200,58 @@ async fn bulk_scan_is_inert_and_explicit_weave_writes_evidence() {
          (weave summary: {weave_out:?}); expected >= 1 against the \
          pre-seeded anchor",
     );
-    // Familiarity is the observer's responsibility and advances only on
-    // live watched TurnEnds — an offline weave must never touch it.
     assert_eq!(
         after.mentions, 0,
         "weave must not advance mentions (observer-only); got {}",
+        after.mentions
+    );
+}
+
+#[tokio::test]
+async fn serve_scan_auto_weaves_bulk_evidence() {
+    // →007: the serve daemon (ctx=Some) runs an end-of-scan epoch weave, so
+    // bulk-ingested content is bound into the thread graph WITHOUT a manual
+    // `weave` — unlike the inert one-shot path above. Guards the `ctx.is_some()`
+    // end-of-scan weave block in `scan_with_context`.
+    let corpus = TempDir::new().unwrap();
+    let fixture = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("config.toml");
+    let (handle, embedder) =
+        seed_resonant_corpus(corpus.path(), fixture.path(), &config_path).await;
+
+    // A minimal serve context: shares the ledger the end-of-scan weave binds to.
+    let serve_ctx = commands::ServeContext {
+        threads: Arc::new(ThreadsDb::open(corpus.path()).unwrap()),
+        attention: Arc::new(InMemoryAttention::new()),
+        concept_growth: ConceptGrowthRuntime::default(),
+    };
+    commands::scan_with_context(
+        &config_path,
+        Arc::clone(&embedder),
+        None,
+        false,
+        Some(&serve_ctx),
+    )
+    .await
+    .expect("serve scan");
+
+    // The end-of-scan epoch weave must have bound resonant.md to the anchor —
+    // no explicit `weave` was run.
+    let db = ThreadsDb::open(corpus.path()).unwrap();
+    let evidence = db.list_evidence(&handle).unwrap();
+    assert!(
+        !evidence.is_empty(),
+        "→007 regressed: serve-path end-of-scan weave wrote no evidence link \
+         (the ctx.is_some() weave block in scan_with_context is missing/broken)"
+    );
+    let after = db
+        .get_thread(&handle)
+        .unwrap()
+        .expect("seeded thread missing after serve scan");
+    assert_eq!(
+        after.mentions, 0,
+        "auto-weave must not advance mentions (observer-only); got {}",
         after.mentions
     );
 }

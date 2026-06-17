@@ -122,6 +122,16 @@ model = "jina-reranker-v1-turbo-en"         # fastembed v5 RerankerModel id; als
 # coordination / test-plumbing handles); set explicitly to override.
 # stop_handles = ["turn-digest", "squad-lead", "re-run", "no-op", "read-only"]
 #
+# `scan_weave_window_hours` (→007) controls the end-of-scan epoch weave. After
+# every scan the daemon binds bulk-ingested chunks (code, backfilled
+# transcripts) into the thread graph via `weave_window` over content newer than
+# this many hours — the incremental weaver only binds live conversation turns,
+# so without this, evidence-links for bulk content never land (starving recall
+# quality and the value-axis use-feedback). Windowed by chunk timestamp to stay
+# bounded; historical backfills with older timestamps still need a manual
+# `ostk-recall weave`. Default 48; set to 0 to disable the end-of-scan pass.
+# scan_weave_window_hours = 48
+#
 # Independent of this denylist, the weaver ALWAYS treats two classes of
 # structural apparatus as un-weavable (kept in corpus + recall, never anchor or
 # seed threads): Claude Code tool-call envelopes (block_kind tool_use /

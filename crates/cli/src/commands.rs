@@ -649,6 +649,44 @@ pub async fn scan_with_context(
         }
     }
 
+    // End-of-scan epoch weave (→007). SERVE ONLY (`ctx.is_some()`). This is the
+    // deferred "periodic whole-corpus epoch pass" that the incremental
+    // `AutoWeaver::run` loop explicitly defers bulk content to — it binds only
+    // live `TurnEnd`s per event, so without a batched pass bulk-ingested chunks
+    // (code, backfilled transcripts) never enter the thread graph, evidence_links
+    // rot, and `value_use` / recall quality degrade. Serve has no operator to run
+    // a manual `weave`, so it must self-maintain. The one-shot `ostk-recall scan`
+    // path (ctx=None) deliberately stays inert under the P11a "bulk scan is
+    // inert" gate — the operator runs `weave` explicitly there. Windowed by chunk
+    // `ts` to stay bounded; historical backfills (old `ts`) still use a manual
+    // `ostk-recall weave`. `[weaver] scan_weave_window_hours = 0` disables it.
+    let weave_settings = WeaverSettings::resolve(cfg.weaver.as_ref());
+    if ctx.is_some() && !dry_run && weave_settings.scan_weave_window_hours > 0 {
+        if let Some(threads) = threads_db.as_ref() {
+            const SCAN_WEAVE_EPOCH_SIZE: usize = 512;
+            let weaver = AutoWeaver::new(
+                Arc::clone(threads),
+                Arc::clone(&store),
+                WeaverThresholds::default(),
+            )
+            .with_exclude_facets(weave_settings.exclude_facets)
+            .with_stop_handles(weave_settings.stop_handles);
+            let window =
+                chrono::Duration::hours(i64::from(weave_settings.scan_weave_window_hours));
+            let started = std::time::Instant::now();
+            match weaver.weave_window(Some(window), SCAN_WEAVE_EPOCH_SIZE).await {
+                Ok(out) => tracing::info!(
+                    links_written = out.evidence_links_written,
+                    links_touched = out.evidence_links_touched,
+                    chunks_seen = out.chunks_seen,
+                    elapsed_s = started.elapsed().as_secs_f64(),
+                    "end-of-scan weave complete (→007)"
+                ),
+                Err(err) => tracing::warn!(error = %err, "end-of-scan weave failed"),
+            }
+        }
+    }
+
     Ok(ScanOutcome {
         per_source,
         totals,

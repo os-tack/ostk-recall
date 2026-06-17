@@ -416,6 +416,15 @@ pub struct WeaverSettings {
     /// they just can't buy idle dominance of the active surface.
     #[serde(default = "default_weaver_stop_handles")]
     pub stop_handles: Vec<String>,
+    /// Window (hours) for the `serve` daemon's end-of-scan epoch weave (→007).
+    /// After every serve scan it runs `weave_window(Some(window), …)` so bulk-ingested
+    /// chunks (code, backfilled transcripts) are bound into the thread graph —
+    /// the incremental `AutoWeaver` only weaves live `TurnEnd`s, so without this
+    /// bulk evidence-links never land and `value_use` / recall quality rot.
+    /// Windowed by chunk `ts` to stay bounded; historical backfills with old
+    /// timestamps still use a manual `ostk-recall weave`. `0` disables the pass.
+    #[serde(default = "default_weaver_scan_weave_window_hours")]
+    pub scan_weave_window_hours: u32,
 }
 
 fn default_weaver_exclude_facets() -> Vec<String> {
@@ -466,11 +475,20 @@ fn default_weaver_stop_handles() -> Vec<String> {
     .collect()
 }
 
+/// Default end-of-scan epoch-weave window in hours (→007). 48h covers the gap
+/// between scans for content with recent timestamps while keeping the per-scan
+/// weave bounded; `0` disables the pass. Historical backfills (old `ts`) use a
+/// manual `ostk-recall weave`.
+const fn default_weaver_scan_weave_window_hours() -> u32 {
+    48
+}
+
 impl Default for WeaverSettings {
     fn default() -> Self {
         Self {
             exclude_facets: default_weaver_exclude_facets(),
             stop_handles: default_weaver_stop_handles(),
+            scan_weave_window_hours: default_weaver_scan_weave_window_hours(),
         }
     }
 }
