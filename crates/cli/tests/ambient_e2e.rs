@@ -19,7 +19,7 @@
 //! live watched conversation-transcript TurnEnds (observer unit tests), never
 //! on a bulk scan or a weave.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -253,5 +253,45 @@ async fn serve_scan_auto_weaves_bulk_evidence() {
         after.mentions, 0,
         "auto-weave must not advance mentions (observer-only); got {}",
         after.mentions
+    );
+}
+
+#[tokio::test]
+async fn serve_path_scan_auto_weaves_bulk_evidence() {
+    // →007 regression guard for the PER-PATH watch trigger. serve's watcher
+    // routes changed files through `scan_paths_with_context` (not
+    // `scan_with_context`), so it must run the same end-of-scan weave. This is
+    // the exact path that shipped un-woven until the shared
+    // `run_end_of_scan_weave` helper covered both — caught by live validation.
+    let corpus = TempDir::new().unwrap();
+    let fixture = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("config.toml");
+    let (handle, embedder) =
+        seed_resonant_corpus(corpus.path(), fixture.path(), &config_path).await;
+
+    let serve_ctx = commands::ServeContext {
+        threads: Arc::new(ThreadsDb::open(corpus.path()).unwrap()),
+        attention: Arc::new(InMemoryAttention::new()),
+        concept_growth: ConceptGrowthRuntime::default(),
+    };
+    // The watcher passes the specific changed paths, not a full source scan.
+    let changed: Vec<PathBuf> = vec![fixture.path().join("resonant.md")];
+    commands::scan_paths_with_context(
+        &config_path,
+        Arc::clone(&embedder),
+        &changed,
+        false,
+        Some(&serve_ctx),
+    )
+    .await
+    .expect("serve per-path scan");
+
+    let db = ThreadsDb::open(corpus.path()).unwrap();
+    let evidence = db.list_evidence(&handle).unwrap();
+    assert!(
+        !evidence.is_empty(),
+        "→007 regressed on the per-path watch trigger: scan_paths_with_context \
+         wrote no evidence link (run_end_of_scan_weave not wired there?)"
     );
 }
