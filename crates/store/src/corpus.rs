@@ -11,7 +11,7 @@ use lancedb::Connection;
 use lancedb::index::Index;
 use lancedb::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FtsIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::table::OptimizeAction;
+use lancedb::table::{OptimizeAction, OptimizeOptions};
 use ostk_recall_core::{Chunk, SourceKind};
 use thiserror::Error;
 
@@ -1534,15 +1534,47 @@ impl CorpusStore {
 
     /// Cheap, scan-time variant of [`Self::optimize_all`]: just fold any
     /// fragments appended since the last index build into the existing
-    /// scalar / FTS indices. Skips `Compact` and `Prune` because both
+    /// scalar / vector indices. Skips `Compact` and `Prune` because both
     /// scan with the version count, which is `O(commits)` and slow on a
     /// long-running corpus — and the index-folding step is the only
     /// one that affects the next scan's lookup cost.
+    ///
+    /// **Never folds the FTS (`text`) index (→006).** lance-index 7.0.0's
+    /// inverted-index delta-merge (`merge_postings`, `scalar/inverted/
+    /// builder.rs`) remaps a token id past the resized `posting_lists` len —
+    /// an out-of-bounds panic that, under our release `panic = "abort"`,
+    /// crashes `serve` mid-watch. So the per-scan fold is scoped (via
+    /// `OptimizeOptions::index_names`) to the non-`text` indices, keeping
+    /// lance off the broken merge path entirely. The FTS index still answers
+    /// queries across its un-merged deltas; it is collapsed from scratch only
+    /// by `optimize_all` / `optimize_compact_and_prune`
+    /// (`drop_fts_index_if_present` + `ensure_fts_index`) — the one safe way
+    /// to fold FTS deltas under lance-7. Scoping (rather than the sibling
+    /// drop→rebuild dodge) avoids a full FTS rebuild on every watch scan,
+    /// preserving the cheap-incremental intent.
+    // `OptimizeOptions` is `#[non_exhaustive]`, so it is built via `Default`
+    // then field-set — a struct literal is illegal across the crate boundary,
+    // which is exactly what `field_reassign_with_default` would suggest.
+    #[allow(clippy::field_reassign_with_default)]
     pub async fn optimize_indices(&self) -> Result<()> {
         let table = self.conn.open_table(CORPUS_TABLE).execute().await?;
-        table
-            .optimize(OptimizeAction::Index(Default::default()))
-            .await?;
+        // Collect the non-FTS index names and fold only those, so lance never
+        // walks the lance-7 FTS delta-merge (see doc comment).
+        let non_fts: Vec<String> = table
+            .list_indices()
+            .await?
+            .into_iter()
+            .filter(|ix| !ix.columns.iter().any(|c| c == "text"))
+            .map(|ix| ix.name)
+            .collect();
+        if non_fts.is_empty() {
+            // Nothing safe to fold yet (fresh corpus / FTS-only) — skip rather
+            // than fall through to an all-index optimize that would merge FTS.
+            return Ok(());
+        }
+        let mut opts = OptimizeOptions::default();
+        opts.index_names = Some(non_fts);
+        table.optimize(OptimizeAction::Index(opts)).await?;
         Ok(())
     }
 
@@ -2472,6 +2504,75 @@ mod tests {
         assert_eq!(
             text_indices, 1,
             "optimize_all must leave exactly one fresh text FTS index"
+        );
+    }
+
+    /// Guards the scan-time FTS-skip contract in
+    /// [`CorpusStore::optimize_indices`] (→006). lance-index 7.0.0 aborts when
+    /// *merging* accumulated FTS delta indices (`inverted/builder.rs` remaps a
+    /// token id past the merged token-set length), and our release
+    /// `panic = "abort"` turns that into a serve crash mid-watch.
+    /// `optimize_indices` sidesteps it by folding only the non-`text` indices
+    /// (via `OptimizeOptions::index_names`), leaving the FTS index untouched.
+    /// Like the sibling `optimize_all` test, the merge overflow only manifests
+    /// at corpus scale, so this asserts the contract — the call succeeds across
+    /// FTS deltas, rows are preserved, and the existing FTS index is left intact
+    /// (not dropped, not rebuilt) — rather than reproducing the panic.
+    #[tokio::test]
+    async fn optimize_indices_skips_fts_across_deltas() {
+        let tmp = TempDir::new().unwrap();
+        let store = CorpusStore::open_or_create(tmp.path(), 4).await.unwrap();
+
+        // Batch 1, then build BOTH a non-FTS (chunk_id) index and the FTS index
+        // so the per-scan fold has a non-`text` index to optimize AND a `text`
+        // index it must skip.
+        let b1: Vec<Chunk> = (0..50)
+            .map(|i| sample_chunk(&format!("a{i}"), &format!("alpha token{i}")))
+            .collect();
+        store
+            .upsert(&b1, &vec![vec![0.1, 0.2, 0.3, 0.4]; b1.len()])
+            .await
+            .unwrap();
+        store.ensure_chunk_id_index().await.unwrap();
+        store.ensure_fts_index().await.unwrap();
+
+        // Two more batches AFTER the indices exist → FTS + scalar delta
+        // segments, the input to lance's buggy FTS merge path.
+        for batch in 1..3 {
+            let chunks: Vec<Chunk> = (0..50)
+                .map(|i| sample_chunk(&format!("b{batch}-{i}"), &format!("beta token{batch}-{i}")))
+                .collect();
+            store
+                .upsert(&chunks, &vec![vec![0.1, 0.2, 0.3, 0.4]; chunks.len()])
+                .await
+                .unwrap();
+        }
+
+        // The previously-aborting scan-time call. Must succeed and preserve rows.
+        store
+            .optimize_indices()
+            .await
+            .expect("optimize_indices must survive accumulated FTS deltas");
+        assert_eq!(store.row_count().await.unwrap(), 150);
+
+        // The FTS index is left intact (skipped, not dropped/rebuilt): exactly
+        // one `text` index still present after the fold.
+        let table = store
+            .conn
+            .open_table(CORPUS_TABLE)
+            .execute()
+            .await
+            .unwrap();
+        let text_indices = table
+            .list_indices()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|ix| ix.columns.iter().any(|c| c == "text"))
+            .count();
+        assert_eq!(
+            text_indices, 1,
+            "optimize_indices must leave the FTS index intact (skipped, not merged)"
         );
     }
 
