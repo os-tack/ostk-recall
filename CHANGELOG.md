@@ -6,21 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.9.0] - 2026-07-11
 ### Added
 - **Autonomous-salience scorer, axis 1 (specificity) — behind a flag.** New
   `[salience]` config block with a master `scorer_v2` flag (default **OFF**, so
   `compute_score_parts` stays bit-identical to v1 until opted in). The
-  specificity axis computes each thread handle's co-occurrence entropy across
-  the distinct source documents its evidence links resonate with
-  (`specificity = 1 − H/H_max`) and multiplies it into the idle floor — the
-  principled, continuous replacement for the binary `is_stop_handle` cliff. A
-  handle that resonates with *everything* (diffuse, high-entropy — `re-read`,
-  `top-level`) self-demotes toward the unresonant baseline with **no hand-list**;
-  a concentrated concept (`cognitive-memory`, `dereference-or-void`) is
-  preserved. Factors are precomputed once at boot (one evidence-graph scan +
-  corpus join) and carried scope-independently on the attention runtime; the
-  scorer reads them by value with zero added score-time cost. Value (axis 3) and
-  negative-transfer (axis 2) fields ship as the neutral identity for now.
+  specificity axis measures how concentrated a handle's whole-phrase mentions
+  are across the corpus's distinct projects (project-span IDF:
+  `spec = 1 − (span−1)/(N_global−1)`, raw span — not entropy, which
+  volume-weights every bursty handle into one mid-band) and multiplies it into
+  the idle floor — the principled, continuous replacement for the binary
+  `is_stop_handle` cliff. A handle mentioned *everywhere* (diffuse —
+  `in-memory`, `top-level`) self-demotes toward the unresonant baseline with
+  **no hand-list**; a concentrated concept (`cognitive-memory`,
+  `dereference-or-void`) is preserved. Projects are derived per-repo from
+  transcript file paths, so the shared `claude-code-history` bucket (~80% of
+  the corpus) doesn't collapse into a single project. Factors are precomputed
+  once at boot (one projected corpus scan) and carried scope-independently on
+  the attention runtime; the scorer reads them by value with zero added
+  score-time cost. Value (axis 3) and negative-transfer (axis 2) fields ship
+  as the neutral identity for now.
   `ScoreAttribution` gains `specificity`/`value`/`neg_penalty` (serde-default
   neutral, so older clients still parse). The curated `[weaver] stop_handles`
   set stays wired as a safety net and A/B control.
@@ -45,6 +51,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scorers, so its metrics double as the A/B scoreboard. Thresholds live in a
   `[salience.health]` config block (live-tunable); the result is cached on a
   30s TTL. Every metric is decomposable (carries its `why`).
+- **Read-only `salience-ab` diagnostic.** Offline scorer_v2 off/on A/B over
+  the live ledger — scores both ways, diffs the rankings, mutates nothing.
+- **Serve auto-weaves bulk content at end-of-scan (→007).** The AutoWeaver
+  incremental path binds only live TurnEnds, so bulk-ingested chunks (code,
+  backfilled transcripts) waited on a manual `ostk-recall weave` that serve
+  never ran — evidence_links rotted, starving value_use and degrading recall.
+  Both serve scan entry points (full-scan and the per-path watch trigger) now
+  run a shared batched end-of-scan weave, windowed by chunk timestamp
+  (`[weaver] scan_weave_window_hours`, default 48; 0 disables). Serve-only:
+  one-shot `ostk-recall scan` stays inert under the P11a gate.
+- **Typed `page_handles` on `recall_fault`.** Alongside the legacy `pages`
+  array, the response now carries provider-neutral `context_page` handles
+  whose resolver explicitly names `context_load` with the stable logical page
+  name. Additive on the wire; existing haystack kernels keep consuming
+  `pages` unchanged.
+
+### Fixed
+- **lance-index 7.0.0 FTS delta-merge panic dodged on every optimize path
+  (→006).** `merge_postings` remaps a token id past the resized posting-lists
+  length (out-of-bounds), and release `panic=abort` kills the process —
+  either at explicit `optimize` or mid-watch as FTS deltas re-accumulate.
+  Explicit `optimize` / `--aggressive` now drop the FTS index up front and
+  rebuild it single-pass (a fresh build never takes the merge path); the
+  end-of-scan fold in `serve --watch` scopes itself to non-FTS indices via
+  `OptimizeOptions::index_names`, leaving FTS deltas un-merged but queryable.
+  Verified panic-free on a 544k-row corpus.
 
 ## [0.8.3] - 2026-06-15
 ### Changed
