@@ -68,20 +68,33 @@ pub fn tool_recall_audit() -> Value {
 /// Embeds the query, runs hybrid recall, runs `Synthesizer::collapse`, and
 /// returns the resulting pages as `(name, content)` pairs. The caller
 /// (haystack kernel) writes them to its page table via `store_page_owned`;
-/// this tool does NOT touch the kernel page table.
+/// this tool does NOT touch the kernel page table. `page_handles` is the
+/// provider-neutral dereference surface; legacy callers may continue to
+/// consume `pages` unchanged.
 ///
 /// Result shape (inside the MCP `content[0].text` JSON):
 /// ```json
-/// { "pages": [
-///   { "name": "recall:src:kernel:memory.rs",
-///     "content": "<JSON-encoded SynthesizedPage>" }
-/// ] }
+/// {
+///   "pages": [{
+///     "name": "recall:src:kernel:memory.rs",
+///     "content": "<JSON-encoded SynthesizedPage>"
+///   }],
+///   "page_handles": [{
+///     "type": "context_page",
+///     "version": 1,
+///     "logical_name": "recall:src:kernel:memory.rs",
+///     "resolver": {
+///       "tool": "context_load",
+///       "arguments": { "name": "recall:src:kernel:memory.rs" }
+///     }
+///   }]
+/// }
 /// ```
 #[must_use]
 pub fn tool_recall_fault() -> Value {
     json!({
         "name": "recall_fault",
-        "description": "Synthesize recall hits into virtual memory pages. Embeds the query, runs hybrid retrieval, collapses hits via Synthesizer, returns pages as (name, content) pairs for the caller to write to its page table.",
+        "description": "Synthesize recall hits into virtual memory pages. Returns legacy pages as (name, content) pairs plus typed page_handles whose resolver explicitly calls context_load with the logical page name.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -534,7 +534,7 @@ impl Server {
                     .map(named_page_value)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| JsonRpcError::internal(format!("serialize page: {e}")))?;
-                json!({ "pages": named })
+                recall_fault_value(named)
             }
             "memory_recall" => {
                 // Recall + learn (memory-tool-surface.md). Runs hybrid
@@ -1316,18 +1316,94 @@ fn query_error_to_rpc(err: QueryError) -> JsonRpcError {
     }
 }
 
-/// Build the `{name, content}` pair for one synthesized page. The name
-/// is the kernel page-table key; content is the JSON-encoded
+/// Build the stable logical page-table name for a synthesized source.
+/// Physical storage and provider-upload names are projections of this
+/// identifier and must not replace it on the wire.
+fn logical_page_name(source_id: &str) -> String {
+    let slug = source_id.replace(['/', '\\'], ":").replace(' ', "_");
+    format!("recall:{slug}")
+}
+
+/// Build the legacy `{name, content}` pair for one synthesized page. The
+/// name is the kernel page-table key; content is the JSON-encoded
 /// `SynthesizedPage` the kernel writes via `store_page_owned`.
 fn named_page_value(page: &SynthesizedPage) -> std::result::Result<Value, serde_json::Error> {
-    let slug = page
-        .head
-        .source_id
-        .replace(['/', '\\'], ":")
-        .replace(' ', "_");
-    let name = format!("recall:{slug}");
+    let name = logical_page_name(&page.head.source_id);
     let content = serde_json::to_string(page)?;
     Ok(json!({ "name": name, "content": content }))
+}
+
+/// Provider-neutral handle for a page stored by the calling kernel.
+/// `context_load` is the canonical dereference operation in every harness;
+/// a provider-specific file id is only a physical projection of this handle.
+fn page_handle_value(logical_name: &str) -> Value {
+    json!({
+        "type": "context_page",
+        "version": 1,
+        "logical_name": logical_name,
+        "resolver": {
+            "tool": "context_load",
+            "arguments": { "name": logical_name },
+        },
+    })
+}
+
+/// Add typed, self-resolving handles without changing the legacy `pages`
+/// array consumed by existing haystack kernels.
+fn recall_fault_value(pages: Vec<Value>) -> Value {
+    let page_handles = pages
+        .iter()
+        .filter_map(|page| page.get("name").and_then(Value::as_str))
+        .map(page_handle_value)
+        .collect::<Vec<_>>();
+    json!({ "pages": pages, "page_handles": page_handles })
+}
+
+#[cfg(test)]
+mod recall_fault_wire_tests {
+    use super::*;
+
+    #[test]
+    fn logical_page_names_are_stable_and_provider_neutral() {
+        assert_eq!(
+            logical_page_name(r"docs\spec/l1.5 cache theory.md"),
+            "recall:docs:spec:l1.5_cache_theory.md"
+        );
+    }
+
+    #[test]
+    fn page_handle_names_context_load_as_the_resolver() {
+        let name = "recall:docs:spec:l1.5-cache-theory.md";
+        assert_eq!(
+            page_handle_value(name),
+            json!({
+                "type": "context_page",
+                "version": 1,
+                "logical_name": name,
+                "resolver": {
+                    "tool": "context_load",
+                    "arguments": { "name": name },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn typed_handles_are_additive_to_legacy_pages() {
+        let legacy_pages = vec![json!({
+            "name": "recall:src:kernel:memory.rs",
+            "content": "{\"title\":\"Page: memory.rs\"}",
+        })];
+        let value = recall_fault_value(legacy_pages.clone());
+
+        assert_eq!(value["pages"], json!(legacy_pages));
+        assert_eq!(value["page_handles"][0]["type"], "context_page");
+        assert_eq!(value["page_handles"][0]["resolver"]["tool"], "context_load");
+        assert_eq!(
+            value["page_handles"][0]["resolver"]["arguments"]["name"],
+            value["pages"][0]["name"]
+        );
+    }
 }
 
 #[cfg(test)]
