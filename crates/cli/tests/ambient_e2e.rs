@@ -85,8 +85,7 @@ async fn seed_resonant_corpus(
     config_path: &Path,
 ) -> (ThreadHandle, Arc<dyn ChunkEmbedder>) {
     let resonant_body = "Resonant anchor text body for the e2e fixture content.";
-    let mention_body =
-        "We keep circling three-time-scales as the same shape under three names.\n";
+    let mention_body = "We keep circling three-time-scales as the same shape under three names.\n";
     std::fs::write(fixture.join("resonant.md"), resonant_body).unwrap();
     std::fs::write(fixture.join("mention.md"), mention_body).unwrap();
     write_config(config_path, corpus, fixture);

@@ -243,8 +243,10 @@ impl CorpusStore {
 
         let mut all_projects: HashSet<String> = HashSet::new();
         // handle → (project → match count)
-        let mut hits: HashMap<&str, HashMap<String, f32>> =
-            needles.iter().map(|(h, _)| (h.as_str(), HashMap::new())).collect();
+        let mut hits: HashMap<&str, HashMap<String, f32>> = needles
+            .iter()
+            .map(|(h, _)| (h.as_str(), HashMap::new()))
+            .collect();
         for batch in &batches {
             if batch.num_rows() == 0 {
                 continue;
@@ -1453,7 +1455,10 @@ impl CorpusStore {
             let Some(field) = manifest.schema.field(name) else {
                 continue;
             };
-            if field.metadata.get(LANCE_STRUCTURAL_ENCODING_KEY).map(String::as_str)
+            if field
+                .metadata
+                .get(LANCE_STRUCTURAL_ENCODING_KEY)
+                .map(String::as_str)
                 == Some(LANCE_STRUCTURAL_ENCODING_FULLZIP)
             {
                 continue; // already pinned
@@ -2488,12 +2493,7 @@ mod tests {
         assert_eq!(store.row_count().await.unwrap(), 150);
 
         // Exactly one index remains on `text` — the freshly rebuilt one.
-        let table = store
-            .conn
-            .open_table(CORPUS_TABLE)
-            .execute()
-            .await
-            .unwrap();
+        let table = store.conn.open_table(CORPUS_TABLE).execute().await.unwrap();
         let text_indices = table
             .list_indices()
             .await
@@ -2557,12 +2557,7 @@ mod tests {
 
         // The FTS index is left intact (skipped, not dropped/rebuilt): exactly
         // one `text` index still present after the fold.
-        let table = store
-            .conn
-            .open_table(CORPUS_TABLE)
-            .execute()
-            .await
-            .unwrap();
+        let table = store.conn.open_table(CORPUS_TABLE).execute().await.unwrap();
         let text_indices = table
             .list_indices()
             .await

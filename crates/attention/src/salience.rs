@@ -409,7 +409,8 @@ pub fn value_judgment(
             sum += link.similarity.unwrap_or(0.5).max(0.0);
         }
         // (ii) j_concept: this coordinate is cited by a live active concept.
-        if let Some(activation) = active_coords.get(&(meta.source.clone(), meta.source_id.clone())) {
+        if let Some(activation) = active_coords.get(&(meta.source.clone(), meta.source_id.clone()))
+        {
             sum += activation.max(0.0);
         }
     }
@@ -815,7 +816,10 @@ mod tests {
         let a_used = vec![used(AccessKind::ExplicitRecall)];
         let a_ev = vec![judg_link("dec-1", 0.9)];
         let mut cm = HashMap::new();
-        cm.insert("dec-1".to_string(), meta_src("haystack", "ostk_decision", "some_decision"));
+        cm.insert(
+            "dec-1".to_string(),
+            meta_src("haystack", "ostk_decision", "some_decision"),
+        );
         let empty_coords: HashMap<(String, String), f32> = HashMap::new();
         let now = Utc::now();
 
@@ -829,7 +833,10 @@ mod tests {
                 va >= vb,
                 "value monotone in evidence at value_neutral={vn}: A {va} < B {vb}"
             );
-            assert!(vb >= vn - 1e-6, "unevidenced handle sits at the neutral floor");
+            assert!(
+                vb >= vn - 1e-6,
+                "unevidenced handle sits at the neutral floor"
+            );
         }
     }
 
@@ -847,7 +854,10 @@ mod tests {
 
         // Heavily-evidenced handle.
         let proven = value_from(
-            &[used(AccessKind::ExplicitRecall), used(AccessKind::OperatorSelected)],
+            &[
+                used(AccessKind::ExplicitRecall),
+                used(AccessKind::OperatorSelected),
+            ],
             &[judg_link("dec-1", 0.95)],
             &cm,
             &coords,
@@ -856,8 +866,14 @@ mod tests {
         );
         // Evidence-less handle.
         let bare = value_from(&[], &[], &cm, &coords, now, &c);
-        assert!((proven - 1.0).abs() < 1e-6, "v1 proven handle is 1.0, got {proven}");
-        assert!((bare - 1.0).abs() < 1e-6, "v1 bare handle is 1.0, got {bare}");
+        assert!(
+            (proven - 1.0).abs() < 1e-6,
+            "v1 proven handle is 1.0, got {proven}"
+        );
+        assert!(
+            (bare - 1.0).abs() < 1e-6,
+            "v1 bare handle is 1.0, got {bare}"
+        );
     }
 
     #[test]
@@ -873,7 +889,10 @@ mod tests {
 
         // Judged: evidence link to a decision chunk.
         let mut cm = HashMap::new();
-        cm.insert("dec-1".to_string(), meta_src("haystack", "ostk_decision", "dereference_or_void"));
+        cm.insert(
+            "dec-1".to_string(),
+            meta_src("haystack", "ostk_decision", "dereference_or_void"),
+        );
         let judged = value_from(&[], &[judg_link("dec-1", 0.9)], &cm, &coords, now, &c);
 
         // Plumbing: an Active link to an ordinary code chunk (no judgment, no use).
@@ -881,9 +900,18 @@ mod tests {
         pm.insert("code-1".to_string(), meta_src("p", "code", "src/turn.rs"));
         let plumbing = value_from(&[], &[judg_link("code-1", 0.9)], &pm, &coords, now, &c);
 
-        assert!(judged > 0.7, "decision-cited handle is raised above neutral: {judged}");
-        assert!((plumbing - 0.7).abs() < 1e-6, "plumbing-only stays at neutral: {plumbing}");
-        assert!(judged > plumbing, "judged out-ranks plumbing: {judged} vs {plumbing}");
+        assert!(
+            judged > 0.7,
+            "decision-cited handle is raised above neutral: {judged}"
+        );
+        assert!(
+            (plumbing - 0.7).abs() < 1e-6,
+            "plumbing-only stays at neutral: {plumbing}"
+        );
+        assert!(
+            judged > plumbing,
+            "judged out-ranks plumbing: {judged} vs {plumbing}"
+        );
     }
 
     #[test]
@@ -895,13 +923,19 @@ mod tests {
         c.value_neutral = 0.7;
         let now = Utc::now();
         let mut cm = HashMap::new();
-        cm.insert("ch-1".to_string(), meta_src("p", "thread", "cognitive-memory"));
+        cm.insert(
+            "ch-1".to_string(),
+            meta_src("p", "thread", "cognitive-memory"),
+        );
         let mut coords: HashMap<(String, String), f32> = HashMap::new();
         coords.insert(("thread".to_string(), "cognitive-memory".to_string()), 1.2);
 
         let lifted = value_from(&[], &[judg_link("ch-1", 0.8)], &cm, &coords, now, &c);
         let bare = value_from(&[], &[], &cm, &coords, now, &c);
-        assert!(lifted > bare, "active-concept coordinate lifts the handle: {lifted} vs {bare}");
+        assert!(
+            lifted > bare,
+            "active-concept coordinate lifts the handle: {lifted} vs {bare}"
+        );
         assert!(lifted > 0.7, "lift is above the neutral floor: {lifted}");
     }
 
@@ -914,10 +948,16 @@ mod tests {
         // value_neutral. Model on activation.rs::distinct_query_gate_not_raw_count.
         let now = Utc::now();
         let one_bucket = vec![used(AccessKind::ExplicitRecall)]; // 50 raw → 1 distinct
-        let two_buckets = vec![used(AccessKind::ExplicitRecall), used(AccessKind::ExplicitRecall)];
+        let two_buckets = vec![
+            used(AccessKind::ExplicitRecall),
+            used(AccessKind::ExplicitRecall),
+        ];
         let v_one = value_use(&one_bucket, now);
         let v_two = value_use(&two_buckets, now);
-        assert!(v_two > v_one, "2 distinct buckets beat 1: {v_two} vs {v_one}");
+        assert!(
+            v_two > v_one,
+            "2 distinct buckets beat 1: {v_two} vs {v_one}"
+        );
 
         // And it propagates through value_from at value_neutral < 1.0.
         let mut c = cfg();
@@ -926,7 +966,10 @@ mod tests {
         let coords: HashMap<(String, String), f32> = HashMap::new();
         let val_one = value_from(&one_bucket, &[], &cm, &coords, now, &c);
         let val_two = value_from(&two_buckets, &[], &cm, &coords, now, &c);
-        assert!(val_two >= val_one, "gate propagates to value: {val_two} vs {val_one}");
+        assert!(
+            val_two >= val_one,
+            "gate propagates to value: {val_two} vs {val_one}"
+        );
     }
 
     // --- SalienceScorer derivation --------------------------------------
@@ -979,8 +1022,15 @@ mod tests {
                 snap.damper_floor
             );
             // The other knobs land in their documented [0,1] ranges, never NaN.
-            for v in [snap.neg_gamma, snap.negative_lift_cutoff, snap.specificity_lift_cutoff] {
-                assert!(v.is_finite() && (0.0..=1.0).contains(&v), "knob {v} not in [0,1]");
+            for v in [
+                snap.neg_gamma,
+                snap.negative_lift_cutoff,
+                snap.specificity_lift_cutoff,
+            ] {
+                assert!(
+                    v.is_finite() && (0.0..=1.0).contains(&v),
+                    "knob {v} not in [0,1]"
+                );
             }
             // The whole point: `clamp(eps, 1.0)` is now always valid (no panic).
             let _ = (1.0f32 - snap.neg_gamma * 1.0).clamp(snap.damper_floor, 1.0);

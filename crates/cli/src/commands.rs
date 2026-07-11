@@ -697,7 +697,10 @@ async fn run_end_of_scan_weave(
     .with_stop_handles(settings.stop_handles);
     let window = chrono::Duration::hours(i64::from(settings.scan_weave_window_hours));
     let started = std::time::Instant::now();
-    match weaver.weave_window(Some(window), SCAN_WEAVE_EPOCH_SIZE).await {
+    match weaver
+        .weave_window(Some(window), SCAN_WEAVE_EPOCH_SIZE)
+        .await
+    {
         Ok(out) => tracing::info!(
             links_written = out.evidence_links_written,
             links_touched = out.evidence_links_touched,
@@ -1208,7 +1211,10 @@ pub async fn recover_orphans(
         recovered += chunks.len();
     }
     if skipped > 0 {
-        tracing::warn!(skipped, "orphans skipped (backup vector missing or wrong dim)");
+        tracing::warn!(
+            skipped,
+            "orphans skipped (backup vector missing or wrong dim)"
+        );
     }
 
     Ok(RecoverOrphansOutcome {
@@ -2109,9 +2115,7 @@ async fn re_anchor_threads_from_corpus(
     // hang their precompute off this same single walk (design §2.2: ONE pass);
     // I1 fills only the specificity field.
     if salience.scorer_v2 {
-        if let Err(err) =
-            precompute_salience_factors(threads, corpus, attention, salience).await
-        {
+        if let Err(err) = precompute_salience_factors(threads, corpus, attention, salience).await {
             // Never block boot on the precompute — a failure just leaves the
             // factors neutral (the scorer falls back to v1 behavior).
             tracing::warn!(error = %err, "salience precompute failed; factors left neutral");
@@ -2318,30 +2322,31 @@ async fn precompute_salience_factors(
     // separates them (diagnostic: concepts ≤6 projects, plumbing 8–14, N=23).
     // One projected (project, text) scan, run only when the axis is on; a scan
     // error degrades every handle to neutral specificity.
-    let (n_projects_global, project_dist): (usize, HashMap<String, Vec<f32>>) =
-        if salience.specificity_enabled {
-            // Specificity is a property of the handle STRING (its text
-            // co-occurrence across projects) — independent of whether the
-            // thread has a cached anchor_vec. Source from EVERY thread handle
-            // (`reanchor`), not just the anchored subset, so anchor-poor but
-            // text-rich plumbing (in-memory, hand-off) is measured + demoted
-            // rather than escaping to neutral.
-            let handle_strings: Vec<String> = reanchor
-                .iter()
-                .map(|i| i.handle.as_str().to_string())
-                .collect::<HashSet<String>>()
-                .into_iter()
-                .collect();
-            match corpus.project_phrase_cooccurrence(&handle_strings).await {
-                Ok((n, d)) => (n, d),
-                Err(e) => {
-                    tracing::warn!(error = %e, "salience: project_phrase_cooccurrence failed; specificity stays neutral");
-                    (0, HashMap::new())
-                }
+    let (n_projects_global, project_dist): (usize, HashMap<String, Vec<f32>>) = if salience
+        .specificity_enabled
+    {
+        // Specificity is a property of the handle STRING (its text
+        // co-occurrence across projects) — independent of whether the
+        // thread has a cached anchor_vec. Source from EVERY thread handle
+        // (`reanchor`), not just the anchored subset, so anchor-poor but
+        // text-rich plumbing (in-memory, hand-off) is measured + demoted
+        // rather than escaping to neutral.
+        let handle_strings: Vec<String> = reanchor
+            .iter()
+            .map(|i| i.handle.as_str().to_string())
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        match corpus.project_phrase_cooccurrence(&handle_strings).await {
+            Ok((n, d)) => (n, d),
+            Err(e) => {
+                tracing::warn!(error = %e, "salience: project_phrase_cooccurrence failed; specificity stays neutral");
+                (0, HashMap::new())
             }
-        } else {
-            (0, HashMap::new())
-        };
+        }
+    } else {
+        (0, HashMap::new())
+    };
 
     // ---- pass C: per-handle factors (one map, all three axes) ----
     // Specificity = 1 − H(project_dist)/ln(N_projects_global) (concentrated in
@@ -2509,7 +2514,10 @@ pub async fn salience_ab(
         engine: &QueryEngine,
         embedder: &Arc<dyn ChunkEmbedder>,
         weaver_stop: &[String],
-    ) -> Result<(Vec<ostk_recall_core::AttentionPage>, ostk_recall_core::SalienceHealth)> {
+    ) -> Result<(
+        Vec<ostk_recall_core::AttentionPage>,
+        ostk_recall_core::SalienceHealth,
+    )> {
         use ostk_recall_attention::salience_health;
         // Read-only threads handle: SQLITE_OPEN_READ_ONLY + NoopChainSink, so
         // even a stray chain-emitting/anchor-backfill call cannot write.
@@ -2707,11 +2715,21 @@ pub async fn salience_ab(
     board("on", &on_health);
     println!("top rank drops (NOISE should dominate):");
     for r in &drops {
-        println!("  {:<34} Δ{:+} {}", r.handle, r.rank_delta.unwrap_or(0), r.tag);
+        println!(
+            "  {:<34} Δ{:+} {}",
+            r.handle,
+            r.rank_delta.unwrap_or(0),
+            r.tag
+        );
     }
     println!("top rank rises (CONCEPT should dominate):");
     for r in &rises {
-        println!("  {:<34} Δ{:+} {}", r.handle, r.rank_delta.unwrap_or(0), r.tag);
+        println!(
+            "  {:<34} Δ{:+} {}",
+            r.handle,
+            r.rank_delta.unwrap_or(0),
+            r.tag
+        );
     }
     Ok(())
 }
@@ -2749,9 +2767,12 @@ async fn reanchor_into_attention_read_only(
             agent: Some("substrate".into()),
             privacy_tier: input.privacy_tier,
         };
-        let vec = input
-            .anchor_vec
-            .or_else(|| input.anchor_chunk_id.as_ref().and_then(|id| fetched.get(id).cloned()));
+        let vec = input.anchor_vec.or_else(|| {
+            input
+                .anchor_chunk_id
+                .as_ref()
+                .and_then(|id| fetched.get(id).cloned())
+        });
         if let Some(vec) = vec {
             attention
                 .seed_anchor(&scope, input.handle, vec)
@@ -3123,7 +3144,9 @@ async fn reconnect_with_backoff(
         match connect_and_replay(endpoint, cached_initialize, cached_initialized).await {
             Ok(c) => {
                 if attempts > 1 {
-                    eprintln!("[recall-bridge] daemon reconnect recovered after {attempts} attempts");
+                    eprintln!(
+                        "[recall-bridge] daemon reconnect recovered after {attempts} attempts"
+                    );
                 }
                 break c;
             }
@@ -4810,10 +4833,9 @@ mod daemon_transport_tests {
 
         let init_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
         let initialized_line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
-        let conn =
-            super::reconnect_with_backoff(&sock, Some(init_line), Some(initialized_line))
-                .await
-                .expect("heal against live socket");
+        let conn = super::reconnect_with_backoff(&sock, Some(init_line), Some(initialized_line))
+            .await
+            .expect("heal against live socket");
         drop(conn);
 
         let (init, initialized, receipt) = daemon.await.unwrap();

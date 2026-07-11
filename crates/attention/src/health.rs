@@ -32,9 +32,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ostk_recall_core::AttentionPage;
 use ostk_recall_core::config::SalienceHealthSettings;
 use ostk_recall_core::types::{NeverUsed, SalienceHealth, SalienceHealthThresholds};
-use ostk_recall_core::AttentionPage;
 use ostk_recall_store::UseLedger;
 
 use crate::salience::shannon_entropy;
@@ -89,8 +89,14 @@ pub fn salience_health(
         None
     };
     let surface_score_spread = match (
-        surface.iter().map(|p| p.score).fold(f32::NEG_INFINITY, f32::max),
-        surface.iter().map(|p| p.score).fold(f32::INFINITY, f32::min),
+        surface
+            .iter()
+            .map(|p| p.score)
+            .fold(f32::NEG_INFINITY, f32::max),
+        surface
+            .iter()
+            .map(|p| p.score)
+            .fold(f32::INFINITY, f32::min),
     ) {
         (max, min) if max.is_finite() && min.is_finite() => max - min,
         _ => 0.0,
@@ -161,8 +167,7 @@ pub fn salience_health(
 
     // --- Health verdict (drives the push leg) ------------------------------
     let entropy_breach = surface_entropy.is_some_and(|h| h < cfg.min_surface_entropy);
-    let drift_breach =
-        active_decided_drift.is_some_and(|d| d > cfg.max_active_decided_drift);
+    let drift_breach = active_decided_drift.is_some_and(|d| d > cfg.max_active_decided_drift);
     let never_used_breach = !never_used.is_empty();
     let unhealthy = entropy_breach || drift_breach || never_used_breach;
 
@@ -189,8 +194,8 @@ pub fn salience_health(
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
-    use ostk_recall_core::attention::ScoreAttribution;
     use ostk_recall_core::FoldDepth;
+    use ostk_recall_core::attention::ScoreAttribution;
 
     fn page(handle: &str, score: f32) -> AttentionPage {
         AttentionPage {
@@ -260,11 +265,11 @@ mod tests {
         ];
         let spread = salience_health(&even, &curated, &ledger, &judged, &cfg);
         let h_high = spread.surface_entropy.expect("entropy defined");
+        assert!(h_high > 0.99, "uniform spread ⇒ H/ln(N) ≈ 1, got {h_high}");
         assert!(
-            h_high > 0.99,
-            "uniform spread ⇒ H/ln(N) ≈ 1, got {h_high}"
+            h_high > h_low,
+            "even surface is more diverse than collapsed"
         );
-        assert!(h_high > h_low, "even surface is more diverse than collapsed");
     }
 
     #[test]
@@ -292,13 +297,12 @@ mod tests {
         // load-bearing list names exactly those handles.
         let cfg = thresholds();
         let surface = vec![
-            page("turn-digest", 1.2),   // curated
-            page("squad-lead", 1.1),    // curated
+            page("turn-digest", 1.2), // curated
+            page("squad-lead", 1.1),  // curated
             page("cognitive-memory", 1.0),
             page("ostk-cache", 0.9),
         ];
-        let curated: HashSet<String> =
-            ["turn-digest".to_string(), "squad-lead".to_string()].into();
+        let curated: HashSet<String> = ["turn-digest".to_string(), "squad-lead".to_string()].into();
         let ledger = HashMap::new();
         let judged = HashSet::new();
         let out = salience_health(&surface, &curated, &ledger, &judged, &cfg);
@@ -401,13 +405,7 @@ mod tests {
     #[test]
     fn drift_none_when_no_judgment_and_empty_surface() {
         let cfg = thresholds();
-        let out = salience_health(
-            &[],
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &cfg,
-        );
+        let out = salience_health(&[], &HashSet::new(), &HashMap::new(), &HashSet::new(), &cfg);
         assert_eq!(out.active_decided_drift, None);
         assert!(out.drift_forgotten.is_empty());
         assert!(!out.unhealthy, "a fully-empty read is not a failure");

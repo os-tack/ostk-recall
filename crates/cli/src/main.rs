@@ -658,7 +658,8 @@ async fn async_main(cli: Cli, worker_threads: usize) -> Result<()> {
             } else {
                 println!("recover-orphans: diffing + re-embedding backup-only rows…");
             }
-            let out = commands::recover_orphans(&config_path, embedder, &from, batch, dry_run).await?;
+            let out =
+                commands::recover_orphans(&config_path, embedder, &from, batch, dry_run).await?;
             println!(
                 "backup_rows={} live_rows={} orphans={}",
                 out.backup_rows, out.live_rows, out.orphans

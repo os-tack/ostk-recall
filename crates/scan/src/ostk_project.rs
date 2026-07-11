@@ -1628,7 +1628,9 @@ mod tests {
         std::fs::create_dir_all(proj.path().join(".ostk/journal-seals")).unwrap();
         write_jsonl(
             &proj.path().join(".ostk/journal.jsonl"),
-            &[r#"{"ts":"2026-06-01T00:00:00Z","event":"tool.bash","tool":"bash","agent":"a1","success":true}"#],
+            &[
+                r#"{"ts":"2026-06-01T00:00:00Z","event":"tool.bash","tool":"bash","agent":"a1","success":true}"#,
+            ],
         );
         let seg = proj.path().join(".ostk/journal-seals/epoch-0000.jsonl");
         write_jsonl(

@@ -100,7 +100,10 @@ fn link(handle: &str, chunk_id: &str) -> EvidenceLink {
 /// Returns the `(evidence-by-handle, chunk_meta)` the real
 /// `specificity_from_evidence` consumes — exactly the shape the boot pass
 /// builds from `list_evidence_all` + `fetch_chunks_by_ids`.
-fn build_evidence() -> (HashMap<String, Vec<EvidenceLink>>, HashMap<String, SourceMeta>) {
+fn build_evidence() -> (
+    HashMap<String, Vec<EvidenceLink>>,
+    HashMap<String, SourceMeta>,
+) {
     let mut ev: HashMap<String, Vec<EvidenceLink>> = HashMap::new();
     let mut meta: HashMap<String, SourceMeta> = HashMap::new();
 
@@ -109,12 +112,19 @@ fn build_evidence() -> (HashMap<String, Vec<EvidenceLink>>, HashMap<String, Sour
         let mut links = Vec::new();
         for i in 0..12 {
             let cid = format!("{h}-c{i}");
-            let project = if i % 2 == 0 { "ostk-recall" } else { "haystack" };
-            meta.insert(cid.clone(), SourceMeta {
-                project: Some(project.to_string()),
-                source: "claude_code".to_string(),
-                source_id: format!("doc-{h}-{i}.jsonl"),
-            });
+            let project = if i % 2 == 0 {
+                "ostk-recall"
+            } else {
+                "haystack"
+            };
+            meta.insert(
+                cid.clone(),
+                SourceMeta {
+                    project: Some(project.to_string()),
+                    source: "claude_code".to_string(),
+                    source_id: format!("doc-{h}-{i}.jsonl"),
+                },
+            );
             links.push(link(h, &cid));
         }
         ev.insert((*h).to_string(), links);
@@ -124,11 +134,14 @@ fn build_evidence() -> (HashMap<String, Vec<EvidenceLink>>, HashMap<String, Sour
         let mut links = Vec::new();
         for i in 0..12 {
             let cid = format!("{h}-c{i}");
-            meta.insert(cid.clone(), SourceMeta {
-                project: Some("ostk-recall".to_string()),
-                source: "code".to_string(),
-                source_id: format!("{h}.md"),
-            });
+            meta.insert(
+                cid.clone(),
+                SourceMeta {
+                    project: Some("ostk-recall".to_string()),
+                    source: "code".to_string(),
+                    source_id: format!("{h}.md"),
+                },
+            );
             links.push(link(h, &cid));
         }
         ev.insert((*h).to_string(), links);
@@ -145,7 +158,13 @@ fn compute_factors(cfg: &SalienceSettings) -> HashMap<String, SalienceFactors> {
     let mut factors = HashMap::new();
     for (h, links) in &ev {
         let specificity = specificity_from_evidence(links, &meta, cfg);
-        factors.insert(h.clone(), SalienceFactors { specificity, ..Default::default() });
+        factors.insert(
+            h.clone(),
+            SalienceFactors {
+                specificity,
+                ..Default::default()
+            },
+        );
     }
     factors
 }
@@ -158,7 +177,10 @@ async fn seed_set(store: &InMemoryAttention, sc: &AttentionScope) {
     store.attend(sc, "active working context").await.unwrap();
     let anchor = stub_embed("active working context");
     for h in COHERENT_NOISE.iter().chain(REAL_CONCEPTS) {
-        store.seed_anchor(sc, handle(h), anchor.clone()).await.unwrap();
+        store
+            .seed_anchor(sc, handle(h), anchor.clone())
+            .await
+            .unwrap();
         store.seed_counters(sc, &handle(h), 300, 290).await.unwrap();
     }
 }
@@ -259,12 +281,24 @@ async fn ab_p3_ostk_cache_survives_negative_penalty() {
     let idle = stub_embed("unrelated-idle-context-zzz");
 
     // ostk-cache: actively resonating, high real specificity.
-    store.seed_anchor(&sc, handle("ostk-cache"), live.clone()).await.unwrap();
-    store.seed_counters(&sc, &handle("ostk-cache"), 22, 11).await.unwrap();
+    store
+        .seed_anchor(&sc, handle("ostk-cache"), live.clone())
+        .await
+        .unwrap();
+    store
+        .seed_counters(&sc, &handle("ostk-cache"), 22, 11)
+        .await
+        .unwrap();
     // Coherent noise: idle (orthogonal), high mentions / diffuse specificity.
     for n in COHERENT_NOISE {
-        store.seed_anchor(&sc, handle(n), idle.clone()).await.unwrap();
-        store.seed_counters(&sc, &handle(n), 300, 290).await.unwrap();
+        store
+            .seed_anchor(&sc, handle(n), idle.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&sc, &handle(n), 300, 290)
+            .await
+            .unwrap();
     }
 
     // Drive the REAL negative_penalty(): ostk-cache sits in a NEIGHBORHOOD of
@@ -277,7 +311,10 @@ async fn ab_p3_ostk_cache_survives_negative_penalty() {
     // it.) Exemplars are deterministic blends toward `live` plus a far one.
     let global_mean = vec![0.0_f32; live.len()];
     let blend = |a: &[f32], b: &[f32], w: f32| -> Vec<f32> {
-        a.iter().zip(b).map(|(x, y)| w * x + (1.0 - w) * y).collect()
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| w * x + (1.0 - w) * y)
+            .collect()
     };
     let exemplars: Vec<Vec<f32>> = vec![
         blend(&live, &idle, 0.92), // very near ostk-cache
@@ -285,9 +322,8 @@ async fn ab_p3_ostk_cache_survives_negative_penalty() {
         blend(&live, &idle, 0.80),
         stub_embed("another-far-rejected-term-qqq"), // far — excluded by k=3
     ];
-    let cache_neg = ostk_recall_attention::salience::negative_penalty(
-        &live, &global_mean, &exemplars, &cfg,
-    );
+    let cache_neg =
+        ostk_recall_attention::salience::negative_penalty(&live, &global_mean, &exemplars, &cfg);
     assert!(
         cache_neg > 0.3,
         "the rejected-vocab neighborhood must produce a substantial real \
@@ -295,7 +331,10 @@ async fn ab_p3_ostk_cache_survives_negative_penalty() {
     );
 
     let mut factors = compute_factors(&cfg);
-    factors.entry("ostk-cache".to_string()).or_default().neg_penalty = cache_neg;
+    factors
+        .entry("ostk-cache".to_string())
+        .or_default()
+        .neg_penalty = cache_neg;
     store.set_salience_factors(factors).await;
 
     let scores = rank(&store, &sc).await;
@@ -354,8 +393,10 @@ async fn ab_p4_curated_stopset_is_redundant() {
     seed_set(&without_stopset, &sc).await;
     without_stopset.set_salience_factors(factors).await;
     let surf_without = without_stopset.surface(&sc, 100).await.unwrap();
-    let scores_without: HashMap<String, f32> =
-        surf_without.iter().map(|p| (p.handle.clone(), p.score)).collect();
+    let scores_without: HashMap<String, f32> = surf_without
+        .iter()
+        .map(|p| (p.handle.clone(), p.score))
+        .collect();
     let curated_without: HashSet<String> = without_stopset.curated_handles();
     let health_without = salience_health(
         &surf_without,

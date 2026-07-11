@@ -1306,7 +1306,10 @@ impl ThreadsDb {
                 )
             });
             for cid in chunks {
-                chunk_to_handles.entry(cid.as_str()).or_default().push(handle);
+                chunk_to_handles
+                    .entry(cid.as_str())
+                    .or_default()
+                    .push(handle);
             }
         }
         if chunk_to_handles.is_empty() {
@@ -1393,11 +1396,13 @@ impl ThreadsDb {
                 for ((qh, kind), ts) in buckets {
                     used_weighted += weights.weight_of(*kind);
                     distinct_q.insert(qh.as_str());
-                    accesses.push(UsedAccess { kind: *kind, ts: *ts });
+                    accesses.push(UsedAccess {
+                        kind: *kind,
+                        ts: *ts,
+                    });
                 }
                 slot.0.used_weighted = used_weighted;
-                slot.0.distinct_used_queries =
-                    u32::try_from(distinct_q.len()).unwrap_or(u32::MAX);
+                slot.0.distinct_used_queries = u32::try_from(distinct_q.len()).unwrap_or(u32::MAX);
                 slot.1 = accesses;
             }
         }
@@ -4364,7 +4369,8 @@ CREATE TABLE concept_edges (
     #[test]
     fn surfaced_vs_used_distinct_query_gate_and_classification() {
         let (_t, db, sink) = db_with_sink();
-        let mut hc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut hc: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         // `chatty`: 5 ExplicitRecall, ALL one query_hash → 1 distinct used query.
         hc.insert("chatty".into(), vec!["c-chatty".into()]);
         for _ in 0..5 {
@@ -4424,7 +4430,8 @@ CREATE TABLE concept_edges (
         // A chunk that backs two threads credits both (a chunk can resonate
         // with several anchors — weaver.rs writes an edge per anchor).
         let (_t, db, sink) = db_with_sink();
-        let mut hc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut hc: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         hc.insert("a".into(), vec!["shared".into()]);
         hc.insert("b".into(), vec!["shared".into()]);
         explicit_recall(&sink, "shared", "qh-1");
@@ -4439,7 +4446,8 @@ CREATE TABLE concept_edges (
     fn surfaced_vs_used_respects_since_cutoff() {
         // Events strictly before `since` are not joined.
         let (_t, db, sink) = db_with_sink();
-        let mut hc: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut hc: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         hc.insert("h".into(), vec!["c".into()]);
         explicit_recall(&sink, "c", "qh-1");
         // A `since` in the future excludes the just-written event.

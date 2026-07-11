@@ -323,11 +323,7 @@ impl Server {
                     bridge_pid = bridge_pid.unwrap_or(0),
                     "bridge.reconnected — connect bridge healed"
                 );
-                if let Some(root) = self
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.expanded_root().ok())
-                {
+                if let Some(root) = self.config.as_ref().and_then(|c| c.expanded_root().ok()) {
                     let row = json!({
                         "event": "bridge.reconnected",
                         "ts": chrono::Utc::now().to_rfc3339(),

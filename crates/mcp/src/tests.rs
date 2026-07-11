@@ -310,10 +310,7 @@ async fn attention_tools_unavailable_without_dispatch() {
 /// `ostk_project` source rooted at `proj_root`, with one ingested audit
 /// row at `row_ts`. Each call builds a fresh server (the stale probe
 /// caches for 30s, so cases must not share one).
-async fn build_server_with_watch(
-    proj_root: &std::path::Path,
-    row_ts: &str,
-) -> (TempDir, Server) {
+async fn build_server_with_watch(proj_root: &std::path::Path, row_ts: &str) -> (TempDir, Server) {
     let (tmp, server) = build_server().await;
     // Drop the plain server; rebuild with config + a seeded events row.
     drop(server);

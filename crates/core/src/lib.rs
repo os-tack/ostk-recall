@@ -41,8 +41,8 @@ pub use record_rules::{
 pub use scanner::{Scanner, SourceItem};
 pub use source::{RetentionPolicy, Source, SourceKind};
 pub use types::{
-    AttentionBiasParams, AuditResult, MatchFeature, NeverUsed, RankingOverrides, RecallHit,
-    RecallLinkResult, AuditFreshness, RecallParams, RecallStats, RerankerStats, SalienceHealth,
+    AttentionBiasParams, AuditFreshness, AuditResult, MatchFeature, NeverUsed, RankingOverrides,
+    RecallHit, RecallLinkResult, RecallParams, RecallStats, RerankerStats, SalienceHealth,
     SalienceHealthThresholds, SourceCount, SynthesizedPage,
 };
 

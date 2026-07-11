@@ -714,17 +714,33 @@ impl SalienceSettings {
         let mut s = slot.cloned().unwrap_or_default();
         // `damper_floor` is the floor of a `[damper_floor, 1.0]` clamp — hold it
         // strictly < 1.0 so the clamp range is always valid.
-        s.damper_floor =
-            sanitize_f32(s.damper_floor, 0.0, 1.0 - f32::EPSILON, default_damper_floor());
+        s.damper_floor = sanitize_f32(
+            s.damper_floor,
+            0.0,
+            1.0 - f32::EPSILON,
+            default_damper_floor(),
+        );
         s.neg_gamma = sanitize_f32(s.neg_gamma, 0.0, 1.0, default_neg_gamma());
         // τ feeds `(prox − τ)/(1 − τ)`; keep it strictly < 1.0 to avoid a
         // zero/negative denominator (the fn also guards with `.max(EPSILON)`).
-        s.negative_tau =
-            sanitize_f32(s.negative_tau, 0.0, 1.0 - f32::EPSILON, default_negative_tau());
-        s.negative_lift_cutoff =
-            sanitize_f32(s.negative_lift_cutoff, 0.0, 1.0, default_negative_lift_cutoff());
-        s.specificity_lift_cutoff =
-            sanitize_f32(s.specificity_lift_cutoff, 0.0, 1.0, default_specificity_lift_cutoff());
+        s.negative_tau = sanitize_f32(
+            s.negative_tau,
+            0.0,
+            1.0 - f32::EPSILON,
+            default_negative_tau(),
+        );
+        s.negative_lift_cutoff = sanitize_f32(
+            s.negative_lift_cutoff,
+            0.0,
+            1.0,
+            default_negative_lift_cutoff(),
+        );
+        s.specificity_lift_cutoff = sanitize_f32(
+            s.specificity_lift_cutoff,
+            0.0,
+            1.0,
+            default_specificity_lift_cutoff(),
+        );
         s.value_neutral = sanitize_f32(s.value_neutral, 0.0, 1.0, default_value_neutral());
         // Weights only need to be non-negative finite (the `positive` sum is
         // clamped to [0,1] downstream); cap at 1.0 so neither dominates.
@@ -1412,7 +1428,10 @@ paths = ["~/notes"]
     #[test]
     fn weaver_default_stop_handles_seeded() {
         let d = WeaverSettings::default();
-        assert!(!d.stop_handles.is_empty(), "default stop-set must be seeded");
+        assert!(
+            !d.stop_handles.is_empty(),
+            "default stop-set must be seeded"
+        );
         assert!(
             d.stop_handles.iter().any(|h| h == "turn-digest"),
             "seed set must include known harness handles",
@@ -1473,7 +1492,10 @@ paths = ["~/notes"]
                 r.value_w_use,
                 r.value_w_judg,
             ] {
-                assert!(v.is_finite() && (0.0..=1.0).contains(&v), "knob {v} not finite in [0,1]");
+                assert!(
+                    v.is_finite() && (0.0..=1.0).contains(&v),
+                    "knob {v} not finite in [0,1]"
+                );
             }
             assert!(r.negative_knn_k >= 1, "kNN k must resolve to >= 1");
             // The clamp the scorer runs is now always valid (no panic).
@@ -1503,8 +1525,7 @@ paths = ["~/notes"]
         // A `[weaver]` block that sets only `exclude_facets` must still get
         // the seeded `stop_handles` via the field's serde default — not an
         // empty list (which would silently disable the gate).
-        let w: WeaverSettings =
-            toml::from_str(r#"exclude_facets = ["status:archived"]"#).unwrap();
+        let w: WeaverSettings = toml::from_str(r#"exclude_facets = ["status:archived"]"#).unwrap();
         assert_eq!(w.exclude_facets, vec!["status:archived".to_string()]);
         assert!(
             !w.stop_handles.is_empty(),

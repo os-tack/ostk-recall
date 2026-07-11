@@ -30,6 +30,7 @@ pub mod weaver;
 pub use cluster::{EMERGENT_THRESHOLD, EmergentCluster, find_clusters, find_clusters_with};
 pub use concept_growth::{ConceptGrowthConfig, ConceptGrowthRuntime};
 pub use curator::{CuratorConfig, CuratorError, CuratorTick, IdleCurator, TensionTransition};
+pub use health::salience_health;
 pub use observer::{
     ObservationResult, ObserverError, ProposedThreadStub, TurnObserver, ambient_scope_default,
 };
@@ -37,7 +38,6 @@ pub use query::{
     Axis, AxisAttribution, CompositeWeights, RankBy, ThreadQueryAttribution, ThreadQueryError,
     ThreadQueryParams, ThreadQueryReport, run_query,
 };
-pub use health::salience_health;
 pub use salience::{
     SalienceFactors, SalienceScorer, SourceMeta, center, negative_penalty, shannon_entropy,
     specificity_from_histogram, specificity_from_project_dist, value_from, value_judgment,
@@ -851,8 +851,8 @@ fn compute_score_parts(
     let lift_is_stop = is_stop
         || (cfg.specificity_enabled && spec < cfg.specificity_lift_cutoff)
         || (cfg.negative_enabled && neg > cfg.negative_lift_cutoff);
-    let lift_term = BETA
-        * off_diagonal_lift(state.tension, resonance, state.resonance, lift_is_stop);
+    let lift_term =
+        BETA * off_diagonal_lift(state.tension, resonance, state.resonance, lift_is_stop);
     let score = decay_term + resonance_term + lift_term;
     ScoreParts {
         score,
@@ -2629,8 +2629,7 @@ mod tests {
             "guard: 300/290 (rate 0.97) is NOT a derived stopword — only the \
              curated list can demote it",
         );
-        let store =
-            InMemoryAttention::new().with_stop_handles(vec!["turn-digest".to_string()]);
+        let store = InMemoryAttention::new().with_stop_handles(vec!["turn-digest".to_string()]);
         let scope = scope_for("haystack");
         store.attend(&scope, "ctx").await.unwrap();
         let v = stub_embed("ctx");
@@ -2728,24 +2727,35 @@ mod tests {
             !is_stop_handle(300, 290),
             "guard: 300/290 is not a derived stopword — specificity must do the work",
         );
-        let store = InMemoryAttention::new()
-            .with_salience_settings(&salience_specificity_only());
+        let store = InMemoryAttention::new().with_salience_settings(&salience_specificity_only());
         let scope = scope_for("haystack");
         store.attend(&scope, "ctx").await.unwrap();
         let v = stub_embed("ctx");
 
         for h in ["diffuse", "concentrated"] {
-            store.seed_anchor(&scope, handle(h), v.clone()).await.unwrap();
-            store.seed_counters(&scope, &handle(h), 300, 290).await.unwrap();
+            store
+                .seed_anchor(&scope, handle(h), v.clone())
+                .await
+                .unwrap();
+            store
+                .seed_counters(&scope, &handle(h), 300, 290)
+                .await
+                .unwrap();
         }
         let mut factors = HashMap::new();
         factors.insert(
             "diffuse".to_string(),
-            SalienceFactors { specificity: 0.05, ..Default::default() },
+            SalienceFactors {
+                specificity: 0.05,
+                ..Default::default()
+            },
         );
         factors.insert(
             "concentrated".to_string(),
-            SalienceFactors { specificity: 0.95, ..Default::default() },
+            SalienceFactors {
+                specificity: 0.95,
+                ..Default::default()
+            },
         );
         store.set_salience_factors(factors).await;
 
@@ -2787,8 +2797,14 @@ mod tests {
         for on in [false, true] {
             let store = build(on);
             store.attend(&scope, "ctx").await.unwrap();
-            store.seed_anchor(&scope, handle("idea"), v.clone()).await.unwrap();
-            store.seed_counters(&scope, &handle("idea"), 22, 11).await.unwrap();
+            store
+                .seed_anchor(&scope, handle("idea"), v.clone())
+                .await
+                .unwrap();
+            store
+                .seed_counters(&scope, &handle("idea"), 22, 11)
+                .await
+                .unwrap();
             if on {
                 // Explicitly neutral factor — must be a no-op.
                 let mut f = HashMap::new();
@@ -2813,18 +2829,26 @@ mod tests {
         // vector still surfaces: the floor is clamped, but the live
         // `ALPHA·resonance` term is untouched by specificity, so an actively
         // resonating diffuse handle clears ARCHIVE_THRESHOLD.
-        let store = InMemoryAttention::new()
-            .with_salience_settings(&salience_specificity_only());
+        let store = InMemoryAttention::new().with_salience_settings(&salience_specificity_only());
         let scope = scope_for("haystack");
         store.attend(&scope, "ctx").await.unwrap();
         let v = stub_embed("ctx"); // aligned with the scope's attention vec
 
-        store.seed_anchor(&scope, handle("diffuse-live"), v.clone()).await.unwrap();
-        store.seed_counters(&scope, &handle("diffuse-live"), 300, 290).await.unwrap();
+        store
+            .seed_anchor(&scope, handle("diffuse-live"), v.clone())
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("diffuse-live"), 300, 290)
+            .await
+            .unwrap();
         let mut f = HashMap::new();
         f.insert(
             "diffuse-live".to_string(),
-            SalienceFactors { specificity: 0.05, ..Default::default() },
+            SalienceFactors {
+                specificity: 0.05,
+                ..Default::default()
+            },
         );
         store.set_salience_factors(f).await;
 
@@ -2846,24 +2870,35 @@ mod tests {
         // in precomputed `neg_penalty`. The high-penalty handle (a near-twin of
         // the rejected/dormant centroid) must rank BELOW the clean one — the
         // `1 − γ·neg` damp on the idle floor, with no hand-list.
-        let store =
-            InMemoryAttention::new().with_salience_settings(&salience_negative_only());
+        let store = InMemoryAttention::new().with_salience_settings(&salience_negative_only());
         let scope = scope_for("haystack");
         store.attend(&scope, "ctx").await.unwrap();
         let v = stub_embed("ctx");
 
         for h in ["clean", "harness-twin"] {
-            store.seed_anchor(&scope, handle(h), v.clone()).await.unwrap();
-            store.seed_counters(&scope, &handle(h), 300, 290).await.unwrap();
+            store
+                .seed_anchor(&scope, handle(h), v.clone())
+                .await
+                .unwrap();
+            store
+                .seed_counters(&scope, &handle(h), 300, 290)
+                .await
+                .unwrap();
         }
         let mut factors = HashMap::new();
         factors.insert(
             "clean".to_string(),
-            SalienceFactors { neg_penalty: 0.0, ..Default::default() },
+            SalienceFactors {
+                neg_penalty: 0.0,
+                ..Default::default()
+            },
         );
         factors.insert(
             "harness-twin".to_string(),
-            SalienceFactors { neg_penalty: 1.0, ..Default::default() },
+            SalienceFactors {
+                neg_penalty: 1.0,
+                ..Default::default()
+            },
         );
         store.set_salience_factors(factors).await;
 
@@ -2892,27 +2927,44 @@ mod tests {
         // handle carry neg_penalty 1.0, but `ostk-cache` also has a strong live
         // resonance (anchor aligned with the attention vector) while noise does
         // not — so the bounded form preserves the genuine signal.
-        let store =
-            InMemoryAttention::new().with_salience_settings(&salience_negative_only());
+        let store = InMemoryAttention::new().with_salience_settings(&salience_negative_only());
         let scope = scope_for("haystack");
         store.attend(&scope, "ctx").await.unwrap();
         let aligned = stub_embed("ctx"); // resonates with the live vector
         let orthogonal = stub_embed("totally-unrelated-context-zzz");
 
-        store.seed_anchor(&scope, handle("ostk-cache"), aligned).await.unwrap();
-        store.seed_counters(&scope, &handle("ostk-cache"), 22, 11).await.unwrap();
-        store.seed_anchor(&scope, handle("pure-noise"), orthogonal).await.unwrap();
-        store.seed_counters(&scope, &handle("pure-noise"), 300, 290).await.unwrap();
+        store
+            .seed_anchor(&scope, handle("ostk-cache"), aligned)
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("ostk-cache"), 22, 11)
+            .await
+            .unwrap();
+        store
+            .seed_anchor(&scope, handle("pure-noise"), orthogonal)
+            .await
+            .unwrap();
+        store
+            .seed_counters(&scope, &handle("pure-noise"), 300, 290)
+            .await
+            .unwrap();
 
         let mut factors = HashMap::new();
         // Both look like rejected twins by embedding proximity.
         factors.insert(
             "ostk-cache".to_string(),
-            SalienceFactors { neg_penalty: 1.0, ..Default::default() },
+            SalienceFactors {
+                neg_penalty: 1.0,
+                ..Default::default()
+            },
         );
         factors.insert(
             "pure-noise".to_string(),
-            SalienceFactors { neg_penalty: 1.0, ..Default::default() },
+            SalienceFactors {
+                neg_penalty: 1.0,
+                ..Default::default()
+            },
         );
         store.set_salience_factors(factors).await;
 
@@ -2957,14 +3009,23 @@ mod tests {
             };
             let store = InMemoryAttention::new().with_salience_settings(&cfg);
             store.attend(&scope, "ctx").await.unwrap();
-            store.seed_anchor(&scope, handle("idea"), v.clone()).await.unwrap();
-            store.seed_counters(&scope, &handle("idea"), 22, 11).await.unwrap();
+            store
+                .seed_anchor(&scope, handle("idea"), v.clone())
+                .await
+                .unwrap();
+            store
+                .seed_counters(&scope, &handle("idea"), 22, 11)
+                .await
+                .unwrap();
             if on {
                 // v1 only ever assigns value = 1.0; assert that is a no-op.
                 let mut f = HashMap::new();
                 f.insert(
                     "idea".to_string(),
-                    SalienceFactors { value: 1.0, ..Default::default() },
+                    SalienceFactors {
+                        value: 1.0,
+                        ..Default::default()
+                    },
                 );
                 store.set_salience_factors(f).await;
             }
@@ -2997,17 +3058,29 @@ mod tests {
         let off = stub_embed("an-unrelated-idle-context-qqq");
 
         for h in ["proven", "unproven"] {
-            store.seed_anchor(&scope, handle(h), off.clone()).await.unwrap();
-            store.seed_counters(&scope, &handle(h), 22, 11).await.unwrap();
+            store
+                .seed_anchor(&scope, handle(h), off.clone())
+                .await
+                .unwrap();
+            store
+                .seed_counters(&scope, &handle(h), 22, 11)
+                .await
+                .unwrap();
         }
         let mut factors = HashMap::new();
         factors.insert(
             "proven".to_string(),
-            SalienceFactors { value: 1.0, ..Default::default() },
+            SalienceFactors {
+                value: 1.0,
+                ..Default::default()
+            },
         );
         factors.insert(
             "unproven".to_string(),
-            SalienceFactors { value: 0.7, ..Default::default() },
+            SalienceFactors {
+                value: 0.7,
+                ..Default::default()
+            },
         );
         store.set_salience_factors(factors).await;
 
@@ -3051,7 +3124,11 @@ mod tests {
             depth: FoldDepth::Folded,
             fade_multiplier: 1.0,
             anchor,
-            origin: ScopeKey { project: None, session_id: None, agent: None },
+            origin: ScopeKey {
+                project: None,
+                session_id: None,
+                agent: None,
+            },
             origin_was_private: false,
         };
 
@@ -3064,9 +3141,15 @@ mod tests {
 
         let s_off =
             compute_score_parts(&state, &attn, now, false, SalienceFactors::default(), &off).score;
-        let s_on =
-            compute_score_parts(&state, &attn, now, false, SalienceFactors::default(), &on_neutral)
-                .score;
+        let s_on = compute_score_parts(
+            &state,
+            &attn,
+            now,
+            false,
+            SalienceFactors::default(),
+            &on_neutral,
+        )
+        .score;
         assert_eq!(
             s_off.to_bits(),
             s_on.to_bits(),
