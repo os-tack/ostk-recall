@@ -1203,9 +1203,12 @@ mod tests {
 
         // Real config with a person markdown source (via the TOML load path).
         let toml = format!(
-            "[corpus]\nroot = \"{root}/corpus\"\n[embedder]\nmodel = \"m\"\n\
+            // Literal (single-quoted) TOML strings for the interpolated
+            // paths — Windows temp paths carry backslashes that a basic
+            // string would parse as escapes.
+            "[corpus]\nroot = '{root}/corpus'\n[embedder]\nmodel = \"m\"\n\
              [[sources]]\nkind = \"markdown\"\nproject = \"memories\"\n\
-             paths = [\"{people}\"]\nextensions = [\"md\"]\nentity_type = \"person\"\n\
+             paths = ['{people}']\nextensions = [\"md\"]\nentity_type = \"person\"\n\
              edges = [\"families\"]\n",
             root = tmp.path().display(),
             people = people.display(),

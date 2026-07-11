@@ -175,19 +175,21 @@ mod tests {
     use tempfile::TempDir;
 
     /// Build a config (via the real TOML load path) with one `person` markdown
-    /// source rooted at `<dir>/people`.
+    /// source rooted at `<dir>/people`. Paths interpolate into TOML *literal*
+    /// (single-quoted) strings: Windows temp paths carry backslashes that a
+    /// basic string would parse as escapes.
     fn cfg_with_person_dir(dir: &std::path::Path) -> Config {
         let people = dir.join("people");
         let toml = format!(
             r#"
 [corpus]
-root = "{root}/corpus"
+root = '{root}/corpus'
 [embedder]
 model = "minishlab/potion-retrieval-32M"
 [[sources]]
 kind = "markdown"
 project = "memories"
-paths = ["{people}"]
+paths = ['{people}']
 extensions = ["md"]
 entity_type = "person"
 edges = ["families", "works_on"]
