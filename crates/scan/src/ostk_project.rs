@@ -1263,10 +1263,7 @@ fn scan_specs(
                 .is_some_and(|x| x.eq_ignore_ascii_case("md"))
         }) {
             let path = entry.path();
-            let source_id = path.strip_prefix(root).map_or_else(
-                |_| path.to_string_lossy().into_owned(),
-                |p| p.to_string_lossy().into_owned(),
-            );
+            let source_id = rel_source_id(root, path);
             let text = match std::fs::read_to_string(path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1307,6 +1304,22 @@ fn scan_specs(
     chunks
 }
 
+/// Root-relative `source_id`, `/`-separated on every platform. Corpus
+/// coordinates must match across OSes (the markdown/code/file_glob scanners
+/// already normalize this way); a lossy platform-path print would key
+/// Windows scans on `\`.
+fn rel_source_id(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).map_or_else(
+        |_| path.to_string_lossy().into_owned(),
+        |rel| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        },
+    )
+}
+
 /// Single-file path-routed variant of `scan_specs`. Parses exactly the
 /// requested `.md` file under `docs/spec` or `docs/draft`; identical
 /// chunking shape.
@@ -1319,10 +1332,7 @@ fn scan_one_spec(
     if !path.is_file() {
         return Vec::new();
     }
-    let source_id = path.strip_prefix(root).map_or_else(
-        |_| path.to_string_lossy().into_owned(),
-        |p| p.to_string_lossy().into_owned(),
-    );
+    let source_id = rel_source_id(root, path);
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -1388,10 +1398,7 @@ fn scan_code(
                 })
         }) {
             let path = entry.path();
-            let source_id = path.strip_prefix(root).map_or_else(
-                |_| path.to_string_lossy().into_owned(),
-                |p| p.to_string_lossy().into_owned(),
-            );
+            let source_id = rel_source_id(root, path);
             let text = match std::fs::read_to_string(path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1475,10 +1482,7 @@ fn scan_one_code(
     if !path.is_file() || !has_code_extension(path) {
         return Vec::new();
     }
-    let source_id = path.strip_prefix(root).map_or_else(
-        |_| path.to_string_lossy().into_owned(),
-        |p| p.to_string_lossy().into_owned(),
-    );
+    let source_id = rel_source_id(root, path);
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {

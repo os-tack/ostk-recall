@@ -1270,7 +1270,15 @@ fn seed_doc_node(
     // Evidence: map docs-root-relative `rel` → the ingesting source's
     // project-root coordinate (`<root_name>/<rel>`, e.g. `docs/spec/foo.md`)
     // and anchor on the first chunk (lowest `chunk_index`). No re-embed.
-    let source_id = format!("{root_name}/{}", rel.to_string_lossy());
+    // Corpus coordinates are `/`-separated on every platform — join the
+    // components rather than lossy-print the platform path, which would
+    // key the lookup on `\` under Windows.
+    let rel_slash = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let source_id = format!("{root_name}/{rel_slash}");
     if let Ok(chunks) = ingest.chunk_ids_for_source_id(Source::OstkSpec.as_str(), &source_id) {
         if let Some(anchor) = chunks.first() {
             let attached = threads.attach_concept_evidence(&EvidenceAttach {
