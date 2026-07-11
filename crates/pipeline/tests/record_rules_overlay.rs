@@ -150,9 +150,11 @@ async fn tag_rule_sets_record_kind_and_reembeds() {
         "tag (record_kind) must re-embed; stats={s2:?}"
     );
 
-    // And the stored chunk carries the facet.
+    // And the stored chunk carries the facet. `facets` is a flat JSON-array
+    // string (see corpus_schema), so match the serialized element — lance-side
+    // array_contains cannot apply to a Utf8 column.
     let n = store
-        .count_active("array_contains(facets, 'record_kind:test_kind')")
+        .count_active(r#"facets LIKE '%"record_kind:test_kind"%'"#)
         .await
         .unwrap();
     assert_eq!(n, 1, "the tagged chunk must carry record_kind:test_kind");
