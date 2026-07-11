@@ -1225,7 +1225,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["created"], json!(true));
-        assert!(out["path"].as_str().unwrap().ends_with("people/sarah.md"));
+        // `path` is a native filesystem path (display()-rendered) — normalize
+        // separators before the suffix check so the assert holds on Windows.
+        let stub_path = out["path"].as_str().unwrap().replace('\\', "/");
+        assert!(stub_path.ends_with("people/sarah.md"));
         assert!(people.join("sarah.md").exists());
 
         // Without config → invalid_request, never panics.
