@@ -708,8 +708,11 @@ fn scan_audit(
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_micros() as i64);
-                let key = seg.to_string_lossy();
-                if hwms.get(key.as_ref()) == Some(&(size, mtime)) {
+                // Separator-normalized key: the same segment must map to one
+                // HWM row however the path was spelled (Windows read_dir
+                // yields `\`; configs and joins may carry `/`).
+                let key = seg.to_string_lossy().replace('\\', "/");
+                if hwms.get(key.as_str()) == Some(&(size, mtime)) {
                     continue;
                 }
                 if ingest_events_only(&seg, project, events) {
@@ -1649,7 +1652,7 @@ mod tests {
         // First scan: segment ingested, HWM recorded at its (size, mtime).
         scan_audit(proj.path(), Some("p"), "cfg", Some(&events)).unwrap();
         let hwms = events.seal_hwms().unwrap();
-        let key = seg.to_string_lossy().into_owned();
+        let key = seg.to_string_lossy().replace('\\', "/");
         let mark = hwms.get(&key).copied().expect("HWM recorded for segment");
         let meta = std::fs::metadata(&seg).unwrap();
         assert_eq!(mark.0, i64::try_from(meta.len()).unwrap(), "size matches");
